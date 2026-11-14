@@ -1,74 +1,85 @@
 ---
 name: fleet-evolve
-description: >-
-  Self-hosting multi-agent fleet evolution, orthogonal Shell x LLM capability
-  recalculation, host-global synchronization, and full-stack subtraction hygiene
-  protocol across Antigravity, Codex, Claude Code (plus CC Switch), and DeepSeek
-  Harness. Trigger with highest priority when the user asks to comprehensively
-  upgrade, re-evaluate agent/LLM configurations, or run full regression hygiene.
+description: >
+  Self-hosting multi-agent fleet evolution, full-stack non-Master toolchain upgrade with dependency
+  coupling warnings, orthogonal Shell x LLM recalculation, and whole-file SSOT refactoring hygiene across
+  Antigravity, Codex, Claude Code (plus CC Switch), and DeepSeek Harness. Trigger with highest priority
+  when the user asks to comprehensively upgrade, audit, refactor, or run full regression hygiene.
 ---
 
-# 多引擎舰队自举演进与全栈清淤回归协议（`fleet-evolve`）
+# 多引擎舰队全栈自举演进与整仓重构协议（`fleet-evolve`）
 
-当用户提出模糊或明确的全面升级诉求（如“全面更新整套配置”“根据各家最新动态升级适配”“重算各端与模型分工”“全量清淤回归”，或显式点名 `fleet-evolve`／`fleet-evolve audit`／`fleet-evolve hygiene`）时，优先启用本技能。
+当用户提出模糊或明确的全面升级、全栈更新或整仓治理诉求（如“全面更新整套配置”“全升级所有用到的工具”“看看各家最新动态重算方案”“全量优化仓库代码和文档可读性”“清淤回归”）时，最高优先级启用本技能。为严守 `R0` 目录复杂度 $O(1)$，本协议不拆分额外插件或独立矩阵文件，内部通过**三种单趟入口模式**流转：
 
-- **前置自理边界 vs. 单仓按需分发**：网络连通／合规代理、各客户端安装升级、官方登录态（OAuth）与供应商 API Key 属**用户自理基础前提**（体检发现缺失或网络不通时直接如实暴露提示用户自理，严禁编造绕过或反代逻辑）；底层工具循环、补丁解析、沙箱与压缩留给官方 CLI，本仓库作为**唯一上游真源**维护全部全局规则、通用技能、确定性钩子、只读子代理与本地路由，按各 Agent 外壳特性、基座 LLM 特性与本机任务需求编译分发。
+1. **`full`（默认：全栈升级演进 + 宿主机同步 + 整仓门禁回归）**：覆盖除当前活跃主控进程外的全栈工具链分级升级、二维正交选型重算、双侧宿主机同步、真机探针验收与整仓清淤终审。
+2. **`audit`（只读体检与耦合评估）**：仅执行 Phase 1–2 只读采集、工具链依赖耦合诊断与方案对比，零文件写入。
+3. **`hygiene`（整仓代码／结构／文档单点真源重构与主控 `R6` 终审）**：聚焦全仓源码逻辑、安全边界、死代码清淤、文件结构收敛与面向 CAE 工程师的文档整篇重写（消除补丁式堆叠），执行 Phase 4 全量门禁验收。
 
-## 一、四条核心铁律
+---
 
-1. **性能上限优先，剥离省钱降挡**：调研阶段并发调动可用只读子代理与无头节点拉满信息密度；目标配置凡涉及数理推导、核心编码、边界审查与门禁验收，默认锁死各端**单模型纯思考最高挡**（`max`／`high`，跳过二次派生子代理的 `ultra` 挡），禁止引入静默降级路由或偷懒低挡。
-2. **二维正交选型（宿主外壳控制面 × 基座模型推理面）**：禁止只看榜单换模型名。必须正交评估**宿主外壳机制**（工具闭环摩擦、生命周期 Hooks、`--output-schema`/`--json-schema` 结构化约束、压缩阈值、沙箱写域）与**基座模型能力**（高阶数理深度、长程召回率、工具调用稳定性、直连合规性），明确界定每一组合的不可替代场景（如为何选 `Claude Code + Kimi/DeepSeek` 而非 `DSH + DeepSeek`，何时必须调 `Codex Astra/Sol` 而非主控原生子代理）。
-3. **证据降噪权重**：评估信源严格按以下权重排序裁决：**① 本机跨项目真实翻车账本**（收敛阶退化、量纲错配、压缩失忆、钩子异常、尾随停止标签泄漏、跨盘 I/O 超时） **> ② 官方 System Card / Changelog 底层机制与客户端目录实测参数 > ③ 社区硬核长程工程实测 > ④ 通用榜单跑分**（剔除玩具页面打榜软文）。
-4. **减法清淤与反膨胀（`R0`/`R3.3`）**：新模型或新 CLI 原生修复的旧缺陷，其历史防呆补丁、废弃兼容分支与重复叮嘱必须同步删净；禁止重写底层执行循环或堆砌脆弱的终端输出解析胶水。
+## 0. 四条硬约束
 
-## 二、三种单趟模式与二阶段自举（Bootstrap）入口
+1. **性能与精度优先，锁定单模型纯思考最高挡**：核心推导、代码审查与物理门禁一律锁定单模型最高纯思考挡（`max`／`xhigh`／`high`），严禁静默降级或套娃启用 `ultra`。
+2. **二维正交选型（宿主外壳控制面 × 基座模型推理面）**：同时评估宿主 CLI 外壳（工具循环稳定性、补丁命中率、生命周期钩子、压缩策略、沙箱边界）与基座模型（数学物理推导深度、长上下文保真度、配额与内网可达性），明确给出组合选型依据（如为何终端交互选 `Claude Code + DeepSeek` 而纯无头保底选 `DSH + DeepSeek`）。
+3. **全栈非主控升级与三级耦合红线**：全面检查仓库运行与科研工作流依赖的客户端 CLI、路由脚本、CI 工作流、Python 运行时及 WSL2 环境；**绝不原地热更当前正在运行的活跃主控进程**，且对高耦合底层环境必须输出显式**依赖耦合警告**，严禁强行覆盖破坏现有编译扩展或求解器 ABI。
+4. **整篇重构清淤（反叠补丁）**：每次更新文档与规则时，必须按单点真源（SSOT）通篇重写收敛，剔除过时补丁、重复叮嘱与非 CAE 管道噪音，保持仓库总复杂度收敛。
 
-支持三种单趟执行模式：**`full`**（默认全流程：并发调研 $\rightarrow$ 矩阵重算 $\rightarrow$ 双侧实装与真机探针 $\rightarrow$ 清淤回归）、**`audit`**（严格只读体检与方案评估，零文件写入）、**`hygiene`**（仅执行代码合理性、减法清淤、脱敏与全量测试回归）。
+---
 
-状态锁脚本位于 [scripts/fleet_state.py](scripts/fleet_state.py)，状态文件独立落盘于宿主机本地运行目录（Windows `%LOCALAPPDATA%/cae-harness/fleet-evolve/state.windows.json`、WSL／Linux `${XDG_STATE_HOME:-~/.local/state}/cae-harness/fleet-evolve/state.posix.json`，绝不污染 Git 工作区或四端配置根目录）。启动 `full` 模式时先运行：
+## 1. 二阶段自举状态锁（`scripts/fleet_state.py`）
 
-```sh
-python -B scripts/fleet_state.py --repo "<上游仓库根目录>" status
+状态锁存放于宿主机本地状态目录（Windows `%LOCALAPPDATA%\cae-harness\fleet-evolve\state.windows.json`；WSL2／Linux `${XDG_STATE_HOME:-~/.local/state}/cae-harness/fleet-evolve/state.posix.json`），零污染 Git 工作区：
+
+```bash
+python -B -X utf8 <skill_dir>/scripts/fleet_state.py --repo <repo_root> status
 ```
 
-- **`phase == "IDLE"`（含已完成收口或因超时／侧别不符／仓库演进而自动失效的旧锁）** $\rightarrow$ 进入 **Pass 1**：完成全量只读并发调研、方案重算、仓库与非主控端配置更新及真机 CLI 探针验收：
-  - **单趟直通（默认常态）**：若评估结论为当前常驻主控宿主与旗舰模型无需更换（如保持反重力 `Gemini 4 Carbon (High)` 总控），无需写挂起锁，直接进入 Phase 4 完成全仓回归并提示用户“新会话即自动加载更新后的插件技能”。
-  - **二阶段挂起（主控需切换宿主或模型时）**：调用 `fleet_state.py --repo "<上游仓库根目录>" record-pass1 --session-id "<当前会话ID>" --target-master "<目标主控>"` 写入绑定 `execution_side`、`repo_commit`、`plugin_version`、`skill_sha256`、`session_id` 与 `24h TTL` 的状态锁，输出手动切换主控清单并暂停；待用户切换主控后重发本指令。
-- **`phase == "AWAITING_MASTER_RELOAD"`** $\rightarrow$ 调用 `fleet_state.py --repo "<上游仓库根目录>" verify-pass2 --session-id "<新会话ID>"`：校验通过（确认新会话 ID 异于 Pass 1、未超时且仓库提交一致）后**跳过重复外网调研**，直接进入 **Pass 2** 完成新主控接管核验、跨端联调与 Phase 4 终审，收口时执行 `fleet_state.py --repo "<上游仓库根目录>" clear --verified` 重置回 `IDLE`。校验不通过则报明原因并执行 `fleet_state.py --repo "<上游仓库根目录>" clear` 重置，严防死循环。
+- **`phase == "IDLE"`（默认 Pass 1）**：正常执行 Phase 1 $\rightarrow$ Phase 4；若 `stale_reason` 非空（`expired_ttl`／`repo_drift`／`side_mismatch`／`corrupt_state`），先 `clear` 归零再进入 Pass 1。
+- **`phase == "AWAITING_MASTER_RELOAD"`（新主控重启后 Pass 2 重入）**：运行 `verify-pass2 --session-id <current_session_id>` 原子认领状态锁（防同会话死循环与并发重入），跳过重复外网检索，直接校验新主控并进入 Phase 3 真机联调与 Phase 4 门禁收口。
 
-## 三、四阶标准流水线
+---
 
-### Phase 1：读写屏障与全员只读并发调研（改配置前零写入）
+## 2. 标准四阶执行流水线
 
-改动任何仓库文件或宿主机全局配置前，先确认 `git status -sb` 干净可回滚，随后利用当前稳定态的**原生只读子代理 + `cae-harness` 只读节点**并发采集三路证据：
+### Phase 1：零写入全员并发调研与工具链耦合诊断（Pass 1 ＆ `audit` 执行）
 
-1. **本机全栈目录与漂移体检（双侧零写入）**：
-   依次运行仓库根 `python -B install.py --probe-apps`、`python -B install.py --audit-upgrade`（WSL 侧用 `python3`），以及 `cae_harness.py probe --discover-models`、`assess` 与 `ccswitch_admin.py status`，获取四端客户端版本、CC Switch `schema_version`、声明最大窗口、可调思考挡位及规则／钩子／技能漂移清单。
-2. **外部官方与硬核实测拉齐**：
-   检索 Antigravity / Gemini、OpenAI Codex、Anthropic Claude Code（及 Kimi / DeepSeek 卡片模型）、DeepSeek Harness 最新版本变更、上下文退化拐点、工具调用与新增 CLI 协议约束。
-3. **本机跨项目历史账本匿名深挖**：
-   只读扫描宿主机各端会话与钩子日志（`lifecycle.log`、`router.log`、历史会话记录），提取真实故障模式（如复杂 glob 异常、无头 JSON 尾随标签泄漏、压缩失忆、沙箱锁冲突）。**严禁将任何个人路径、用户名、主机名、会话 UUID 或密钥写入仓库文件（`R4`）**。
-   > **跨端并发投喂准则**：向 `Codex Astra (max)` 或 `Kimi K3.1 (max)` 派发深层只读分析时，须预先标明核心文件与行号区间并设 `--timeout 900` 以上；避免在 WSL 侧对 `/mnt/` 跨盘大目录发起全树遍历。
+在改动任何文件前，并发调起原生只读子代理与 `cae-harness` 采集三路证据：
+1. **双侧环境、资产漂移与工具链耦合体检**：
+   - 运行 Windows 与 WSL 双侧 `install.py --probe-apps`、`install.py --audit-upgrade --with-cc-router`（读取 `host.toolchain` 中的 Python 次版本、全局编译型科学计算包列表与 `coupling_warnings`）及 `cae_harness.py probe --discover-models`／`assess`。
+   - 检查非主控工具链可用更新：各非主控 Agent CLI（`claude`、`codex`、`dsh`、`cc-switch`）、`Python.Launcher`、Python 同次版本补丁、WSL2 内核（`wsl --status`）与 `.github/workflows/ci.yml` Action 版本。
+   - 若检出网络不通、客户端未登录或 API Key 缺失，直接向用户列出**前置自理清单**，不编造绕过逻辑。
+2. **外部官方机制与硬核实测核查**：按权重优先级采信——**本机历史真实翻车记录（收敛阶退化、量纲错配、压缩失忆、钩子误拦） > 官方 Release Notes / System Card 机制参数 > 长程工程实测 > 通用榜单**。
+3. **整仓代码、结构与文档全量审计（`full` ＆ `hygiene` 必跑）**：并发派发只读子代理与异构无头引擎（如 `codex:sol`、`dsh:default`），逐文件排查逻辑矛盾、目录越界绕过、死代码与多文档重复堆叠。
 
-### Phase 2：全栈正交配置重算与双核心可视化矩阵维护
+### Phase 2：全栈升级分级裁决、正交重算与双矩阵原地维护
 
-遵循 `R0` 文件最少原则，**严禁新建独立 `FLEET_MATRIX.md` 或拆分 `README_ZH.md`**；直接在仓库根 `README.md` 第四章原地维护单一权威**双核心可视化矩阵**（**矩阵一：Agent × LLM 二维正交适配矩阵**；**矩阵二：用户模糊说法与 100% 精确调起映射矩阵**），覆盖四层正交参数：
-1. **常驻总控（Master）与原生子代理**：确定总控宿主、旗舰单模型、思考挡位、长会话收口阈值，以及同端 `inherit` 只读子代理（`readonly-reader` / `readonly-auditor` / `readonly-collaborator`）与 `run_workflow` 的分流边界。
-2. **四端宿主外壳与确定性 Hooks**：对齐反重力、Codex、Claude Code、DSH 的全局规则（保留用户自定义 `## 工具与...` 尾段）、前置目录边界与防空转门禁（`status_guard.py`）、压缩原话恢复（`session_context_loader.py`）、长会话交接（`handoff_gate.py`）及本地分流路由（`router.py` 强制子代理挡位映射）。
-3. **双矩阵同步对齐**：矩阵一逐条写清 `角色层级 | 宿主外壳 × 基座模型 | 锁定挡位与窗口 | 核心 Hooks 与隔离约束 | 不可替代适配准则 | 宿主探针状态`（严格区分 `官方声明`、`本机目录声明` 与 `宿主受控实测` 三层证据，`R3.6`/`R5`）；矩阵二逐条对齐日常模糊说法、100% 锁定调起的精确模块名（如 `fleet-evolve`、`cae-harness gate`、`codex:astra`、`readonly-auditor`、`ccswitch_admin.py`）及底层硬约束。
-4. **代码同步演进**：在 `install.py`、`cae_harness.py`、`template/claude/router/` 及对应模板中精准落实模型映射、多技能同步与缺陷修复，清理过时模型映射与死代码。
+1. **全栈非主控工具链三级升级裁决（严守耦合安全边界）**：
 
-### Phase 3：自举分步落地与真机 CLI 探针门禁
+   | 耦合等级 | 涵盖对象 | 执行准则 |
+   | :--- | :--- | :--- |
+   | **Tier 1：无耦合工具／CLI** | 非活跃主控的 `claude`、`codex`（独立安装包）、`dsh`、`cc-switch`、`Python.Launcher`（`py.exe`）、GitHub Actions | 经 `R4` 批准后直接原地升级至最新稳定版，并跑 `--version` 与无头探针验收；Windows 商店版 AppX 包或活跃主控自身仅提示更新路径，不强杀运行态进程。 |
+   | **Tier 2：同次版本运行时／WSL 内核** | 全局 Python 同次版本安全补丁（如 `3.13.x -> 3.13.y`，`cp313` ABI 兼容）、`wsl --update` | **先查进程锁**：确认无活跃钩子／脚本占用 `python.exe`、WSL 内无正在运行的 MPI／CFD／FEA 求解任务后再升级；若存在活跃占用，向用户发出明确提示并给出空闲执行命令。 |
+   | **Tier 3：重度 ABI／环境耦合升级** | 含 `jax`/`jaxlib`/`scipy`/`mpi4py`/`petsc4py`/`torch` 等编译扩展的全局 Python 跨次版本升级（如 `3.13 -> 3.14`）、WSL 跨 LTS 发行版升级（`do-release-upgrade`） | **强制警告拦截（绝不自动强升）**：明确告知用户跨版本原地覆盖将导致已编译科学计算轮子、求解器动态库与全局钩子解释器失效；推荐通过 `uv python install` 或项目独立 `venv` 并行安装新版本。 |
 
-1. **双侧预演与 `R4` 授权落盘**：先执行 `install.py --dry-run --yes`（含 `--with-cc-router` 等选定参数）核验变更计划、既有模型保留与 `cc-switch.db` 在线备份策略；获用户明确授权后同步宿主机全局目录（Windows 与已启用的 WSL 对侧）。
-2. **真机 CLI 往返探针（硬退出码门禁）**：对本机已就绪的非主控端逐一跑最小真实无头往返探针（如 `cae_harness.py task` 只读微探针及 `install.py --audit-upgrade`），**必须取得真实 `returncode == 0`、合法结构化输出且 `all_aligned: true`**，严禁仅凭静态配置文件宣称完工；任一探针失败立即定位修复或回滚。
+2. **代码重构与 `README.md` 第四章双矩阵原地更新**：
+   - 更新 `install.py`、`cae_harness.py`、`hooks/*.py` 与 `router/` 中经主控 `R6` 核实的代码改进。
+   - 在上游仓库 `README.md` 第四章原地重写更新**矩阵一（Agent/LLM 正交适配矩阵）**与**矩阵二（用户模糊指令、全栈升级与整仓重构精确调起矩阵）**，并按单点真源原则整篇收敛关联文档（底层钩子 JSON、代理协议与压测细节统一归口至 `docs/architecture-and-hooks.md`）。
 
-### Phase 4：全仓清淤、脱敏、双语导引与待推送硬挂起（Explicit Push Gate）
+### Phase 3：非主控实装、宿主机同步与真机 CLI 探针验收
 
-1. **Codex 无头回归审查与自动化门禁（`R3.1.4`）**：调用 `cae-harness`（`codex:sol` + `max` 挡 + `--verify-cmd`）对全部改动源码做边界审查、Debug 排错与死代码清理。
-2. **六模式临时沙箱隔离安装与离线全量单测**：在系统标准临时目录跑通 `codex`、`antigravity`、`claude --with-cc-router`、`dsh`、`both`、`all --with-cc-router` 六种沙箱安装、沙箱 `--audit-upgrade` 零漂移复核、`agy plugin validate --strict` 及全量 `python -B -X utf8 -m unittest discover -s tests -p "test_*.py" -v`（严守 `R3.6` 绝不弱化断言）。
-3. **减法清淤、单一版本真源与公开脱敏终审**：
-   - 双 `AGENTS.md` 均严格 `< 16,000` UTF-8 字节，保持 `template/user-guard/plugin.json` 单一版本真源（除 `CHANGELOG.md` 外任何 `.md` 严禁硬编码当前版本号）；
-   - 保持单本 `README.md` 顶层 `English Overview` 与中文正文能力矩阵同步，纯 ASCII 路径与本地相对链接全部有效，`LICENSE`（Apache-2.0）与 `NOTICE` 归属完整；
-   - 派发 `readonly-auditor` 核对行号依据，全仓扫描确认零本机路径、零用户名／主机名、零具体硬件型号、零内网地址、零会话 UUID 与零密钥残留。
-4. **待推送硬挂起**：运行 `git status -sb` 与 `git diff --stat`，向用户交付【架构与矩阵变更摘要 + 真机 CLI 探针结果 + 清淤脱敏核查单】。**严禁自动执行 `git push`**，原地等待用户明确下达推送指令后再推送远端。
+1. **预演与授权落盘**：先运行 `install.py --dry-run --yes` 预演，获用户 `R4` 授权后执行 Tier 1（及无锁 Tier 2）工具升级与双侧宿主机 `install.py` 正式同步。
+2. **真机无头往返探针（硬门禁）**：对每一条已就绪后端（如 `codex:sol`、Windows/WSL `cc:default`、`dsh:default`）发起真实 CLI 只读探针，必须同时拿到 **`returncode == 0`**、合法结构化回执以及双侧 `--audit-upgrade` **`all_aligned: true`**，严禁仅凭静态配置文件报完工。
+3. **主控自举分支判定**：
+   - **当前主控无需换壳／升级客户端（或已处于 Pass 2）**：运行 `fleet_state.py clear --verified`，直通 Phase 4。
+   - **主控客户端或常驻模型需切换**：运行 `fleet_state.py record-pass1 --session-id <sid> --target-master "<Target>"`，输出简明切换步骤后暂停退出，待用户重启主控后重发指令完成 Pass 2 合龙。
+
+### Phase 4：整仓清淤、沙箱门禁与待推送硬挂起（Explicit Push Gate）
+
+无论是 `full`、Pass 2 还是 `hygiene` 模式，收口前必须全部跑通以下 7 项确定性门禁：
+1. **独立审查与主控 `R6` 复核**：完成 `codex:sol (max)` 对改动文件的独立审查，主控逐行查对行号确认无死代码、无越界隐患、无未验证夸大表述（`R5`／`R3.6`）。
+2. **六模式临时沙箱安装与零漂移体检**：在临时目录跑通 `codex`、`antigravity`、`claude --with-cc-router`、`dsh`、`both`、`all --with-cc-router` 六种模式，且沙箱 `--audit-upgrade --with-cc-router` 全端 `drift_files == []`。
+3. **插件严格校验**：`agy plugin validate --strict template/user-guard` 零错误通过。
+4. **全量离线单测**：`python -B -X utf8 -m unittest discover -s tests -p "test_*.py" -v` 100% 通过（严禁删改或弱化测试断言）。
+5. **字节预算与单一版本真源**：`template/user-guard/rules/AGENTS.md` 与根 `AGENTS.md` 均 `< 16,000` 字节；版本号仅在 `template/user-guard/plugin.json` 与 `CHANGELOG.md` 出现，其余 `.md` 零硬编码版本号、零静态验证日期。
+6. **链接与公开脱敏终审**：全仓 `.md` 相对链接 100% 指向仓内真实文件；全仓零个人用户名路径、零会话 UUID、零具体 CPU/GPU 型号、零私有 IP、零密钥残留。
+7. **待推送硬挂起**：输出 `git status -sb`、`git diff --stat`、工具链升级与耦合警告清单及验收摘要，**严禁自动执行 `git push`**，等待用户明确推送指令。

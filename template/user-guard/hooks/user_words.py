@@ -106,13 +106,13 @@ def resolve_data_dirs(hooks_dir: Path) -> Tuple[Path, Path]:
     3. 本地回退目录 hooks_dir/state 与 hooks_dir/logs。
     """
     plugin_data = os.environ.get("PLUGIN_DATA", "").strip()
-    default_base = Path(plugin_data) if plugin_data else hooks_dir
+    default_base = Path(plugin_data).expanduser() if plugin_data else hooks_dir
 
     state_env = os.environ.get("USER_GUARD_STATE_DIR", "").strip()
     logs_env = os.environ.get("USER_GUARD_LOGS_DIR", "").strip()
 
-    state_dir = Path(state_env) if state_env else (default_base / "state")
-    logs_dir = Path(logs_env) if logs_env else (default_base / "logs")
+    state_dir = Path(state_env).expanduser() if state_env else (default_base / "state")
+    logs_dir = Path(logs_env).expanduser() if logs_env else (default_base / "logs")
     return state_dir, logs_dir
 
 
@@ -133,9 +133,22 @@ def valid_session_id(value: str) -> bool:
     return isinstance(value, str) and bool(re.fullmatch(r"[A-Za-z0-9_-]{1,160}", value))
 
 
+def _is_reparse_or_link(path: Path) -> bool:
+    try:
+        st = path.lstat()
+    except OSError:
+        return False
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_file_attributes", 0) & reparse_flag)
+
+
 def atomic_write_text(target_path: Path, content: str) -> None:
     """使用同目录临时文件 + fsync + os.replace 原子更新文件，防止并发或中断产生半截损坏文件"""
+    if _is_reparse_or_link(target_path.parent) or _is_reparse_or_link(target_path):
+        raise OSError(errno.EINVAL, "拒绝通过符号链接或重解析点写入状态文件", str(target_path))
     target_path.parent.mkdir(parents=True, exist_ok=True)
+    if _is_reparse_or_link(target_path.parent):
+        raise OSError(errno.EINVAL, "状态文件父目录不得为符号链接或重解析点", str(target_path.parent))
     tmp_path = target_path.with_name(f".{target_path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
     created = False
     try:
@@ -175,8 +188,12 @@ def session_state_lock(state_dir: Path, session_id: str, timeout_sec: float = 1.
     """串行化同会话状态事务。锁文件作为稳定锚点，进程退出由内核释放锁。"""
     if not valid_session_id(session_id):
         raise ValueError("会话标识缺失或不合法")
+    if _is_reparse_or_link(state_dir):
+        raise OSError(errno.EINVAL, "状态目录不得为符号链接或重解析点", str(state_dir))
     state_dir.mkdir(parents=True, exist_ok=True)
     path = state_dir / f".{session_id}.lock"
+    if _is_reparse_or_link(path):
+        raise OSError(errno.EINVAL, "会话锁不得为符号链接或重解析点", str(path))
     fd = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
     deadline = time.monotonic() + timeout_sec
     token = uuid.uuid4().hex.encode("ascii")

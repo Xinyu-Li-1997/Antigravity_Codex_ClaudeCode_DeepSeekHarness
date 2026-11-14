@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Upgrade CC Switch inside WSL using official GitHub release .deb with SHA-256 verification.
 # Usage:
 #   update-cc-switch-wsl.sh 4.0.31             Download official .deb, verify SHA-256, install via sudo apt
@@ -6,8 +6,9 @@
 #   Add --no-hash to proceed if GitHub release metadata omits asset digest (aborts by default)
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 PKGS="$HOME/cc-switch-app.pkgs"
+UID_CUR="$(id -u)"
 if [ "$#" -lt 1 ] || [ "$#" -gt 2 ] || { [ "$#" -eq 2 ] && [ "$2" != "--no-hash" ]; }; then
     echo "Usage: update-cc-switch-wsl.sh <version|local-deb-path> [--no-hash]" >&2
     exit 2
@@ -27,8 +28,7 @@ resolve_launcher() {
     local candidate
     for candidate in \
         "$SCRIPT_DIR/launch-cc-switch-wsl.sh" \
-        "$HOME/.claude/router/launch-cc-switch-wsl.sh" \
-        "$HOME/launch-cc-switch.sh"; do
+        "$HOME/.claude/router/launch-cc-switch-wsl.sh"; do
         if [ -x "$candidate" ]; then
             printf '%s\n' "$candidate"
             return 0
@@ -48,7 +48,8 @@ else
     mkdir -p "$PKGS"
     name="CC-Switch-v${ver}-Linux-x86_64.deb"
     deb="$PKGS/$name"
-    want="$(curl -fsSL "https://api.github.com/repos/farion1231/cc-switch/releases/tags/v${ver}" \
+    want="$(curl -fsSL --proto '=https' --tlsv1.2 --connect-timeout 10 --max-time 30 \
+        "https://api.github.com/repos/farion1231/cc-switch/releases/tags/v${ver}" \
         | python3 -I -B -X utf8 -c 'import json,sys; r=json.load(sys.stdin); print(next(((a.get("digest") or "") for a in r["assets"] if a["name"] == sys.argv[1]), ""))' "$name")"
     if [ -z "$want" ] && [ "$allow_nohash" != "--no-hash" ]; then
         echo "GitHub release did not publish SHA-256 for $name; aborting (pass --no-hash to override)." >&2
@@ -60,7 +61,8 @@ else
     fi
     echo "Downloading $name (expected digest: ${want:-none})"
     part=$(mktemp "$PKGS/.${name}.XXXXXX.part")
-    curl -fL --retry 3 -o "$part" "https://github.com/farion1231/cc-switch/releases/download/v${ver}/${name}"
+    curl -fL --proto '=https' --tlsv1.2 --connect-timeout 10 --max-time 180 --retry 3 -o "$part" \
+        "https://github.com/farion1231/cc-switch/releases/download/v${ver}/${name}"
     got="sha256:$(sha256sum "$part" | cut -d' ' -f1)"
     if [ -n "$want" ] && [ "${want,,}" != "$got" ]; then
         echo "Digest mismatch (expected $want, got $got); aborting." >&2
@@ -74,7 +76,7 @@ fi
 dpkg-deb -f "$deb" Package Version
 
 LAUNCHER="$(resolve_launcher || true)"
-pkill -TERM -f '^/usr/bin/cc-switch( |$)' 2>/dev/null || true
+pkill -TERM -u "$UID_CUR" -f '^/usr/bin/cc-switch( |$)' 2>/dev/null || true
 if ! sudo apt install -y "$deb"; then
     echo "Installation failed; attempting to restart previous version." >&2
     if [ -n "$LAUNCHER" ]; then "$LAUNCHER" || true; fi

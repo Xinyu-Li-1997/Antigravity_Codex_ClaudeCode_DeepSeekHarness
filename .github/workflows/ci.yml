@@ -16,6 +16,7 @@ jobs:
   verify:
     name: Verify (${{ matrix.os }}, Python ${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -24,10 +25,12 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -81,11 +84,13 @@ jobs:
               audit = subprocess.run(
                   [*py, "install.py", "--audit-upgrade", "--target-dir", str(base / "all_agy" / "plugins" / "user-guard"),
                    "--codex-home", str(base / "all_codex"), "--claude-home", str(base / "all_claude"),
-                   "--dsh-home", str(base / "all_dsh")],
+                   "--dsh-home", str(base / "all_dsh"), "--with-cc-router"],
                   cwd=repo, check=True, capture_output=True, text=True, encoding="utf-8",
               )
               report = json.loads(audit.stdout)
               assert snapshot() == before_audit, "Upgrade audit changed sandbox files or directories"
               for name in ("antigravity", "codex", "claude", "dsh"):
                   assert report[name]["drift_files"] == [], report[name]
+              assert report["claude"]["router"]["drift_files"] == [], report["claude"]["router"]
+              assert report["claude"]["router"]["config_exists"] is True, report["claude"]["router"]
           PY

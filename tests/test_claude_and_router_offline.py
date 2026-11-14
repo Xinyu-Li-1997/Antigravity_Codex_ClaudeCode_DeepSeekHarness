@@ -64,8 +64,23 @@ HANDOFF_TEXT = (
 
 class OfflineSandbox(unittest.TestCase):
     def setUp(self):
+        import time
+
         temporary = tempfile.TemporaryDirectory(prefix="claude-offline-", dir=REPO_ROOT / "tests")
-        self.addCleanup(temporary.cleanup)
+
+        def _cleanup_tempdir() -> None:
+            for attempt in range(5):
+                try:
+                    if Path(temporary.name).exists():
+                        shutil.rmtree(temporary.name)
+                    break
+                except OSError:
+                    if attempt == 4:
+                        raise
+                    time.sleep(0.05)
+            temporary.cleanup()
+
+        self.addCleanup(_cleanup_tempdir)
         self.root = Path(temporary.name).resolve()
         self.project = self.root / "project"
         self.project.mkdir()
@@ -1933,6 +1948,51 @@ class TestClaudeInstallerAndUpgradeAudit(OfflineSandbox):
             "tool_input": {"path": str(work), "pattern": "residual", "glob": "*.{log,out}"},
         }, state_dir=state_dir, logs_dir=logs_dir)
         self.assertEqual(second_log["hookSpecificOutput"]["permissionDecision"], "deny")
+
+        # 验证 host.toolchain 三级耦合诊断、router 请求体/并发上限与损坏激活卡片识别
+        self.assertIn("toolchain", report["host"])
+        self.assertIn("python_minor", report["host"]["toolchain"])
+        with mock.patch.object(installer.sys, "prefix", "/global_py"), \
+                mock.patch.object(installer.sys, "base_prefix", "/global_py"), \
+                mock.patch.object(
+                    installer.importlib.metadata,
+                    "distributions",
+                    return_value=[SimpleNamespace(metadata={"Name": "jax"}, version="0.7.0")],
+                ):
+            tc = installer._audit_host_toolchain(
+                is_sandbox_run=False, detection={"wsl_probe": {"installed_distros": ["Ubuntu-24.04"]}},
+            )
+        self.assertFalse(tc["python_isolated_env"])
+        self.assertEqual(tc["compiled_scientific_packages"], ["jax==0.7.0"])
+        self.assertTrue(any("jax==0.7.0" in w for w in tc["coupling_warnings"]))
+
+        def make_router_handler(body_bytes: bytes, max_body: int = 64 * 1024 * 1024):
+            h = object.__new__(router.Handler)
+            h.server = SimpleNamespace(cfg={**copy.deepcopy(router.DEFAULTS), "max_body_bytes": max_body})
+            h.path, h.command, h.headers = "/v1/messages", "POST", Message()
+            h.headers["Content-Length"] = str(len(body_bytes))
+            h.rfile, h.wfile = io.BytesIO(body_bytes), io.BytesIO()
+            h.send_error = mock.Mock()
+            return h
+
+        oversize_h = make_router_handler(b"x" * 64, max_body=8)
+        oversize_h.do_POST()
+        self.assertEqual(oversize_h.send_error.call_args.args[0], 413)
+
+        busy_h = make_router_handler(b"{}")
+        with mock.patch.object(router, "_INFLIGHT_SEM", SimpleNamespace(acquire=lambda blocking=False: False, release=lambda: None)):
+            busy_h.do_POST()
+        self.assertEqual(busy_h.send_error.call_args.args[0], 503)
+
+        with closing(sqlite3.connect(db)) as con:
+            con.execute("UPDATE providers SET is_current = 0")
+            con.execute(
+                "INSERT INTO providers (id, app_type, name, settings_config, is_current, sort_index) VALUES (?,?,?,?,?,?)",
+                ("p_claude_broken", "claude", "Kimi", "{bad json", 1, 11),
+            )
+            con.commit()
+        broken_status = admin.inspect_status(db, self.claude_home / "settings.json")
+        self.assertFalse(broken_status["settings_aligned"])
 
 
 if __name__ == "__main__":

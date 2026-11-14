@@ -32,8 +32,6 @@ user_words.ensure_utf8_stdio()
 
 MAX_INLINE_TOTAL_CHARS = 8000
 MAX_INLINE_ITEM_CHARS = 1200
-MAX_LOG_BYTES = user_words.MAX_LOG_BYTES
-TRIM_LOG_BYTES = user_words.TRIM_LOG_BYTES
 MAX_TRANSCRIPT_TRACKED_IMAGES = 2000
 ARCHIVE_RETRY_INTERVAL_SEC = 30
 
@@ -834,7 +832,7 @@ def handle_claude_session_start(
 # ⑦ 命令行主入口
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Antigravity & Codex Compaction Context Loader Hook")
+    parser = argparse.ArgumentParser(description="Antigravity, Codex & Claude Code Compaction Context Loader Hook")
     parser.add_argument("--client", type=str, default="antigravity", choices=("antigravity", "codex", "claude"), help="Host client type")
     parser.add_argument("--event", type=str, default="", help="Hook event name: SessionStart or PreInvocation")
     parser.add_argument("--state-dir", type=str, default="", help="Optional state directory override (used by Codex hook)")

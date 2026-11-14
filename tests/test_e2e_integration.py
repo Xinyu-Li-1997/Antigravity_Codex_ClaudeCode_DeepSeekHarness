@@ -2346,9 +2346,35 @@ class TestEndToEndIntegration(unittest.TestCase):
             ready = run_state("verify-pass2", "--session-id", "pass2_sess")
             self.assertEqual(ready.returncode, 0, ready.stderr)
             self.assertEqual(json.loads(ready.stdout)["reason"], "ready_for_pass2")
+            # 同一 Pass 2 会话重入幂等通过，并发竞争会话被原子认领拦截
+            ready_again = run_state("verify-pass2", "--session-id", "pass2_sess")
+            self.assertEqual(ready_again.returncode, 0, ready_again.stderr)
+            competing = run_state("verify-pass2", "--session-id", "competing_pass2_sess")
+            self.assertEqual(competing.returncode, 2)
+            self.assertEqual(json.loads(competing.stdout)["reason"], "already_claimed")
+            overwrite_blocked = run_state("record-pass1", "--session-id", "other_pass1", "--target-master", "Antigravity Carbon High")
+            self.assertEqual(overwrite_blocked.returncode, 2)
+            self.assertEqual(json.loads(overwrite_blocked.stdout)["reason"], "active_pass2_claimed")
+            overwrite_forced = run_state("record-pass1", "--force", "--session-id", "other_pass1", "--target-master", "Antigravity Carbon High")
+            self.assertEqual(overwrite_forced.returncode, 0)
 
             state_file = Path(json.loads(rec.stdout)["state_file"])
-            drifted = json.loads(state_file.read_text(encoding="utf-8"))
+            state_file.write_text("{corrupt json", encoding="utf-8")
+            corrupt_st = json.loads(run_state("status").stdout)
+            self.assertEqual(corrupt_st["phase"], "IDLE")
+            self.assertEqual(corrupt_st["stale_reason"], "corrupt_state")
+
+            bad_field = json.loads(rec.stdout)["state"]
+            bad_field["ttl_seconds"] = "bad_int"
+            state_file.write_text(json.dumps(bad_field), encoding="utf-8")
+            bad_field_st = json.loads(run_state("status").stdout)
+            self.assertEqual(bad_field_st["phase"], "IDLE")
+            self.assertEqual(bad_field_st["stale_reason"], "corrupt_state")
+            bad_field_ver = run_state("verify-pass2", "--session-id", "pass2_sess")
+            self.assertEqual(bad_field_ver.returncode, 2)
+            self.assertEqual(json.loads(bad_field_ver.stdout)["reason"], "corrupt_state")
+
+            drifted = json.loads(rec.stdout)["state"]
             drifted["plugin_version"] = "0.0.1"
             state_file.write_text(json.dumps(drifted), encoding="utf-8")
             drift_st = json.loads(run_state("status").stdout)
@@ -2370,6 +2396,16 @@ class TestEndToEndIntegration(unittest.TestCase):
             self.assertEqual(run_state("clear").returncode, 0)
             self.assertEqual(json.loads(run_state("status").stdout)["phase"], "IDLE")
             self.assertIsNone(json.loads(run_state("status").stdout)["saved"])
+
+        # 验证 _rules_equal 精确捕获 R10/R11 尾段漂移并保留用户自定义 ## 工具与本机 尾段
+        tmpl_rules = (TEMPLATE_DIR / "rules" / "AGENTS.md").read_bytes()
+        self.assertTrue(INSTALLER._rules_equal(tmpl_rules, tmpl_rules))
+        drifted_r11 = tmpl_rules.replace(b"R11.", b"R11-OLD.")
+        self.assertFalse(INSTALLER._rules_equal(drifted_r11, tmpl_rules))
+        with_custom_tail = tmpl_rules.rstrip(b"\r\n") + "\n\n## 工具与本机求解器路径\n- OpenFOAM v2406\n".encode("utf-8")
+        self.assertTrue(INSTALLER._rules_equal(with_custom_tail, tmpl_rules))
+        drifted_core_with_tail = with_custom_tail.replace(b"R10.", b"R10-OLD.")
+        self.assertFalse(INSTALLER._rules_equal(drifted_core_with_tail, tmpl_rules))
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

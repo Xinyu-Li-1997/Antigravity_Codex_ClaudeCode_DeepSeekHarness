@@ -1,4 +1,4 @@
-﻿# Antigravity & Codex Windows 安装入口。
+﻿# Antigravity, Codex, Claude Code & DeepSeek Harness Windows 安装入口。
 $ErrorActionPreference = "Stop"
 $PSNativeCommandUseErrorActionPreference = $false
 

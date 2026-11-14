@@ -4,6 +4,20 @@
 
 ---
 
+## [1.11.0] - 2026-11-15
+
+完成全栈非主控工具链三级耦合升级体系、多代理整仓代码／安全／逻辑深度审计加固，以及面向 CAE 工程师的全仓文档单点真源（SSOT）整篇重构：
+
+- **全栈非主控升级三级耦合分级与 `host.toolchain` ABI 耦合预警（`install.py`、`fleet-evolve/SKILL.md`、`AGENTS.md`）**：明确全升级覆盖除当前活跃主控进程外的全部外部 CLI、辅助工具与运行时，按耦合风险划分为 **Tier 1**（无耦合非主控 CLI／`Python.Launcher`／CI Actions 直接原地更新并跑真机探针）、**Tier 2**（同次版本 Python 补丁与 `wsl --update` 先验进程锁再执行）与 **Tier 3**（挂载 `jax`/`jaxlib`/`scipy`/`mpi4py` 等编译扩展的全局 Python 跨次版本跳跃及 WSL 跨 LTS 升级强制发出依赖耦合警告拦截强升）；`install.py --audit-upgrade` 新增 `host.toolchain` 零写入诊断，自动识别非隔离全局编译型科学计算包并输出 `coupling_warnings`。
+- **整仓多代理安全、并发与边界审计修复（`status_guard.py`、`cae_harness.py`、`fleet_state.py`、`router.py`、`ccswitch_admin.py`、`install.py`）**：
+  - `status_guard.py`：新增递归解包深度上限失败闭合（`depth > 4`），剥离 Shell `if/elif/while/until` 条件头，精确解析 `env`（含 `-C`）、`sudo`、`command`（放行 `-v/-V` 查询）、`timeout` 包装，跨子句串联追踪 `cd/pushd` 工作目录，拦截无空格紧邻重定向（`echo x>/out`、`>|`、`<>`、`&>`），识别 `py`/`python -Bc` 内联脚本并支持 CAE 整数步号 `f-string`（如 `f"step_{i:04d}.vtk"`）、`pathlib.Path()` 与 `.resolve()` 静态路径求值，所有状态读写前置重解析点校验；
+  - `cae_harness.py`：加固 Windows PowerShell `finally` 无条件进程树清理、纯 `probe` 与 `--dry-run` 严格零写盘、WSL 跨子系统 `.cmd/.bat` `%`->`%%` 防注入转义、`.github` 纳入快照收集、以及 `AGY_ERROR` 超时行优先拦截；
+  - `fleet_state.py`：引入跨平台文件锁（`msvcrt`/`fcntl`）、`repo_root` + `core_sha256` 漂移校验、`verify-pass2` `claimed_by_session_id` 原子认领与损坏状态 `corrupt_state` 诊断；
+  - `router.py` ＆ `ccswitch_admin.py` ＆ `install.py`：新增本地路由 `64 MiB` 请求体上限（`413`）与 `64` 并发信号量（`503`）、原生 Linux 无 `powershell.exe` 快速短路；加固 `ccswitch_admin.py` 符号链接拦截、归档先于 SQLite `commit` 失败回滚及 `settings.json` 优先恢复；`install.py` 新增 `_rules_equal` 精确识别无自定义尾段时的 `R10/R11` 漂移并规范化比对 Codex `hooks.json`。
+- **全仓文档单点真源（SSOT）整篇重构与矩阵二 `fleet-evolve hygiene` 收编（`README.md`、`docs/`、`AGENTS.md`、`SKILL.md`）**：按职责边界通篇重写全部核心文档，彻底消除补丁式堆叠与跨文件重复，将客户端钩子协议与路由细节统一收敛至 `docs/architecture-and-hooks.md`，并在 `README.md` 第四章矩阵二正式纳管 `fleet-evolve hygiene`（整仓代码／结构／文档重构与主控 `R6` 验收门禁），同步修正 `ccswitch_admin.py switch-card` 位置参数命令示例与 `Hydrogen` 自动压缩标定归属。
+
+---
+
 ## [1.10.0] - 2026-11-15
 
 新增多引擎舰队自举演进与减法清淤协议（`fleet-evolve`）、原地升级可视化舰队矩阵，并修复跨端实测检出的钩子 glob、无头 DSML 标签泄漏及升级体检隐私隔离缺陷：

@@ -18,6 +18,7 @@ import json
 import os
 import shutil
 import sqlite3
+import stat
 import sys
 import tempfile
 import time
@@ -140,6 +141,35 @@ def _table_exists(con: sqlite3.Connection, table_name: str) -> bool:
         (table_name,),
     ).fetchone()
     return row is not None
+
+
+def _is_reparse_or_symlink(path: Path) -> bool:
+    try:
+        st = path.lstat()
+    except OSError:
+        return False
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_file_attributes", 0) & reparse_flag)
+
+
+def _query_skills_state(con: sqlite3.Connection) -> Tuple[int, List[str], List[Dict[str, Any]]]:
+    if not _table_exists(con, "skills"):
+        return 0, [], []
+    total = int(con.execute("SELECT COUNT(*) FROM skills").fetchone()[0])
+    skill_cols = [r[1] for r in con.execute("PRAGMA table_info(skills)").fetchall()]
+    enabled_cols = [c for c in skill_cols if c.startswith("enabled_")]
+    enabled_skills: List[Dict[str, Any]] = []
+    if {"id", "name"}.issubset(skill_cols) and enabled_cols:
+        select_cols = ", ".join(['"id"', '"name"', *(f'"{c}"' for c in enabled_cols)])
+        for row in con.execute(f"SELECT {select_cols} FROM skills ORDER BY id").fetchall():
+            apps = [
+                c.removeprefix("enabled_")
+                for c, val in zip(enabled_cols, row[2:])
+                if str(val) not in ("0", "", "None")
+            ]
+            if apps:
+                enabled_skills.append({"id": row[0], "name": row[1], "enabled_apps": apps})
+    return total, enabled_cols, enabled_skills
 
 
 def _build_card_templates(
@@ -276,7 +306,8 @@ def inspect_status(
         "router_health": None,
         "warnings": [],
     }
-    active_card_token: Optional[str] = None
+    active_cfg_obj: Optional[Dict[str, Any]] = None
+    active_card_invalid_json = False
     claude_current_count = 0
     if db_path.is_file():
         with closing(sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True, timeout=10)) as con:
@@ -288,10 +319,17 @@ def inspect_status(
                     "SELECT id, app_type, name, settings_config, is_current FROM providers ORDER BY app_type, sort_index, name"
                 ).fetchall()
                 for row_id, app_type, name, raw_cfg, is_current in rows:
-                    cfg_obj = {}
+                    invalid_json = False
+                    cfg_obj: Any = {}
                     try:
                         cfg_obj = json.loads(raw_cfg) if raw_cfg else {}
+                        if not isinstance(cfg_obj, dict) or not isinstance(cfg_obj.get("env", {}), dict):
+                            invalid_json = True
+                            cfg_obj = {}
                     except ValueError:
+                        invalid_json = True
+                        cfg_obj = {}
+                    if invalid_json:
                         report["warnings"].append(f"Invalid JSON in provider card {app_type}:{name}")
                     env = cfg_obj.get("env") if isinstance(cfg_obj, dict) and isinstance(cfg_obj.get("env"), dict) else {}
                     token_raw = env.get("ANTHROPIC_AUTH_TOKEN") or env.get("ANTHROPIC_API_KEY")
@@ -306,11 +344,14 @@ def inspect_status(
                         "max_context": env.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS"),
                         "token": mask_token_state(token_raw) if app_type == "claude" else "n/a",
                     }
+                    if invalid_json:
+                        entry["invalid_json"] = True
                     report["cards"].append(entry)
                     if app_type == "claude" and is_current:
                         claude_current_count += 1
                         report["current_claude_card"] = entry
-                        active_card_token = token_raw if isinstance(token_raw, str) else None
+                        active_cfg_obj = cfg_obj
+                        active_card_invalid_json = invalid_json
                 if claude_current_count > 1:
                     report["multiple_current_claude_cards"] = True
                     report["warnings"].append(f"Multiple Claude provider cards ({claude_current_count}) have is_current=1.")
@@ -328,45 +369,41 @@ def inspect_status(
                         report["warnings"].append(
                             "Enabled prompts exist in cc-switch.db and may overwrite AGENTS.md or CLAUDE.md if triggered."
                         )
-            if _table_exists(con, "skills"):
-                skill_cols = [r[1] for r in con.execute("PRAGMA table_info(skills)").fetchall()]
-                enabled_cols = [c for c in skill_cols if c.startswith("enabled_")]
-                report["stored_skill_count"] = int(con.execute("SELECT COUNT(*) FROM skills").fetchone()[0])
-                if {"id", "name"}.issubset(skill_cols) and enabled_cols:
-                    select_cols = ", ".join(['"id"', '"name"', *(f'"{c}"' for c in enabled_cols)])
-                    s_rows = con.execute(f"SELECT {select_cols} FROM skills ORDER BY id").fetchall()
-                    for row in s_rows:
-                        apps = [c.removeprefix("enabled_") for c, val in zip(enabled_cols, row[2:]) if str(val) not in ("0", "", "None")]
-                        if apps:
-                            report["enabled_skills"].append({"id": row[0], "name": row[1], "enabled_apps": apps})
-                    if report["enabled_skills"]:
-                        report["warnings"].append(
-                            "Enabled skills exist in cc-switch.db and may overwrite client global skills directories if triggered."
-                        )
+            total_skills, _, enabled_skills = _query_skills_state(con)
+            report["stored_skill_count"] = total_skills
+            report["enabled_skills"] = enabled_skills
+            if enabled_skills:
+                report["warnings"].append(
+                    "Enabled skills exist in cc-switch.db and may overwrite client global skills directories if triggered."
+                )
         skills_dir = db_path.parent / "skills"
-        if skills_dir.is_dir():
+        if _is_reparse_or_symlink(skills_dir):
+            report["warnings"].append("CC Switch skills directory is a symbolic link or reparse point.")
+        elif skills_dir.is_dir():
             report["skills_dir_entries"] = sorted(p.name for p in skills_dir.iterdir() if p.name != ".DS_Store")
 
     if settings_path and settings_path.is_file():
         settings_obj = json.loads(settings_path.read_text(encoding="utf-8-sig"))
-        env_obj = settings_obj.get("env") if isinstance(settings_obj.get("env"), dict) else {}
-        report["effort_level"] = settings_obj.get("effortLevel")
+        env_obj = settings_obj.get("env") if isinstance(settings_obj, dict) and isinstance(settings_obj.get("env"), dict) else {}
+        report["effort_level"] = settings_obj.get("effortLevel") if isinstance(settings_obj, dict) else None
         report["locked_effort_env"] = "CLAUDE_CODE_EFFORT_LEVEL" in env_obj
         if report["locked_effort_env"]:
             report["warnings"].append("CLAUDE_CODE_EFFORT_LEVEL is set in settings.json env, locking interactive /effort.")
         cur = report["current_claude_card"]
-        if claude_current_count > 1:
+        if claude_current_count > 1 or active_card_invalid_json:
             report["settings_aligned"] = False
-        elif cur:
-            settings_token = env_obj.get("ANTHROPIC_AUTH_TOKEN") or env_obj.get("ANTHROPIC_API_KEY")
-            card_max_ctx = cur.get("max_context")
-            report["settings_aligned"] = (
-                env_obj.get("ANTHROPIC_BASE_URL") == cur.get("base_url")
-                and env_obj.get("ANTHROPIC_MODEL") == cur.get("model")
-                and env_obj.get("CLAUDE_CODE_SUBAGENT_MODEL") == cur.get("subagent_model")
-                and (not card_max_ctx or env_obj.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS") == card_max_ctx)
-                and settings_token == active_card_token
-            )
+            if active_card_invalid_json:
+                report["warnings"].append("Current active CC Switch Claude card contains invalid JSON.")
+        elif cur and active_cfg_obj is not None:
+            active_env = active_cfg_obj.get("env") if isinstance(active_cfg_obj.get("env"), dict) else {}
+            try:
+                projected = project_claude_settings(settings_obj, {}, active_cfg_obj)
+                report["settings_aligned"] = (
+                    projected == settings_obj
+                    and env_obj.get("CLAUDE_CODE_SUBAGENT_MODEL_FORCE") == active_env.get("CLAUDE_CODE_SUBAGENT_MODEL_FORCE")
+                )
+            except ValueError:
+                report["settings_aligned"] = False
             if not report["settings_aligned"]:
                 report["warnings"].append("Claude settings.json env differs from current active CC Switch card.")
 
@@ -490,19 +527,6 @@ def prepare_cards(
                 else:
                     next_sort += 1
                     record["sort_index"] = next_sort
-                    for col in columns:
-                        if col not in record or record[col] is None:
-                            if col in (
-                                "website_url", "category", "created_at", "sort_index", "notes",
-                                "icon", "icon_color", "limit_daily_usd", "limit_monthly_usd", "provider_type",
-                            ):
-                                continue
-                            if col == "meta":
-                                record[col] = "{}"
-                            elif col in ("is_current", "in_failover_queue"):
-                                record[col] = 0
-                            elif col == "cost_multiplier":
-                                record[col] = "1.0"
                     insert_cols = [col for col in columns if col in record]
                     placeholders_sql = ",".join("?" for _ in insert_cols)
                     cols_sql = ",".join('"' + col.replace('"', '""') + '"' for col in insert_cols)
@@ -607,10 +631,10 @@ def switch_card(
             con.commit()
         except BaseException:
             try:
-                con.rollback()
-            finally:
                 if published:
                     atomic_write_bytes(settings_path, original_bytes)
+            finally:
+                con.rollback()
             raise
         return {
             "dry_run": False,
@@ -709,6 +733,9 @@ def retire_prompts_and_skills(
     dry_run: bool = False,
 ) -> Dict[str, Any]:
     skills_dir = db_path.parent / "skills"
+    archive_parent = db_path.parent / "backups"
+    if _is_reparse_or_symlink(skills_dir) or _is_reparse_or_symlink(archive_parent):
+        raise ValueError("Refusing to operate on symbolic link or reparse point under ~/.cc-switch")
     dir_entries = sorted(p.name for p in skills_dir.iterdir() if p.name != ".DS_Store") if skills_dir.is_dir() else []
     if not db_path.is_file():
         return {
@@ -726,10 +753,7 @@ def retire_prompts_and_skills(
             con.execute("BEGIN IMMEDIATE")
         schema_ver, warnings = _check_schema(con)
         disabled_prompts: List[Dict[str, Any]] = []
-        disabled_skills: List[Dict[str, Any]] = []
         total_prompts = 0
-        total_skills = 0
-        enabled_cols: List[str] = []
 
         if _table_exists(con, "prompts"):
             total_prompts = int(con.execute("SELECT COUNT(*) FROM prompts").fetchone()[0])
@@ -738,16 +762,7 @@ def retire_prompts_and_skills(
                 rows = con.execute("SELECT id, app_type, name FROM prompts WHERE enabled != 0 ORDER BY app_type, id").fetchall()
                 disabled_prompts = [{"id": r[0], "app_type": r[1], "name": r[2]} for r in rows]
 
-        if _table_exists(con, "skills"):
-            total_skills = int(con.execute("SELECT COUNT(*) FROM skills").fetchone()[0])
-            s_cols = [r[1] for r in con.execute("PRAGMA table_info(skills)").fetchall()]
-            enabled_cols = [c for c in s_cols if c.startswith("enabled_")]
-            if {"id", "name"}.issubset(s_cols) and enabled_cols:
-                select_cols = ", ".join(['"id"', '"name"', *(f'"{c}"' for c in enabled_cols)])
-                for row in con.execute(f"SELECT {select_cols} FROM skills ORDER BY id").fetchall():
-                    apps = [c.removeprefix("enabled_") for c, val in zip(enabled_cols, row[2:]) if str(val) not in ("0", "", "None")]
-                    if apps:
-                        disabled_skills.append({"id": row[0], "name": row[1], "enabled_apps": apps})
+        total_skills, enabled_cols, disabled_skills = _query_skills_state(con)
 
         db_changes = bool(total_prompts or total_skills) if purge else bool(disabled_prompts or disabled_skills)
         fs_changes = bool(purge and skills_dir.is_dir())
@@ -782,16 +797,24 @@ def retire_prompts_and_skills(
                     set_zero = ", ".join(f'"{c}" = 0' for c in enabled_cols)
                     where_any = " OR ".join(f'("{c}" IS NOT NULL AND CAST("{c}" AS TEXT) NOT IN (\'0\', \'\'))' for c in enabled_cols)
                     con.execute(f"UPDATE skills SET {set_zero} WHERE {where_any}")
-            con.commit()
-        else:
-            con.rollback()
 
         archived_skills_dir: Optional[Path] = None
         if fs_changes:
-            archive_parent = db_path.parent / "backups"
             archive_parent.mkdir(parents=True, exist_ok=True)
+            if _is_reparse_or_symlink(archive_parent):
+                raise ValueError("Refusing to archive into symbolic link or reparse point")
             archived_skills_dir = archive_parent / f"retired-skills-{timestamp}"
             shutil.move(str(skills_dir), str(archived_skills_dir))
+
+        try:
+            if db_changes:
+                con.commit()
+            else:
+                con.rollback()
+        except BaseException:
+            if archived_skills_dir and archived_skills_dir.exists() and not skills_dir.exists():
+                shutil.move(str(archived_skills_dir), str(skills_dir))
+            raise
 
         return {
             "db_exists": True, "schema_version": schema_ver, "dry_run": False, "purge": purge,
@@ -841,6 +864,8 @@ def verify_alignment(
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(description="CC Switch & Claude Code card/prompt management CLI")
     parser.add_argument("--db", default="~/.cc-switch/cc-switch.db", help="Path to cc-switch.db")
     parser.add_argument("--settings", default="~/.claude/settings.json", help="Path to Claude settings.json")

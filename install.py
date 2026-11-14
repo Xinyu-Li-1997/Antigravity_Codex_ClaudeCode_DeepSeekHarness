@@ -20,6 +20,7 @@ import argparse
 import copy
 import datetime
 import hashlib
+import importlib.metadata
 import json
 import os
 import re
@@ -1471,15 +1472,17 @@ def _sync_global_rules(template_rules_path: Path, rules_path: Path, label: str, 
     original = _read_optional_bytes(codex_agents)
     existing = _decode_utf8(codex_agents, original or b"")
 
-    user_env = env_sec_re.search(existing)
-    has_custom_env = bool(user_env and user_env.group(1).strip() != "运行环境")
+    env_matches = list(env_sec_re.finditer(existing))
+    first_env = env_matches[0] if env_matches else None
+    custom_env = next((m for m in env_matches if m.group(1).strip() != "运行环境"), None)
     newline = "\r\n" if "\r\n" in existing else "\n"
-    if has_custom_env and user_env is not None:
-        custom_tail = existing[user_env.start():]
+    if custom_env is not None:
+        custom_tail = existing[custom_env.start():]
         # 旧版安装器为尾段补一个末尾换行，继续兼容这一输出约定。
         if not custom_tail.endswith("\n"):
             custom_tail += newline
-        merged = (template_core.replace("\n", newline) + newline * 2 if template_core else "") + custom_tail
+        prefix = template_core if (first_env is custom_env) else template_text.rstrip()
+        merged = (prefix.replace("\n", newline) + newline * 2 if prefix else "") + custom_tail
     else:
         merged = (template_text.rstrip() + "\n").replace("\n", newline)
 
@@ -1652,6 +1655,7 @@ def _read_codex_hooks(path: Path, raw: Optional[bytes]) -> Dict[str, Any]:
 def _plan_codex_hooks(
     hooks_path: Path, template_path: Path, py_cmd: str,
     mode: Optional[str] = None, compact_limit: Optional[int] = None,
+    *, verify_interpreters: bool = True,
 ) -> CodexHooksPlan:
     """逐条识别本项目钩子并合并，保留用户 handler、信任信息及交接策略。"""
     _validate_path(hooks_path, directory=False)
@@ -1730,7 +1734,7 @@ def _plan_codex_hooks(
                 if matching and kind in desired and kind not in retained:
                     updated_handler = handler
                     if handler["command"] != desired[kind]["command"]:
-                        if managed.interpreter is None or not _is_working_python_cmd(*managed.interpreter):
+                        if verify_interpreters and (managed.interpreter is None or not _is_working_python_cmd(*managed.interpreter)):
                             updated_handler = {**handler, "command": desired[kind]["command"]}
                         else:
                             tokens = _codex_hook_tokens(handler)
@@ -2141,6 +2145,80 @@ def _rules_core(raw: bytes) -> str:
     return re.split(r"^##[ \t]+工具与[^\n]*", text, maxsplit=1, flags=re.MULTILINE)[0].rstrip()
 
 
+def _rules_equal(actual_raw: bytes, expected_raw: bytes) -> bool:
+    actual_text = actual_raw.decode("utf-8-sig").replace("\r\n", "\n")
+    expected_text = expected_raw.decode("utf-8-sig").replace("\r\n", "\n")
+    env_sec_re = re.compile(r"^##[ \t]+工具与([^\r\n]*)[^\S\n]*(?:\r?\n|$)", re.MULTILINE)
+    env_matches = list(env_sec_re.finditer(actual_text))
+    custom_env = next((m for m in env_matches if m.group(1).strip() != "运行环境"), None)
+    if custom_env is not None:
+        if env_matches and env_matches[0] is custom_env:
+            return _rules_core(actual_raw) == _rules_core(expected_raw)
+        return actual_text[:custom_env.start()].rstrip() == expected_text.rstrip()
+    return actual_text.rstrip() == expected_text.rstrip()
+
+
+_SCIENTIFIC_ABI_PACKAGES = (
+    "jax", "jaxlib", "jaxopt", "scipy", "matplotlib", "torch", "cupy", "mpi4py",
+    "petsc4py", "h5py", "numba", "vtk", "gmsh", "fenics-dolfinx",
+)
+
+
+def _audit_host_toolchain(*, is_sandbox_run: bool, detection: Dict[str, Any]) -> Dict[str, Any]:
+    in_venv = sys.prefix != getattr(sys, "base_prefix", sys.prefix)
+    py_minor = f"{sys.version_info.major}.{sys.version_info.minor}"
+    info: Dict[str, Any] = {
+        "python_minor": py_minor,
+        "python_isolated_env": in_venv,
+        "uv_detected": bool(shutil.which("uv")),
+        "git_version": None,
+        "compiled_scientific_packages": [],
+        "coupling_warnings": [],
+    }
+    if is_sandbox_run:
+        return info
+    git_bin = shutil.which("git")
+    if git_bin:
+        try:
+            proc = subprocess.run(
+                [git_bin, "--version"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=2,
+            )
+            match = re.search(r"\b\d+(?:\.\d+){1,3}(?:\.[A-Za-z0-9_-]+)*\b", proc.stdout or "")
+            if proc.returncode == 0 and match:
+                info["git_version"] = match[0]
+        except (OSError, subprocess.SubprocessError):
+            pass
+    found_pkgs: List[str] = []
+    wanted = {name.lower(): name for name in _SCIENTIFIC_ABI_PACKAGES}
+    try:
+        seen: Set[str] = set()
+        for dist in importlib.metadata.distributions():
+            raw_name = (dist.metadata.get("Name") or "").strip().lower()
+            if raw_name in wanted and raw_name not in seen:
+                seen.add(raw_name)
+                ver = (dist.version or "").strip()
+                found_pkgs.append(f"{wanted[raw_name]}=={ver}" if ver else wanted[raw_name])
+    except OSError:
+        pass
+    found_pkgs.sort()
+    info["compiled_scientific_packages"] = found_pkgs
+    if not in_venv and found_pkgs:
+        pkg_preview = ", ".join(found_pkgs[:6]) + (" ..." if len(found_pkgs) > 6 else "")
+        info["coupling_warnings"].append(
+            f"全局 Python {py_minor} 环境已安装编译型科学计算包 ({pkg_preview}) 且被宿主全局钩子引用："
+            f"同次版本补丁升级 ({py_minor}.x) 保持 ABI 兼容（升级前须先退出占用 python 的进程）；"
+            f"严禁原地跨次版本覆盖至 Python {sys.version_info.major}.{sys.version_info.minor + 1}，"
+            f"请用 uv / venv 隔离新版本以免破坏编译扩展与全局钩子。"
+        )
+    wsl_probe = detection.get("wsl_probe") if isinstance(detection.get("wsl_probe"), dict) else {}
+    if os.name == "nt" and (wsl_probe.get("installed_distros") or wsl_probe.get("distros")):
+        info["coupling_warnings"].append(
+            "WSL2 内核更新 (wsl --update) 会重启正在运行的发行版实例，执行前须确认无后台 MPI / 求解器算例运行；"
+            "严禁自动执行跨 LTS 发行版大版本升级 (do-release-upgrade)，以免破坏 gcc/gfortran/MPI/glibc 二进制兼容性。"
+        )
+    return info
+
+
 def _audit_redact(value: Any, roots: List[Tuple[Path, str]], secrets: Set[str]) -> Any:
     if isinstance(value, dict):
         return {_audit_redact(key, roots, secrets): _audit_redact(item, roots, secrets) for key, item in value.items()}
@@ -2231,7 +2309,7 @@ def audit_upgrade_status(
             actual = read_raw(root / relative)
             expected = source.read_bytes()
             try:
-                equal = actual is not None and (_rules_core(actual) == _rules_core(expected) if core_rules and relative.endswith(".md") and "/" not in relative else actual == expected)
+                equal = actual is not None and (_rules_equal(actual, expected) if core_rules and relative.endswith(".md") and "/" not in relative else actual == expected)
             except UnicodeError:
                 equal = False
             if not equal:
@@ -2333,7 +2411,33 @@ def audit_upgrade_status(
     skill_sources = [(source, source.relative_to(template).as_posix()) for source in _template_files(template / "skills")]
     cx_sources += skill_sources
     cx["drift_files"] = drift(codex_root, cx_sources, core_rules=True)
-    if not isinstance(codex_doc.get("hooks"), dict) or not codex_doc["hooks"].get("SessionStart"):
+    codex_hooks_path = codex_root / "hooks.json"
+    try:
+        cx_plan = _plan_codex_hooks(
+            codex_hooks_path, repo_root / "template/codex/hooks.json", "python3 -X utf8 -I -B", verify_interpreters=False,
+        )
+        expected_cx_doc = json.loads(cx_plan.change.content) if cx_plan.change else codex_doc
+
+        def codex_hook_layout(doc: Dict[str, Any]) -> List[Any]:
+            result = []
+            for event, groups in doc.get("hooks", {}).items():
+                for group in groups:
+                    for handler in group["hooks"]:
+                        tokens = _codex_hook_tokens(handler)
+                        for idx, tok in enumerate(tokens[1:], start=1):
+                            sname = Path(tok).name
+                            if sname in {"session_context_loader.py", "handoff_gate.py"} and _same_nonlink_path(
+                                Path(tok).expanduser(), codex_root / "hooks" / sname
+                            ):
+                                prefix_end = 2 if tokens[1:2] == ["-3"] else 1
+                                result.append((event, group.get("matcher"), sname, tokens[prefix_end:idx], tokens[idx + 1:]))
+                                break
+            return sorted(result, key=repr)
+
+        cx["hooks_aligned"] = codex_hooks_path.is_file() and codex_hook_layout(codex_doc) == codex_hook_layout(expected_cx_doc)
+    except (OSError, ValueError, TypeError, KeyError, RuntimeError):
+        cx["hooks_aligned"] = False
+    if not cx["hooks_aligned"]:
         cx["drift_files"].append("hooks.json")
 
     cl = _audit_cli(detection.get("claude", {}))
@@ -2488,8 +2592,10 @@ def audit_upgrade_status(
             actions.append("inspect_ccswitch_schema")
     if errors:
         actions.append("repair_unreadable_configs")
+    toolchain = _audit_host_toolchain(is_sandbox_run=is_sandbox_run, detection=detection)
     report = {"plugin_version": repo_version,
-              "host": {"platform": sys.platform, "python_version": sys.version.split()[0], "is_wsl": detection.get("is_wsl"), "wsl_probe": detection.get("wsl_probe")},
+              "host": {"platform": sys.platform, "python_version": sys.version.split()[0], "is_wsl": detection.get("is_wsl"),
+                       "wsl_probe": detection.get("wsl_probe"), "toolchain": toolchain},
               "antigravity": ag, "codex": cx, "claude": cl, "dsh": dsh, "cc_switch": cc,
               "summary": {"all_aligned": not actions, "recommended_actions": actions}, "read_errors": errors}
     roots = [(home, "~"), (target_plugin_dir, "<antigravity>"), (codex_root, "<codex>"), (claude_root, "<claude>"),
@@ -2510,7 +2616,7 @@ def _confirm_single_app_install(
     """当本机仅检测到单客户端时提示用户：是否先去安装另一端，或不安装直接单独配置当前客户端"""
     print("-" * 80)
     print(f"[!] 单客户端提示：检测到本机已安装 {installed_label}，未检测到 {missing_label}。")
-    print(f"    - 若希望启用『反重力 <-> Codex』双端协作，可先退出安装 {missing_label} 后再运行本脚本；")
+    print(f"    - 若希望启用多端协同（反重力 / Codex / Claude Code / DSH），可先退出安装 {missing_label} 后再运行本脚本；")
     print(f"    - 若暂不安装 {missing_label}，可直接单独配置 {installed_label} 的完整独立工作流。")
     if dry_run or auto_yes or not interactive:
         print(f"[*] 当前为非交互或自动确认模式，将仅针对已安装的 {installed_label} 生成/执行独立配置。")

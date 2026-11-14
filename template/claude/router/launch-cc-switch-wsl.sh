@@ -1,10 +1,13 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # WSLg launcher for CC Switch using system WebKitGTK, X11 backend, software rendering, and 100% scale.
 # Checks Windows RAIL window visibility after launch and restores/restarts once if hidden at 0x0.
 set -euo pipefail
 
 APP=/usr/bin/cc-switch
 PAT="^$APP( |\$)"
+UID_CUR="$(id -u)"
+LOG_DIR="$HOME/.claude/router/logs"
+LOG_FILE="$LOG_DIR/cc-switch-gui.log"
 if [ ! -x "$APP" ]; then
     echo "CC Switch binary not found or not executable: $APP" >&2
     exit 1
@@ -66,18 +69,19 @@ PS
 }
 
 start_app() {
+    mkdir -p -m 700 "$LOG_DIR"
     cd "$HOME" || exit 1
     setsid nohup env -u LD_LIBRARY_PATH DISPLAY=:0 LIBGL_ALWAYS_SOFTWARE=1 \
         WEBKIT_DISABLE_DMABUF_RENDERER=1 WEBKIT_DISABLE_COMPOSITING_MODE=1 \
         GDK_BACKEND=x11 GDK_SCALE=1 GDK_DPI_SCALE=1 \
-        "$APP" >>/tmp/cc-switch-gui.log 2>&1 </dev/null &
+        "$APP" >>"$LOG_FILE" 2>&1 </dev/null &
 }
 
 wait_visible() {
     local n="$1" i st
     for i in $(seq 1 "$n"); do
         sleep 2
-        if ! pgrep -f "$PAT" >/dev/null; then
+        if ! pgrep -u "$UID_CUR" -f "$PAT" >/dev/null; then
             echo "CC Switch process exited." >&2
             return 1
         fi
@@ -91,16 +95,16 @@ wait_visible() {
     return 1
 }
 
-RUNNING=$( { pgrep -f "$PAT" || true; } | tr '\n' ' ')
+RUNNING=$( { pgrep -u "$UID_CUR" -f "$PAT" || true; } | tr '\n' ' ')
 start_app
 
 if [ -n "$RUNNING" ]; then
     echo "CC Switch already running (PID ${RUNNING% }); requested window restore."
     for i in 1 2 3 4 5; do
         sleep 1
-        [ "$( { pgrep -f "$PAT" || true; } | wc -l)" -le 1 ] && break
+        [ "$( { pgrep -u "$UID_CUR" -f "$PAT" || true; } | wc -l)" -le 1 ] && break
     done
-    for p in $(pgrep -f "$PAT" || true); do
+    for p in $(pgrep -u "$UID_CUR" -f "$PAT" || true); do
         case " $RUNNING " in
             *" $p "*) ;;
             *) if kill "$p" 2>/dev/null; then echo "Terminated duplicate instance (PID $p)."; fi ;;
@@ -119,12 +123,12 @@ else
 fi
 
 echo "Window still hidden; restarting CC Switch once."
-for p in $(pgrep -f "$PAT" || true); do kill "$p" 2>/dev/null || true; done
+for p in $(pgrep -u "$UID_CUR" -f "$PAT" || true); do kill "$p" 2>/dev/null || true; done
 for i in $(seq 1 10); do
     sleep 1
-    pgrep -f "$PAT" >/dev/null || break
+    pgrep -u "$UID_CUR" -f "$PAT" >/dev/null || break
 done
-if pgrep -f "$PAT" >/dev/null; then pkill -9 -f "$PAT" 2>/dev/null || true; fi
+if pgrep -u "$UID_CUR" -f "$PAT" >/dev/null; then pkill -9 -u "$UID_CUR" -f "$PAT" 2>/dev/null || true; fi
 sleep 1
 start_app
 
@@ -138,5 +142,5 @@ else
         exit 0
     fi
 fi
-echo "Window still not visible after restart. Check /tmp/cc-switch-gui.log and WSLg status."
+echo "Window still not visible after restart. Check $LOG_FILE and WSLg status."
 exit 1

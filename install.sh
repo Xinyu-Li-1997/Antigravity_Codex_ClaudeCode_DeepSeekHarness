@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Antigravity & Codex 统一工作流与双向协作安装脚本 (Linux / WSL2)
+# Antigravity, Codex, Claude Code & DeepSeek Harness 统一安装脚本 (Linux / WSL2)
 set -euo pipefail
 
 # 清空 CDPATH，防止 cd 的额外输出混入安装器路径。
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 export PYTHONDONTWRITEBYTECODE=1
 
-printf '%s\n' "[*] 启动 Antigravity & Codex 统一配置安装器..." >&2
+printf '%s\n' "[*] 启动四端统一配置安装器 (Antigravity / Codex / Claude Code / DSH)..." >&2
 
 for candidate in python3 python; do
     executable="$(type -P "${candidate}")" || continue

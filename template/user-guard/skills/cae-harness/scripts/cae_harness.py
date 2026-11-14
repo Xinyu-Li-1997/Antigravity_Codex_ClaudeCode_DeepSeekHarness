@@ -629,7 +629,8 @@ def _interop_command(command, work_dir, temp_dir, input_text, codex_home=None, e
     args = subprocess.list2cmdline(command[1:])
     executable = _wsl_path(Path(command[0]))
     if Path(command[0]).suffix.lower() in ('.cmd', '.bat'):
-        args = '/d /s /c "' + subprocess.list2cmdline([executable, *command[1:]]) + '"'
+        batch_args = [str(arg).replace('%', '%%') for arg in command[1:]]
+        args = '/d /s /c "' + subprocess.list2cmdline([executable, *batch_args]) + '"'
         executable = 'cmd.exe'
     env_lines = ["$info.EnvironmentVariables['CAE_HARNESS_DEPTH'] = '1'"]
     if codex_home:
@@ -656,7 +657,7 @@ def _interop_command(command, work_dir, temp_dir, input_text, codex_home=None, e
         '[void]$p.Start()', '$started = $true',
         *pipes,
         '$exitCode = $p.ExitCode', '$completed = $true', '} finally {',
-        'if ($started -and -not $completed) { & taskkill.exe /T /F /PID $p.Id | Out-Null }',
+        'if ($started) { & taskkill.exe /T /F /PID $p.Id 2>$null | Out-Null }',
         '$p.Dispose()', '}', 'exit $exitCode',
     ])
     encoded = base64.b64encode(script.encode('utf-16le')).decode('ascii')
@@ -1810,9 +1811,14 @@ def probe_backends(codex_input_budget=None, agy_input_budget=None, discover_mode
         'capacity_notice': '配置和缓存供预算估算，实际模型权限、压缩阈值及完整读取仍需执行验证。'}
     requested = agy_input_budget or _positive_int(os.environ.get('CAE_AGY_INPUT_BUDGET'))
     agy = _agy_info(_find_binary('agy'), requested, now)
-    if discover_models:
-        agy = _refresh_agy_listing(agy, _QuotaBatch(), refresh_model_cache=refresh_model_cache,
-                                   record_quota=refresh_model_cache)
+    if discover_models and agy.get('binary'):
+        try:
+            agy = _refresh_agy_listing(agy, _QuotaBatch(), refresh_model_cache=refresh_model_cache,
+                                       record_quota=refresh_model_cache)
+        except HarnessError as exc:
+            agy['discovery_error'] = str(exc)
+    elif discover_models:
+        agy['discovery_error'] = 'agy_not_detected'
     claude = _claude_info(_find_binary('claude'), claude_input_budget or _positive_int(os.environ.get('CAE_CLAUDE_INPUT_BUDGET')))
     dsh = _dsh_info(_find_binary('dsh'), dsh_input_budget or _positive_int(os.environ.get('CAE_DSH_INPUT_BUDGET')))
     result_map = {'codex': codex, 'agy': agy, 'claude': claude, 'dsh': dsh}
@@ -2494,25 +2500,41 @@ def _decode_output_json(raw_text):
     except RecursionError as exc:
         raise OutputParseError('JSON 嵌套过深') from exc
     except ValueError as exc:
+        def _raise_if_stream_error_lines(text):
+            err_items = []
+            saw_timeout = False
+            for raw_line in text.splitlines():
+                stripped_line = _strip_dsml_tail(raw_line.strip())
+                if not stripped_line:
+                    continue
+                parsed_err = _parse_agy_error_line(stripped_line)
+                if parsed_err is not None:
+                    err_items.append(parsed_err)
+                    continue
+                if re.match(r'^(?:\[agy\]\s+print timeout after\b|error:\s+print timeout after\b)', stripped_line, re.I):
+                    saw_timeout = True
+            for item in err_items:
+                reason = str(item.get('reason') or '').lower()
+                short_err = str(item.get('short_error') or item.get('message') or '')
+                if reason == 'print_timeout' or 'print timeout after' in short_err.lower():
+                    raise HarnessError('后端输出因超时截断', 'timeout', finished_reason='print_timeout')
+                if _is_quota_exhausted(short_err):
+                    raise HarnessError('后端返回错误回执', 'quota_exhausted', error=short_err[-2000:])
+            if saw_timeout:
+                raise HarnessError('后端输出因超时截断', 'timeout', finished_reason='print_timeout')
+            if err_items:
+                short_err = str(err_items[-1].get('short_error') or err_items[-1])[-2000:]
+                raise HarnessError('后端返回错误回执', 'failed', error=short_err)
+
+        _raise_if_stream_error_lines(raw)
         fence = re.fullmatch(r'```(?:json)?\s*(\{[\s\S]*\})\s*```', raw)
         try:
             if fence:
                 return json.loads(_strip_dsml_tail(fence.group(1)))
             events = []
-            agy_errors = []
-            saw_timeout_diag = False
             for line in raw.splitlines():
                 stripped = _strip_dsml_tail(line.strip())
-                if not stripped:
-                    continue
-                agy_err = _parse_agy_error_line(stripped)
-                if agy_err is not None:
-                    agy_errors.append(agy_err)
-                    continue
-                if re.match(r'^(?:\[agy\]\s+print timeout after\b|error:\s+print timeout after\b)', stripped, re.I):
-                    saw_timeout_diag = True
-                    continue
-                if stripped.startswith('[llm-'):
+                if not stripped or stripped.startswith('[llm-'):
                     continue
                 events.append(json.loads(stripped))
         except (ValueError, RecursionError) as decode_error:
@@ -2523,18 +2545,6 @@ def _decode_output_json(raw_text):
                 except (ValueError, RecursionError):
                     pass
             raise OutputParseError('子任务输出不是合法 JSON') from decode_error
-        for agy_err in agy_errors:
-            reason = str(agy_err.get('reason') or '').lower()
-            short_err = str(agy_err.get('short_error') or agy_err.get('message') or '')
-            if reason == 'print_timeout' or 'print timeout after' in short_err.lower():
-                raise HarnessError('后端输出因超时截断', 'timeout', finished_reason='print_timeout')
-            if _is_quota_exhausted(short_err):
-                raise HarnessError('后端返回错误回执', 'quota_exhausted', error=short_err[-2000:])
-        if saw_timeout_diag:
-            raise HarnessError('后端输出因超时截断', 'timeout', finished_reason='print_timeout')
-        if agy_errors:
-            short_err = str(agy_errors[-1].get('short_error') or agy_errors[-1])[-2000:]
-            raise HarnessError('后端返回错误回执', 'failed', error=short_err)
         results = []
         for event in events:
             if not isinstance(event, dict):
@@ -3179,7 +3189,7 @@ def collect_target_files(target, skipped_files=None):
     candidates = [target] if target.is_file() else []
     if target.is_dir():
         for root, dirs, files in os.walk(target):
-            dirs[:] = sorted(d for d in dirs if d not in IGNORED_DIRS and not d.startswith('.'))
+            dirs[:] = sorted(d for d in dirs if d not in IGNORED_DIRS and (d == '.github' or not d.startswith('.')))
             for name in list(dirs):
                 directory = Path(root) / name
                 if _is_link(directory):
@@ -3521,8 +3531,11 @@ def run_physics_gate_loop(target_dir, task_desc, verify_cmd, worker_fn, verify_f
             **extra_quota, **scope_error}
 
 
-def _args_backends(args):
+def _args_backends(args, *, refresh_model_cache=None):
+    if refresh_model_cache is None:
+        refresh_model_cache = not getattr(args, 'dry_run', False)
     return probe_backends(args.codex_input_budget, args.agy_input_budget, getattr(args, 'discover_models', False),
+                          refresh_model_cache=refresh_model_cache,
                           claude_input_budget=args.claude_input_budget, dsh_input_budget=args.dsh_input_budget)
 
 
@@ -3708,7 +3721,9 @@ def _print(payload):
 
 
 def cmd_probe(args):
-    return _print({'status': 'ok', 'caller': resolve_caller(args.caller), 'backends': _args_backends(args)})
+    refresh = bool(getattr(args, 'discover_models', False))
+    return _print({'status': 'ok', 'caller': resolve_caller(args.caller),
+                   'backends': _args_backends(args, refresh_model_cache=refresh)})
 
 
 def cmd_assess(args):
@@ -3777,9 +3792,10 @@ def cmd_audit(args):
         if not fb_engine:
             return _print({'status': exc.status, **meta, 'error': str(exc), 'requested_engines': list(engines), **exc.details})
         tripped_spec = next((e for e in engines if e and _engine_parts(e)[0] == q_backend), f'{q_backend}:default')
-        meta['quota_fallback'] = _quota_fallback_record(tripped_spec, fb_engine, exc.details)
         kept = [e for e in engines if e and _engine_parts(e)[0] != q_backend]
-        engines = (kept[0] if kept else fb_engine, None)
+        target_engine = kept[0] if kept else fb_engine
+        meta['quota_fallback'] = _quota_fallback_record(tripped_spec, target_engine, exc.details)
+        engines = (target_engine, None)
         try:
             _prepare_execution(backends, engines, batch, dry_run=args.dry_run)
             if not _workspace_unchanged(fallback_before, root):

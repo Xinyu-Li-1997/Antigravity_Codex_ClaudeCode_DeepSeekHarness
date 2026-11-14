@@ -1753,6 +1753,39 @@ class TestGuardsOffline(unittest.TestCase):
                 res = status_guard.handle_pre_tool_use({**base, "toolCall": {"name": "run_command", "args": {"CommandLine": cmd}}})
                 self.assertEqual(res["decision"], expected, cmd)
 
+    def test_32_shell_control_wrappers_tight_redirect_and_cae_ast_paths(self) -> None:
+        project = self.tmp_root / "proj32_root" / "solver_case"
+        outside = self.tmp_root / "proj32_root" / "outside_sibling"
+        project.mkdir(parents=True)
+        outside.mkdir(parents=True)
+        base = {"conversationId": "guard-32", "cwd": str(project), "workspacePaths": [str(project)]}
+        out_posix = outside.as_posix()
+
+        def decide(cmd: str) -> str:
+            return status_guard.handle_pre_tool_use(
+                {**base, "toolCall": {"name": "run_command", "args": {"CommandLine": cmd}}}
+            )["decision"]
+
+        for blocked_cmd in (
+            f"if rm -rf {out_posix}; then echo done; fi",
+            f"while test -d {out_posix}; do rm -rf {out_posix}; break; done",
+            f"env -i FOO=bar rm -rf {out_posix}",
+            f"env -C {out_posix} touch leaked.dat",
+            "echo preflight && cd .. && rm -rf outside_sibling",
+            f"echo payload>{out_posix}/tight.txt",
+            f"echo payload&>{out_posix}/tight_both.txt",
+            "echo $(echo $(echo $(echo $(echo $(ls)))))",
+            f'py -3 -Bc "open({(out_posix + "/bad.vtk")!r}, \'w\')"',
+        ):
+            self.assertEqual(decide(blocked_cmd), "force_ask", blocked_cmd)
+
+        for allowed_cmd in (
+            "command -v rm && command -V python3",
+            'python -Bc "from pathlib import Path; step = 12; (Path() / f\'sol_{step:04d}.vtk\').write_text(\'ok\')"',
+            'python -c "from pathlib import Path; (Path(\'mesh\').resolve()).mkdir(exist_ok=True)"',
+        ):
+            self.assertEqual(decide(allowed_cmd), "allow", allowed_cmd)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

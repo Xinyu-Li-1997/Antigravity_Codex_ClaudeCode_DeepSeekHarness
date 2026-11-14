@@ -41,11 +41,13 @@ DEFAULTS = {
         {"prefix": "deepseek", "upstream": "https://api.deepseek.com/anthropic",
          "key_from_card": "DeepSeek", "force_effort": "max"}
     ],
-    "default_key_from_card": "",
-    "kimi_effort_map": {},
+    "default_key_from_card": "Kimi",
+    "kimi_effort_map": {"xhigh": "max"},
     "ccswitch_db": "~/.cc-switch/cc-switch.db",
     "log": "~/.claude/router/logs/router.log",
     "timeout_s": 900,
+    "max_body_bytes": 64 * 1024 * 1024,
+    "max_inflight": 64,
     "follow_windows_proxy": False,
 }
 HOP = {"host", "content-length", "connection", "keep-alive", "proxy-connection",
@@ -69,6 +71,7 @@ _FAKE_IP_NETWORKS = (ipaddress.ip_network("198.18.0.0/15"), ipaddress.ip_network
 _proxy_cache = None
 _proxy_lock = threading.Lock()
 _log_lock = threading.Lock()
+_INFLIGHT_SEM = threading.BoundedSemaphore(64)
 
 
 def default_config_path():
@@ -91,7 +94,9 @@ def load_config(path):
 
 def _read_windows_proxy_settings():
     """Read manual registry settings without exposing subprocess output on failure."""
-    powershell = shutil.which("powershell.exe") or WINDOWS_POWERSHELL
+    powershell = shutil.which("powershell.exe") or (WINDOWS_POWERSHELL if os.path.exists(WINDOWS_POWERSHELL) else None)
+    if not powershell:
+        return {"enabled": False, "server": "", "pac": "", "override": ""}
     try:
         result = subprocess.run(
             [powershell, "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", WINDOWS_PROXY_QUERY],
@@ -290,6 +295,7 @@ def log_line(cfg, rec):
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.0"     # stream until close; no chunk re-encoding needed
     server_version = "k3ds-router/1"
+    timeout = 60
 
     def log_message(self, *args):     # silence default stderr access log
         pass
@@ -306,6 +312,7 @@ class Handler(BaseHTTPRequestHandler):
         self.forward(b"")
 
     def do_POST(self):
+        max_bytes = int(self.server.cfg.get("max_body_bytes") or (64 * 1024 * 1024))
         try:
             n = int(self.headers.get("Content-Length") or 0)
             if n < 0:
@@ -313,12 +320,25 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             self.send_error(400, "invalid Content-Length")
             return
+        if n > max_bytes:
+            self.send_error(413, "request body exceeds router max_body_bytes")
+            return
         self.forward(self.rfile.read(n) if n else b"")
 
     do_PUT = do_POST
     do_DELETE = do_GET
 
     def forward(self, body):
+        sem = getattr(self.server, "inflight_sem", _INFLIGHT_SEM)
+        if not sem.acquire(blocking=False):
+            self.send_error(503, "router max_inflight reached")
+            return
+        try:
+            self._forward_locked(body)
+        finally:
+            sem.release()
+
+    def _forward_locked(self, body):
         cfg = self.server.cfg
         t0 = time.time()
         rec = {"t": time.strftime("%Y-%m-%d %H:%M:%S"), "m": self.command,
@@ -433,6 +453,7 @@ def main():
     srv = ThreadingHTTPServer((cfg["listen"], cfg["port"]), Handler)
     srv.daemon_threads = True
     srv.cfg = cfg
+    srv.inflight_sem = threading.BoundedSemaphore(max(1, int(cfg.get("max_inflight") or 64)))
     log_line(cfg, {"t": time.strftime("%Y-%m-%d %H:%M:%S"), "event": "start", "port": cfg["port"], "pid": os.getpid()})
     srv.serve_forever()
 

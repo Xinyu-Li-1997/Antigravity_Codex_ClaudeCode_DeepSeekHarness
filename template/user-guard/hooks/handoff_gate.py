@@ -1486,6 +1486,8 @@ def check_pre_tool_use_locked(payload: Dict[str, Any], state_dir: Path,
     # 5. send_message / post_message / swarm_wait：仅允许在 drain 消耗 1 次动作通知收尾，freeze 冻结阻断
     if tool_name in ("send_message", "post_message", "swarm_wait"):
         if phase == "freeze" or int(gate_state.get("drainActionsRemaining", 0)) <= 0:
+            if phase != "freeze":
+                gate_state["enteredFreezeAtStep"] = tel["latestStep"]
             gate_state["phase"] = "freeze"
             save_gate_state(state_dir, conversation_id, gate_state)
             return {
@@ -1545,7 +1547,9 @@ def check_pre_tool_use_locked(payload: Dict[str, Any], state_dir: Path,
         save_gate_state(state_dir, conversation_id, gate_state)
         return None
 
-    if phase == "freeze" or int(gate_state["drainActionsRemaining"]) <= 0:
+    if phase == "freeze" or int(gate_state.get("drainActionsRemaining", 0)) <= 0:
+        if phase != "freeze":
+            gate_state["enteredFreezeAtStep"] = tel["latestStep"]
         gate_state["phase"] = "freeze"
         save_gate_state(state_dir, conversation_id, gate_state)
         return {"decision": "deny", "reason": "【user-guard 冻结】当前工具缺少可核实的只读或交接用途。"}
@@ -2080,7 +2084,12 @@ def _handle_native_handoff(payload: Dict[str, Any], state_dir: Path, mode: str,
                 response = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                             "permissionDecisionReason": notice}}
             elif kind == "mutating_other":
-                consume_drain_action(state)
+                if consume_drain_action(state):
+                    notice = _codex_notice(state["phase"], count, mode)
+                    if client == "claude":
+                        notice = notice.replace("Codex", "Claude", 1)
+                    if state["compactionIssues"]:
+                        notice += " 压缩轨迹对账存在缺口，次数按当前可见证据保守计算。"
                 response = _codex_context(event, notice)
             elif kind == "handoff_document":
                 for target in targets:
@@ -2108,7 +2117,7 @@ def _handle_native_handoff(payload: Dict[str, Any], state_dir: Path, mode: str,
 # ⑦ 命令行主入口
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Codex 长会话交接事件适配；反重力使用既有模块接口")
+    parser = argparse.ArgumentParser(description="Codex & Claude Code 长会话交接事件适配；反重力使用既有模块接口")
     parser.add_argument("--client", choices=("codex", "claude"), required=True)
     parser.add_argument("--mode", choices=("advisory", "enforce", "off"), default="advisory")
     parser.add_argument("--compact-limit", type=int, default=0)
@@ -2117,7 +2126,7 @@ def main() -> None:
     try:
         payload = user_words.read_hook_payload()
         handler = handle_claude_handoff if args.client == "claude" else handle_codex_handoff
-        state_dir = Path(args.state_dir).expanduser() if args.client == "claude" else Path(args.state_dir)
+        state_dir = Path(args.state_dir).expanduser()
         response = handler(payload, state_dir, args.mode, args.compact_limit)
     except Exception as exc:
         # 状态/协议异常时不伪装已受保护，不在失败的钩子中无限继续。

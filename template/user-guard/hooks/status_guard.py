@@ -116,8 +116,8 @@ _INSTALLER_INVOKE_RE = re.compile(
 )
 
 _PY_INLINE_HEAD_RE = re.compile(
-    r"""(?<![^\s;|&()])(?:"[^"\r\n]*[\\/]|'[^'\r\n]*[\\/]|[^\s"';|&()]+[\\/]|["'])?\bpython[0-9.]*(?:\.exe)?\b["']?"""
-    r"(?:\s+(?:-[BIuEsSqvV]+|-X\s+\S+|-W\s+\S+))*\s+-c\s+",
+    r"""(?<![^\s;|&()])(?:"[^"\r\n]*[\\/]|'[^'\r\n]*[\\/]|[^\s"';|&()]+[\\/]|["'])?\b(?:python[0-9.]*|py)(?:\.exe)?\b["']?"""
+    r"""(?:\s+(?:-[0-9][0-9.]*|-[BIuEsSqvVOP]+|-X\s+\S+|-W\s+\S+))*\s+-(?:[BIuEsSqvVOP]+)?c(?:\s+|(?=['"]))""",
     re.IGNORECASE,
 )
 _PS_HERESTRING_PY_RE = re.compile(
@@ -134,7 +134,7 @@ _DOTNET_IO_MUTATE_RE = re.compile(
     re.IGNORECASE,
 )
 _SHELL_REDIRECT_RE = re.compile(
-    r"""(?:^|[\s;|&()])(?:\d+)?(>{1,2})(?![>&=])\s*("(?:\\.|[^"\\])+"|'(?:''|[^'])+'|[^\s;|&<>()]+)""",
+    r"""(?:&>{1,2}|(?<![->=&])(?:\d+)?(?:>{1,2}\|?|<>))(?![>&=])\s*("(?:\\.|[^"\\])+"|'(?:''|[^'])+'|[^\s;|&<>()]+)""",
 )
 _PY_FALLBACK_PAIRS = (
     ("Python 写入文件 (open)", re.compile(
@@ -302,9 +302,6 @@ def _unwrap_inner_command(tokens: List[str]) -> Tuple[List[str], bool]:
         head_name = Path(head_raw.replace("\\", "/")).name.lower()
 
         # 跳过形如 KEY=VALUE 的环境变量前缀
-        if "=" in head_raw and not head_raw.startswith("-") and head_name != head_raw.lower():
-            idx += 1
-            continue
         if "=" in head_raw and not head_raw.startswith("-") and "/" not in head_raw and "\\" not in head_raw:
             idx += 1
             continue
@@ -312,7 +309,10 @@ def _unwrap_inner_command(tokens: List[str]) -> Tuple[List[str], bool]:
         if head_name == "timeout":
             idx += 1
             while idx < n and tokens[idx].startswith("-"):
+                flag_low = tokens[idx].lower()
                 idx += 1
+                if flag_low in ("-k", "--kill-after", "-s", "--signal") and idx < n:
+                    idx += 1
             if idx < n:
                 idx += 1  # 跳过秒数参数
             continue
@@ -492,7 +492,7 @@ def _locate_task_log_file(transcript_path_str: Optional[str], task_id: str) -> O
     """根据会话 transcriptPath 定位 Antigravity 后台任务日志 .system_generated/tasks/<TaskId>.log"""
     if not transcript_path_str or not user_words.valid_session_id(task_id):
         return None
-    tp = Path(transcript_path_str)
+    tp = Path(transcript_path_str).expanduser()
     # 标准布局: <brain>/<convId>/.system_generated/logs/transcript.jsonl
     sg_dir = tp.parent.parent
     candidates = [
@@ -683,6 +683,10 @@ def _expand_host_vars(raw_str: str) -> str:
         "%temp%": tempfile.gettempdir(),
         "$env:tmp": tempfile.gettempdir(),
         "%tmp%": tempfile.gettempdir(),
+        "$tmpdir": os.environ.get("TMPDIR") or tempfile.gettempdir(),
+        "${tmpdir}": os.environ.get("TMPDIR") or tempfile.gettempdir(),
+        "$xdg_cache_home": os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache"),
+        "${xdg_cache_home}": os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache"),
     }
     low = s.lower()
     for prefix, val in env_map.items():
@@ -1250,11 +1254,30 @@ def _eval_ast_path_candidates(node, bindings):
         parts = []
         for part in node.values:
             if isinstance(part, ast.FormattedValue):
-                # 动态格式说明符同样可能改变路径。
-                if part.format_spec is not None or part.conversion not in (-1, 115):
+                if part.conversion not in (-1, 115):
                     parts.append(dynamic)
-                else:
-                    parts.append(_eval_ast_path_candidates(part.value, bindings))
+                    continue
+                fmt_spec: Optional[str] = ""
+                if part.format_spec is not None:
+                    if isinstance(part.format_spec, ast.JoinedStr) and all(
+                        isinstance(seg, ast.Constant) and isinstance(seg.value, str) for seg in part.format_spec.values
+                    ):
+                        fmt_spec = "".join(seg.value for seg in part.format_spec.values)
+                    else:
+                        fmt_spec = None
+                if fmt_spec is None:
+                    parts.append(dynamic)
+                    continue
+                formatted = set()
+                for cand_val in _eval_ast_path_candidates(part.value, bindings):
+                    if isinstance(cand_val, (str, int)) and not isinstance(cand_val, bool):
+                        try:
+                            formatted.add(format(cand_val, fmt_spec) if fmt_spec else str(cand_val))
+                        except (ValueError, TypeError):
+                            formatted.add(_AST_DYNAMIC)
+                    else:
+                        formatted.add(_AST_DYNAMIC)
+                parts.append(frozenset(formatted) or dynamic)
             else:
                 parts.append(_eval_ast_path_candidates(part, bindings))
         return _ast_product(parts, lambda values: "".join(values))
@@ -1302,11 +1325,12 @@ def _eval_ast_path_candidates(node, bindings):
         name = node.func.id if isinstance(node.func, ast.Name) else (node.func.attr if isinstance(node.func, ast.Attribute) else "")
         if name == "home" and isinstance(node.func, ast.Attribute) and not node.args:
             return frozenset(("~",))
-        if name in ("Path", "PurePath", "WindowsPath", "PosixPath", "expanduser", "abspath", "realpath", "join", "joinpath", "str"):
+        if name in ("Path", "PurePath", "WindowsPath", "PosixPath", "expanduser", "abspath", "realpath", "resolve", "join", "joinpath", "str"):
             parts = [_eval_ast_path_candidates(arg, bindings) for arg in node.args]
-            if name == "joinpath" or (not node.args and isinstance(node.func, ast.Attribute)):
+            is_path_ctor = name in ("Path", "PurePath", "WindowsPath", "PosixPath")
+            if name in ("joinpath", "expanduser", "resolve") or (not node.args and isinstance(node.func, ast.Attribute) and not is_path_ctor):
                 parts.insert(0, _eval_ast_path_candidates(node.func.value, bindings))
-            if not parts and name in ("Path", "PurePath", "WindowsPath", "PosixPath"):
+            if not parts and is_path_ctor:
                 return frozenset((".",))
             return _ast_product(parts, lambda values: _join_ast_path_parts(list(values)))
     return dynamic
@@ -2044,8 +2068,10 @@ def _detect_command_external_mutation(
     精准检测命令行是否改动项目目录外的业务路径或全局配置。
     返回 None（允许），或 (具体动作说明, 项目外目标路径, 触发语句片段)。
     """
-    if not command_line or not command_line.strip() or depth > 3:
+    if not command_line or not command_line.strip():
         return None
+    if depth > 4:
+        return "深层嵌套命令超出静态目录边界审查上限", "<NESTED_DEPTH_EXCEEDED>", _compact_snippet(command_line)
 
     wsl_prefix = _wsl_command_prefix(command_line) if os.name == "nt" else None
     if wsl_prefix and not _outer_shell_operators(wsl_prefix[1]):
@@ -2192,43 +2218,81 @@ def _detect_command_external_mutation(
             ):
                 return f".NET 文件写删操作 ([IO.{cls_name}]::{method_name})", cand, _compact_snippet(m_net.group(0))
 
-    # 4. 检查外层 Shell 重定向 (> / >>) 的直接输出目标（忽略位于引号字面量内的符号）
+    # 4. 检查外层 Shell 重定向 (> / >> / >| / <> / &>) 的直接输出目标（忽略位于引号字面量内的符号）
     for m_red in _SHELL_REDIRECT_RE.finditer(shell_masked):
         if _pos_inside_quotes(shell_masked, m_red.start()):
             continue
-        op, red_tok = m_red.group(1), m_red.group(2).strip().strip("\"'")
+        red_tok = m_red.group(1).strip().strip("\"'")
         if not _is_write_target_allowed(
             red_tok, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp, wsl_distribution
         ):
-            return f"Shell 输出重定向写入 ({op})", red_tok, _compact_snippet(m_red.group(0))
+            return "Shell 输出重定向写入", red_tok, _compact_snippet(m_red.group(0))
 
-    # 5. 按子句严格检查处于“命令头位置”的 Shell/PowerShell 写删移动复制命令
+    # 5. 按子句严格检查处于“命令头位置”的 Shell/PowerShell 写删移动复制命令，并跟踪多子句目录切换
+    clause_cwd = base_cwd
     clauses = handoff_gate._split_shell_clauses(shell_masked)
     for raw_clause in clauses:
         clause = raw_clause.strip()
         if not clause:
             continue
-        # 剥离前导 else / then / do 控制流关键字，跳过条件判断头部
-        clause = re.sub(r"^(?:(?:else|then|do)\b\s*)+", "", clause, flags=re.IGNORECASE)
-        if re.match(r"^(?:if|elif|while|until)(?:\s|\()", clause, re.IGNORECASE):
-            continue
+        # 剥离前导控制流关键字（if/elif/while/until 条件子句中的命令同样会真实执行）
+        clause = re.sub(r"^(?:(?:else|then|do|if|elif|while|until)\b\s*)+", "", clause, flags=re.IGNORECASE)
         tokens = _safe_split_tokens(clause)
         if not tokens:
             continue
 
-        # 跳过前导 env / sudo / wsl / timeout / KEY=VAL / PowerShell & 调用符
+        # 跳过前导 env / sudo / wsl / timeout / command / KEY=VAL / PowerShell & 调用符
         idx = 0
         n_tok = len(tokens)
+        lookup_only = False
+        effective_cwd = clause_cwd
         while idx < n_tok:
             t = tokens[idx]
             tl = Path(t.replace("\\", "/")).name.lower()
-            if tl in ("sudo", "env", "&", "command"):
+            if tl == "&":
                 idx += 1
+                continue
+            if tl == "command":
+                idx += 1
+                while idx < n_tok and tokens[idx].startswith("-"):
+                    fl = tokens[idx]
+                    idx += 1
+                    if fl in ("-v", "-V") or (not fl.startswith("--") and any(c in fl[1:] for c in ("v", "V"))):
+                        lookup_only = True
+                        break
+                if lookup_only:
+                    break
+                continue
+            if tl == "env":
+                idx += 1
+                while idx < n_tok and tokens[idx].startswith("-"):
+                    fl = tokens[idx]
+                    idx += 1
+                    if fl in ("-u", "--unset") and idx < n_tok:
+                        idx += 1
+                    elif fl in ("-C", "--chdir") and idx < n_tok:
+                        effective_cwd = _ast_resolve_cwd(_expand_host_vars(tokens[idx]), effective_cwd)
+                        idx += 1
+                    elif fl.startswith("--chdir="):
+                        effective_cwd = _ast_resolve_cwd(_expand_host_vars(fl.split("=", 1)[1]), effective_cwd)
+                continue
+            if tl == "sudo":
+                idx += 1
+                while idx < n_tok and tokens[idx].startswith("-"):
+                    fl = tokens[idx]
+                    idx += 1
+                    if fl in ("-u", "--user", "-g", "--group", "-h", "--host", "-p", "--prompt", "-C", "-D", "--chdir") and idx < n_tok:
+                        if fl in ("-D", "--chdir"):
+                            effective_cwd = _ast_resolve_cwd(_expand_host_vars(tokens[idx]), effective_cwd)
+                        idx += 1
                 continue
             if tl == "timeout":
                 idx += 1
                 while idx < n_tok and tokens[idx].startswith("-"):
+                    fl = tokens[idx].lower()
                     idx += 1
+                    if fl in ("-k", "--kill-after", "-s", "--signal") and idx < n_tok:
+                        idx += 1
                 if idx < n_tok:
                     idx += 1
                 continue
@@ -2238,13 +2302,15 @@ def _detect_command_external_mutation(
                     fl = tokens[idx].lower()
                     idx += 1
                     if fl in ("-d", "--distribution", "-u", "--user", "--cd") and idx < n_tok:
+                        if fl == "--cd":
+                            effective_cwd = _ast_resolve_cwd(_expand_host_vars(tokens[idx]), effective_cwd)
                         idx += 1
                 continue
             if "=" in t and not t.startswith("-") and "/" not in t and "\\" not in t:
                 idx += 1
                 continue
             break
-        if idx >= n_tok:
+        if lookup_only or idx >= n_tok:
             continue
 
         cmd_tokens = tokens[idx:]
@@ -2252,6 +2318,14 @@ def _detect_command_external_mutation(
         head_low = Path(raw_head.replace("\\", "/")).name.lower()
         if head_low.endswith(".exe"):
             head_low = head_low[:-4]
+
+        if head_low in ("cd", "chdir", "set-location", "pushd"):
+            cd_targets = _extract_clause_path_targets(cmd_tokens)
+            if cd_targets:
+                cd_target = _expand_host_vars(cd_targets[0])
+                if cd_target and not cd_target.startswith(("$", "%")):
+                    clause_cwd = _ast_resolve_cwd(cd_target, effective_cwd)
+            continue
 
         action_label: Optional[str] = None
         targets: List[str] = []
@@ -2279,8 +2353,11 @@ def _detect_command_external_mutation(
 
         if action_label and targets:
             for cand in targets:
-                if not cand or cand.startswith("$") and not cand.lower().startswith(("$home", "${home}", "$env:")):
+                if not cand:
                     continue
+                expanded_cand = _expand_host_vars(cand)
+                if expanded_cand.startswith(("$", "%")):
+                    return f"{action_label} [未解析动态变量路径]", cand, _compact_snippet(clause)
                 command_distribution = wsl_distribution
                 if wsl_distribution is not None and any(
                     Path(tok.replace("\\", "/")).name.casefold() in REMOTE_OR_SUBSYSTEM_WRAPPERS | {"chroot", "nsenter"}
@@ -2288,7 +2365,7 @@ def _detect_command_external_mutation(
                 ):
                     command_distribution = None
                 if not _is_write_target_allowed(
-                    cand, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp, command_distribution
+                    expanded_cand, effective_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp, command_distribution
                 ):
                     return action_label, cand, _compact_snippet(clause)
 
