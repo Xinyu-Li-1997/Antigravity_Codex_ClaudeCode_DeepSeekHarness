@@ -2667,6 +2667,16 @@ else:
             with patch.dict(os.environ, {'WSL_DISTRO_NAME': 'Ubuntu-24.04', 'HTTPS_PROXY': 'http://127.0.0.1:7897'}, clear=True):
                 harness._verify_claude_llm_ready(direct_wsl)
 
+    def test_decode_output_json_strips_leaked_deepseek_dsml_stop_tags(self):
+        payload = {'summary': 'ok', 'content': 'verified', 'evidence': ['a.py:1'], 'unverified': []}
+        leaked = (
+            json.dumps(payload, ensure_ascii=False)
+            + '\n</｜｜DSML｜｜parameter>\n</｜｜DSML｜｜invoke>\n</｜｜DSML｜｜tool_calls>\n'
+        )
+        self.assertEqual(harness._decode_output_json(leaked), payload)
+        fenced = f'```json\n{json.dumps(payload)}\n```\n</||DSML||tool_calls>'
+        self.assertEqual(harness._decode_output_json(fenced), payload)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

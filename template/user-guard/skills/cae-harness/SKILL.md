@@ -28,7 +28,7 @@ Antigravity（反重力，`agy`）、Codex（`codex`）、Claude Code（`claude`
    - **Codex（`codex:default` / `codex:astra` / `codex:sol`）**：数学推导（`math`）、路线论证（`direction`）及高复杂度数理审查自动选深度推理旗舰 **`Astra`**（如 `gpt-6-astra`）；核心编码（`code`）、常规审查（`review`）、大输入审计（`audit`）与验证门禁（`gate`）自动选最新代工程旗舰 **`Sol`**（如 `gpt-6.1-sol`）。
    - **反重力（`agy:default` / `agy:carbon`）**：默认选当前最高代主力单模型 **`Carbon`**（如 `gemini-4-carbon-high`），默认排除固定复合模式（`Orchestrator`）、自动路由与稀缺配额第三方模型。
    - **Claude Code（`claude:default` 或 `cc:default`，支持 `cc:kimi` / `cc:deepseek` 别名）**：默认继承 `~/.claude/settings.json` 或 CC Switch 当前激活卡片配置的主模型（如混合分流下的 `k3.1-pro[1m]` 或直连卡片下的 `deepseek-flash[1M]`；官方订阅登录下回退标准别名 `opus`/`sonnet`/`haiku`）。
-   - **DeepSeek Harness（`dsh:default` / `dsh:deepseek-v4-pro` / `dsh:flash`）**：默认选旗舰 **`deepseek-v4-pro`**（`DeepSeek-V4-Pro`），轻量省流档自动切 **`deepseek-flash`**（`DeepSeek-V4.1-Flash`）。
+   - **DeepSeek Harness（`dsh:default` / `dsh:deepseek-v4-pro` / `dsh:flash`）**：默认选旗舰 **`deepseek-v4-pro`**（`DeepSeek-V4-Pro`），轻量省流档自动切 **`deepseek-flash`**（`DeepSeek-V4.1-Flash`；在多文件代码审查与工具循环场景亦可显式传 `dsh:flash --tier max` 调用）。
 2. **默认单模型最高纯思考挡 + 按需分级省流（禁套娃 `ultra`）**：
    - **默认满血模式**：除纯文字润色（`polish` 短篇 `medium`、长篇 `high`，防 R5 无声放大）外，所有 `math`、`direction`、`code`、`review`、`audit`、`gate` 默认启用所选模型的**单模型纯思考最高挡**（Codex／Claude Code／DSH 为 `max`，反重力 `Carbon` 为 `high`），默认跳过二次派生子代理的 `ultra` 挡。
    - **按需省流模式**：仅当显式传 `--tier`、设置 `CAE_DEFAULT_TIER`，或用户在提示词中明确／模糊提出降挡、省额度、省 token 时切换分级自适应——常规任务用 `high` 挡，表面拼写／格式微查启用轻量高速模型（`Luna`、`Hydrogen`、`deepseek-flash`）配 `low` 挡。

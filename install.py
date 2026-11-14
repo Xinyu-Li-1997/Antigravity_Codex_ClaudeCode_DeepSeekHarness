@@ -8,8 +8,8 @@
    - 单反重力独立模式：部署 ~/.gemini/config/plugins/user-guard 全套插件（含双模压缩恢复与两阶段长会话交接停机门禁）、CLI 默认模型补缺与可选 Zotero MCP；
    - 单 Codex 独立模式：部署 ~/.codex/AGENTS.md（保留自定义本机硬件段）、agents/readonly-*.toml 只读子代理、
      hooks/ 原话压缩恢复和长会话交接钩子、config.toml 安全沙箱和默认模型补缺及可选 Zotero MCP；
-   - both 保持反重力加 Codex；all 部署三端并按已安装状态接入 DSH。Claude 可选集成本地路由器与 CC Switch 提示词清理。
-   - 单 DSH 独立模式：同步 ~/.dsh/AGENTS.md 与 skills/cae-harness，不改登录凭据或 cordis.patch.yml。
+   - both 保持反重力加 Codex；all 部署四端（按已安装状态接入 DSH）。Claude 可选集成本地路由器与 CC Switch 提示词清理。
+   - 单 DSH 独立模式：同步 ~/.dsh/AGENTS.md 与 skills/ 托管技能（cae-harness、fleet-evolve），不改登录凭据或 cordis.patch.yml。
 2. 当本机仅检测到单客户端时，清晰提示是否先安装另一方；选择不安装（或非交互 --yes）即单独配置当前客户端，零报错闭环。
 3. --probe-apps 探测客户端；--audit-upgrade 零写入检查资产、卡片与本地模型目录对齐状态。
 4. 以 -B 无字节码模式运行 tests/ 下全套离线与端到端回归测试。
@@ -1155,19 +1155,32 @@ def _parse_agy_model_lines(output: str) -> List[Dict[str, str]]:
 
 
 def _select_agy_frontier_max_label(models: List[Dict[str, str]]) -> Optional[str]:
-    skip_tokens = {"lite", "mini", "fast", "flash", "hydrogen", "orchestrator", "router"}
+    blocked_tokens = {
+        "orchestrator", "router", "claude", "sonnet", "opus", "haiku", "gpt", "oss",
+    }
+    light_tokens = {"lite", "mini", "fast", "flash", "hydrogen"}
+
+    def _tokens(slug: str) -> Set[str]:
+        return set(re.split(r"[^a-z0-9]+", slug.lower()))
+
+    eligible = [
+        item for item in models
+        if not item["slug"].lower().endswith("-ultra") and not (_tokens(item["slug"]) & blocked_tokens)
+    ]
+    if not eligible:
+        return None
     tiered: List[Tuple[str, str, str]] = []
-    for item in models:
-        match = re.match(r"^(.+)-(minimal|low|medium|high|xhigh|max|ultra)$", item["slug"].lower())
-        if match and match.group(2) != "ultra":
+    for item in eligible:
+        match = re.match(r"^(.+)-(minimal|low|medium|high|xhigh|max)$", item["slug"].lower())
+        if match:
             tiered.append((match.group(1), match.group(2), item["display_name"]))
     if not tiered:
         return next(
-            (item["display_name"] for item in models if not item["slug"].lower().endswith("-ultra")),
-            None,
+            (item["display_name"] for item in eligible if not (_tokens(item["slug"]) & light_tokens)),
+            eligible[0]["display_name"],
         )
     primary_family = next(
-        (fam for fam, _, _ in tiered if not (set(re.split(r"[^a-z0-9]+", fam)) & skip_tokens)),
+        (fam for fam, _, _ in tiered if not (_tokens(fam) & light_tokens)),
         tiered[0][0],
     )
     variants = {tier: label for fam, tier, label in tiered if fam == primary_family}
@@ -1265,19 +1278,31 @@ def _agy_hooks_bytes(source: bytes, py_cmd: str) -> bytes:
 # 五、Codex 规则、只读子代理、钩子与沙箱配置同步
 
 
-def codex_skill_target(skills_dir: str, plugin_target_explicit: bool, disabled: bool) -> Optional[Path]:
+def _managed_skill_names(template_dir: Path) -> List[str]:
+    skills_root = template_dir / "skills"
+    if not skills_root.is_dir():
+        return ["cae-harness"]
+    return sorted(
+        entry.name for entry in skills_root.iterdir()
+        if entry.is_dir() and not entry.name.startswith(".") and entry.name != "__pycache__"
+    )
+
+
+def codex_skill_target(
+    skills_dir: str, plugin_target_explicit: bool, disabled: bool, skill_name: str = "cae-harness"
+) -> Optional[Path]:
     """显式插件目标仅配合显式技能目标，避免隔离安装触及真实用户目录。"""
     if disabled:
         return None
     if skills_dir:
-        return Path(skills_dir).expanduser().absolute() / "cae-harness"
+        return Path(skills_dir).expanduser().absolute() / skill_name
     if plugin_target_explicit:
         return None
     configured_home = os.environ.get("CODEX_HOME", "").strip()
     codex_root = Path(configured_home).expanduser() if configured_home else Path.home() / ".codex"
     if not codex_root.is_dir():
         return None
-    return codex_root.absolute() / "skills" / "cae-harness"
+    return codex_root.absolute() / "skills" / skill_name
 
 
 def _apply_codex_frontier_max(
@@ -2219,7 +2244,7 @@ def audit_upgrade_status(
     version_tuple = lambda value: tuple(int(part) for part in re.findall(r"\d+", str(value or "")))
     ag["upgrade_recommended"] = version_tuple(ag["installed_version"]) < version_tuple(repo_version)
     ag_sources = [(source, source.relative_to(template).as_posix()) for source in _template_files(template)
-                  if source.relative_to(template).parts[0] in {"rules", "hooks", "agents", "skills"}]
+                  if source.relative_to(template).as_posix() != "hooks.json"]
     ag["drift_files"] = drift(target_plugin_dir, ag_sources)
     installed_ag_hooks = read_json(target_plugin_dir / "hooks.json")
     try:
@@ -2269,11 +2294,13 @@ def audit_upgrade_status(
     cx.update({key: config.get(key) for key in ("model", "model_reasoning_effort", "model_context_window")})
     cx_models = read_json(codex_root / "models_cache.json").get("models", [])
     cx_models = [item for item in cx_models if isinstance(item, dict) and isinstance(item.get("slug"), str)] if isinstance(cx_models, list) else []
-    sol, astra = _latest_codex_model(cx_models, "sol"), _latest_codex_model(cx_models, "astra")
-    selected = sol or astra
+    sol, astra, terra = (_latest_codex_model(cx_models, name) for name in ("sol", "astra", "terra"))
+    selected = sol or astra or terra
     current = next((item for item in cx_models if item["slug"] == cx["model"]), None)
-    family = "astra" if re.fullmatch(r"gpt-\d+(?:\.\d+)*-astra", str(cx["model"])) else "sol"
-    latest = (astra if family == "astra" else sol) or selected
+    fam_match = re.fullmatch(r"gpt-\d+(?:\.\d+)*-(astra|sol|terra)", str(cx["model"]))
+    family = fam_match.group(1) if fam_match else "sol"
+    family_latest = {"astra": astra, "sol": sol, "terra": terra}[family]
+    latest = family_latest if (fam_match and cx_models) else (family_latest or selected)
     cx["latest_sol_slug"], cx["latest_astra_slug"] = (sol or {}).get("slug"), (astra or {}).get("slug")
     cx["declared_max_context_window"] = _model_window(latest or {})
     cx["supported_efforts"] = _model_efforts(latest or {})
@@ -2303,8 +2330,7 @@ def audit_upgrade_status(
     cx_sources = [(template / "rules/AGENTS.md", "AGENTS.md")]
     cx_sources += [(source, "agents/" + source.name) for source in (repo_root / "template/codex/agents").glob("*.toml")]
     cx_sources += [(template / "hooks" / name, "hooks/" + name) for name in _codex_hook_script_names(codex_mode)]
-    skill_sources = [(source, "skills/cae-harness/" + source.relative_to(template / "skills/cae-harness").as_posix())
-                     for source in _template_files(template / "skills/cae-harness")]
+    skill_sources = [(source, source.relative_to(template).as_posix()) for source in _template_files(template / "skills")]
     cx_sources += skill_sources
     cx["drift_files"] = drift(codex_root, cx_sources, core_rules=True)
     if not isinstance(codex_doc.get("hooks"), dict) or not codex_doc["hooks"].get("SessionStart"):
@@ -2354,42 +2380,75 @@ def audit_upgrade_status(
     dsh = _audit_cli(detection.get("dsh", {}))
     dsh["drift_files"] = drift(dsh_root, [(template / "rules/AGENTS.md", "AGENTS.md"), *skill_sources], core_rules=True)
     dsh["credentials_present"] = any((dsh_root / name).is_file() for name in (".credentials.yaml", ".env"))
-    dsh_active = bool(app_scope == "dsh" or explicit_dsh or app_scope in ("auto", "all") and not is_sandbox_run
-                      and (dsh.get("native_installed") or dsh_root.is_dir()))
-
     if app_scope == "all":
         ag_active, cx_active, cl_active = True, True, True
+        dsh_active = bool(explicit_dsh or (not is_sandbox_run and (dsh.get("native_installed") or dsh_root.is_dir())))
     elif app_scope == "both":
-        ag_active, cx_active, cl_active = True, True, False
+        ag_active, cx_active, cl_active, dsh_active = True, True, False, False
     elif app_scope == "antigravity":
-        ag_active, cx_active, cl_active = True, False, False
+        ag_active, cx_active, cl_active, dsh_active = True, False, False, False
     elif app_scope == "codex":
-        ag_active, cx_active, cl_active = False, True, False
+        ag_active, cx_active, cl_active, dsh_active = False, True, False, False
     elif app_scope == "claude":
-        ag_active, cx_active, cl_active = False, False, True
+        ag_active, cx_active, cl_active, dsh_active = False, False, True, False
     elif app_scope == "dsh":
-        ag_active, cx_active, cl_active = False, False, False
+        ag_active, cx_active, cl_active, dsh_active = False, False, False, True
     elif explicit_ag or explicit_cx or explicit_cl or explicit_dsh:
-        ag_active, cx_active, cl_active = explicit_ag, explicit_cx, explicit_cl
+        ag_active, cx_active, cl_active, dsh_active = explicit_ag, explicit_cx, explicit_cl, explicit_dsh
     else:
         ag_active = bool(ag.get("native_installed") or target_plugin_dir.is_dir())
         cx_active = bool(cx.get("native_installed") or codex_root.is_dir())
         cl_active = bool(cl.get("native_installed") or claude_root.is_dir())
+        dsh_active = bool(not is_sandbox_run and (dsh.get("native_installed") or dsh_root.is_dir()))
         if not (ag_active or cx_active or cl_active or dsh_active):
             ag_active = cx_active = cl_active = True
+
+    for peer_report, is_active, peer_dir in (
+        (ag, ag_active, target_plugin_dir),
+        (cx, cx_active, codex_root),
+        (cl, cl_active, claude_root),
+        (dsh, dsh_active, dsh_root),
+    ):
+        peer_report["active"] = is_active
+        if not is_active and not peer_dir.is_dir():
+            peer_report["drift_files"] = []
 
     cc = _audit_cli(detection.get("cc_switch", {}))
     port = 8240 if os.name == "nt" else 8241
     card_uses_router = False
-    try:
-        admin = _load_ccswitch_admin(repo_root)
-        cc.update(admin.inspect_status(ccswitch_db, settings_path))
-        current_card = cc.get("current_claude_card") or {}
-        card_uses_router = current_card.get("base_url") == f"http://127.0.0.1:{port}"
-        if cl_active and (card_uses_router or (not is_sandbox_run and (expect_cc_router or cl["router"]["installed"]))):
-            cc.update(admin.inspect_status(ccswitch_db, settings_path, router_port=port))
-    except (OSError, ValueError, TypeError, sqlite3.Error) as exc:
-        cc.update(db_exists=ccswitch_db.is_file(), schema_version=None, enabled_prompts=[], enabled_skills=[], inspection_error=type(exc).__name__)
+    inspect_cc_db = not is_sandbox_run or explicit_cc
+    if inspect_cc_db:
+        try:
+            admin = _load_ccswitch_admin(repo_root)
+            cc.update(admin.inspect_status(ccswitch_db, settings_path))
+            current_card = cc.get("current_claude_card") or {}
+            card_uses_router = current_card.get("base_url") == f"http://127.0.0.1:{port}"
+            if cl_active and (card_uses_router or (not is_sandbox_run and (expect_cc_router or cl["router"]["installed"]))):
+                cc.update(admin.inspect_status(ccswitch_db, settings_path, router_port=port))
+        except (OSError, ValueError, TypeError, sqlite3.Error) as exc:
+            cc.update(db_exists=ccswitch_db.is_file(), schema_version=None, enabled_prompts=[], enabled_skills=[], inspection_error=type(exc).__name__)
+    else:
+        cc.update(
+            db_exists=False, schema_version=None, cards=[], current_claude_card=None,
+            enabled_prompts=[], stored_prompt_count=0, enabled_skills=[], stored_skill_count=0,
+            skills_dir_entries=[], settings_aligned=None,
+        )
+    managed_card_names = {"Kimi", "DeepSeek", "K3.1主+DS子代理"}
+    custom_card_refs: List[Tuple[str, str]] = []
+    for card in cc.get("cards") or []:
+        if isinstance(card, dict) and (card.get("app_type") != "claude" or card.get("name") not in managed_card_names):
+            if isinstance(card.get("app_type"), str) and isinstance(card.get("name"), str) and card["name"]:
+                custom_card_refs.append((card["app_type"], card["name"]))
+            card["name"] = "<custom-card>"
+    if isinstance(cc.get("current_claude_card"), dict) and cc["current_claude_card"].get("name") not in managed_card_names:
+        cc["current_claude_card"]["name"] = "<custom-card>"
+    if custom_card_refs and isinstance(cc.get("warnings"), list):
+        ordered_refs = sorted(set(custom_card_refs), key=lambda item: len(item[1]), reverse=True)
+        ref_re = re.compile("|".join(re.escape(f"{app_t}:{raw_name}") for app_t, raw_name in ordered_refs))
+        cc["warnings"] = [
+            ref_re.sub(lambda m: m.group(0).split(":", 1)[0] + ":<custom-card>", str(warn))
+            for warn in cc["warnings"]
+        ]
     cc["default_router_port"] = port
     cc["legacy_residue_present"] = bool(
         cc.get("stored_prompt_count") or cc.get("stored_skill_count") or cc.get("skills_dir_entries")
@@ -2397,7 +2456,7 @@ def audit_upgrade_status(
     router_active = cl_active and bool(
         expect_cc_router or cl["router"]["installed"] or cl["router"]["config_exists"] or card_uses_router
     )
-    cc_active = cl_active and bool(not is_sandbox_run or explicit_cc or ccswitch_db.is_file())
+    cc_active = cl_active and inspect_cc_db and bool(not is_sandbox_run or ccswitch_db.is_file())
     actions = []
     if ag_active:
         if ag["drift_files"] or ag["upgrade_recommended"]:
@@ -2567,7 +2626,7 @@ def main() -> None:
         "--app",
         choices=("auto", "all", "both", "antigravity", "codex", "claude", "dsh"),
         default="auto",
-        help="auto 按已安装集合配置；both 仅反重力加 Codex；all 配置三端并按需接入 DSH；也可单独指定客户端",
+        help="auto 按已安装集合配置；both 仅反重力加 Codex；all 配置四端（按需接入 DSH）；也可单独指定客户端",
     )
     parser.add_argument("--probe-apps", action="store_true", help="只读探测四端客户端、CC Switch 与 Zotero，输出 JSON")
     parser.add_argument("--audit-upgrade", action="store_true", help="零写入全栈升级与本地模型目录对齐体检，输出 JSON")
@@ -2575,12 +2634,12 @@ def main() -> None:
     parser.add_argument("--target-dir", type=str, default="",
                         help="自定义反重力插件目录。配置 Zotero 时须采用 <配置目录>/plugins/user-guard 布局")
     parser.add_argument("--codex-home", type=str, default="", help="自定义 Codex 主配置目录（默认 $CODEX_HOME 或 ~/.codex，用于沙箱全量验证）")
-    parser.add_argument("--codex-skills-dir", default="", help="仅自定义 Codex 技能根目录（其下安装 cae-harness，兼容隔离验证）")
+    parser.add_argument("--codex-skills-dir", default="", help="仅自定义 Codex 技能根目录（其下安装托管技能 cae-harness 与 fleet-evolve，兼容隔离验证）")
     parser.add_argument("--claude-home", default="", help="Claude Code 主目录（默认 $CLAUDE_CONFIG_DIR 或 ~/.claude）")
     parser.add_argument("--dsh-home", default="", help="DeepSeek Harness 主目录（默认 $DSH_HOME 或 ~/.dsh）")
     parser.add_argument("--no-dsh-rules", action="store_true", help="跳过 DSH 全局 AGENTS.md")
-    parser.add_argument("--no-dsh-skill", action="store_true", help="跳过 DSH cae-harness 技能")
-    parser.add_argument("--no-claude-skill", action="store_true", help="跳过 Claude cae-harness 技能")
+    parser.add_argument("--no-dsh-skill", action="store_true", help="跳过 DSH 托管技能（cae-harness、fleet-evolve）")
+    parser.add_argument("--no-claude-skill", action="store_true", help="跳过 Claude 托管技能（cae-harness、fleet-evolve）")
     parser.add_argument("--no-claude-rules", action="store_true", help="跳过 Claude 全局 CLAUDE.md")
     parser.add_argument("--no-claude-agents", action="store_true", help="跳过 Claude 只读子代理")
     parser.add_argument("--no-claude-hooks", action="store_true", help="跳过 Claude 钩子同步")
@@ -2594,7 +2653,7 @@ def main() -> None:
     parser.add_argument("--skip-test", action="store_true", help="跳过安装后的全套自动化回归测试")
     parser.add_argument("--no-zotero", action="store_true", help="跳过本机可选 Zotero MCP 自动探测与配置")
     parser.add_argument("--zotero-cmd", type=str, default="", help="显式指定本地 zotero-mcp 可执行文件路径")
-    parser.add_argument("--no-codex-skill", action="store_true", help="跳过 Codex cae-harness 技能安装")
+    parser.add_argument("--no-codex-skill", action="store_true", help="跳过 Codex 托管技能（cae-harness、fleet-evolve）安装")
     parser.add_argument("--no-codex-rules", action="store_true", help="跳过 Codex 全局 AGENTS.md 核心总纲同步")
     parser.add_argument("--no-codex-agents", action="store_true", help="跳过 Codex 只读子代理 (agents/*.toml) 同步")
     parser.add_argument("--no-codex-hooks", action="store_true", help="跳过 Codex 钩子 (hooks.json + hooks/) 同步")
@@ -2642,7 +2701,7 @@ def main() -> None:
     if args.no_codex_skill and args.codex_skills_dir:
         parser.error("--no-codex-skill 与 --codex-skills-dir 不能同时指定")
     if args.codex_home and args.codex_skills_dir:
-        parser.error("--codex-home 已包含 skills/cae-harness 管理，请勿同时指定 --codex-skills-dir")
+        parser.error("--codex-home 已包含托管技能管理，请勿同时指定 --codex-skills-dir")
     if args.app == "codex" and args.target_dir:
         parser.error("--app codex 模式下不应指定反重力 --target-dir")
     if args.app == "antigravity" and (args.codex_home or args.codex_skills_dir):
@@ -2722,20 +2781,24 @@ def main() -> None:
         else:
             target_plugin_dir = default_config_root / "plugins" / "user-guard"
 
+    skill_names = _managed_skill_names(template_dir)
     codex_root: Optional[Path] = None
     full_codex_sync = False
-    target_skill_dir: Optional[Path] = None
+    codex_skill_dirs: List[Path] = []
 
     if install_cx:
         if args.codex_skills_dir and not args.codex_home:
             # 兼容仅指定 --codex-skills-dir 的轻量技能隔离同步模式
             full_codex_sync = False
-            target_skill_dir = codex_skill_target(args.codex_skills_dir, False, args.no_codex_skill)
+            codex_skill_dirs = [
+                path for name in skill_names
+                if (path := codex_skill_target(args.codex_skills_dir, False, args.no_codex_skill, name)) is not None
+            ]
         else:
             full_codex_sync = True
             codex_root = Path(args.codex_home).expanduser().absolute() if args.codex_home else default_codex_root.absolute()
             if not args.no_codex_skill:
-                target_skill_dir = codex_root / "skills" / "cae-harness"
+                codex_skill_dirs = [codex_root / "skills" / name for name in skill_names]
 
     zotero_exe: Optional[str] = None
     if not args.no_zotero and (not is_sandbox_run or args.zotero_cmd):
@@ -2779,6 +2842,14 @@ def main() -> None:
             lp, rp = left_path.resolve(), right_path.resolve()
             return lp == rp or lp in rp.parents or rp in lp.parents
 
+        def _validate_skill_targets(skill_paths: List[Path]) -> List[Path]:
+            validated: List[Path] = []
+            for dst in skill_paths:
+                checked = validate_install_target(dst, repo_root)
+                _validate_mirror(template_dir / "skills" / checked.name, checked)
+                validated.append(checked)
+            return validated
+
         default_plugin_root = default_config_root / "plugins" / "user-guard"
         if target_plugin_dir is not None and any(
             _paths_overlap(target_plugin_dir, other)
@@ -2790,17 +2861,15 @@ def main() -> None:
             if any(_paths_overlap(codex_root, other) for other in (default_plugin_root, default_claude_root, default_dsh_root)):
                 raise ValueError("Codex 目录不能与其他客户端配置目录相互包含")
             if not args.no_codex_skill:
-                target_skill_dir = codex_root / "skills" / "cae-harness"
-        if target_skill_dir is not None:
-            target_skill_dir = validate_install_target(target_skill_dir, repo_root)
-            _validate_mirror(template_dir / "skills" / "cae-harness", target_skill_dir)
+                codex_skill_dirs = [codex_root / "skills" / name for name in skill_names]
+        if codex_skill_dirs:
+            codex_skill_dirs = _validate_skill_targets(codex_skill_dirs)
         if claude_root is not None:
             claude_root = validate_codex_home_target(claude_root, repo_root)
             if any(_paths_overlap(claude_root, other) for other in (default_plugin_root, default_codex_root, default_dsh_root)):
                 raise ValueError("Claude 目录不能与其他客户端配置目录相互包含")
             if not args.no_claude_skill:
-                claude_skill_dir = validate_install_target(claude_root / "skills" / "cae-harness", repo_root)
-                _validate_mirror(template_dir / "skills" / "cae-harness", claude_skill_dir)
+                _validate_skill_targets([claude_root / "skills" / name for name in skill_names])
         if dsh_root is not None:
             dsh_root = validate_codex_home_target(dsh_root, repo_root)
             if any(_paths_overlap(dsh_root, other) for other in (default_plugin_root, default_codex_root, default_claude_root)):
@@ -2808,18 +2877,17 @@ def main() -> None:
             if not args.no_dsh_rules:
                 _decode_utf8(dsh_root / "AGENTS.md", _read_optional_bytes(dsh_root / "AGENTS.md") or b"")
             if not args.no_dsh_skill:
-                dsh_skill_dir = validate_install_target(dsh_root / "skills" / "cae-harness", repo_root)
-                _validate_mirror(template_dir / "skills" / "cae-harness", dsh_skill_dir)
-        targets = [path for path in (target_plugin_dir, codex_root, claude_root, dsh_root, target_skill_dir) if path is not None]
+                _validate_skill_targets([dsh_root / "skills" / name for name in skill_names])
+        targets = [*(path for path in (target_plugin_dir, codex_root, claude_root, dsh_root) if path is not None), *codex_skill_dirs]
         for index, left in enumerate(targets):
             for right in targets[index + 1:]:
-                if left == codex_root and right == target_skill_dir:
-                    continue  # Codex 自带的 skills/cae-harness 是明确约定的从属资产。
+                if left == codex_root and right in codex_skill_dirs:
+                    continue  # Codex 自带的托管技能目录是明确约定的从属资产。
                 if left == right or left in right.parents or right in left.parents:
                     raise ValueError("不同客户端的安装目标不能相互包含")
         if agy_config_root is not None:
             mcp_path = agy_config_root / "mcp_config.json"
-            if mcp_path in {codex_root, target_skill_dir}:
+            if mcp_path in {codex_root, *codex_skill_dirs}:
                 raise ValueError(f"反重力 Zotero 配置文件与 Codex 目标目录冲突: {mcp_path}")
             agy_zotero_change = _plan_user_zotero(agy_config_root, zotero_exe)
         if target_plugin_dir is not None or (codex_root is not None and not args.no_codex_hooks) or (claude_root is not None and not args.no_claude_hooks):
@@ -2872,8 +2940,8 @@ def main() -> None:
         print(f"[*] Claude 主目录: {claude_root}")
     if dsh_root is not None:
         print(f"[*] DSH 主目录   : {dsh_root}")
-    if target_skill_dir is not None:
-        print(f"[*] Codex 技能路径: {target_skill_dir}")
+    if codex_skill_dirs:
+        print(f"[*] Codex 技能路径: {', '.join(str(path) for path in codex_skill_dirs)}")
     print("-" * 80)
 
     try:
@@ -2886,8 +2954,8 @@ def main() -> None:
 
         # 部署 Codex 侧。
         if install_cx:
-            if target_skill_dir is not None:
-                mirror_sync_plugin(template_dir / "skills" / "cae-harness", target_skill_dir, dry_run=args.dry_run)
+            for skill_dst in codex_skill_dirs:
+                mirror_sync_plugin(template_dir / "skills" / skill_dst.name, skill_dst, dry_run=args.dry_run)
             if full_codex_sync and codex_root is not None:
                 if not args.dry_run:
                     codex_root.mkdir(parents=True, exist_ok=True)
@@ -2900,7 +2968,8 @@ def main() -> None:
                 _apply_file_change(codex_config_change, args.dry_run)
         if claude_root is not None:
             if not args.no_claude_skill:
-                mirror_sync_plugin(template_dir / "skills/cae-harness", claude_root / "skills/cae-harness", dry_run=args.dry_run)
+                for name in skill_names:
+                    mirror_sync_plugin(template_dir / "skills" / name, claude_root / "skills" / name, dry_run=args.dry_run)
             if not args.no_claude_rules:
                 _sync_claude_global_rules(template_dir / "rules/AGENTS.md", claude_root, args.dry_run)
             if not args.no_claude_agents:
@@ -2915,7 +2984,8 @@ def main() -> None:
             if not args.no_dsh_rules:
                 _sync_global_rules(template_dir / "rules/AGENTS.md", dsh_root / "AGENTS.md", "DeepSeek Harness", args.dry_run)
             if not args.no_dsh_skill:
-                mirror_sync_plugin(template_dir / "skills/cae-harness", dsh_root / "skills/cae-harness", dry_run=args.dry_run)
+                for name in skill_names:
+                    mirror_sync_plugin(template_dir / "skills" / name, dsh_root / "skills" / name, dry_run=args.dry_run)
         if retire_ccswitch:
             result = ccswitch_admin.retire_prompts_and_skills(
                 ccswitch_db, purge=args.purge_ccswitch_legacy, dry_run=args.dry_run

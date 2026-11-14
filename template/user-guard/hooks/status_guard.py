@@ -2455,6 +2455,103 @@ def _claude_permission(decision: str, reason: str) -> Dict[str, Any]:
                                    "permissionDecisionReason": reason}}
 
 
+def _expand_rg_braces(pattern: str) -> List[str]:
+    match = re.search(r"\{([^{}]+)\}", pattern)
+    if not match:
+        return [pattern]
+    prefix, suffix = pattern[:match.start()], pattern[match.end():]
+    expanded: List[str] = []
+    for part in match.group(1).split(","):
+        expanded.extend(_expand_rg_braces(prefix + part.strip() + suffix))
+    return expanded
+
+
+def _rg_glob_to_regex(pattern: str) -> Tuple[bool, re.Pattern[str]]:
+    pat = re.sub(r"/+", "/", pattern.replace("\\", "/"))
+    while pat.startswith("./"):
+        pat = pat[2:]
+    pat = pat.lstrip("/")
+    pat = re.sub(r"(?:^|/)\*\*(?:/\*\*)+(?=/|$)", lambda m: "/**" if m.group(0).startswith("/") else "**", pat)
+    match_path = "/" in pat or "**" in pat
+    if not pat or pat in ("*", "**", "**/*"):
+        return True, re.compile(r"^.*$")
+    parts: List[str] = ["^"]
+    idx, length = 0, len(pat)
+    while idx < length:
+        if pat.startswith("/**/", idx):
+            parts.append(r"(?:/.+/|/)")
+            idx += 4
+        elif idx == 0 and pat.startswith("**/", idx):
+            parts.append(r"(?:.+/)?")
+            idx += 3
+        elif pat.startswith("/**", idx) and idx + 3 == length:
+            parts.append(r"/.*")
+            idx += 3
+        elif pat.startswith("**", idx):
+            parts.append(r".*")
+            idx += 2
+        elif pat[idx] == "*":
+            parts.append(r"[^/]*")
+            idx += 1
+        elif pat[idx] == "?":
+            parts.append(r"[^/]")
+            idx += 1
+        elif pat[idx] == "[":
+            search_start = idx + 2 if pat[idx + 1 : idx + 2] in ("!", "^") else idx + 1
+            if pat[search_start : search_start + 1] == "]":
+                search_start += 1
+            end = pat.find("]", search_start)
+            if end != -1:
+                neg = "^" if pat[idx + 1 : idx + 2] in ("!", "^") else ""
+                body = pat[idx + (2 if neg else 1) : end]
+                if body.startswith("]"):
+                    body = r"\]" + body[1:]
+                parts.append(f"(?!/)[{neg}{body}]")
+                idx = end + 1
+            else:
+                parts.append(r"\[")
+                idx += 1
+        else:
+            parts.append(re.escape(pat[idx]))
+            idx += 1
+    parts.append("$")
+    try:
+        return match_path, re.compile("".join(parts))
+    except re.error:
+        return match_path, re.compile("^" + re.escape(pat) + "$")
+
+
+def _rg_glob_matches(rel_posix: str, name: str, pattern: str) -> bool:
+    match_path, regex = _rg_glob_to_regex(pattern)
+    return bool(regex.match(rel_posix if match_path else name))
+
+
+def _claude_grep_evidence_targets(target: Path, raw_glob: Any) -> List[Path]:
+    raw_pat = str(raw_glob or "").strip()
+    clauses = [item.strip() for item in (_expand_rg_braces(raw_pat) if raw_pat else []) if item.strip()]
+    positives = [item for item in clauses if not item.startswith("!")]
+    negatives = [item[1:].strip() for item in clauses if item.startswith("!") and item[1:].strip()]
+    skip_dirs = {".git", "__pycache__", "node_modules", ".venv", ".mypy_cache", ".pytest_cache"}
+    matched: List[Path] = []
+    try:
+        for root_str, dirs, files in os.walk(target):
+            dirs[:] = [d for d in dirs if d not in skip_dirs]
+            root_path = Path(root_str)
+            for fname in files:
+                fpath = root_path / fname
+                if not is_evidence_file(str(fpath)):
+                    continue
+                rel_posix = fpath.relative_to(target).as_posix()
+                if positives and not any(_rg_glob_matches(rel_posix, fname, pat) for pat in positives):
+                    continue
+                if any(_rg_glob_matches(rel_posix, fname, pat) for pat in negatives):
+                    continue
+                matched.append(fpath)
+    except OSError:
+        return []
+    return sorted(matched)
+
+
 def _claude_check_polling(tool_name: str, args: Dict[str, Any], sid: str, cwd: Optional[str],
                           state_dir: Path, logs_dir: Path) -> Dict[str, Any]:
     raw_target = ""
@@ -2476,8 +2573,7 @@ def _claude_check_polling(tool_name: str, args: Dict[str, Any], sid: str, cwd: O
         return {}
     target = resolve_target_path(raw_target, cwd, [])
     if tool_name == "Grep" and target.is_dir():
-        targets = sorted(path for path in target.rglob(str(args.get("glob") or "*"))
-                         if path.is_file() and is_evidence_file(str(path)))
+        targets = _claude_grep_evidence_targets(target, args.get("glob"))
     else:
         targets = [target] if is_evidence_file(str(target)) else []
     fingerprints = []

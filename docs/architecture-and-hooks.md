@@ -17,9 +17,9 @@
 | --- | --- |
 | 常量、路径安全与无损配置处理 | 软链接／目录联接越界防护、各客户端目录互不包含校验、基于 `tomllib` 的保留注释 TOML 编辑、JSON 原子替换写盘 |
 | 四端客户端、WSL 互操作与环境探测 | 零写入探测本侧与跨子系统（Windows `<->` WSL）的反重力、Codex、Claude Code、DeepSeek Harness、CC Switch、Python 3.11+ 与 `zotero-mcp` |
-| 反重力插件、Codex 与 DSH 配置同步 | 幂等同步 `~/.gemini/config/plugins/user-guard`、`~/.codex/` 与 `~/.dsh/`（自动保留 `AGENTS.md` 末尾自定义 `## 工具与...` 段落，同步各自 `skills/cae-harness`，绝不触碰 DSH `.credentials.yaml` 凭据文件） |
-| Claude Code、本地路由与 CC Switch 协同同步 | 同步 `~/.claude/CLAUDE.md`、`agents/readonly-*.md`、`hooks/*.py`、`skills/cae-harness`、无损合并 `settings.json`（自动迁移旧版拆分式 `"args"` 钩子），可选同步 `router/` 与禁用 `cc-switch.db` 陈旧提示词 |
-| 全栈升级与大模型对齐体检（`--audit-upgrade`） | 零写入核查四端版本、规则／钩子／技能字节漂移、CC Switch Schema 与激活卡片、路由健康度及大模型目录对齐状态 |
+| 反重力插件、Codex 与 DSH 配置同步 | 幂等同步 `~/.gemini/config/plugins/user-guard`、`~/.codex/` 与 `~/.dsh/`（自动保留 `AGENTS.md` 末尾自定义 `## 工具与...` 段落，同步各自 `skills/` 下的 `cae-harness` 与 `fleet-evolve`，绝不触碰 DSH `.credentials.yaml` 凭据文件） |
+| Claude Code、本地路由与 CC Switch 协同同步 | 同步 `~/.claude/CLAUDE.md`、`agents/readonly-*.md`、`hooks/*.py`、`skills/`（`cae-harness`、`fleet-evolve`）、无损合并 `settings.json`（自动迁移旧版拆分式 `"args"` 钩子），可选同步 `router/` 与禁用 `cc-switch.db` 陈旧提示词 |
+| 全栈升级与大模型对齐体检（`--audit-upgrade`） | 零写入核查四端活跃资产与多技能字节漂移、CC Switch Schema 与自定义卡名脱敏、沙箱数据库隔离、路由健康度及大模型目录对齐状态 |
 
 ### 2. 多端共用生命周期守护脚本 `template/user-guard/hooks/*.py`（5 个模块）
 
@@ -112,8 +112,8 @@
 ### 4. DeepSeek Harness（`DSH`）全局指令与无头临时补丁协议
 
 DSH 采用模块化插件栈（Profile + Patch Overlay）架构，不暴露反重力／Codex／Claude Code 同构的同步命令式 `PreToolUse`／`Stop` JSON 钩子接口：
-- **全局指令与技能落盘**：`install.py` 将 `R0–R11` 全局规则同步至 `~/.dsh/AGENTS.md`（由 `@deepseek-ai/dsh-agent-instructions` 插件自动加载，完整保留用户末尾自定义 `## 工具与...` 段落），并将 `cae-harness` 同步至 `~/.dsh/skills/cae-harness`（由 `@deepseek-ai/dsh-skill-filesystem` 自动发现）。
-- **无头执行零污染补丁**：DSH 内置的 `--profile headless` 默认将 `credentials`、`authorization` 与 `deepseek-account` 置为 `disabled: true`。`cae-harness` 在系统临时目录动态生成一次性 `--patch` YAML 覆盖层，按预检检出的官方凭据类型（`deepseek-official` API Key 或 `deepseek-account` 官方登录态）按需启用凭据插件并注入目标模型（`deepseek-v4-pro`／`deepseek-flash`）与 `reasoningEffort`（`off`/`low`/`high`/`max`），任务结束后立即清理临时补丁，对 `~/.dsh` 下的持久化配置文件与 `.credentials.yaml` 零改动；只读审查通过 `--permission-mode read-only --approval-policy never` 与工作区文件快照双重锁定。
+- **全局指令与技能落盘**：`install.py` 将 `R0–R11` 全局规则同步至 `~/.dsh/AGENTS.md`（由 `@deepseek-ai/dsh-agent-instructions` 插件自动加载，完整保留用户末尾自定义 `## 工具与...` 段落），并将 `cae-harness` 与 `fleet-evolve` 同步至 `~/.dsh/skills/`（由 `@deepseek-ai/dsh-skill-filesystem` 自动发现）。
+- **无头执行零污染补丁与尾随停止标签净化**：DSH 内置的 `--profile headless` 默认将 `credentials`、`authorization` 与 `deepseek-account` 置为 `disabled: true`。`cae-harness` 在系统临时目录动态生成一次性 `--patch` YAML 覆盖层，按预检检出的官方凭据类型（`deepseek-official` API Key 或 `deepseek-account` 官方登录态）按需启用凭据插件并注入目标模型（`deepseek-v4-pro`／`deepseek-flash`）与 `reasoningEffort`（`off`/`low`/`high`/`max`），同时在输出解码器中自动剥离底层分词器偶发尾随泄漏的 `</｜｜DSML｜｜...>` 停止标签，任务结束后立即清理临时补丁，对 `~/.dsh` 下的持久化配置文件与 `.credentials.yaml` 零改动；只读审查通过 `--permission-mode read-only --approval-policy never` 与工作区文件快照双重锁定。
 
 > **跨平台 Python 解释器自动重写**：`install.py` 部署时自动探测可用的 Python 3.11+（Windows 探测 `python.exe` 或 `py.exe -3`，WSL2／Linux 优先探测 `python3`），将钩子命令统一升级为 `-X utf8 -I -B`；未找到合规解释器则直接中止报错，绝不写入失效钩子。
 

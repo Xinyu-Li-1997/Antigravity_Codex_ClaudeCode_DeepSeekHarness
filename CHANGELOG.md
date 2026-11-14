@@ -1,6 +1,16 @@
 # 更新日志（Changelog）
 
-记录 `Antigravity_Codex_ClaudeCode_DeepSeekHarness`（含 `user-guard` 原生插件与 `cae-harness` 多引擎验证台架）各版本的功能演进、宿主协议适配与安全加固。
+记录 `Antigravity_Codex_ClaudeCode_DeepSeekHarness`（含 `user-guard` 原生插件、`cae-harness` 多引擎验证台架与 `fleet-evolve` 自举演进协议）各版本的功能演进、宿主协议适配与安全加固。
+
+---
+
+## [1.10.0] - 2026-11-15
+
+新增多引擎舰队自举演进与减法清淤协议（`fleet-evolve`）、原地升级可视化舰队矩阵，并修复跨端实测检出的钩子 glob、无头 DSML 标签泄漏及升级体检隐私隔离缺陷：
+
+- **`fleet-evolve` 舰队自举演进技能与宿主机二阶段状态锁（`template/user-guard/skills/fleet-evolve/`、`install.py`、`AGENTS.md`）**：新增单一顶层演进协议 `SKILL.md`（支持 `full`、`audit`、`hygiene` 三种单趟模式）与纯标准库状态锁脚本 `scripts/fleet_state.py`（独立落盘于宿主机本地状态目录，绑定 `execution_side`、`repo_commit`、`plugin_version`、`skill_sha256`、`session_id` 不等校验与 `24h` TTL，防止主控换代重入死循环）；扩展 `install.py` 将 `skills/` 下全部托管技能（`cae-harness`、`fleet-evolve`）对称同步并纳入四端 `--audit-upgrade` 漂移核查，同时将双 `AGENTS.md` 减法精简收敛。
+- **二维正交选型可视化舰队矩阵原地升级（`README.md`、`docs/`）**：遵循 `R0` 单一真源在 `README.md` 第四章原地建立六列可视化舰队矩阵（`宿主外壳控制面 × 基座模型推理面`），明确界定反重力 `Carbon (High)` 总控、原生 `inherit` 只读子代理、Codex `Astra/Sol (max, 872k)`、`Claude Code + Kimi/DeepSeek` 本地混合分流与 `DSH + DeepSeek` 的不可替代发起准则及三层实测证据。
+- **真机并发评审检出缺陷修复与体检隐私加固（`status_guard.py`、`cae_harness.py`、`install.py`、`ccswitch_admin.py`）**：修复 `status_guard.py` 在 Claude Code 目录 `Grep` 传入 ripgrep 复杂 glob（如 `**.py`、`{a,b}`、`!exclude`）时触发 `Path.rglob` `ValueError` 及遍历 `.git` 的问题；修复 `cae_harness.py` 在 `dsh` 无头模式下底层模型尾随泄漏 `</｜｜DSML｜｜...>` 停止标签导致的 JSON 解析报错；加固 `install.py` 排除反重力默认选模中的第三方托管模型、隔离沙箱审计对宿主机 `cc-switch.db` 的读取、脱敏非标准自定义卡片名称、抑制未安装客户端的空目录漂移噪点，并补齐 `ccswitch_admin.py` 卡片上下文窗口对齐校验。
 
 ---
 

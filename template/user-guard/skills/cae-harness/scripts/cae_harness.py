@@ -2478,8 +2478,15 @@ def _check_output_status(parsed):
                            finished_reason=finished_reason, error=error)
 
 
+DSML_TAIL_RE = re.compile(r'(?:\s*</?[｜|]+DSML[｜|]+[^>]*>)+\s*$')
+
+
+def _strip_dsml_tail(text):
+    return DSML_TAIL_RE.sub('', text).strip()
+
+
 def _decode_output_json(raw_text):
-    raw = raw_text.strip().lstrip('\ufeff')
+    raw = _strip_dsml_tail(raw_text.strip().lstrip('\ufeff'))
     if not raw:
         raise OutputParseError('子任务输出为空')
     try:
@@ -2490,12 +2497,12 @@ def _decode_output_json(raw_text):
         fence = re.fullmatch(r'```(?:json)?\s*(\{[\s\S]*\})\s*```', raw)
         try:
             if fence:
-                return json.loads(fence.group(1))
+                return json.loads(_strip_dsml_tail(fence.group(1)))
             events = []
             agy_errors = []
             saw_timeout_diag = False
             for line in raw.splitlines():
-                stripped = line.strip()
+                stripped = _strip_dsml_tail(line.strip())
                 if not stripped:
                     continue
                 agy_err = _parse_agy_error_line(stripped)
@@ -2512,7 +2519,7 @@ def _decode_output_json(raw_text):
             fence = re.search(r'```(?:json)?\s*(\{[\s\S]*?\})\s*```', raw)
             if fence:
                 try:
-                    return json.loads(fence.group(1))
+                    return json.loads(_strip_dsml_tail(fence.group(1)))
                 except (ValueError, RecursionError):
                     pass
             raise OutputParseError('子任务输出不是合法 JSON') from decode_error

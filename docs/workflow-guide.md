@@ -1,6 +1,6 @@
 # Antigravity、Codex、Claude Code 与 DeepSeek Harness 工程及科研协作实践指南
 
-本文面向从事计算流体力学（CFD）、有限元分析（FEA）、偏微分方程（PDE）数值求解器与高性能科学计算的开发者，说明宿主机全局落盘后的 `user-guard`、四端无头验证台架 `cae-harness` 以及 Claude Code 本地路由／CC Switch 协同工具在零门槛起步、课题统管、公式推导、求解器编码、跨模块审计及例行升级回归中的实战配合方法。命令行细则见 [`cae-harness` 技能说明](../template/user-guard/skills/cae-harness/SKILL.md)，底层钩子协议与无头执行机制见[架构设计与生命周期钩子规范](architecture-and-hooks.md)，部署方法见[仓库总 README](../README.md)。
+本文面向从事计算流体力学（CFD）、有限元分析（FEA）、偏微分方程（PDE）数值求解器与高性能科学计算的开发者，说明宿主机全局落盘后的 `user-guard`、四端无头验证台架 `cae-harness`、自举演进协议 `fleet-evolve` 以及 Claude Code 本地路由／CC Switch 协同工具在零门槛起步、课题统管、公式推导、求解器编码、跨模块审计及升级回归中的实战配合方法。命令行细则见 [`cae-harness` 技能说明](../template/user-guard/skills/cae-harness/SKILL.md)与 [`fleet-evolve` 技能说明](../template/user-guard/skills/fleet-evolve/SKILL.md)，底层钩子协议见[架构设计与生命周期钩子规范](architecture-and-hooks.md)，部署与可视化舰队矩阵见[仓库总 README](../README.md)。
 
 ---
 
@@ -33,11 +33,10 @@
 1. **前端主会话 + 本侧原生只读子代理（文献通读与多文件静态核查）**：
    - 前端主会话始终保留用户自选的模型与挡位（反重力推荐单模型 `Gemini 4 Carbon (High)`，避免固定复合模式 `Orchestrator` 在同一窗口内交替混用模型挤占容量）。
    - 并行通读多篇论文、摘录几十个源文件中的边界条件实现或核对汇报行号时，直接唤起本侧原生 `readonly-reader`、`readonly-auditor` 或 `readonly-collaborator`（反重力限制 `read_file/search_web`，Codex 启用 `read-only` 沙箱，Claude Code 限制 `Read/Grep/Glob`），把大体积原始文本隔离在独立子窗口内；10 个以上同构算例目录或子模块的结构化只读盘点可使用反重力原生 `run_workflow` 并行扇出（`/boost`、`/swarm`、`/teamwork` 仅在用户显式点名时启用）。
-2. **`cae-harness` 四端无头调度（发包前预检就绪 + 默认满血旗舰）**：
-   - **Codex 硬核推导与求解器门禁（`codex:default`）**：`math`／`direction` 自动优选深度推理旗舰 **`Astra`**（`gpt-6-astra`，聚焦预提炼方程，复杂推导建议设 `--timeout 900–1200`）；`code`／`review`／`audit`／`gate` 自动优选最新代工程旗舰 **`Sol`**（`gpt-6.1-sol`），默认启用单模型纯思考最高挡 **`max`** 并显式下发 **`872,000` token** 声明最大窗口（默认排除内部二次派生的 `ultra` 挡防套娃耗尽配额）。
-   - **Claude Code 原生配置继承与按需调用（`cc:default` / `claude:default`）**：发包前自动检查是否存在有效 API 凭据、运行中的本地 `router.py`（探活 `/__router/health` 并核查 `cc-switch.db` 卡片密钥）或有效登录态，拦截 `PASTE_*` 等未填占位符；执行 `claude -p` 时不加 `--bare`，完整继承 `~/.claude` 下的 `CLAUDE.md`、`settings.json`、生命周期钩子与 CC Switch 当前卡片（支持 `cc:kimi`、`cc:deepseek` 别名及自然语言点名“让 CC 检查”）。
-   - **DeepSeek Harness 合规直连与应急兜底（`dsh:default`）**：发包前核验环境变量、`.env` 或 `.credentials.yaml` 中的官方 API Key／官方账号凭据，通过临时运行补丁（`--profile headless --patch`）按任务下发旗舰 **`deepseek-v4-pro`**（`max` 挡）或轻量 **`deepseek-flash`**（`low` 挡），绝不污染 `~/.dsh` 持久化配置文件。
-   - **纯文字润色与按需分级省流**：`polish` 任务采用短篇 `medium`、长篇 `high` 挡防 `R5` 无声放大；仅当用户显式传 `--tier` 或在提示词中提出降挡、省额度、省 token 时，才切换为分级省流模式。
+2. **`cae-harness` 四端无头分流（宿主外壳 × 基座模型正交择优）**：
+   - **何时必须调 `Codex`（`Astra`／`Sol`）而非本侧原生子代理**：需要单模型 `max` 最高纯思考挡、异构模型家族独立复核、`872,000` token 超长同轮无损检索，或需要带 `--write-scope` 与 `--verify-cmd` 守恒／收敛阶验收脚本的写入闭环时，优先调 `codex:default`（`math`／`direction` 选 `Astra`，须预切核心文件与行号并设 `--timeout 900–1200`；`code`／`review`／`audit`／`gate` 选 `Sol`）。
+   - **何时选 `Claude Code`（`cc`）vs `DeepSeek Harness`（`dsh`）**：需要完整五类生命周期 Hooks、`--json-schema` 强回执校验、MCP 工具循环或 `Kimi K3.1` 百万上下文主模型 + `DeepSeek-V4.1-Flash` 子代理本地混合分流时选 `cc:default`（不加 `--bare` 原生继承 `~/.claude` 与激活卡片）；需要零反代／零路由最少依赖起步、直连原生 `DeepSeek-V4-Pro`（或显式 `dsh:flash --tier max`）及三端配额受限保底接管时选 `dsh`。完整矩阵见[仓库总 README 第四章](../README.md)。
+   - **纯文字润色与按需省流**：`polish` 采用短篇 `medium`／长篇 `high` 防 `R5` 无声放大；仅当用户提出降挡或省额度／token 时才切分级省流。
 
 ---
 
@@ -76,11 +75,6 @@
 
 ---
 
-## 七、客户端、CC Switch 与大模型升级例行回归流程
+## 七、多引擎舰队自举演进与升级回归（`fleet-evolve`）
 
-当任一客户端（反重力、Codex、Claude Code、DSH）、CC Switch 或上游大模型升级，用户提出**“根据各自升级做适配与回归测试”**时，按 [AGENTS.md](../AGENTS.md) 第三章的触发式六步流程闭环执行：
-
-1. **全栈只读体检**：运行 `python -B install.py --audit-upgrade` 与 `cae_harness.py probe --discover-models`／`assess`，一次查清四端版本、规则／钩子／技能漂移、CC Switch Schema 与卡片状态、本地路由健康度及最新大模型目录。
-2. **能力匹配与精简修订**：针对新模型代际、窗口扩容或无头 CLI 参数演进更新模板与选路映射，清理已下线模型配置（遵循 `R3.3` 不留废弃兼容层）。
-3. **跨端代码门禁与六模式沙箱测试**：调 Codex `Sol (max)` 完成边界审查与 `--verify-cmd` 门禁，在临时目录跑通 `codex`、`antigravity`、`claude --with-cc-router`、`dsh`、`both`、`all --with-cc-router` 六套沙箱安装、沙箱 `--audit-upgrade` 零漂移校验及全量 `unittest` 回归。
-4. **润色脱敏与双侧预演收口**：更新文档能力矩阵与 `CHANGELOG.md`，通过全仓脱敏审计后输出 Windows 与 WSL 双侧 `--dry-run --yes` 预演清单，获用户批准后同步生产配置并复核零漂移收口。
+当任一客户端、CC Switch 或上游大模型大版本迭代，或直接提出“全面更新整套配置”“根据各家最新动态重算各端方案”“全量清淤回归”时，直接触发 [`fleet-evolve` 自举演进协议](../template/user-guard/skills/fleet-evolve/SKILL.md)（支持 `full` 全流程、`audit` 纯只读评估、`hygiene` 减法清淤三种单趟模式，并通过 `fleet_state.py` 宿主机状态锁保障主控换代时的二阶段防死循环重入与真机 `returncode == 0` 探针门禁）。

@@ -1,6 +1,6 @@
 # `user-guard` 工程与科学计算协作插件及同源核心模板
 
-`user-guard` 是本仓库（`Antigravity_Codex_ClaudeCode_DeepSeekHarness`）维护的核心同源目录：既作为 Google Antigravity（反重力）的原生插件直接安装至 `~/.gemini/config/plugins/user-guard`，同时也是 OpenAI Codex、Anthropic Claude Code 与 DeepSeek Harness（`DSH`）全局规则、生命周期守护钩子及四端无头协作台架 `cae-harness` 的唯一上游真源（Codex 与 Claude Code 专属的事件挂载模板、只读子代理定义及本地分流路由分别位于同级的 `../codex/` 与 `../claude/`）。
+`user-guard` 是本仓库（`Antigravity_Codex_ClaudeCode_DeepSeekHarness`）维护的核心同源目录：既作为 Google Antigravity（反重力）的原生插件直接安装至 `~/.gemini/config/plugins/user-guard`，同时也是 OpenAI Codex、Anthropic Claude Code 与 DeepSeek Harness（`DSH`）全局规则、生命周期守护钩子及托管技能（`cae-harness`、`fleet-evolve`）的唯一上游真源（Codex 与 Claude Code 专属的事件挂载模板、只读子代理定义及本地分流路由分别位于同级的 `../codex/` 与 `../claude/`）。
 
 安装脚本执行后，各客户端配置直接落盘在各自的宿主机全局配置根目录（`~/.gemini/config/plugins/user-guard`、`~/.codex`、`~/.claude`、`~/.dsh`），日常科研与求解器业务仓库无需内嵌或依赖本模板目录。
 
@@ -21,6 +21,7 @@
 | `agents/readonly-auditor.md` | 反重力只读审查子代理（默认 `inherit`），负责逐行核对公式符号、边界条件、数值容差与运行证据 |
 | `agents/readonly-collaborator.md` | 反重力只读协作子代理（默认 `inherit`），负责数学与离散格式推导、方案论证及技术文档润色 |
 | `skills/cae-harness/` | 四端无头 CLI 协作与门禁验证台架（`SKILL.md` 与 `scripts/cae_harness.py`），统一支持 `codex`、`agy`、`claude`（`cc`）与 `dsh` 的环境预检（`probe`／`assess`）、按需／模糊派工（`task`）、分片审计（`audit`）与验证门禁（`gate`） |
+| `skills/fleet-evolve/` | 多引擎舰队自举演进与全栈清淤回归元技能（`SKILL.md` 与宿主机二阶段状态锁 `scripts/fleet_state.py`），覆盖只读并发调研、二维正交选型矩阵重算、双侧真机探针验收与减法清淤门禁 |
 
 ## 四端编排、配窗与顺位兜底要点
 
@@ -28,4 +29,4 @@
 2. **日常反重力统管、专长分工与零门槛起步**：多端环境下推荐由反重力居中统管配置与上下文，硬核公式推导与求解器编码／门禁优先调 Codex（`Astra`／最新代 `Sol` + `max` 最高挡 + `872,000` 声明最大窗口），也可按需或按自然语言指派调用继承 `~/.claude` 与 CC Switch 卡片的 `Claude Code`（`cc`）及官方直连的 `DeepSeek Harness`（`dsh`，默认 `DeepSeek-V4-Pro`、轻量档 `DeepSeek-V4.1-Flash`，`1,048,576` 窗口）；新用户可直接用零门槛合规的 `DSH + DeepSeek` 独立跑通全套规范，后续开通任一更强客户端无缝接手。
 3. **额度耗尽自动回退**：调用时附带 `--fallback-on-quota`，若目标端在预检或启动阶段触发额度熔断（`quota_exhausted`）且尚未改动工作区文件，自动切回发起方本侧或顺位已就绪的对等端完成任务。
 
-命令行细则见 [`cae-harness` 技能说明](skills/cae-harness/SKILL.md)，完整安装、全栈升级体检与架构文档见[仓库总 README](../../README.md)与[架构设计及生命周期钩子规范](../../docs/architecture-and-hooks.md)。
+命令行细则见 [`cae-harness` 技能说明](skills/cae-harness/SKILL.md)与 [`fleet-evolve` 技能说明](skills/fleet-evolve/SKILL.md)，完整安装、可视化舰队矩阵与架构文档见[仓库总 README](../../README.md)与[架构设计及生命周期钩子规范](../../docs/architecture-and-hooks.md)。

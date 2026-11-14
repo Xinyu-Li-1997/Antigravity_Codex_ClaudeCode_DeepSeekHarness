@@ -2260,5 +2260,116 @@ class TestEndToEndIntegration(unittest.TestCase):
                 hooks_path.write_bytes(plan.change.content)
                 self.assertIsNone(INSTALLER._plan_codex_hooks(hooks_path, template, "python -X utf8 -I -B").change)
 
+    def test_43_fleet_evolve_skill_and_two_pass_bootstrap_state_lock(self) -> None:
+        skill_md = TEMPLATE_DIR / "skills" / "fleet-evolve" / "SKILL.md"
+        state_py = TEMPLATE_DIR / "skills" / "fleet-evolve" / "scripts" / "fleet_state.py"
+        self.assertTrue(skill_md.is_file())
+        self.assertTrue(state_py.is_file())
+        self.assertTrue(skill_md.read_text(encoding="utf-8").startswith("---\nname: fleet-evolve"))
+
+        label = INSTALLER._select_agy_frontier_max_label([
+            {"slug": "claude-opus-5-5-high", "display_name": "Claude Opus 5.5 (High)"},
+            {"slug": "gpt-oss-120b-medium", "display_name": "GPT-OSS 120B (Medium)"},
+            {"slug": "gemini-4-carbon-medium", "display_name": "Gemini 4 Carbon (Medium)"},
+            {"slug": "gemini-4-carbon-high", "display_name": "Gemini 4 Carbon (High)"},
+        ])
+        self.assertEqual(label, "Gemini 4 Carbon (High)")
+        self.assertIsNone(INSTALLER._select_agy_frontier_max_label([
+            {"slug": "claude-opus-5-5-high", "display_name": "Claude Opus 5.5 (High)"},
+            {"slug": "gpt-oss-120b-medium", "display_name": "GPT-OSS 120B (Medium)"},
+            {"slug": "auto-router-max", "display_name": "Auto Router (Max)"},
+        ]))
+        self.assertEqual(INSTALLER._select_agy_frontier_max_label([
+            {"slug": "claude-opus-5-5-high", "display_name": "Claude Opus 5.5 (High)"},
+            {"slug": "gemini-3-flash-low", "display_name": "Gemini 3 Flash (Low)"},
+            {"slug": "gemini-3-flash-high", "display_name": "Gemini 3 Flash (High)"},
+        ]), "Gemini 3 Flash (High)")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_root = Path(tmp)
+            state_dir = tmp_root / "fleet_state"
+            env = {**os.environ, "CAE_FLEET_STATE_DIR": str(state_dir)}
+
+            auto_repo = subprocess.run(
+                [sys.executable, "-B", "-X", "utf8", str(state_py), "status"],
+                cwd=tmp_root, capture_output=True, text=True, encoding="utf-8", env=env, timeout=15,
+            )
+            self.assertEqual(auto_repo.returncode, 0, auto_repo.stderr)
+            self.assertEqual(json.loads(auto_repo.stdout)["phase"], "IDLE")
+
+            installed_copy = tmp_root / "isolated_skill" / "fleet_state.py"
+            installed_copy.parent.mkdir(parents=True)
+            installed_copy.write_bytes(state_py.read_bytes())
+            no_repo_err = subprocess.run(
+                [sys.executable, "-B", "-X", "utf8", str(installed_copy), "status"],
+                cwd=tmp_root, capture_output=True, text=True, encoding="utf-8", env=env, timeout=15,
+            )
+            self.assertNotEqual(no_repo_err.returncode, 0)
+
+            tilde_env = {
+                **os.environ,
+                "HOME": str(tmp_root),
+                "USERPROFILE": str(tmp_root),
+                "CODEX_HOME": "~/custom_codex",
+                "CAE_FLEET_STATE_DIR": str(tmp_root / "custom_codex" / "sub"),
+            }
+            tilde_overlap = subprocess.run(
+                [sys.executable, "-B", "-X", "utf8", str(state_py), "--repo", str(REPO_ROOT), "status"],
+                capture_output=True, text=True, encoding="utf-8", env=tilde_env, timeout=15,
+            )
+            self.assertNotEqual(tilde_overlap.returncode, 0)
+
+            def run_state(*cli_args: str) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    [sys.executable, "-B", "-X", "utf8", str(state_py), "--repo", str(REPO_ROOT), *cli_args],
+                    capture_output=True, text=True, encoding="utf-8", env=env, timeout=15,
+                )
+
+            st0 = json.loads(run_state("status").stdout)
+            self.assertEqual(st0["phase"], "IDLE")
+
+            bad_env = {**os.environ, "CAE_FLEET_STATE_DIR": str(REPO_ROOT / "bad_state")}
+            bad = subprocess.run(
+                [sys.executable, "-B", "-X", "utf8", str(state_py), "--repo", str(REPO_ROOT), "status"],
+                capture_output=True, text=True, encoding="utf-8", env=bad_env, timeout=15,
+            )
+            self.assertNotEqual(bad.returncode, 0)
+
+            rec = run_state("record-pass1", "--session-id", "pass1_sess", "--target-master", "Antigravity Carbon High")
+            self.assertEqual(rec.returncode, 0, rec.stderr)
+            self.assertEqual(json.loads(run_state("status").stdout)["phase"], "AWAITING_MASTER_RELOAD")
+
+            same = run_state("verify-pass2", "--session-id", "pass1_sess")
+            self.assertEqual(same.returncode, 2)
+            self.assertEqual(json.loads(same.stdout)["reason"], "same_session_loop")
+
+            ready = run_state("verify-pass2", "--session-id", "pass2_sess")
+            self.assertEqual(ready.returncode, 0, ready.stderr)
+            self.assertEqual(json.loads(ready.stdout)["reason"], "ready_for_pass2")
+
+            state_file = Path(json.loads(rec.stdout)["state_file"])
+            drifted = json.loads(state_file.read_text(encoding="utf-8"))
+            drifted["plugin_version"] = "0.0.1"
+            state_file.write_text(json.dumps(drifted), encoding="utf-8")
+            drift_st = json.loads(run_state("status").stdout)
+            self.assertEqual(drift_st["phase"], "IDLE")
+            self.assertEqual(drift_st["stale_reason"], "repo_drift")
+
+            saved = json.loads(rec.stdout)["state"]
+            saved["updated_at_epoch"] = 1
+            state_file.write_text(json.dumps(saved), encoding="utf-8")
+            expired = run_state("verify-pass2", "--session-id", "pass2_sess")
+            self.assertEqual(expired.returncode, 2)
+            self.assertEqual(json.loads(expired.stdout)["reason"], "expired_ttl")
+            self.assertEqual(json.loads(run_state("status").stdout)["phase"], "IDLE")
+
+            self.assertEqual(run_state("clear", "--verified").returncode, 0)
+            ver_st = json.loads(run_state("status").stdout)
+            self.assertEqual(ver_st["phase"], "IDLE")
+            self.assertIn("last_verified_epoch", ver_st["saved"])
+            self.assertEqual(run_state("clear").returncode, 0)
+            self.assertEqual(json.loads(run_state("status").stdout)["phase"], "IDLE")
+            self.assertIsNone(json.loads(run_state("status").stdout)["saved"])
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

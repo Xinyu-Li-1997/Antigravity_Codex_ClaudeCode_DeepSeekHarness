@@ -58,7 +58,7 @@ FLOOR_TOP = {
     "modelOverrides", "modelPicker", "advisorModel", "awsAuthRefresh", "awsCredentialExport", "gcpAuthRefresh",
 }
 RESIDUE_ENV = {
-    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": ("262144", "372000", "983616"),
+    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": ("262144", "372000", "983616", "1048576"),
     "CLAUDE_CODE_AUTO_COMPACT_WINDOW": ("262144", "372000", "1000000"),
     "CLAUDE_CODE_MAX_OUTPUT_TOKENS": ("131072",),
 }
@@ -150,7 +150,7 @@ def _build_card_templates(
     compact_window: str = "1000000",
 ) -> Dict[str, Tuple[Any, Optional[str], str]]:
     ds_base = deepseek_model.replace("[1m]", "").replace("[1M]", "")
-    ds_main = ds_base if ds_base.endswith(("[1m]", "[1M]")) else f"{ds_base}[1M]"
+    ds_main = f"{ds_base}[1M]"
 
     def kimi_env(token: str) -> Dict[str, str]:
         return {
@@ -359,10 +359,12 @@ def inspect_status(
             report["settings_aligned"] = False
         elif cur:
             settings_token = env_obj.get("ANTHROPIC_AUTH_TOKEN") or env_obj.get("ANTHROPIC_API_KEY")
+            card_max_ctx = cur.get("max_context")
             report["settings_aligned"] = (
                 env_obj.get("ANTHROPIC_BASE_URL") == cur.get("base_url")
                 and env_obj.get("ANTHROPIC_MODEL") == cur.get("model")
                 and env_obj.get("CLAUDE_CODE_SUBAGENT_MODEL") == cur.get("subagent_model")
+                and (not card_max_ctx or env_obj.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS") == card_max_ctx)
                 and settings_token == active_card_token
             )
             if not report["settings_aligned"]:

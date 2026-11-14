@@ -1849,6 +1849,91 @@ class TestClaudeInstallerAndUpgradeAudit(OfflineSandbox):
         self.assertEqual(received["path"], "/anthropic/v1/messages")
         self.assertEqual(received["body"]["output_config"]["effort"], "max")
 
+    def test_fleet_evolve_four_peer_sync_glob_guard_and_card_name_redaction(self):
+        dsh = self.root / "target/dsh"
+        db = self.database()
+        self.install(*self.all_args(), "--dsh-home", dsh)
+        expected_skill = (REPO_ROOT / "template/user-guard/skills/fleet-evolve/SKILL.md").read_bytes()
+        expected_state = (REPO_ROOT / "template/user-guard/skills/fleet-evolve/scripts/fleet_state.py").read_bytes()
+        peer_roots = {
+            "antigravity": self.plugin,
+            "codex": self.codex,
+            "claude": self.claude_home,
+            "dsh": dsh,
+        }
+        for root in peer_roots.values():
+            self.assertEqual((root / "skills/fleet-evolve/SKILL.md").read_bytes(), expected_skill)
+            self.assertEqual((root / "skills/fleet-evolve/scripts/fleet_state.py").read_bytes(), expected_state)
+            (root / "skills/fleet-evolve/SKILL.md").write_text("# drifted\n", encoding="utf-8")
+
+        admin.prepare_cards(db, admin.default_router_port())
+        with closing(sqlite3.connect(db)) as con:
+            con.execute(
+                "INSERT INTO providers (id, app_type, name, settings_config, is_current, sort_index) VALUES (?,?,?,?,?,?)",
+                ("p_prefix", "kimi", "bob", "{}", 0, 8),
+            )
+            con.execute(
+                "INSERT INTO providers (id, app_type, name, settings_config, is_current, sort_index) VALUES (?,?,?,?,?,?)",
+                ("p_custom", "kimi", "alice_private_account_label", "{}", 0, 9),
+            )
+            con.execute(
+                "INSERT INTO providers (id, app_type, name, settings_config, is_current, sort_index) VALUES (?,?,?,?,?,?)",
+                ("p_broken", "kimi", "bob_broken_secret_card", "{bad json", 0, 10),
+            )
+            con.commit()
+        report = installer.audit_upgrade_status(
+            REPO_ROOT, self.plugin, self.codex, self.claude_home, db,
+            detection={}, is_sandbox_run=True, app_scope="all", dsh_home=dsh,
+        )
+        for name in peer_roots:
+            self.assertIn("skills/fleet-evolve/SKILL.md", report[name]["drift_files"])
+        serialized = json.dumps(report, ensure_ascii=False)
+        self.assertNotIn("alice_private_account_label", serialized)
+        self.assertNotIn("bob_broken_secret_card", serialized)
+        self.assertNotIn("_broken_secret_card", serialized)
+        self.assertIn("kimi:<custom-card>", serialized)
+
+        self.assertTrue(status_guard._rg_glob_matches(".solver.log", ".solver.log", ".solver.log"))
+        self.assertFalse(status_guard._rg_glob_matches("solver.log", "solver.log", ".solver.log"))
+        self.assertTrue(status_guard._rg_glob_matches("src/solver.log", "solver.log", "./src/**/*.log"))
+        self.assertTrue(status_guard._rg_glob_matches("src/solver.log", "solver.log", "src/**/**/*.log"))
+        self.assertTrue(status_guard._rg_glob_matches("src/a/b/solver.log", "solver.log", "src/**/*.log"))
+        self.assertTrue(status_guard._rg_glob_matches("].log", "].log", "[]].log"))
+        self.assertFalse(status_guard._rg_glob_matches("].log", "].log", "[!]].log"))
+        self.assertFalse(status_guard._rg_glob_matches("src/a/b.log", "b.log", "src/*[!]]*.log"))
+        self.assertTrue(status_guard._rg_glob_matches("src/solver.log", "solver.log", "src/*.log"))
+        self.assertFalse(status_guard._rg_glob_matches("src/sub/solver.log", "solver.log", "src/*.log"))
+
+        absent_dsh = self.root / "target/absent_dsh"
+        scoped = installer.audit_upgrade_status(
+            REPO_ROOT, self.plugin, self.codex, self.claude_home, db,
+            detection={"dsh": {"native_installed": False}}, is_sandbox_run=True,
+            app_scope="claude", dsh_home=absent_dsh,
+        )
+        self.assertFalse(scoped["dsh"]["active"])
+        self.assertEqual(scoped["dsh"]["drift_files"], [])
+
+        work = self.project / "grep_case"
+        (work / ".git").mkdir(parents=True)
+        (work / ".git/git_internal.log").write_text("ignore git\n", encoding="utf-8")
+        (work / "solver.log").write_text("iter=1 residual=1e-3\n", encoding="utf-8")
+        state_dir, logs_dir = self.root / "sg_state", self.root / "sg_logs"
+        py_glob = status_guard.handle_claude_pre_tool_use({
+            "session_id": "sid_glob", "cwd": str(self.project), "tool_name": "Grep",
+            "tool_input": {"path": str(work), "pattern": "residual", "glob": "**.py"},
+        }, state_dir=state_dir, logs_dir=logs_dir)
+        self.assertEqual(py_glob, {})
+        first_log = status_guard.handle_claude_pre_tool_use({
+            "session_id": "sid_glob", "cwd": str(self.project), "tool_name": "Grep",
+            "tool_input": {"path": str(work), "pattern": "residual", "glob": "*.{log,out}"},
+        }, state_dir=state_dir, logs_dir=logs_dir)
+        self.assertEqual(first_log, {})
+        second_log = status_guard.handle_claude_pre_tool_use({
+            "session_id": "sid_glob", "cwd": str(self.project), "tool_name": "Grep",
+            "tool_input": {"path": str(work), "pattern": "residual", "glob": "*.{log,out}"},
+        }, state_dir=state_dir, logs_dir=logs_dir)
+        self.assertEqual(second_log["hookSpecificOutput"]["permissionDecision"], "deny")
+
 
 if __name__ == "__main__":
     unittest.main()
