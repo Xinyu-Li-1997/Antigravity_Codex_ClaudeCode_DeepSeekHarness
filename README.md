@@ -34,7 +34,7 @@
 | 同一个算例残差日志被反复空读、空等套话连续刷屏 | 日志复合指纹门禁 + 回复数值进展识别守卫 | 日志内容有变化或迭代步数／残差有推进才放行，拦截原地空转刷屏 |
 | 会话已频繁压缩丢细节，还在继续派任务铺摊子 | 长会话分级预警、排空（`drain`）、冻结（`freeze`）与交接四要素核验 | 反重力自动收口生成【新对话提示词】；Codex 与 Claude Code 默认采用 `advisory` 提醒 |
 | 跨端调用未检查模型就绪，或目标端配额耗尽死循环重试 | 发包前 LLM／路由就绪预检 + 默认满血旗舰选模配窗 + `--fallback-on-quota` 顺位回退 | 预检拦截空凭据与离线路由；配额耗尽且工作区未改动时自动切回本侧或可用对等端 |
-| CC Switch 切卡冲掉全局规则，或升级后模型窗口失配 | `ccswitch_admin.py` 无损卡片投影与提示词禁用 + `install.py --audit-upgrade` 全栈体检 | CC Switch 仅管卡片凭据，规则、钩子与技能统一归本仓库同源同步 |
+| CC Switch 切卡或旧提示词／技能冲掉全局规范，升级后模型失配 | `ccswitch_admin.py` 无损卡片投影与提示词／技能退役守护 + `install.py --audit-upgrade` 全栈体检 | CC Switch 仅管供应商卡片凭据，内置提示词与技能已退役，规则、钩子与技能统一归本仓库下发至四端各自宿主机全局根目录 |
 
 ---
 
@@ -200,7 +200,7 @@ python -B install.py --dry-run --yes
 | `--sync-model-defaults` / `--no-model-config` | 前者显式将前端默认模型更新为推荐值（默认保留用户既有选择），后者完全跳过模型配置（二者互斥） |
 | `--codex-handoff-mode` / `--claude-handoff-mode` | 设置 Codex 或 Claude Code 长会话交接模式（`advisory`/`enforce`/`off`，默认 `advisory`） |
 | `--with-cc-router` | 将 Kimi+DeepSeek 本地分流路由与 CC Switch 管理工具同步至 `<claude_home>/router/` |
-| `--disable-ccswitch-prompts` | 在线原子备份 `cc-switch.db` 并禁用陈旧提示词，防止切卡时反向覆盖全局规则 |
+| `--disable-ccswitch-prompts` / `--purge-ccswitch-legacy` | 前者在线原子备份 `cc-switch.db` 并禁用已退役提示词与技能开关；后者备份归档后清空已退役提示词、技能表记录及 `~/.cc-switch/skills` 目录 |
 | `--dsh-home` / `--claude-home` / `--codex-home` / `--target-dir` | 指定对应客户端自定义或临时沙箱目标根目录 |
 | `--no-zotero` | 跳过可选的 `zotero-mcp` 文献检索服务配置 |
 

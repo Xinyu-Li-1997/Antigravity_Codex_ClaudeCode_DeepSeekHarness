@@ -2,11 +2,12 @@
 """ccswitch_admin.py - Pure stdlib CC Switch provider card, live projection, and prompt guard CLI.
 
 Subcommands:
-  * status          Read-only inspection of cc-switch.db, Claude settings.json, and prompt conflicts
+  * status          Read-only inspection of cc-switch.db, Claude settings.json, and prompt/skill conflicts
   * prepare-cards   Atomically create or update Kimi, DeepSeek, and hybrid router cards (preserving keys)
   * switch-card     Safely project a target Claude card into settings.json using CC Switch floor/residue rules
   * disable-prompts Disable enabled prompts in cc-switch.db so stale rules never overwrite AGENTS.md/CLAUDE.md
-  * verify          Validate card alignment, effort settings, prompt safety, and optional router health
+  * retire-legacy   Disable or purge retired CC Switch prompts/skills (with backup) so host global roots remain sole source
+  * verify          Validate card alignment, effort settings, prompt/skill safety, and optional router health
 """
 from __future__ import annotations
 
@@ -264,6 +265,10 @@ def inspect_status(
         "cards": [],
         "current_claude_card": None,
         "enabled_prompts": [],
+        "stored_prompt_count": 0,
+        "enabled_skills": [],
+        "stored_skill_count": 0,
+        "skills_dir_entries": [],
         "settings_exists": bool(settings_path and settings_path.is_file()),
         "settings_aligned": None,
         "effort_level": None,
@@ -311,6 +316,7 @@ def inspect_status(
                     report["warnings"].append(f"Multiple Claude provider cards ({claude_current_count}) have is_current=1.")
             if _table_exists(con, "prompts"):
                 prompt_cols = {r[1] for r in con.execute("PRAGMA table_info(prompts)").fetchall()}
+                report["stored_prompt_count"] = int(con.execute("SELECT COUNT(*) FROM prompts").fetchone()[0])
                 if {"id", "app_type", "name", "enabled"}.issubset(prompt_cols):
                     p_rows = con.execute(
                         "SELECT id, app_type, name FROM prompts WHERE enabled != 0 ORDER BY app_type, id"
@@ -322,6 +328,24 @@ def inspect_status(
                         report["warnings"].append(
                             "Enabled prompts exist in cc-switch.db and may overwrite AGENTS.md or CLAUDE.md if triggered."
                         )
+            if _table_exists(con, "skills"):
+                skill_cols = [r[1] for r in con.execute("PRAGMA table_info(skills)").fetchall()]
+                enabled_cols = [c for c in skill_cols if c.startswith("enabled_")]
+                report["stored_skill_count"] = int(con.execute("SELECT COUNT(*) FROM skills").fetchone()[0])
+                if {"id", "name"}.issubset(skill_cols) and enabled_cols:
+                    select_cols = ", ".join(['"id"', '"name"', *(f'"{c}"' for c in enabled_cols)])
+                    s_rows = con.execute(f"SELECT {select_cols} FROM skills ORDER BY id").fetchall()
+                    for row in s_rows:
+                        apps = [c.removeprefix("enabled_") for c, val in zip(enabled_cols, row[2:]) if str(val) not in ("0", "", "None")]
+                        if apps:
+                            report["enabled_skills"].append({"id": row[0], "name": row[1], "enabled_apps": apps})
+                    if report["enabled_skills"]:
+                        report["warnings"].append(
+                            "Enabled skills exist in cc-switch.db and may overwrite client global skills directories if triggered."
+                        )
+        skills_dir = db_path.parent / "skills"
+        if skills_dir.is_dir():
+            report["skills_dir_entries"] = sorted(p.name for p in skills_dir.iterdir() if p.name != ".DS_Store")
 
     if settings_path and settings_path.is_file():
         settings_obj = json.loads(settings_path.read_text(encoding="utf-8-sig"))
@@ -677,6 +701,113 @@ def disable_prompts(
         con.close()
 
 
+def retire_prompts_and_skills(
+    db_path: Path,
+    purge: bool = False,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    skills_dir = db_path.parent / "skills"
+    dir_entries = sorted(p.name for p in skills_dir.iterdir() if p.name != ".DS_Store") if skills_dir.is_dir() else []
+    if not db_path.is_file():
+        return {
+            "db_exists": False, "dry_run": dry_run, "purge": purge,
+            "disabled_prompts": [], "disabled_skills": [],
+            "purged_prompts": 0, "purged_skills": 0,
+            "archived_skills_dir": None, "skills_dir_entries": dir_entries if purge else [],
+            "backup": None, "warnings": [],
+        }
+
+    mode_flag = "ro" if dry_run else "rw"
+    con = sqlite3.connect(db_path.resolve().as_uri() + f"?mode={mode_flag}", uri=True, timeout=15)
+    try:
+        if not dry_run:
+            con.execute("BEGIN IMMEDIATE")
+        schema_ver, warnings = _check_schema(con)
+        disabled_prompts: List[Dict[str, Any]] = []
+        disabled_skills: List[Dict[str, Any]] = []
+        total_prompts = 0
+        total_skills = 0
+        enabled_cols: List[str] = []
+
+        if _table_exists(con, "prompts"):
+            total_prompts = int(con.execute("SELECT COUNT(*) FROM prompts").fetchone()[0])
+            p_cols = {r[1] for r in con.execute("PRAGMA table_info(prompts)").fetchall()}
+            if {"id", "app_type", "name", "enabled"}.issubset(p_cols):
+                rows = con.execute("SELECT id, app_type, name FROM prompts WHERE enabled != 0 ORDER BY app_type, id").fetchall()
+                disabled_prompts = [{"id": r[0], "app_type": r[1], "name": r[2]} for r in rows]
+
+        if _table_exists(con, "skills"):
+            total_skills = int(con.execute("SELECT COUNT(*) FROM skills").fetchone()[0])
+            s_cols = [r[1] for r in con.execute("PRAGMA table_info(skills)").fetchall()]
+            enabled_cols = [c for c in s_cols if c.startswith("enabled_")]
+            if {"id", "name"}.issubset(s_cols) and enabled_cols:
+                select_cols = ", ".join(['"id"', '"name"', *(f'"{c}"' for c in enabled_cols)])
+                for row in con.execute(f"SELECT {select_cols} FROM skills ORDER BY id").fetchall():
+                    apps = [c.removeprefix("enabled_") for c, val in zip(enabled_cols, row[2:]) if str(val) not in ("0", "", "None")]
+                    if apps:
+                        disabled_skills.append({"id": row[0], "name": row[1], "enabled_apps": apps})
+
+        db_changes = bool(total_prompts or total_skills) if purge else bool(disabled_prompts or disabled_skills)
+        fs_changes = bool(purge and skills_dir.is_dir())
+        if dry_run or not (db_changes or fs_changes):
+            if not dry_run:
+                con.rollback()
+            return {
+                "db_exists": True, "schema_version": schema_ver, "dry_run": dry_run, "purge": purge,
+                "disabled_prompts": disabled_prompts, "disabled_skills": disabled_skills,
+                "purged_prompts": total_prompts if purge else 0,
+                "purged_skills": total_skills if purge else 0,
+                "archived_skills_dir": None,
+                "skills_dir_entries": dir_entries if purge else [],
+                "backup": None, "warnings": warnings,
+            }
+
+        timestamp = time.strftime("%Y%m%d-%H%M%S") + f"-{time.time_ns()}"
+        backup_path: Optional[Path] = None
+        if db_changes:
+            backup_tag = "retire-legacy" if purge else "disable-prompts"
+            backup_path = Path(f"{db_path}.bak-before-{backup_tag}-{timestamp}")
+            backup_sqlite_database(db_path, backup_path)
+            if purge:
+                if _table_exists(con, "prompts"):
+                    con.execute("DELETE FROM prompts")
+                if _table_exists(con, "skills"):
+                    con.execute("DELETE FROM skills")
+            else:
+                if disabled_prompts:
+                    con.execute("UPDATE prompts SET enabled = 0 WHERE enabled != 0")
+                if disabled_skills and enabled_cols:
+                    set_zero = ", ".join(f'"{c}" = 0' for c in enabled_cols)
+                    where_any = " OR ".join(f'("{c}" IS NOT NULL AND CAST("{c}" AS TEXT) NOT IN (\'0\', \'\'))' for c in enabled_cols)
+                    con.execute(f"UPDATE skills SET {set_zero} WHERE {where_any}")
+            con.commit()
+        else:
+            con.rollback()
+
+        archived_skills_dir: Optional[Path] = None
+        if fs_changes:
+            archive_parent = db_path.parent / "backups"
+            archive_parent.mkdir(parents=True, exist_ok=True)
+            archived_skills_dir = archive_parent / f"retired-skills-{timestamp}"
+            shutil.move(str(skills_dir), str(archived_skills_dir))
+
+        return {
+            "db_exists": True, "schema_version": schema_ver, "dry_run": False, "purge": purge,
+            "disabled_prompts": disabled_prompts, "disabled_skills": disabled_skills,
+            "purged_prompts": total_prompts if purge else 0,
+            "purged_skills": total_skills if purge else 0,
+            "archived_skills_dir": str(archived_skills_dir) if archived_skills_dir else None,
+            "skills_dir_entries": dir_entries if purge else [],
+            "backup": str(backup_path) if backup_path else None, "warnings": warnings,
+        }
+    except BaseException:
+        if not dry_run:
+            con.rollback()
+        raise
+    finally:
+        con.close()
+
+
 def verify_alignment(
     db_path: Path,
     settings_path: Path,
@@ -690,6 +821,8 @@ def verify_alignment(
         errors.append("Claude settings.json does not exist")
     if status["enabled_prompts"]:
         errors.append(f"cc-switch.db still has {len(status['enabled_prompts'])} enabled prompt(s)")
+    if status["enabled_skills"]:
+        errors.append(f"cc-switch.db still has {len(status['enabled_skills'])} enabled skill(s)")
     if status["locked_effort_env"]:
         errors.append("CLAUDE_CODE_EFFORT_LEVEL is locked in settings.json env")
     if status["db_exists"] and status["current_claude_card"] is None:
@@ -735,7 +868,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     p_prompts.add_argument("--dry-run", action="store_true")
 
-    p_verify = sub.add_parser("verify", help="Verify alignment and prompt safety")
+    p_retire = sub.add_parser("retire-legacy", help="Disable or purge retired prompts and skills in CC Switch")
+    p_retire.add_argument("--purge", action="store_true", help="Backup and delete retired prompt/skill rows and ~/.cc-switch/skills")
+    p_retire.add_argument("--dry-run", action="store_true")
+
+    p_verify = sub.add_parser("verify", help="Verify alignment and prompt/skill safety")
     p_verify.add_argument("--check-router-port", type=int, default=None)
 
     args = parser.parse_args(argv)
@@ -764,6 +901,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
     if args.cmd == "disable-prompts":
         out = disable_prompts(db_path, app_types=args.app_type, dry_run=args.dry_run)
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return 0
+    if args.cmd == "retire-legacy":
+        out = retire_prompts_and_skills(db_path, purge=args.purge, dry_run=args.dry_run)
         print(json.dumps(out, ensure_ascii=False, indent=2))
         return 0
     if args.cmd == "verify":

@@ -11,6 +11,7 @@ import concurrent.futures
 import datetime
 import fnmatch
 import hashlib
+import ipaddress
 import json
 import math
 import ntpath
@@ -20,6 +21,7 @@ import queue
 import re
 import shutil
 import signal
+import socket
 import sqlite3
 import stat
 import subprocess
@@ -1697,6 +1699,31 @@ def _verify_claude_router_card_key(info, model_name):
         raise HarnessError(f'Claude Code 路由卡片 {card} 缺少有效 API 凭据，请先在 CC Switch 配置密钥')
 
 
+_WSL_FAKE_IP_NETWORKS = (ipaddress.ip_network('198.18.0.0/15'), ipaddress.ip_network('2001:2::/48'))
+
+
+def _wsl_upstream_hits_unproxied_fake_ip(base_url):
+    if not (_is_posix() and os.environ.get('WSL_DISTRO_NAME')):
+        return False
+    if any(os.environ.get(k) for k in ('HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'ALL_PROXY', 'all_proxy')):
+        return False
+    host = (urlsplit(base_url or '').hostname or '').strip()
+    if not host or host == 'localhost':
+        return False
+    try:
+        addrs = [ans[4][0] for ans in socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)]
+    except OSError:
+        return False
+    for addr in addrs:
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            continue
+        if any(ip in net for net in _WSL_FAKE_IP_NETWORKS):
+            return True
+    return False
+
+
 def _verify_claude_llm_ready(info, requested_model='', batch=None):
     source = info.get('llm_source', 'unconfigured')
     if source == 'placeholder_token':
@@ -1706,7 +1733,14 @@ def _verify_claude_llm_ready(info, requested_model='', batch=None):
         if not _probe_router_health(info):
             raise HarnessError('Claude Code 本地路由器未就绪，请先启动路由器并检查 /__router/health')
         _verify_claude_router_card_key(info, requested_model)
-    elif source != 'settings_env':
+    elif source == 'settings_env':
+        if not info.get('windows_interop') and _wsl_upstream_hits_unproxied_fake_ip(info.get('base_url', '')):
+            raise HarnessError(
+                'WSL 检测到 Claude Code 直连上游域名解析为宿主 Fake-IP 且未配置代理环境变量；'
+                '请切换至本地路由卡片（K3.1主+DS子代理 / 127.0.0.1:8241）或配置 HTTPS_PROXY',
+                execution_environment=_execution_environment(info),
+            )
+    else:
         if not info.get('binary'):
             raise HarnessError('未发现 Claude Code CLI，请先安装或指定 CAE_CLAUDE_BINARY')
         first = info

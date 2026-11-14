@@ -2250,7 +2250,11 @@ def audit_upgrade_status(
     ag["carbon_supported_efforts"] = sorted({item["slug"].rsplit("-", 1)[-1] for item in carbon
                                              if item["slug"].rsplit("-", 1)[-1] in EFFORT_ORDER}, key=EFFORT_ORDER.index)
     ag["retiring_models"] = [item["slug"] for item in ag_models if re.search(r"claude[- ]?4[.-]6|gpt[- ]oss[- ]120b", item["slug"], re.I)]
-    if isinstance(ag["configured_model"], str) and re.search(r"claude[- ]?4[.-]6|gpt[- ]oss[- ]120b", ag["configured_model"], re.I):
+    ag["configured_model_retiring"] = bool(
+        isinstance(ag["configured_model"], str)
+        and re.search(r"claude[- ]?4[.-]6|gpt[- ]oss[- ]120b", ag["configured_model"], re.I)
+    )
+    if ag["configured_model_retiring"] and ag["configured_model"] not in ag["retiring_models"]:
         ag["retiring_models"].append(ag["configured_model"])
     ag["catalog_source"] = "local_cache"
 
@@ -2274,8 +2278,15 @@ def audit_upgrade_status(
     cx["declared_max_context_window"] = _model_window(latest or {})
     cx["supported_efforts"] = _model_efforts(latest or {})
     reasons = []
+    codex_interop_only = bool(
+        not cx.get("native_installed")
+        and (detection.get("codex", {}).get("interop_available") or cx.get("interop_status") == "executable_detected")
+        and not cx_models
+        and cx.get("model") is None
+    )
     if latest is None:
-        reasons.append("本地模型目录缺少 Sol / Astra，需刷新客户端目录后复查")
+        if not codex_interop_only:
+            reasons.append("本地模型目录缺少 Sol / Astra，需刷新客户端目录后复查")
     else:
         if current is None or current["slug"] != latest["slug"]:
             reasons.append("当前默认模型与本地目录的最新同系列模型不一致")
@@ -2284,7 +2295,8 @@ def audit_upgrade_status(
         best_effort = max(cx["supported_efforts"], key=EFFORT_ORDER.index, default=None)
         if best_effort is None or cx["model_reasoning_effort"] != best_effort:
             reasons.append("思考强度未对齐目录中的最高单模型挡位")
-    cx.update(model_aligned=not reasons, upgrade_recommended=bool(reasons), alignment_reasons=reasons, catalog_source="local_cache")
+    cx.update(model_aligned=not reasons, upgrade_recommended=bool(reasons), alignment_reasons=reasons,
+              catalog_source="interop_delegated" if codex_interop_only else "local_cache")
     codex_doc = read_json(codex_root / "hooks.json")
     marker = HANDOFF_MARKER.search(str(codex_doc.get("description", "")))
     codex_mode = marker[1] if marker else "advisory"
@@ -2377,8 +2389,11 @@ def audit_upgrade_status(
         if cl_active and (card_uses_router or (not is_sandbox_run and (expect_cc_router or cl["router"]["installed"]))):
             cc.update(admin.inspect_status(ccswitch_db, settings_path, router_port=port))
     except (OSError, ValueError, TypeError, sqlite3.Error) as exc:
-        cc.update(db_exists=ccswitch_db.is_file(), schema_version=None, enabled_prompts=[], inspection_error=type(exc).__name__)
+        cc.update(db_exists=ccswitch_db.is_file(), schema_version=None, enabled_prompts=[], enabled_skills=[], inspection_error=type(exc).__name__)
     cc["default_router_port"] = port
+    cc["legacy_residue_present"] = bool(
+        cc.get("stored_prompt_count") or cc.get("stored_skill_count") or cc.get("skills_dir_entries")
+    )
     router_active = cl_active and bool(
         expect_cc_router or cl["router"]["installed"] or cl["router"]["config_exists"] or card_uses_router
     )
@@ -2387,7 +2402,7 @@ def audit_upgrade_status(
     if ag_active:
         if ag["drift_files"] or ag["upgrade_recommended"]:
             actions.append("sync_antigravity_plugin")
-        if ag["retiring_models"]:
+        if ag["configured_model_retiring"]:
             actions.append("review_antigravity_models")
     if cx_active:
         if cx["drift_files"]:
@@ -2404,7 +2419,7 @@ def audit_upgrade_status(
     if router_active and (router_drift or not cl["router"]["config_exists"]):
         actions.append("sync_cc_router")
     if cc_active:
-        if cc.get("enabled_prompts"):
+        if cc.get("enabled_prompts") or cc.get("enabled_skills"):
             actions.append("disable_ccswitch_prompts")
         if cc.get("settings_aligned") is False:
             actions.append("align_ccswitch_card")
@@ -2573,7 +2588,8 @@ def main() -> None:
     parser.add_argument("--claude-handoff-compactions", type=int, help="首次默认 0，升级沿用已有阈值")
     parser.add_argument("--with-cc-router", action="store_true", help="同步 Claude 本地路由器并保留已有 router.json")
     parser.add_argument("--ccswitch-db", default="", help="自定义 CC Switch 数据库路径")
-    parser.add_argument("--disable-ccswitch-prompts", action="store_true", help="在线备份并禁用陈旧提示词，支持预演")
+    parser.add_argument("--disable-ccswitch-prompts", action="store_true", help="在线备份并禁用 CC Switch 陈旧提示词与技能开关，支持预演")
+    parser.add_argument("--purge-ccswitch-legacy", action="store_true", help="在线备份并归档清空 CC Switch 已退役的提示词、技能表及 ~/.cc-switch/skills 目录")
     parser.add_argument("--dry-run", action="store_true", help="演练模式，仅打印同步与配置计划不实际写入")
     parser.add_argument("--skip-test", action="store_true", help="跳过安装后的全套自动化回归测试")
     parser.add_argument("--no-zotero", action="store_true", help="跳过本机可选 Zotero MCP 自动探测与配置")
@@ -2695,7 +2711,7 @@ def main() -> None:
     claude_root = claude_root if install_cl else None
     dsh_root = (Path(args.dsh_home).expanduser().absolute() if args.dsh_home else default_dsh_root.absolute()) if install_dsh else None
     ccswitch_db = Path(args.ccswitch_db).expanduser().absolute() if args.ccswitch_db else Path.home() / ".cc-switch/cc-switch.db"
-    disable_prompts = args.disable_ccswitch_prompts and (not is_sandbox_run or bool(args.ccswitch_db))
+    retire_ccswitch = (args.disable_ccswitch_prompts or args.purge_ccswitch_legacy) and (not is_sandbox_run or bool(args.ccswitch_db))
     if args.with_cc_router and not install_cl:
         parser.error("--with-cc-router 需要选择 Claude 安装")
 
@@ -2828,11 +2844,11 @@ def main() -> None:
                 include_model=not args.no_model_config, overwrite_model=args.sync_model_defaults,
             )
             _validate_claude_assets(repo_root, claude_root, args, claude_settings_plan.mode)
-        if disable_prompts:
+        if retire_ccswitch:
             _validate_path(ccswitch_db, directory=False)
             ccswitch_admin = _load_ccswitch_admin(repo_root)
             # 先只读验证 schema，再写入客户端资产；预演不备份、不改库。
-            ccswitch_admin.disable_prompts(ccswitch_db, dry_run=True)
+            ccswitch_admin.retire_prompts_and_skills(ccswitch_db, purge=args.purge_ccswitch_legacy, dry_run=True)
         if target_plugin_dir == (default_config_root / "plugins" / "user-guard").absolute() and not args.no_model_config:
             agy_model_changes = _plan_agy_model(
                 default_config_root.parent, dry_run=args.dry_run, overwrite=args.sync_model_defaults,
@@ -2900,11 +2916,22 @@ def main() -> None:
                 _sync_global_rules(template_dir / "rules/AGENTS.md", dsh_root / "AGENTS.md", "DeepSeek Harness", args.dry_run)
             if not args.no_dsh_skill:
                 mirror_sync_plugin(template_dir / "skills/cae-harness", dsh_root / "skills/cae-harness", dry_run=args.dry_run)
-        if disable_prompts:
-            result = ccswitch_admin.disable_prompts(ccswitch_db, dry_run=args.dry_run)
-            print(f"[*] CC Switch 提示词处理: {len(result['disabled'])} 条；备份: {result['backup']}")
-        elif args.disable_ccswitch_prompts:
-            print("[*] 沙箱未显式指定 --ccswitch-db，跳过宿主提示词数据库。")
+        if retire_ccswitch:
+            result = ccswitch_admin.retire_prompts_and_skills(
+                ccswitch_db, purge=args.purge_ccswitch_legacy, dry_run=args.dry_run
+            )
+            if args.purge_ccswitch_legacy:
+                print(
+                    f"[*] CC Switch 退役资产清理: 提示词 {result['purged_prompts']} 条, "
+                    f"技能 {result['purged_skills']} 条, 归档目录 {result['archived_skills_dir']}; 备份: {result['backup']}"
+                )
+            else:
+                print(
+                    f"[*] CC Switch 提示词/技能禁用: 提示词 {len(result['disabled_prompts'])} 条, "
+                    f"技能 {len(result['disabled_skills'])} 条; 备份: {result['backup']}"
+                )
+        elif args.disable_ccswitch_prompts or args.purge_ccswitch_legacy:
+            print("[*] 沙箱未显式指定 --ccswitch-db，跳过宿主提示词与技能数据库。")
     except (OSError, ValueError, sqlite3.Error) as exc:
         print(f"[!] 配置同步失败: {exc}", file=sys.stderr)
         sys.exit(1)

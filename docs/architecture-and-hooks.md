@@ -48,7 +48,7 @@
 | 脚本／配置 | 核心职责 |
 | --- | --- |
 | `router.py` + `router.windows.json` / `router.wsl.json` | 纯标准库多线程本地 HTTP 分流守护进程（Windows 默认 `127.0.0.1:8240`，WSL 默认 `127.0.0.1:8241`）：主会话请求转发至 Kimi Coding API（支持 `kimi_effort_map` 挡位映射），匹配 `deepseek` 前缀的子代理请求转发至 DeepSeek Anthropic 兼容端点（自动剥离 `[1m]`/`[1M]` 后缀并施加 `force_effort: "max"`），通过只读 URI 从 `cc-switch.db` 读取上游密钥（内存缓存 60 秒，磁盘零明文落盘），支持 SSE 逐块流式透传与 WSL 自动跟随宿主系统代理（缓存 5 秒） |
-| `ccswitch_admin.py` | 零依赖 SQLite 管理 CLI（`status`、`prepare-cards`、`switch-card`、`disable-prompts`、`verify`）：执行在线数据库原子备份，维护直连 Kimi（`k3.1-pro[1m]`）、直连 DeepSeek（`deepseek-flash[1M]`）与本地混合分流（`k3.1-pro[1m]` + `deepseek-flash`）三张卡片，切卡时仅无损投影受管的模型／鉴权字段（完整保留 `hooks`、`effortLevel`、`permissions` 及用户自定义键） |
+| `ccswitch_admin.py` | 零依赖 SQLite 管理 CLI（`status`、`prepare-cards`、`switch-card`、`disable-prompts`、`retire-legacy`、`verify`）：执行在线数据库原子备份，维护直连 Kimi（`k3.1-pro[1m]`）、直连 DeepSeek（`deepseek-flash[1M]`）与本地混合分流（`k3.1-pro[1m]` + `deepseek-flash`）三张卡片，切卡时仅无损投影受管的模型／鉴权字段（完整保留 `hooks`、`effortLevel`、`permissions` 及用户自定义键），并对已退役的 CC Switch 提示词与技能执行开关禁用或备份归档清理 |
 | `launch-cc-switch-wsl.sh` / `update-cc-switch-wsl.sh` | WSLg 下禁用 WebKitGTK DMA-BUF 防白屏启动包装器，以及带 GitHub API SHA-256 摘要强校验的 `.deb` 升级脚本 |
 
 ---
@@ -166,12 +166,12 @@ $$\text{Fingerprint} = \begin{cases} (\text{mtime\_ns},\ \text{size},\ \text{SHA
   - 默认 `advisory` 模式下五类事件全部真实触发，跨进程 `resume` 压缩计数不重复累加；隔离进程开启 `enforce` 后准确拦截 `drain` 期远端推送与 `freeze` 期源码补丁，正常放行局部收尾与交接文档补正。
 - **反重力 CLI `1.5.8`（Windows 与 WSL `Ubuntu-24.04`）**：
   - 四类事件在双平台原生触发；WSL 原生 CLI 登录后，`cae-harness` 只读审查与 `Hydrogen (High)` 写入任务以纯 Linux 原生链路（`side=posix`、`windows_interop=false`）一次通过三单元周期通量差 9 组精确分数验收（`49.64s`）；`Orchestrator (Carbon)` 在 `--timeout 900` 下以 `342.07s` 通过同一守恒验收。
-- **Claude Code CLI `2.1.323` 无头继承执行、钩子协议与本地路由联调（Windows 实机 + 离线全套夹具）**：
-  - 实机运行 `cae_harness.py task --caller antigravity --engine cc:default --kind review`：预检准确识别 `~/.claude/settings.json` 中的 CC Switch 卡片环境（`deepseek-flash[1M]`，配置窗口 `1,048,576`、压缩窗口 `1,000,000`），不加 `--bare` 原生继承全局配置启动 `claude -p --output-format json --json-schema ... --tools Read,Grep,Glob --permission-prompts none`，一次返回 `returncode=0`、通过 `modelUsage` 回填真实执行模型 `actual_model="deepseek-flash[1m]"`、工作区快照 `changed_files=[]`，并交付逐行精确引用的结构化审查回执；
-  - 五类钩子事件、`router.py`（Kimi `k3.1-pro[1m]` + DeepSeek `deepseek-flash` SSE 流式分流与 WSL 代理跟随）及 `ccswitch_admin.py` SQLite 原子备份切卡全部通过事务回归验证。
-- **DeepSeek Harness CLI `0.2.2-rc.3` 裸态预检与临时补丁无头执行实测（Windows 实机）**：
+- **Claude Code CLI `2.1.323` 无头继承执行、钩子协议与本地路由联调（Windows 与 WSL `Ubuntu-24.04` 双端实机 + 离线全套夹具）**：
+  - Windows 实机运行 `cae_harness.py task --caller antigravity --engine cc:default --kind review`：预检准确识别 `~/.claude/settings.json` 中的 CC Switch 卡片环境（`deepseek-flash[1M]`，配置窗口 `1,048,576`、压缩窗口 `1,000,000`），不加 `--bare` 原生继承全局配置启动 `claude -p --output-format json --json-schema ... --tools Read,Grep,Glob --permission-prompts none`，一次返回 `returncode=0`、通过 `modelUsage` 回填真实执行模型 `actual_model="deepseek-flash[1m]"`、工作区快照 `changed_files=[]`；WSL `Ubuntu-24.04` 实机在宿主 TUN Fake-IP（`198.18.0.0/15`）环境下经本地 `router.py`（`127.0.0.1:8241` 自动穿透宿主代理）驱动原生 `~/.local/bin/claude`（`cc:ds`）同样一次返回 `returncode=0`、`changed_files=[]`，且预检对未挂代理的 WSL 直连 Fake-IP 卡片实现毫秒级拦截提示；
+  - 五类钩子事件、`router.py`（Kimi `k3.1-pro[1m]` + DeepSeek `deepseek-flash` SSE 流式分流与 WSL 代理跟随）及 `ccswitch_admin.py` SQLite 原子备份切卡与提示词／技能退役归档全部通过事务回归验证。
+- **DeepSeek Harness CLI `0.2.2-rc.3` 裸态预检、临时补丁无头执行与 WSL 互操作实测（Windows 与 WSL 双侧实机）**：
   - 在本机裸装 DSH（仅含官方账号登录凭据 `deepseek-account`）环境下运行 `cae_harness.py probe`／`assess`：零写入准确检出 `dsh_provider="deepseek-account"`、内置双模型 `deepseek-v4-pro`／`deepseek-flash`（声明窗口 `1,048,576` token，安全预算 `943,718` token）；
-  - 实机运行 `cae_harness.py task --caller antigravity --engine dsh:default --kind review`：动态生成临时 `--patch` YAML 开启 `credentials`/`authorization`/`deepseek-account` 并在 `--permission-mode read-only --approval-policy never` 下驱动 `dsh --profile headless --json`，成功过滤中间工具探测异常（`tool_result` 恢复轮次）并精确提取末尾 `type="final"`（`reason.kind="completed"`）结构化 JSON 回执（`returncode=0`、`changed_files=[]`、`~/.dsh` 持久化凭据与配置零改动）。
+  - Windows 原生与 WSL `Ubuntu-24.04` 跨子系统互操作（`command_transport="windows_interop"`）分别运行 `cae_harness.py task --caller antigravity --engine dsh:default --kind review`：均动态生成临时 `--patch` YAML 开启 `credentials`/`authorization`/`deepseek-account` 并在 `--permission-mode read-only --approval-policy never` 下驱动 `dsh --profile headless --json`，成功过滤中间工具探测恢复轮次并精确提取末尾 `type="final"`（`reason.kind="completed"`）结构化 JSON 回执（`returncode=0`、`changed_files=[]`、`~/.dsh` 持久化凭据与配置零改动）。
 
 ### 2. 上下文窗口容量与自动检查点压缩边界压力测试
 

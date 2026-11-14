@@ -71,7 +71,7 @@
 ## 六、Windows 与 WSL2 跨子系统协同及 CC Switch 职责边界
 
 1. **计算环境隔离与无痕会话**：大规模 C++/Fortran 编译、细密网格生成或高内存 MPI 数值算例建议置于 WSL2 或独立计算节点执行（`R10`）。四端无头调用均保持会话隔离（`codex exec --ephemeral`、`~/.gemini/antigravity-cli`、`claude -p --no-session-persistence`、`dsh --profile headless`），不污染交互历史；Windows 与 WSL2 各自维护独立主目录与冷却缓存，升级后两侧分别运行一次安装器即可同源对齐。
-2. **Claude Code 本地分流路由与 CC Switch 卡片解耦**：全局规则、只读子代理与钩子统一由 `install.py` 从本仓库同步；CC Switch 仅管供应商凭据与卡片切换，通过 `--disable-ccswitch-prompts` 保持内置提示词禁用以免冲掉全局规则。启用 `--with-cc-router` 时，Windows 侧默认监听 `127.0.0.1:8240`、WSL2 侧默认监听 `127.0.0.1:8241`（自动识别 WSL 网关／系统代理透传）；`ccswitch_admin.py switch-card` 切卡时仅原子投影受管的模型／鉴权字段，100% 保留 `hooks`、`effortLevel` 与自定义键，且 `cae-harness` 调 `cc` 时实时继承切卡结果。
+2. **Claude Code 本地分流路由与 CC Switch 职责收口**：CC Switch 内的提示词（Prompts）与技能（Skills）分发功能均已退役停用，仅保留供应商凭据与卡片切换职责；全局规则、只读子代理、钩子与 `cae-harness` 统一由 `install.py` 从本仓库下发至四个客户端各自的宿主机全局根目录（可通过 `--disable-ccswitch-prompts` 禁用开关，或通过 `--purge-ccswitch-legacy` 在线备份归档后彻底清空已退役提示词／技能表及 `~/.cc-switch/skills` 目录）。启用 `--with-cc-router` 时，Windows 侧默认监听 `127.0.0.1:8240`、WSL2 侧默认监听 `127.0.0.1:8241`（自动识别宿主系统代理与 Fake-IP 透传；WSL2 在宿主开启 TUN Fake-IP 且未设 `HTTPS_PROXY` 时应激活本地路由卡片 `K3.1主+DS子代理`）；`ccswitch_admin.py switch-card` 切卡时仅原子投影受管的模型／鉴权字段，100% 保留 `hooks`、`effortLevel` 与自定义键，且 `cae-harness` 调 `cc` 时实时继承切卡结果。
 3. **WSL2 `<->` Windows 自动互操作**：WSL2 下运行 `cae-harness` 优先调用本侧已就绪的原生 Linux CLI，未安装或未登录时自动回退调用 Windows 侧 CLI（`/mnt/<盘符>` 共享盘可直接读写；纯 Linux 路径支持只读临时镜像审查，写入任务须置于共享盘或使用 WSL 原生 CLI）。
 
 ---

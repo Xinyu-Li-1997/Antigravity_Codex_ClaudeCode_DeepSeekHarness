@@ -9,7 +9,7 @@
 1. **各端全局落盘边界**：
    - **反重力（`--app antigravity`）**：同步 `~/.gemini/config/plugins/user-guard` 原生插件（`R0–R11` 全局规则、压缩原话恢复、目录硬边界与日志防空转门禁、防刷屏拦截、长会话收口状态机、三个 `inherit` 只读子代理及 `cae-harness` 技能），可选配置 `zotero-mcp`。
    - **Codex（`--app codex`）**：同步 `~/.codex/AGENTS.md`（保留末尾自定义 `## 工具与...` 段落）、三个 `read-only` 子代理、压缩原话恢复与交接钩子（默认 `advisory`）、`workspace-write` 沙箱基线、`~/.codex/skills/cae-harness` 及可选 `zotero-mcp`。
-   - **Claude Code 与 CC Switch（`--app claude`）**：同步 `~/.claude/CLAUDE.md`（保留自定义尾段）、三个 `Read/Grep/Glob` 只读子代理、五类生命周期钩子（无损合并 `settings.json` 并迁移旧版拆分式钩子，默认补齐 `effortLevel: "xhigh"`）及 `~/.claude/skills/cae-harness`；附带 `--with-cc-router` 时同步 `~/.claude/router/`（Kimi+DeepSeek 本地分流路由 `router.py`、CC Switch 卡片无损投影 `ccswitch_admin.py` 及 WSLg 脚本）；附带 `--disable-ccswitch-prompts` 时原子备份并禁用 `cc-switch.db` 陈旧提示词。
+   - **Claude Code 与 CC Switch（`--app claude`）**：同步 `~/.claude/CLAUDE.md`（保留自定义尾段）、三个 `Read/Grep/Glob` 只读子代理、五类生命周期钩子（无损合并 `settings.json` 并迁移旧版拆分式钩子，默认补齐 `effortLevel: "xhigh"`）及 `~/.claude/skills/cae-harness`；附带 `--with-cc-router` 时同步 `~/.claude/router/`（Kimi+DeepSeek 本地分流路由 `router.py`、CC Switch 卡片无损投影 `ccswitch_admin.py` 及 WSLg 脚本）；CC Switch 内的提示词与技能分发已全部退役，附带 `--disable-ccswitch-prompts` 可原子备份并禁用陈旧提示词／技能开关，附带 `--purge-ccswitch-legacy` 可备份归档后清空已退役提示词、技能表及 `~/.cc-switch/skills` 目录。
    - **DeepSeek Harness（`--app dsh`）**：同步 `~/.dsh/AGENTS.md`（保留末尾自定义 `## 工具与...` 段落）与 `~/.dsh/skills/cae-harness`，直接复用用户在 DSH 官方渠道配置的 API Key（`DEEPSEEK_API_KEY`）或官方账号登录态（`deepseek-account`），不触碰 `.credentials.yaml` 凭据文件。
 2. **零门槛合规起步与日常反重力统管**：
    - **首次上手与应急兜底（`DSH + DeepSeek`）**：初次接触本工作流或受限于外网环境的开发者，可先用官方合规的 `DSH + DeepSeek`（零反代等灰色操作）一键跑通整套 `R0–R11` 规范与 `cae-harness` 闭环，后续按需开通任一客户端即可平滑接管；多端并存时，`DSH + DeepSeek` 同时充当其他三端故障或配额耗尽时的保底调试工具。

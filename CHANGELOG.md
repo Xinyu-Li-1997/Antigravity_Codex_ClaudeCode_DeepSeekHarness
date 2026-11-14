@@ -4,6 +4,15 @@
 
 ---
 
+## [1.9.1] - 2026-11-15
+
+补齐 CC Switch 提示词与技能统一退役归档守护、全栈升级体检精准对齐及 WSL 跨子系统无头实测闭环：
+
+- **CC Switch 提示词与技能双退役守护及在线归档清理（`ccswitch_admin.py`、`install.py`、`R11`）**：明确 CC Switch 仅保留供应商卡片管理职责，内置提示词（`prompts`）与技能（`skills`）分发全部退役，全局规则与 `cae-harness` 统一由本仓库下发至四端各自宿主机全局根目录落实；`inspect_status`／`verify_alignment` 与 `install.py --audit-upgrade` 新增 `skills` 表启用列及 `~/.cc-switch/skills` 残留核查，`--disable-ccswitch-prompts` 扩展为同时禁用陈旧提示词与技能开关，并新增 `ccswitch_admin.py retire-legacy --purge` 与 `install.py --purge-ccswitch-legacy`（在线备份 `cc-switch.db` 并归档旧技能目录后清空已退役提示词与技能记录）。
+- **升级体检误报消除与 WSL Fake-IP 直连预检拦截（`install.py`、`cae_harness.py`）**：修正 `audit_upgrade_status` 在反重力已配置最新 `Carbon` 时因上游目录含待下线旧模型导致的 `review_antigravity_models` 误报，以及 WSL 侧仅落盘规则钩子并通过跨子系统互操作复用 Windows Codex CLI 时的 `refresh_codex_model_catalog` 误报；`cae_harness.py` 新增 WSL 直连卡片命中宿主 TUN Fake-IP（`198.18.0.0/15`）且未设代理时的毫秒级预检拦截提示，并完成 WSL 原生 `cc`（经本地 `8241` 路由）与跨子系统 `dsh` 无头端到端实测验收。
+
+---
+
 ## [1.9.0] - 2026-11-15
 
 完成仓库更名与版权归属加固（`Antigravity_Codex_ClaudeCode_DeepSeekHarness` + Apache 2.0 `NOTICE`），并将 Antigravity（`agy`）、Codex（`codex`）、Claude Code（`claude`／`cc`）与 DeepSeek Harness（`dsh`）统一收敛为同级对等工作流与 `cae-harness` 四后端无头调度体系：

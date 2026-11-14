@@ -2656,6 +2656,17 @@ else:
             self.assertTrue(harness._probe_router_health(interop_info))
             self.assertEqual(proc.call_args[0][0][0], 'powershell.exe')
 
+        direct_wsl = {**engines['claude'], 'llm_source': 'settings_env', 'windows_interop': False,
+                      'base_url': 'https://api.deepseek.com/anthropic'}
+        fake_addr = [(harness.socket.AF_INET, harness.socket.SOCK_STREAM, 6, '', ('198.18.0.212', 0))]
+        with patch.object(harness, '_is_posix', return_value=True), \
+             patch.dict(os.environ, {'WSL_DISTRO_NAME': 'Ubuntu-24.04'}, clear=True), \
+             patch.object(harness.socket, 'getaddrinfo', return_value=fake_addr):
+            with self.assertRaisesRegex(harness.HarnessError, 'Fake-IP'):
+                harness._verify_claude_llm_ready(direct_wsl)
+            with patch.dict(os.environ, {'WSL_DISTRO_NAME': 'Ubuntu-24.04', 'HTTPS_PROXY': 'http://127.0.0.1:7897'}, clear=True):
+                harness._verify_claude_llm_ready(direct_wsl)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

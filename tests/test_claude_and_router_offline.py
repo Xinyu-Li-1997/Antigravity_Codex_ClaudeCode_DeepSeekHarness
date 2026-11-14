@@ -1358,6 +1358,57 @@ class TestClaudeInstallerAndUpgradeAudit(OfflineSandbox):
              mock.patch.object(installer.Path, 'home', return_value=self.home):
             self.install('--app', 'codex', code=2)
 
+    def test_ccswitch_skills_retirement_purge_and_audit_alignment_edges(self):
+        db = self.database()
+        self.prompts(db)
+        skills_dir = db.parent / 'skills/task-alignment'
+        skills_dir.mkdir(parents=True)
+        (skills_dir / 'SKILL.md').write_text('# retired skill\n', encoding='utf-8')
+        with closing(sqlite3.connect(db)) as con:
+            con.execute('CREATE TABLE skills (id TEXT, name TEXT, enabled_claude INT, enabled_codex INT, enabled_dsh INT)')
+            con.execute('INSERT INTO skills VALUES (?, ?, ?, ?, ?)', ('local:task-alignment', 'task-alignment', 1, 0, 1))
+            con.commit()
+        self.install(*self.all_args())
+        admin.prepare_cards(db, admin.default_router_port())
+        admin.switch_card(db, self.claude_home / 'settings.json', 'DeepSeek')
+        gemini = self.plugin.parent.parent.parent
+        user_words.atomic_write_json(gemini / 'antigravity-cli/settings.json', {'model': 'Gemini 4 Carbon (High)'})
+        user_words.atomic_write_json(gemini / 'antigravity-cli/cache/cae_models_cache.json', {
+            'models': [{'slug': 'gemini-4-carbon-high'}, {'slug': 'gpt-oss-120b-medium'}],
+        })
+        detection = {
+            'antigravity': {'native_installed': True},
+            'codex': {'native_installed': False, 'interop_available': True},
+            'claude': {'native_installed': True},
+            'dsh': {'native_installed': False},
+            'cc_switch': {'native_installed': True},
+        }
+        report = installer.audit_upgrade_status(REPO_ROOT, self.plugin, self.codex, self.claude_home,
+                                               db, detection=detection, is_sandbox_run=True, app_scope='all')
+        self.assertEqual(len(report['cc_switch']['enabled_skills']), 1)
+        self.assertIn('disable_ccswitch_prompts', report['summary']['recommended_actions'])
+        self.assertNotIn('review_antigravity_models', report['summary']['recommended_actions'])
+        self.assertNotIn('refresh_codex_model_catalog', report['summary']['recommended_actions'])
+        self.assertEqual(report['codex']['catalog_source'], 'interop_delegated')
+
+        self.install(*self.all_args(), '--ccswitch-db', db, '--disable-ccswitch-prompts')
+        st = admin.inspect_status(db, self.claude_home / 'settings.json')
+        self.assertEqual(st['enabled_prompts'], [])
+        self.assertEqual(st['enabled_skills'], [])
+        self.assertEqual(st['stored_skill_count'], 1)
+        self.assertEqual(st['skills_dir_entries'], ['task-alignment'])
+
+        self.install(*self.all_args(), '--ccswitch-db', db, '--purge-ccswitch-legacy')
+        st_after = admin.inspect_status(db, self.claude_home / 'settings.json')
+        self.assertEqual(st_after['stored_prompt_count'], 0)
+        self.assertEqual(st_after['stored_skill_count'], 0)
+        self.assertEqual(st_after['skills_dir_entries'], [])
+        self.assertTrue(any((db.parent / 'backups').glob('retired-skills-*')))
+        aligned = installer.audit_upgrade_status(REPO_ROOT, self.plugin, self.codex, self.claude_home,
+                                                db, detection=detection, is_sandbox_run=True, app_scope='all')
+        self.assertTrue(aligned['summary']['all_aligned'], aligned['summary'])
+        self.assertFalse(aligned['cc_switch']['legacy_residue_present'])
+
     def test_dsh_detection_and_protected_global_skill_roots(self):
         with mock.patch.object(installer.Path, 'home', return_value=self.home), \
              mock.patch.object(installer, '_native_cli', side_effect=lambda name, home: 'fixture-dsh' if name == 'dsh' else None), \
