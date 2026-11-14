@@ -19,8 +19,8 @@ Antigravity（反重力，`agy`）、Codex（`codex`）、Claude Code（`claude`
 
 本技能仅管理通过官方 `codex`、`agy`、`claude` 与 `dsh` CLI 启动的无头独立子进程：
 1. **不干预宿主原生只读子代理**：主会话通过原生机制派生的 `readonly-reader`、`readonly-auditor`、`readonly-collaborator` 始终保持 `inherit`（直接继承前端主会话模型与独立窗口，或在 Claude Code 本地路由下按 `CLAUDE_CODE_SUBAGENT_MODEL` 分流）；反重力原生 `run_workflow` 仅用于同端 10 个以上同构模块或算例目录的轻量纯只读盘点（由 `status_guard.py` 执行 R4 预审）。
-2. **发包前强制校验底层 LLM 就绪**：调用任一后端前自动核实可执行文件与有效模型接入——`claude` 自动拦截未填密钥的占位符（如 `PASTE_*`），本地路由模式下主动探活 `/__router/health` 并只读核查 `cc-switch.db` 上游卡片密钥，直连／订阅模式下核验有效凭据或 `claude auth status`，且执行时不加 `--bare` 以完整继承 `~/.claude`（`CLAUDE.md`、`settings.json`、钩子、子代理与 CC Switch 当前卡片）；`dsh` 自动识别环境变量、`.env` 或 `.credentials.yaml` 中的官方 API Key／官方账号凭据，通过临时运行补丁（`--profile headless --patch`）注入模型与挡位，绝不改写用户全局配置文件。
-3. **支持显式指定与自然语言模糊指派**：除显式传 `--engine codex:sol`、`cc:default`、`dsh:flash` 外，当未锁死具体引擎且用户在任务描述中自然点名（如“让 CC 审一下”“交给 Codex 推导”“用 DSH 跑个兜底检查”），选路器自动识别对应的目标后端与模型家族（否定句如“不用 CC”自动排除，绝不误判）。
+2. **发包前强制校验底层 LLM 就绪（网络与登录／Key 由用户自理）**：网络连通、客户端安装、官方登录态（OAuth）与真实 API Key 属用户自理基础前提；调用任一后端前自动核实可执行文件与有效模型接入，未就绪时直接报明缺口请用户补齐，绝不编造绕过或灰产反代——`claude` 自动拦截未填密钥的占位符（如 `PASTE_*`），本地路由模式下主动探活 `/__router/health` 并只读核查 `cc-switch.db` 上游卡片密钥，直连／订阅模式下核验有效凭据或 `claude auth status`，且执行时不加 `--bare` 以完整继承 `~/.claude`（`CLAUDE.md`、`settings.json`、钩子、子代理与 CC Switch 当前卡片）；`dsh` 自动识别环境变量、`.env` 或 `.credentials.yaml` 中的官方 API Key／官方账号凭据，通过临时运行补丁（`--profile headless --patch`）注入模型与挡位，绝不改写用户全局配置文件。
+3. **支持自然语言模糊指派与 100% 精确模块名锁定**：日常模糊诉求由选路器按任务专长自动分流（或在未锁死具体引擎且自然点名“让 CC 审一下”“交给 Codex 推导”“用 DSH 跑个兜底检查”时自动识别目标后端，否定句如“不用 CC”自动排除）；若需 100% 确定性调起特定功能，用户可直接在对话或参数中显式点名 `cae-harness` 子命令（`task`、`audit`、`gate`）与引擎别名（`codex:astra`、`codex:sol`、`cc:default`、`dsh:default`、`dsh:flash`）。
 
 ## 选模、最高思考挡位与最长上下文规则
 

@@ -5,8 +5,8 @@
 **上游台架与业务仓库解耦**：本仓库并非需要随业务代码拷贝的“项目内配置包”。运行一次 `install.py` 后，四端配置各自独立落盘在宿主机全局根目录（`~/.gemini/config/plugins/user-guard`、`~/.codex`、`~/.claude`、`~/.dsh`），日常课题或求解器项目在自身目录直接受益于全局规范与跨端台架，无需打开或依赖本仓库；本仓库仅作为 Git 版本化上游真源、升级审计与自动化回归工具使用。全仓脚本仅依赖 Python 3.11+ 标准库（零第三方依赖，面向 Windows 与 WSL2／Linux 环境）。
 
 > **English Overview** — `Antigravity_Codex_ClaudeCode_DeepSeekHarness` is an upstream multi-agent engineering guardrail, deterministic verification harness (`cae-harness`), and self-hosting fleet evolution protocol (`fleet-evolve`) spanning four peer CLI/IDE agents—**Google Antigravity (`agy`)**, **OpenAI Codex (`codex`)**, **Anthropic Claude Code (`claude` / `cc`, with CC Switch)**, and **DeepSeek Harness (`dsh`)**—built for **AI-assisted CAE / CFD / FEA / PDE numerical solver development** and scientific computing (**Python 3.11+ standard library only**, zero third-party packages, targeting Windows and WSL2/Linux, licensed under **Apache-2.0**):
-> - **Host-Global Runtime Isolation & Peer-Tier Dispatch**: `install.py` deploys shared `R0–R11` rules, lifecycle hooks, read-only subagents, and shared skills (`cae-harness`, `fleet-evolve`) directly into each agent's own host-global root (`~/.gemini/config/plugins/user-guard`, `~/.codex`, `~/.claude`, `~/.dsh`), keeping scientific/solver repositories clean. All four agents sit at the same logical peer tier: each runs standalone or dispatches headless tasks (`task`, `audit`, `gate`) to any peer via explicit `--engine` or natural-language cues after preflight LLM readiness verification.
-> - **Orthogonal Shell × LLM Fleet Matrix & Self-Hosting Subtraction Hygiene**: Evaluates agent shell capabilities (deterministic hooks, patch fidelity, structured output schemas, sandbox boundaries) orthogonally against foundation LLM strengths, locking maximum single-model pure reasoning tiers (`max` / `high`) while pruning obsolete workarounds during model upgrades via `fleet-evolve` (`full` / `audit` / `hygiene` modes with a host-local two-pass bootstrap state lock).
+> - **Explicit Prerequisite Boundary & Single-Source Adaptive Distribution**: Network/proxy connectivity, client binary installation, official account OAuth sign-in, and provider API keys are **strictly user-managed prerequisites** (surfaced transparently by read-only probes; never bypassed or proxied). Once authenticated, **all upper-layer assets**—shared `R0–R11` rules, general skills (`cae-harness`, `fleet-evolve`), deterministic lifecycle hooks, read-only subagents, and local split routing—are maintained in **this single upstream repository** and adaptively distributed into each agent's host-global root (`~/.gemini/config/plugins/user-guard`, `~/.codex`, `~/.claude`, `~/.dsh`) according to each agent shell's mechanics, foundation LLM traits, and local task needs.
+> - **Dual Visual Matrices (Orthogonal Shell × LLM Matrix + Fuzzy/Exact Invocation Matrix)**: Documents both (1) the orthogonal **Agent Shell × Foundation LLM** capability matrix locking maximum single-model pure reasoning tiers (`max` / `high`) and (2) the **User Prompt Matrix** mapping everyday fuzzy natural-language requests to exact deterministic module/skill/subagent/engine names, maintained in-place via `fleet-evolve` (`full` / `audit` / `hygiene` modes with a host-local two-pass bootstrap state lock).
 > - **Compliant Zero-Barrier Onboarding & Numerical Redlines**: First-time or domestic/intranet teams can start immediately with official **`DSH + DeepSeek`** (zero reverse-proxy grey areas) and smoothly scale up to **Antigravity**, **Codex** (`Astra` / `Sol`), and **Claude Code** (inheriting `~/.claude`, CC Switch cards, and optional local Kimi+DeepSeek HTTP split routing). Restores user specifications across context compaction, enforces workspace write boundaries, and guards `R3.6` numerical tolerance (`rtol`/`atol`) and empirical order of convergence (EOC) redlines via `--verify-cmd` gates. Built-in prompt rules (`R0–R11`) and interactive guards are authored in **Simplified Chinese**.
 
 ---
@@ -38,7 +38,18 @@
 
 ---
 
-## 二、六种部署模式：从零门槛起步到四端全栈协同
+## 二、前置权责边界与六种部署模式
+
+### 1. 权责硬边界：用户自理基础前提 vs. 单仓唯一真源按需分发
+
+本台架将“账号与网络基础设施”与“上层工程治理资产”严格解耦，哪些需要用户自己先行打通、哪些由本仓库全包分发，边界一清二楚：
+
+| 层级 | 负责方 | 覆盖范围与硬性原则 |
+| --- | --- | --- |
+| **底层前置前提**<br>（基础设施与凭据） | **用户本人自理**<br>（未就绪时由探针直接暴露清单，绝不隐瞒或绕过） | 1. **网络连通与合规代理**：海外官方端（Antigravity、Codex、Anthropic 官方）所需的网络出口、系统代理或 TUN 环境须由用户自行打通；国内直连或内网环境无需代理即可直接使用官方 `DSH + DeepSeek` 或 `Claude Code` 挂载国内 Kimi／DeepSeek 官方 API（`cae_harness.py`／`router.py` 仅自动感知本机已配好的系统代理与 Fake-IP，**绝不内置翻墙工具或第三方灰产反代中转**）。<br>2. **客户端安装、官方登录态与 API Key 配置**：各客户端二进制安装升级、`agy`／`codex` 官方账号登录授权（OAuth）、`DSH` 的 `DEEPSEEK_API_KEY`／官方账号登录、以及 `CC Switch`／`~/.claude` 中的真实 API Key 填写须由用户本人完成（`install.py` 与 `cae_harness.py` **绝不代存、篡改或上传任何凭据**）。 |
+| **上层治理资产**<br>（规则／技能／钩子／路由） | **本仓库唯一真源维护，按需自适应编译分发** | 一旦网络与登录／API Key 底座就绪，后续所有的**全局规则（`R0–R11`）、通用托管技能（`cae-harness`、`fleet-evolve` 及后续扩展技能）、确定性生命周期钩子（压缩原话恢复、R4 目录硬边界、日志防空转、防刷屏、长会话收口）、严格只读子代理（`readonly-*`）、本地混合分流路由（`router.py`）及模型最高纯思考挡／最大窗口配置**，全部**仅在本仓库维护一套源码**，由 `install.py`（日常同步）与 `fleet-evolve`（跨代重算）结合**各 Agent 宿主外壳特性、基座 LLM 特性及本机任务需求**编译分发至各端宿主机全局根目录——无需维护多套仓库，业务代码仓也零侵入。 |
+
+### 2. 六种部署模式：从零门槛起步到四端全栈协同
 
 安装器自动探测本侧与跨子系统（Windows `<->` WSL）已安装的客户端，各端配置写入各自的宿主机全局目录，单端起步与多端协同平滑衔接：
 
@@ -99,24 +110,40 @@ flowchart TB
 
 ---
 
-## 四、可视化舰队矩阵：二维正交选型（宿主外壳 × 基座模型）与五层上下文
+## 四、双核心可视化矩阵：Agent/LLM 正交适配矩阵 × 用户模糊与精确调起矩阵
 
-**核验日期：2026-11-15**（由 [`fleet-evolve`](template/user-guard/skills/fleet-evolve/SKILL.md) 统一维护；严守 `R0` 单一真源，不拆独立矩阵文件；严守 `R3.6` 区分**官方声明**、**本机目录声明**与**宿主受控实测**）。多代理实际工程战力取决于**宿主外壳控制面（工具循环、Hooks 门禁、补丁命中率、Schema 约束）× 基座模型推理面（高阶数理、长程召回、工具稳定性）**：
+**核验日期：2026-11-15**（由 [`fleet-evolve`](template/user-guard/skills/fleet-evolve/SKILL.md) 单点维护；严守 `R0` 单一真源，不拆独立矩阵文件；严守 `R3.6` 区分**官方声明**、**本机目录声明**与**宿主受控实测**）。本章并列两张核心矩阵：**矩阵一**解决“哪个 Agent 外壳配哪个 LLM 发挥最大工程性能”，**矩阵二**解决“日常随口说模糊人话怎么路由、关键时刻怎么念精确模块名 100% 锁定调起”。
 
-### 1. 四端正交选型与不可替代发起矩阵
+### 1. 矩阵一：模型／Agent 二维正交适配矩阵（`宿主外壳控制面 × 基座模型推理面`）
 
-| 角色层级 | 宿主外壳 × 基座模型 | 锁定挡位与窗口配置 | 核心 Hooks 与隔离约束 | 不可替代发起准则（为何选此组合而非替代项） | 宿主探针状态 |
+| 角色层级 | 宿主外壳 × 基座模型 | 锁定挡位与窗口配置 | 核心 Hooks 与隔离约束 | 不可替代适配准则（Agent 外壳特性 × LLM 推理特性） | 宿主探针状态 |
 | --- | --- | --- | --- | --- | --- |
 | **常驻总控（Master）** | **Antigravity**（桌面／CLI）× **`Gemini 4 Carbon`** | 锁定单模型最高可用挡 **`high`**（排除单窗口混用模型的 `Orchestrator` 及第三方托管模型）；官方 API 标称 `1,048,576` token | 四类同步钩子：`PreInvocation` 增量检查点原话回溯、`PreToolUse` AST／Shell 硬边界与防空转、`Stop` 防刷屏与四态收口（`normal->advisory->drain->freeze`） | 多文献对照、全局进度／配额／窗口统筹与中文学术写作综合摩擦最低；受控实测 CLI 约 `290k` token 触发自动检查点压缩，故超长单窗口硬算不留在主会话而分流下游 | Windows + WSL 双侧已对齐实测通过 |
-| **同端只读并发层** | **Antigravity 原生子代理**（`readonly-reader`／`auditor`／`collaborator`）× **`inherit`（`Carbon High`）** | 继承主会话 `Carbon (High)`，每个子代理独占独立大窗口（10+ 同构模块盘点方用 `run_workflow`） | 仅开放 `read_file`／`search_web` 只读工具；零写入、零子进程冷启动开销，响应式唤醒（Reactive Wakeup） | 文献通读摘录、跨数十文件行号／符号静态核验与润色无需跨进程起 CLI；但因继承同一 `Carbon` 模型且最高挡为 `high`，**不能替代异构模型交叉复核或写盘验证门禁** | 本会话四路并发实测零越界 |
+| **同端只读并发层** | **Antigravity 原生子代理**（`readonly-reader`／`auditor`／`collaborator`）× **`inherit`（`Carbon High`）** | 继承主会话 `Carbon (High)`，每个子代理独占独立大窗口（10+ 同构模块盘点方用 `run_workflow`） | 仅开放 `read_file`／`search_web` 只读工具；零写入、零子进程冷启动开销，响应式唤醒（Reactive Wakeup） | 文献通读摘录、跨数十文件行号／符号静态核验与润色无需跨进程起 CLI；但因继承同一 `Carbon` 模型且最高挡为 `high`，**不能替代异构模型交叉复核或写盘验证门禁** | 本会话五路并发实测零越界 |
 | **数理与机理攻坚层** | **Codex CLI**（`codex:astra`）× **`GPT-6-Astra`**（`gpt-6-astra`） | 锁定单模型纯思考最高挡 **`max`**（跳过套娃 `ultra`）；显式下发本机目录声明最大窗口 **`872,000` token**（有效比 95%） | `codex exec -s read-only --ephemeral --output-schema`；任务前后全目录哈希快照校验 `changed_files == []` | PDE 弱形式／DGSEM 分裂导数／Riemann 雅可比推导与超长程精确召回首选，提供异于 Gemini 的独立推理家族；深层推理耗时较长，派工须预切核心文件与行号并设 `--timeout 900–1200` | Windows 目录就绪（开放式全仓探索 `600s` 超时边界已核实） |
-| **核心编码与物理门禁层** | **Codex CLI**（`codex:sol`）× **`GPT-6.1-Sol`**（`gpt-6.1-sol`） | 锁定单模型最高挡 **`max`** + 显式下发 **`872,000` token** 窗口（受控实测累积至 `808,892` token 同轮 6/6 全中未压缩） | `workspace-write` 沙箱 + `--write-scope` 白名单快照对比 + `gate` 强制非空 `--verify-cmd` 多轮排错（严禁放宽 `rtol`/`atol`） | 求解器核心编码、常规边界审查、分片审计（`audit`）及带守恒残差／EOC 脚本的闭环门禁（`gate`）主力，多文件补丁与测试循环收敛速度显著快于 `Astra` | Windows 实测门禁与压力探针通过 |
+| **核心编码与物理门禁层** | **Codex CLI**（`codex:sol`）× **`GPT-6.1-Sol`**（`gpt-6.1-sol`） | 锁定单模型最高挡 **`max`** + 显式下发 **`872,000` token** 窗口（受控实测累积至 `808,892` token 同轮 6/6 全中未压缩） | `workspace-write` 沙箱 + `--write-scope` 白名单快照对比 + `gate` 强制非空 `--verify-cmd` 多轮排错（严禁放宽 `rtol`/`atol`） | 求解器核心编码、常规边界审查、分片审计（`audit`）及带守恒残差／EOC 脚本的闭环门禁（`gate`）主力，多文件补丁与测试循环收敛速度显著快于 `Astra` | Windows 实测 `rc=0` 及压力探针通过 |
 | **终端长上下文与混合分流层** | **Claude Code CLI**（`cc:default`）× **`Kimi K3.1 Pro`（`k3.1-pro[1m]`）+ `DeepSeek-V4.1-Flash`（`deepseek-flash`）** | 交互补齐 `effortLevel: "xhigh"`，无头 CLI 下发 **`max`**；卡片声明窗口 `1,048,576`、自动压缩窗口 `1,000,000` token | `claude -p` 不加 `--bare`，完整继承 `~/.claude` 五类钩子（含复杂 `rg` glob 零异常防空转）、`--json-schema` 强约束与本地 `router.py`（子代理强制 `max`） | **为何优先选 `CC + DeepSeek/Kimi` 而非 `DSH + DeepSeek`**：`Claude Code` 具备完整五类确定性 Hooks、原生 JSON Schema 校验、MCP 工具链及 Kimi 主 + DS 子代理混合分流，多步工具与结构化回执稳定性更高（WSL 侧避免跨 `/mnt/` 9P 全盘遍历） | Windows（`deepseek-flash[1M]` `max`）与 WSL（`:8241` 路由）实测 `rc=0` |
-| **零门槛合规起步与应急兜底层** | **DeepSeek Harness CLI**（`dsh:default`／`dsh:flash`）× **`DeepSeek-V4-Pro`（`deepseek-v4-pro`）／`DeepSeek-V4.1-Flash`（`deepseek-flash`）** | 锁定 **`max`** 挡（省流微查用 `low`）；内置契约声明窗口 **`1,048,576` token** | `--profile headless --patch` 一次性临时 YAML 注入模型／挡位与官方凭据（`~/.dsh` 零污染）；`cae-harness` 自动剥离尾随泄漏的 `DSML` 停止标签 | **何时选 `DSH + DeepSeek`**：① 首次上手或内网环境零反代、零本地路由依赖的官方合规最短路径；② 需直连原生 `DeepSeek-V4-Pro`（CC Switch 直连 DS 卡默认为 `deepseek-flash[1M]`），或显式用 `dsh:flash --tier max` 跑高吞吐代码审查；③ 其他三端配额熔断（`--fallback-on-quota`）时的保底接管端 | Windows（`dsh:flash` `max` 与 DSML 剥离）及 WSL 互操作实测 `rc=0` |
+| **零门槛合规起步与应急兜底层** | **DeepSeek Harness CLI**（`dsh:default`／`dsh:flash`）× **`DeepSeek-V4-Pro`（`deepseek-v4-pro`）／`DeepSeek-V4.1-Flash`（`deepseek-flash`）** | 锁定 **`max`** 挡（省流微查用 `low`）；内置契约声明窗口 **`1,048,576` token** | `--profile headless --patch` 一次性临时 YAML 注入模型／挡位与官方凭据（`~/.dsh` 零污染）；`cae-harness` 自动剥离尾随泄漏的 `DSML` 停止标签 | **何时选 `DSH + DeepSeek`**：① 首次上手或内网环境零反代、零本地路由依赖的官方合规最短路径；② 需直连原生 `DeepSeek-V4-Pro`（CC Switch 直连 DS 卡默认为 `deepseek-flash[1M]`），或显式用 `dsh:flash --tier max` 跑高吞吐代码审查；③ 其他三端配额熔断（`--fallback-on-quota`）时的保底接管端 | Windows（`dsh:default` `deepseek-v4-pro` `max` 与 `dsh:flash`）及 WSL 互操作实测 `rc=0` |
 
 > **备选与默认排除模型说明**：Codex `GPT-6.1-Terra`（多模态／明确修改，`872k`）与反重力 `Gemini 4 Argon` 按同族规则识别；Codex `GPT-6-Luna` 与反重力 `Gemini 4 Hydrogen`（支持至 `xhigh`）仅在用户要求省流微查或显式点名时启用；反重力托管第三方模型（如 `Claude Sonnet/Opus 5.5`；旧 `Claude 4.6` 与 `GPT-OSS-120b` 由 `--audit-upgrade` 标记退役）及各端 `ultra` 二次派生挡位默认排除，防止静默烧穿稀缺配额。参考规格：[OpenAI Codex 模型说明](https://learn.chatgpt.com/docs/models)、[Antigravity 模型说明](https://antigravity.google/docs/models)、[Google Gemini 窗口规格表](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/migrate)。
 
-### 2. 上下文窗口的五个物理层级（严禁把“标称窗口”当“单次塞入上限”）
+### 2. 矩阵二：用户日常模糊用法、100% 精确调起锚点与底层执行映射矩阵
+
+日常对话无需死记命令行——**随口说大白话即可由总控按 `R3.1` 自动匹配最优路由**；若你在关键节点想 **100% 确保锁死调起某个具体技能、子代理或无头引擎**，直接在对话里带上表中第 3 列的**精确模块名**即可：
+
+| 任务意图分类 | 日常模糊说法示例（自然对话自动触发） | 100% 确保调起的精确锚点词／具体模块名 | 实际调起的底层模块与硬性执行行为 |
+| --- | --- | --- | --- |
+| **全栈升级重算与清淤回归** | “全面更新一下整套配置”“看看各家最新动态升级适配并做回归测试”“重算一下舰队分工方案” | 点名技能 **`fleet-evolve`**（默认 `full` 模式；支持 `/fleet-evolve`） | 读取 [`fleet-evolve/SKILL.md`](template/user-guard/skills/fleet-evolve/SKILL.md) $\rightarrow$ `fleet_state.py status` $\rightarrow$ 只读并发调研 $\rightarrow$ 重算本章双矩阵 $\rightarrow$ 双侧同步与真机 CLI 探针（`rc == 0` 且 `all_aligned: true`）$\rightarrow$ 六模式沙箱 + 全量单测 + 脱敏清淤 $\rightarrow$ 待推送挂起 |
+| **仅体检漂移／仅仓库清淤** | “只帮我检查下各端配置和模型有没有过期，别改文件”／“只把仓库文档精简清淤、扫一遍脱敏跑个测试” | 点名 **`fleet-evolve audit` 模式**（或 `install.py --audit-upgrade`）／点名 **`fleet-evolve hygiene` 模式** | `audit` 全程零写入输出四端漂移、登录／Key 缺口与选型建议；`hygiene` 跳过外网重算，直接执行 Codex `Sol` 审查、减法清淤、脱敏扫描与全量 `unittest` |
+| **本机初装或跨子系统部署** | “帮我把这台机器配好”“把 WSL 那边也同步装上” | 点名按仓库 **`AGENTS.md` 执行 `install.py`**（如 `--probe-apps`、`--dry-run`、`--with-cc-router`） | 先零写入探测双侧客户端与凭据就绪态（网络／登录／Key 缺口直接列单请用户自理）$\rightarrow$ 空跑预演列出全局路径 $\rightarrow$ 经 `R4` 批准后幂等落盘 |
+| **长文献通读／多文件行号核对** | “把这几篇论文和几十个头文件全读一遍摘出边界公式”“逐行核对汇报里的公式和源码行号对不对” | 点名原生只读子代理 **`readonly-reader`**（通读摘录）、**`readonly-collaborator`**（推导／润色）、**`readonly-auditor`**（逐行核对）；10+ 同构目录盘点点名 **`run_workflow`** | 在当前宿主内派生独立大窗口只读子会话（`inherit` 主会话模型，硬禁写文件与跑命令），返回文件路径与精确行号交主控按 `R6` 复核 |
+| **高难度 PDE 推导／守恒证明** | “把这套 DGSEM 分裂通量和弯曲网格度量恒等式从头严密推一遍，别漏项” | 点名 **`cae-harness` 调 `codex:astra`**（`task --kind math` 或 `direction --tier max`） | 预检就绪后无头启动 `gpt-6-astra`（`max` + `872k` 窗口 + `read-only` 沙箱 + 快照零写入校验；自动预切核心文件行号并设 `--timeout 900+`） |
+| **核心求解器编码 + 物理门禁** | “实现这个 HLLC 通量算子，跑通制造解网格收敛阶测试再交给我” | 点名 **`cae-harness gate` 调 `codex:sol`**（附 `--write-scope` 与 `--verify-cmd`） | 无头启动 `gpt-6.1-sol`（`max` + `872k` 窗口）在白名单内编码 $\rightarrow$ 自动运行非空 `--verify-cmd` $\rightarrow$ 未过则在 `--max-rounds` 内排错（禁放宽 `rtol`/`atol`） |
+| **大型代码库分片审计／异构互审** | “把整个 `src/` 求解器目录扫一遍找隐藏 bug”“让 CC（或 DSH）独立审一下刚写完的模块” | 点名 **`cae-harness audit`**（自动分片）或 **`cae-harness task --kind review --engine codex:sol \| cc:default \| dsh:default \| dsh:flash`** | 发包前预检目标端 LLM／本地路由就绪 $\rightarrow$ 只读快照隔离审查 $\rightarrow$ 结构化 JSON 返回问题定位与行号 $\rightarrow$ 总控按 `R6` 亲自查对原文件 |
+| **Claude 供应商切卡与路由检查** | “看看现在 CC 挂的哪张卡”“把 CC 切到 Kimi 主 + DS 子代理混合分流卡” | 点名 **`ccswitch_admin.py status`** 或 **`ccswitch_admin.py switch-card --card "K3.1主+DS子代理" \| "Kimi" \| "DeepSeek"`** | 核验直连可写模式 $\rightarrow$ 在线备份 `cc-switch.db` 与 `settings.json` $\rightarrow$ 原子投影模型与鉴权字段，100% 保留五类 Hooks 与 `effortLevel: "xhigh"` |
+| **按需省流降挡／断流自动兜底** | “这轮只是改拼写格式，省点额度别开最高挡”“万一没额度自动换别的能用的端跑” | 明确说 **“省流／降挡”** 或点名 **`--tier high \| low`**、**`dsh:flash`**；防断流点名 **`--fallback-on-quota`** | 解除默认 `max` 锁档切入分级省流；目标端触发 `quota_exhausted` 且工作区零改动时，立即熔断冷却并切回本侧或顺位就绪端（含 `dsh`）完成 |
+
+### 3. 上下文窗口的五个物理层级（严禁把“标称窗口”当“单次塞入上限”）
 
 1. **目录／配置声明最大窗口**：模型支持的最大上下文容量（Codex `872,000`、Gemini 4 与 DeepSeek `1,048,576`、Claude 卡片 `1,000,000`／`1,048,576` token）；`cae-harness` 对支持显式窗口参数的 Codex 自动下发 `-c model_context_window=<最大声明窗口>`。
 2. **单条消息入口上限**：Codex `turn/start` 单条消息上限为 `1,048,576` 字符；反重力 CLI `1.5.8` 单条达 44～66 万字节会出现入口截断（分轮每批约 13 万字节则无截断），大体积源码须让模型在目录内按文件读取。
@@ -124,7 +151,7 @@ flowchart TB
 4. **分片审计安全输入预算**：`cae-harness audit` 扣除提示词、清单与 JSON Schema 开销后的单批源码安全上限（预算内 `single-pass`，超预算自动 `sharded`）。
 5. **实际阅读覆盖**：以子任务回执与总控 `R6` 行号抽查为准；触发压缩后严格按 `R9` 重读磁盘原话归档核对缺口，绝不盲目重跑已落盘写入。
 
-### 3. `cae-harness` 挡位锁定与按需省流速查表
+### 4. `cae-harness` 挡位锁定与按需省流速查表
 
 | 场景分类 | 选模与挡位策略 |
 | --- | --- |
