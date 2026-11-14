@@ -1,6 +1,16 @@
 # 更新日志（Changelog）
 
-记录 `Antigravity_Codex_configuration`（含 `user-guard` 原生插件与 `cae-harness` 双向协作编排器）各版本的功能演进、宿主协议适配与安全加固。
+记录 `Antigravity_Codex_ClaudeCode_DeepSeekHarness`（含 `user-guard` 原生插件与 `cae-harness` 多引擎验证台架）各版本的功能演进、宿主协议适配与安全加固。
+
+---
+
+## [1.9.0] - 2026-11-15
+
+完成仓库更名与版权归属加固（`Antigravity_Codex_ClaudeCode_DeepSeekHarness` + Apache 2.0 `NOTICE`），并将 Antigravity（`agy`）、Codex（`codex`）、Claude Code（`claude`／`cc`）与 DeepSeek Harness（`dsh`）统一收敛为同级对等工作流与 `cae-harness` 四后端无头调度体系：
+
+- **四端同级宿主落盘与 `DSH + DeepSeek` 零门槛入门／应急兜底基线（`install.py`、`status_guard.py`）**：新增 `--app dsh` 与 `--dsh-home` 部署及 `--audit-upgrade` 零漂移巡检支持，自动识别裸装 DeepSeek Harness（`~/.dsh`）并无损同步 `R0–R11` 全局规则（保留末尾自定义 `## 工具与...` 段落）与 `skills/cae-harness/`，同步补齐 Claude Code `~/.claude/skills/cae-harness/` 对称部署；明确本仓库仅作为上游模板与升级体检源，安装后各客户端均在各自宿主配置根目录独立闭环运行，支持新用户以官方 `DSH + DeepSeek` 零反代合规起步、后续按需平滑接入更强模型。
+- **`cae-harness` 四引擎对等调度、模糊指定与接入预检门禁（`cae_harness.py`）**：在既有 `agy` 与 `codex` 基础上对等接入 `claude`（别名 `cc`，无 `--bare` 完整继承 `~/.claude` 规则、钩子与 CC Switch／本地分流路由配置）和 `dsh`（`--profile headless` 临时运行时补丁自动激活官方账号登录或 `DEEPSEEK_API_KEY`，映射 `DeepSeek-V4-Pro` 与 `DeepSeek-V4.1-Flash` 百万上下文及思考挡位）；支持中英文语义线索按需点名后端且排除编译环境变量（如 `CC=gcc`）与否定句误触发；调用前强制校验可用大模型凭据、本地路由 `/__router/health` 及关联 CC Switch 卡片密钥或官方登录态，并在 `--fallback-on-quota` 下支持向已就绪对等后端无痕回退。
+- **仓库品牌升级与 Apache 2.0 第 4(d) 条 `NOTICE` 原创归属锁定（`NOTICE`、`LICENSE`、`plugin.json`、`.github/workflows/ci.yml`、`tests/`）**：同步仓库标识至 `Antigravity_Codex_ClaudeCode_DeepSeekHarness`，新增根目录 `NOTICE` 归属声明并在端到端门禁测试与跨平台 CI 矩阵中固化六模式沙箱安装（`codex`、`antigravity`、`claude`、`dsh`、`both`、`all`）及全套离线回归校验。
 
 ---
 

@@ -55,6 +55,25 @@ class TestGuardsOffline(unittest.TestCase):
             os.environ["CAE_HARNESS_DEPTH"] = self.old_harness_depth
         self.tmp_obj.cleanup()
 
+    def test_dsh_installer_sandbox_requires_explicit_contained_peer_directories(self):
+        base = {'conversationId': 'dsh-guard', 'cwd': str(self.tmp_root), 'workspacePaths': [str(self.tmp_root)]}
+        cases = (
+            ('--app dsh --dsh-home inside/dsh', 'allow'),
+            ('--app auto --dsh-home inside/dsh', 'allow'),
+            ('--app dsh', 'deny'),
+            ('--app dsh --dsh-home /outside/dsh', 'deny'),
+            ('--app all --target-dir inside/agy --codex-home inside/codex --claude-home inside/claude --dsh-home inside/dsh', 'allow'),
+            ('--app all --target-dir inside/agy --codex-home inside/codex --claude-home inside/claude --dsh-home /outside/dsh', 'deny'),
+            ('--app claude --claude-home inside/claude --dsh-home inside/dsh', 'deny'),
+            ('--app dsh --dsh-home inside/dsh --claude-home inside/claude', 'deny'),
+        )
+        with unittest.mock.patch.dict(os.environ, {'CAE_HARNESS_DEPTH': '1'}):
+            for flags, expected in cases:
+                with self.subTest(flags=flags):
+                    result = status_guard.handle_pre_tool_use({**base, 'toolCall': {'name': 'run_command',
+                        'args': {'CommandLine': 'python -B install.py ' + flags + ' --no-zotero --skip-test'}}})
+                    self.assertEqual(result['decision'], expected)
+
     def test_01_status_guard_unchanged_deny_and_updated_allow(self) -> None:
         """未变动日志文件同参重复读取被 deny，文件产生增量输出后恢复 allow"""
         conv_id = "guard-001"

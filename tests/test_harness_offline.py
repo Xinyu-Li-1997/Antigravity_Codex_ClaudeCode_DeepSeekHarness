@@ -7,6 +7,7 @@ import io
 import json
 import os
 import signal
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -19,7 +20,12 @@ from unittest.mock import patch, Mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / 'template' / 'user-guard' / 'skills' / 'cae-harness' / 'scripts' / 'cae_harness.py'
-for installed_key in ('USER_GUARD_INSTALLED_CODEX_DIR', 'USER_GUARD_INSTALLED_DIR'):
+for installed_key in (
+    'USER_GUARD_INSTALLED_CODEX_DIR',
+    'USER_GUARD_INSTALLED_CLAUDE_DIR',
+    'USER_GUARD_INSTALLED_DSH_DIR',
+    'USER_GUARD_INSTALLED_DIR',
+):
     installed_root = os.environ.get(installed_key)
     installed_script = Path(installed_root) / 'skills' / 'cae-harness' / 'scripts' / 'cae_harness.py' if installed_root else None
     if installed_script is not None and installed_script.is_file():
@@ -53,6 +59,9 @@ class HarnessTests(unittest.TestCase):
         harness._SESSION_QUOTA_BLOCKED.clear()
         self.temp = tempfile.TemporaryDirectory(prefix='cae-test-')
         self.root = Path(self.temp.name).resolve()
+        home_patch = patch.object(harness.Path, 'home', return_value=self.root)
+        home_patch.start()
+        self.addCleanup(home_patch.stop)
 
     def tearDown(self):
         harness._CANCELLED.clear()
@@ -67,6 +76,407 @@ class HarnessTests(unittest.TestCase):
 
     def args(self, *tokens):
         return harness.build_arg_parser().parse_args(list(tokens))
+
+    def four_backends(self):
+        engines = backends()
+        with patch.object(harness, '_claude_home', return_value=(self.root / 'claude', False)), \
+             patch.object(harness, '_dsh_home', return_value=(self.root / 'dsh', False)), patch.dict(os.environ, {}, clear=True):
+            engines['claude'] = harness._claude_info('claude.exe')
+            engines['dsh'] = harness._dsh_info('dsh.cmd')
+        engines['claude'].update(llm_configured=True, llm_source='settings_env', model='kimi-k3',
+                                 models=[{'slug': 'kimi-k3', 'provider': 'claude_configured'},
+                                         {'slug': 'deepseek-v4-pro', 'provider': 'claude_configured'}])
+        engines['dsh'].update(llm_configured=True, llm_source='api_key', dsh_provider='deepseek-official')
+        for name, info in engines.items():
+            info['config_home'] = str(self.root / (name + '-config'))
+        return engines
+
+    def test_four_peer_alias_callers_routing_and_budgets(self):
+        engines = self.four_backends()
+        for caller, expected in (('antigravity', 'codex'), ('codex', 'agy'), ('claude', 'codex'), ('cc', 'codex'), ('dsh', 'codex')):
+            with self.subTest(caller=caller):
+                self.assertEqual(harness.choose_engine(engines, caller), expected + ':default')
+                self.assertEqual(harness._engine_parts('cc:kimi-k3'), ('claude', 'kimi-k3'))
+                self.assertEqual(harness.choose_engine(engines, caller, 'cc:kimi-k3'), 'claude:kimi-k3')
+                parsed = self.args('probe', '--caller', caller, '--claude-input-budget', '30000', '--dsh-input-budget', '40000')
+                self.assertEqual((parsed.claude_input_budget, parsed.dsh_input_budget), (30000, 40000))
+        with patch.dict(os.environ, {'CAE_HARNESS_CALLER': 'cc'}, clear=True):
+            self.assertEqual(harness.resolve_caller('auto'), 'claude')
+        self.assertEqual(harness.resolve_caller('agy'), 'antigravity')
+        engines['agy']['available'] = engines['codex']['available'] = False
+        self.assertEqual(harness.choose_engine(engines, 'codex'), 'claude:default')
+        engines['claude']['llm_configured'] = False
+        self.assertEqual(harness.choose_engine(engines, 'codex'), 'dsh:default')
+        self.assertEqual(harness.choose_engine(engines, 'dsh'), 'dsh:default')
+        engines['dsh']['llm_configured'] = False
+        self.assertFalse(harness._peer_auto_ready(engines, 'dsh'))
+        with self.assertRaises(harness.HarnessError):
+            harness.choose_engine(engines, 'dsh')
+
+    def test_backend_cues_reject_negation_compilers_and_filename_suffixes(self):
+        positives = {'请用 CC 审查': 'claude', '调用 Claude Code 检查': 'claude', 'use cc cli to review': 'claude',
+                     '用 DSH 跑一下': 'dsh', '调用 DeepSeek Harness': 'dsh', 'switch to dsh cli': 'dsh',
+                     '请使用 codex 检查': 'codex', 'via antigravity': 'agy', '交给反重力审查': 'agy'}
+        for prompt, expected in positives.items():
+            with self.subTest(prompt=prompt):
+                self.assertEqual(harness._extract_prompt_backend_hint(prompt), expected)
+        for prompt in ('不要用 CC', '不用 DSH', 'do not use cc', 'never invoke dsh', 'CC=gcc foo.cc',
+                       '编译 foo.cc', '检查 bar.dsh', 'use cc=gcc', 'use cc.flags', '用 DSH.config',
+                       '`use cc`', '> use dsh\n审查文件'):
+            with self.subTest(prompt=prompt):
+                self.assertEqual(harness._extract_prompt_backend_hint(prompt), '')
+        self.assertEqual(harness._extract_prompt_backend_hint('不要用 CC，而是用 DSH 检查'), 'dsh')
+        engines = self.four_backends()
+        self.assertEqual(harness.choose_engine(engines, 'codex', prompt_text='请用 CC 审查'), 'claude:default')
+        self.assertEqual(harness.choose_engine(engines, 'codex', 'codex:default', '请用 CC 审查'), 'codex:default')
+        for prompt in ('用 CC 模型', '用 DSH 模型', '用 Claude 模型', '用 Harness 模型', '用 Claude Code 模型', '用 DeepSeek Harness 模型'):
+            self.assertEqual(harness._extract_prompt_model_hint(prompt), '')
+        for prompt, model in (('用 Kimi 模型', 'kimi-k3'), ('用 K3 模型', 'kimi-k3'), ('用 DeepSeek 模型', 'deepseek-v4-pro')):
+            self.assertEqual(harness.resolve_execution_profile(engines, 'claude:default', prompt_text=prompt)['model'], model)
+
+    def test_backend_prompt_hints_reach_task_gate_and_audit(self):
+        engines = self.four_backends()
+        (self.root / 'a.py').write_text('value = 1\n', encoding='utf-8')
+        cases = ((harness.cmd_task, ('task', '--kind', 'review', '--task', '请用 CC 审查'), 'engine', 'claude:default'),
+                 (harness.cmd_gate, ('gate', '--task', '用 DSH 跑一下', '--verify-cmd', 'verify'), 'engine', 'dsh:default'),
+                 (harness.cmd_audit, ('audit', '--single', '--focus', '调用 DeepSeek Harness'), 'plan', 'dsh:default'))
+        for function, tokens, key, expected in cases:
+            with self.subTest(command=tokens[0]), patch.object(harness, '_args_backends', return_value=engines):
+                args = self.args(*tokens, '--caller', 'codex', '--target', str(self.root), '--dry-run')
+                code, report = self.capture(function, args)
+                self.assertEqual(code, 0)
+                self.assertEqual(report[key]['left_engine'] if key == 'plan' else report[key], expected)
+        self.assertEqual(harness._audit_engines(engines, True, 'cc:kimi-k3', '', False, 'dsh'),
+                         ('claude:kimi-k3', 'agy:default'))
+
+    def test_four_peer_probe_reads_credentials_without_running_processes_or_leaking_tokens(self):
+        (self.root / 'settings.json').write_text(json.dumps({'env': {'ANTHROPIC_AUTH_TOKEN': 'fixture-token',
+            'ANTHROPIC_MODEL': 'kimi-k3'}}), encoding='utf-8')
+        (self.root / '.env').write_text('DEEPSEEK_API_KEY="fixture-dsh-secret"\n', encoding='utf-8')
+        with patch.dict(os.environ, {}, clear=True), patch.object(harness, '_find_binary', return_value='fixture'), \
+             patch.object(harness, '_codex_home', return_value=(self.root, False)), \
+             patch.object(harness, '_agy_home', return_value=(self.root, False)), \
+             patch.object(harness, '_claude_home', return_value=(self.root, False)), \
+             patch.object(harness, '_dsh_home', return_value=(self.root, False)), \
+             patch.object(harness, 'run_process') as run, patch.object(harness.subprocess, 'run') as subprocess_run:
+            result = harness.probe_backends(claude_input_budget=30000, dsh_input_budget=40000)
+        run.assert_not_called()
+        subprocess_run.assert_not_called()
+        self.assertEqual(set(result), {'codex', 'agy', 'claude', 'dsh'})
+        self.assertEqual(result['claude']['llm_source'], 'settings_env')
+        self.assertEqual(result['dsh']['llm_source'], 'api_key')
+        self.assertEqual(result['dsh']['safe_input_budget_tokens'], 40000)
+        self.assertEqual(result['claude']['safe_input_budget_tokens'], 30000)
+        self.assertEqual(result['dsh']['frontier_model'], 'deepseek-v4-pro')
+        self.assertNotIn('fixture-token', json.dumps(result))
+        self.assertNotIn('fixture-dsh-secret', json.dumps(result))
+
+    def test_claude_sources_placeholder_helper_and_oauth_auth_status(self):
+        settings = self.root / 'settings.json'
+        cases = (({'env': {'ANTHROPIC_AUTH_TOKEN': ''}}, 'placeholder_token'),
+                 ({'env': {'ANTHROPIC_API_KEY': 'PASTE_KEY_HERE'}}, 'placeholder_token'),
+                 ({'env': {'ANTHROPIC_AUTH_TOKEN': 'PASTE_TOKEN', 'ANTHROPIC_API_KEY': 'fixture-token'}}, 'placeholder_token'),
+                 ({'env': {'ANTHROPIC_AUTH_TOKEN': 'fixture-token'}}, 'settings_env'),
+                 ({'apiKeyHelper': 'fixture-helper'}, 'settings_env'), ({}, 'unconfigured'))
+        for doc, expected in cases:
+            with self.subTest(source=expected, doc=doc):
+                settings.write_text(json.dumps(doc), encoding='utf-8')
+                with patch.dict(os.environ, {}, clear=True), patch.object(harness, '_claude_home', return_value=(self.root, False)):
+                    info = harness._claude_info('claude.exe')
+                self.assertEqual(info['llm_source'], expected)
+                with patch.object(harness, 'run_process') as run:
+                    if expected == 'placeholder_token':
+                        with self.assertRaisesRegex(harness.HarnessError, '占位符'):
+                            harness._verify_claude_llm_ready(info)
+                        run.assert_not_called()
+                    elif expected == 'settings_env':
+                        harness._verify_claude_llm_ready(info)
+                        run.assert_not_called()
+        (self.root / '.credentials.json').write_text('{}', encoding='utf-8')
+        with patch.dict(os.environ, {}, clear=True), patch.object(harness, '_claude_home', return_value=(self.root, False)):
+            info = harness._claude_info('claude.exe')
+        self.assertEqual(info['llm_source'], 'credentials_file')
+        for payload, succeeds in (({'loggedIn': True}, True), ({'loggedIn': False}, False), ({'loggedIn': 'true'}, False), ([], False)):
+            result = subprocess.CompletedProcess([], 0, json.dumps(payload), '')
+            with self.subTest(payload=payload), patch.object(harness, 'run_process', return_value=result) as run, \
+                 patch.object(harness, '_is_posix', return_value=False):
+                if succeeds:
+                    harness._verify_claude_llm_ready(info)
+                else:
+                    with self.assertRaisesRegex(harness.HarnessError, '未登录'):
+                        harness._verify_claude_llm_ready(info)
+                self.assertEqual(run.call_args.args[0], ['claude.exe', 'auth', 'status'])
+                self.assertEqual(run.call_args.kwargs['timeout_sec'], 15)
+                self.assertEqual(run.call_args.kwargs['env']['CLAUDE_CONFIG_DIR'], str(self.root))
+
+    def test_claude_native_logout_falls_back_before_execution(self):
+        info = {'binary': 'claude', 'available': True, 'windows_interop': False, 'llm_source': 'credentials_file',
+                'config_home': str(self.root / 'native')}
+        alternate = {**info, 'binary': 'claude.exe', 'windows_interop': True, 'config_home': str(self.root / 'windows')}
+        results = [subprocess.CompletedProcess([], 0, '{"loggedIn":false}', ''),
+                   subprocess.CompletedProcess([], 0, '{"loggedIn":true}', '')]
+        with patch.dict(os.environ, {}, clear=True), patch.object(harness, '_is_posix', return_value=True), \
+             patch.object(harness, '_find_windows_claude_in_wsl', return_value='claude.exe'), \
+             patch.object(harness, '_claude_info', return_value=alternate), \
+             patch.object(harness, '_run_claude_auth', side_effect=results) as auth:
+            harness._verify_claude_llm_ready(info)
+        self.assertEqual(auth.call_count, 2)
+        self.assertTrue(info['windows_interop'])
+        self.assertTrue(info['llm_configured'])
+        self.assertEqual(info['authentication_status'], 'authenticated')
+        self.assertEqual(info['fallback_from']['binary'], 'claude')
+
+    def test_claude_router_health_and_card_credentials_are_required_and_readonly(self):
+        cfg_dir = self.root / 'router'
+        cfg_dir.mkdir()
+        db = self.root / 'cards.db'
+        con = sqlite3.connect(db)
+        try:
+            con.execute('CREATE TABLE providers (name TEXT, app_type TEXT, settings_config TEXT)')
+            con.executemany('INSERT INTO providers VALUES (?, ?, ?)', [
+                ('Kimi', 'claude', json.dumps({'env': {'ANTHROPIC_AUTH_TOKEN': 'fixture-kimi-token'}})),
+                ('DeepSeek', 'claude', json.dumps({'env': {'ANTHROPIC_API_KEY': 'fixture-ds-token'}}))])
+            con.commit()
+        finally:
+            con.close()
+        (cfg_dir / 'router.json').write_text(json.dumps({'ccswitch_db': str(db), 'default_key_from_card': 'Kimi',
+            'routes': [{'prefix': 'deepseek', 'key_from_card': 'DeepSeek'}]}), encoding='utf-8')
+        (self.root / 'settings.json').write_text(json.dumps({'env': {'ANTHROPIC_AUTH_TOKEN': 'via-router',
+            'ANTHROPIC_BASE_URL': 'http://127.0.0.1:8240', 'ANTHROPIC_MODEL': 'kimi-k3'}}), encoding='utf-8')
+        with patch.dict(os.environ, {}, clear=True), patch.object(harness, '_claude_home', return_value=(self.root, False)):
+            info = harness._claude_info('claude.exe')
+        self.assertEqual(info['llm_source'], 'local_router')
+
+        def health(ok=True, status=200):
+            response = io.BytesIO(json.dumps({'ok': ok}).encode())
+            response.status = status
+            return response
+
+        before = db.read_bytes(), db.stat().st_mtime_ns
+        with patch.object(harness, 'urlopen', side_effect=lambda *a, **kw: health()) as request, \
+             patch.object(harness.sqlite3, 'connect', wraps=sqlite3.connect) as connect, patch.object(harness, 'run_process') as run:
+            harness._verify_claude_llm_ready(info, 'kimi-k3')
+            harness._verify_claude_llm_ready(info, 'deepseek-v4-pro')
+        run.assert_not_called()
+        request.assert_called_with('http://127.0.0.1:8240/__router/health', timeout=2.0)
+        self.assertTrue(all(call.args[0].endswith('?mode=ro') and call.kwargs['uri'] for call in connect.call_args_list))
+        self.assertEqual((db.read_bytes(), db.stat().st_mtime_ns), before)
+        for token in ('', 'PASTE_TOKEN', 'via-router'):
+            con = sqlite3.connect(db)
+            try:
+                con.execute('UPDATE providers SET settings_config=? WHERE name=?',
+                            (json.dumps({'env': {'ANTHROPIC_AUTH_TOKEN': token}}), 'DeepSeek'))
+                con.commit()
+            finally:
+                con.close()
+            with self.subTest(token=token), patch.object(harness, 'urlopen', side_effect=lambda *a, **kw: health()):
+                with self.assertRaisesRegex(harness.HarnessError, '路由卡片'):
+                    harness._verify_claude_llm_ready(info, 'deepseek-v4-pro')
+        for ok, status in ((False, 200), (True, 503)):
+            with patch.object(harness, 'urlopen', side_effect=lambda *a, **kw: health(ok, status)):
+                with self.assertRaisesRegex(harness.HarnessError, '路由器未就绪'):
+                    harness._verify_claude_llm_ready(info)
+        with patch.object(harness, 'urlopen', side_effect=OSError('offline')):
+            with self.assertRaises(harness.HarnessError):
+                harness._verify_claude_llm_ready(info)
+
+    def test_claude_invocation_inherits_settings_and_extracts_model_usage(self):
+        engines = self.four_backends()
+        envelope = {'type': 'result', 'is_error': False, 'structured_output': TASK,
+                    'modelUsage': {'kimi-k3-actual': {'inputTokens': 1}}}
+        for readonly in (True, False):
+            def run(command, cwd, input_text, timeout_sec, **kwargs):
+                self.assertEqual(cwd, self.root)
+                self.assertEqual(input_text, '审查输入')
+                self.assertEqual(command[:4], ['claude.exe', '-p', '--output-format', 'json'])
+                self.assertEqual(json.loads(command[command.index('--json-schema') + 1]), harness.TASK_JSON_SCHEMA)
+                self.assertIn('--no-session-persistence', command)
+                self.assertNotIn('--bare', command)
+                self.assertEqual(command[command.index('--effort') + 1], 'max')
+                self.assertEqual(kwargs['env']['CLAUDE_CONFIG_DIR'], engines['claude']['config_home'])
+                if readonly:
+                    self.assertEqual(command[command.index('--tools') + 1], 'Read,Grep,Glob')
+                    self.assertEqual(command[command.index('--permission-prompts') + 1], 'none')
+                    self.assertNotIn('--permission-mode', command)
+                else:
+                    self.assertEqual(command[command.index('--tools') + 1], 'Read,Grep,Glob,Edit,Write,Bash')
+                    self.assertEqual(command[command.index('--permission-mode') + 1], 'bypassPermissions')
+                return subprocess.CompletedProcess(command, 0, json.dumps(envelope), '[claude-code:unrecognized_model] fixture warning')
+            with self.subTest(readonly=readonly), patch.dict(os.environ, {'CAE_CLAUDE_HOME': engines['claude']['config_home']}), \
+                 patch.object(harness, 'run_process', side_effect=run):
+                receipt = {}
+                result = harness.invoke_engine('cc:kimi-k3', self.root, '审查输入', engines, harness.TASK_JSON_SCHEMA,
+                                               readonly=readonly, receipt=receipt)
+            self.assertEqual(result, TASK)
+            self.assertEqual(receipt['actual_model'], 'kimi-k3-actual')
+            self.assertEqual(receipt['actual_model_source'], 'claude_result_model_usage')
+
+    def test_dsh_credentials_and_readiness_without_subprocesses(self):
+        cases = (({}, '', '', 'unconfigured'),
+                 ({'DEEPSEEK_API_KEY': 'fixture-env-token'}, '', '', 'api_key'),
+                 ({}, '# comment\nDEEPSEEK_API_KEY = "fixture-dotenv-token" # comment\n', '', 'api_key'),
+                 ({}, 'DEEPSEEK_API_KEY=PASTE_KEY\n', 'deepseek-official:\n  DEEPSEEK_API_KEY: PASTE_KEY\n', 'unconfigured'),
+                 ({}, '', "deepseek-official:\n  DEEPSEEK_API_KEY: 'fixture-yaml-token'\n", 'api_key'),
+                 ({}, '', "'deepseek-official/DEEPSEEK_API_KEY': fixture-yaml-token\n", 'api_key'),
+                 ({}, '', 'deepseek-official/DEEPSEEK_API_KEY:\n  value: fixture-yaml-token\n', 'api_key'),
+                 ({}, '', "'deepseek-account-platform/fixture': 'fixture-account-token'\n", 'deepseek_account'),
+                 ({}, '', 'deepseek-account-platform/fixture:\n  token: fixture-account-token\n', 'deepseek_account'),
+                 ({}, '', 'deepseek-account-platform/fixture:\n  token: PASTE_TOKEN\n', 'unconfigured'),
+                 ({}, 'DEEPSEEK_API_KEY= # no key\n', 'deepseek-account-platform/fixture: # no token\n', 'unconfigured'))
+        for env, dotenv, yaml, expected in cases:
+            (self.root / '.env').write_text(dotenv, encoding='utf-8')
+            (self.root / '.credentials.yaml').write_text(yaml, encoding='utf-8')
+            with self.subTest(source=expected, yaml=yaml), patch.dict(os.environ, env, clear=True), \
+                 patch.object(harness, '_dsh_home', return_value=(self.root, False)), \
+                 patch.object(harness, 'run_process') as run:
+                info = harness._dsh_info('dsh.cmd')
+                self.assertEqual(info['llm_source'], expected)
+                self.assertEqual(info['llm_configured'], expected != 'unconfigured')
+                if expected == 'unconfigured':
+                    with self.assertRaisesRegex(harness.HarnessError, '未检测到已登录'):
+                        harness._verify_dsh_llm_ready(info)
+                else:
+                    harness._verify_dsh_llm_ready(info)
+                run.assert_not_called()
+                self.assertNotIn('fixture-account-token', json.dumps(info))
+                self.assertNotIn('fixture-yaml-token', json.dumps(info))
+
+    def test_dsh_models_efforts_and_lightweight_selection(self):
+        engines = self.four_backends()
+        efforts = {'ultra': 'max', 'max': 'max', 'xhigh': 'max', 'high': 'high', 'medium': 'low',
+                   'low': 'low', 'minimal': 'low', 'off': 'off', 'none': 'off'}
+        for tier, effort in efforts.items():
+            with self.subTest(tier=tier):
+                profile = harness.resolve_execution_profile(engines, 'dsh:default', tier)
+                self.assertEqual(profile['cli_effort'], effort)
+                self.assertEqual(profile['model'], 'deepseek-flash' if tier in ('low', 'minimal') else 'deepseek-v4-pro')
+                self.assertEqual(profile['capacity']['model_declared_max_window_tokens'], 1_048_576)
+                self.assertEqual(profile['model_category'], 'native')
+                self.assertEqual(profile['catalog_usage'], 'builtin_contract')
+        for query, expected in (('flash', 'deepseek-flash'), ('deepseek', 'deepseek-v4-pro'),
+                                ('deepseek-v4-pro', 'deepseek-v4-pro'), ('deepseek-flash', 'deepseek-flash')):
+            self.assertEqual(harness.resolve_execution_profile(engines, 'dsh:' + query)['model'], expected)
+        for prefix, provider in (('claude', 'claude_configured'), ('claude', 'anthropic'), ('dsh', 'deepseek-account'), ('dsh', 'deepseek-official')):
+            self.assertEqual(harness._model_category(prefix, {'slug': 'fixture-model', 'provider': provider}), 'native')
+        self.assertTrue(all(row['effort_source'] == 'dsh_builtin_model_contract'
+                            for row in harness._capability_matrix('dsh', engines['dsh'])))
+
+    def test_claude_and_dsh_preflight_blocks_before_launch_and_dry_run_stays_offline(self):
+        engines = self.four_backends()
+        engines['claude'].update(llm_configured=False, llm_source='placeholder_token')
+        engines['dsh'].update(llm_configured=False, llm_source='unconfigured')
+        for spec in ('claude:default', 'dsh:default'):
+            with self.subTest(spec=spec), patch.object(harness, 'run_process') as run:
+                harness._prepare_execution(engines, (spec,), harness._QuotaBatch(), dry_run=True)
+                with self.assertRaises(harness.HarnessError) as error:
+                    harness._prepare_execution(engines, (spec,), harness._QuotaBatch())
+                self.assertEqual(error.exception.details['requested_engine'], spec)
+                self.assertIn('execution_environment', error.exception.details)
+                run.assert_not_called()
+
+    def test_dsh_cmd_runtime_patch_permissions_stdin_and_untouched_global_files(self):
+        engines = self.four_backends()
+        root = Path(engines['dsh']['config_home'])
+        root.mkdir()
+        cordis = root / 'cordis.patch.yml'
+        cordis.write_text('# user patch\n', encoding='utf-8')
+        credentials = root / '.credentials.yaml'
+        credentials.write_text('deepseek-official: fixture-token\n', encoding='utf-8')
+        before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in (cordis, credentials)}
+        for provider in ('deepseek-official', 'deepseek-account'):
+            engines['dsh']['dsh_provider'] = provider
+            for readonly in (True, False):
+                def run(command, cwd, input_text, timeout_sec, **kwargs):
+                    self.assertEqual(cwd, self.root)
+                    self.assertEqual(command[:3], ['dsh.cmd', '--profile', 'headless'])
+                    self.assertEqual(command[-1], '-')
+                    self.assertIn('--json', command)
+                    self.assertNotIn('--json-schema', command)
+                    self.assertEqual(command[command.index('--permission-mode') + 1], 'read-only' if readonly else 'workspace-write')
+                    self.assertEqual(command[command.index('--approval-policy') + 1], 'never')
+                    runtime_patch = Path(command[command.index('--patch') + 1]).read_text(encoding='utf-8')
+                    for plugin in ('credentials', 'authorization', 'deepseek-account'):
+                        self.assertIn(f'- id: {plugin}\n  disabled: false', runtime_patch)
+                    self.assertIn(f'provider: {provider}', runtime_patch)
+                    self.assertIn('model: "deepseek-v4-pro"', runtime_patch)
+                    self.assertIn('reasoningEffort: low', runtime_patch)
+                    self.assertTrue(input_text.startswith('执行输入\n\n'))
+                    self.assertIn(json.dumps(harness.TASK_JSON_SCHEMA, ensure_ascii=False), input_text)
+                    self.assertEqual(kwargs['env']['DSH_HOME'], str(root))
+                    self.assertEqual(kwargs['env']['DSH_TELEMETRY_DISABLED'], '1')
+                    stream = json.dumps({'type': 'init'}) + '\n' + json.dumps({'type': 'final',
+                        'reason': {'kind': 'completed'}, 'text': json.dumps(TASK)})
+                    return subprocess.CompletedProcess(command, 0, stream, '')
+                with self.subTest(provider=provider, readonly=readonly), patch.object(harness, 'run_process', side_effect=run):
+                    result = harness.invoke_engine('dsh:default', self.root, '执行输入', engines, harness.TASK_JSON_SCHEMA,
+                                                   readonly=readonly, effort='medium')
+                self.assertEqual(result, TASK)
+        self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in before}, before)
+
+    def test_dsh_final_ndjson_fenced_text_and_incomplete_states(self):
+        final = {'type': 'final', 'reason': {'kind': 'completed'}, 'text': ' \n```json\n' + json.dumps(TASK) + '\n```\n '}
+        for raw in (json.dumps(final), json.dumps({'type': 'init'}) + '\n' + json.dumps(final),
+                    'output:\n```json\n' + json.dumps(TASK) + '\n```\n'):
+            self.assertEqual(harness._extract_json_object(raw, harness.TASK_JSON_SCHEMA), TASK)
+        for reason in (None, 'completed', {}, {'kind': 'cancelled'}, {'kind': 'failed'}):
+            for leading in ('', '{"type":"init"}\n'):
+                with self.subTest(reason=reason), self.assertRaisesRegex(harness.HarnessError, '未完成状态'):
+                    harness._extract_json_object(leading + json.dumps({**final, 'reason': reason}), harness.TASK_JSON_SCHEMA)
+
+    def test_claude_dsh_discovery_home_precedence_and_interop_batch_environment(self):
+        native = self.root / '.local/bin/claude.exe'
+        native.parent.mkdir(parents=True)
+        native.write_bytes(b'fixture')
+        dsh = self.root / 'AppData/Local/Programs/DeepSeek Harness/resources/runtime/cli/bin/dsh.cmd'
+        dsh.parent.mkdir(parents=True)
+        dsh.write_bytes(b'fixture')
+        with patch.dict(os.environ, {'LOCALAPPDATA': str(self.root / 'AppData/Local')}, clear=True), \
+             patch.object(harness, '_is_posix', return_value=False), patch.object(harness.shutil, 'which', side_effect=lambda name: 'claude.cmd' if name == 'claude' else None):
+            self.assertEqual(harness._find_claude(), str(native))
+            self.assertEqual(harness._find_dsh(), str(dsh))
+        with patch.dict(os.environ, {'CAE_CLAUDE_HOME': str(self.root / 'override-cl'), 'CLAUDE_CONFIG_DIR': str(self.root / 'native-cl'),
+                                     'CAE_DSH_HOME': str(self.root / 'override-ds'), 'DSH_HOME': str(self.root / 'native-ds')}, clear=True), \
+             patch.object(harness, '_is_posix', return_value=True):
+            self.assertEqual(harness._claude_home('claude.exe'), (self.root / 'override-cl', True))
+            self.assertEqual(harness._dsh_home('dsh.cmd'), (self.root / 'override-ds', True))
+        with patch.dict(os.environ, {'CLAUDE_CONFIG_DIR': 'ignored-cl', 'DSH_HOME': 'ignored-ds'}, clear=True), \
+             patch.object(harness, '_is_posix', return_value=True), patch.object(harness, '_windows_env', return_value='windows-home'), \
+             patch.object(harness, '_wsl_path', return_value=str(self.root)), patch.object(harness.shutil, 'which', return_value='wslpath'):
+            self.assertEqual(harness._claude_home('claude.exe'), (self.root / '.claude', True))
+            self.assertEqual(harness._dsh_home('dsh.cmd'), (self.root / '.dsh', True))
+            self.assertEqual(harness._find_windows_dsh_in_wsl(), str(dsh))
+        with patch.object(harness, '_wsl_path', side_effect=lambda path: 'Z:\\fixture\\' + Path(path).name):
+            command, _pid = harness._interop_command([str(dsh), '--json', '-'], self.root, self.root, '输入',
+                extra_env={'DSH_HOME': 'Z:\\fixture\\.dsh', 'DSH_TELEMETRY_DISABLED': '1'})
+        script = base64.b64decode(command[-1]).decode('utf-16le')
+        self.assertIn("$info.FileName = 'cmd.exe'", script)
+        self.assertIn('/d /s /c "', script)
+        self.assertIn("$info.EnvironmentVariables['DSH_HOME'] = 'Z:\\fixture\\.dsh'", script)
+        self.assertIn("$info.EnvironmentVariables['DSH_TELEMETRY_DISABLED'] = '1'", script)
+
+    def test_quota_fallback_skips_cooled_peers_and_reaches_claude_then_dsh(self):
+        engines = self.four_backends()
+        workspace = self.root / 'workspace'
+        workspace.mkdir()
+        target = workspace / 'a.py'
+        target.write_text('value = 1\n', encoding='utf-8')
+        for name in ('codex', 'agy'):
+            harness._record_quota_exhausted(name, engines[name], 'insufficient balance')
+        args = self.args('task', '--caller', 'antigravity', '--kind', 'review', '--target', str(target),
+                         '--task', '检查', '--engine', 'codex:default', '--fallback-on-quota')
+        for expected in ('claude:default', 'dsh:default'):
+            with self.subTest(expected=expected), patch.object(harness, '_args_backends', return_value=engines), \
+                 patch.object(harness, 'invoke_engine', return_value=TASK) as invoke:
+                code, report = self.capture(harness.cmd_task, args)
+            self.assertEqual(code, 0)
+            self.assertEqual(report['engine'], expected)
+            self.assertEqual(report['quota_fallback']['to_engine'], expected)
+            self.assertEqual(invoke.call_count, 1)
+            self.assertEqual(harness._engine_parts(invoke.call_args.args[0])[0], expected.split(':')[0])
+            harness._record_quota_exhausted(expected.split(':')[0], engines[expected.split(':')[0]], '余额不足')
+        self.assertIsNone(harness._local_fallback_engine('antigravity', 'codex:default', engines))
+        for message in ('credit balance is too low', 'insufficient_balance', 'insufficient-balance', '账户余额不足'):
+            self.assertTrue(harness._is_quota_exhausted(message))
 
     def test_backend_absolute_paths_match_planned_relative_files(self):
         source = self.root / 'input.py'
@@ -101,7 +511,7 @@ class HarnessTests(unittest.TestCase):
              patch.dict(os.environ, {'CAE_AGY_HOME': str(self.root)}, clear=True), patch.object(harness, 'run_process') as runner:
             result = harness.probe_backends()
         runner.assert_not_called()
-        self.assertEqual(set(result), {'codex', 'agy'})
+        self.assertEqual(set(result), {'codex', 'agy', 'claude', 'dsh'})
         self.assertEqual(result['codex']['inferred_window_tokens'], 872000)
         self.assertIsNone(result['codex']['effective_compaction_tokens'])
         self.assertEqual(result['codex']['verified_status'], 'unverified')
@@ -161,7 +571,7 @@ class HarnessTests(unittest.TestCase):
         for path, contents in files.items():
             path.write_text(contents, encoding='utf-8')
         with patch.dict(os.environ, {'CAE_CODEX_HOME': str(codex_root), 'CAE_AGY_HOME': str(agy_root)}, clear=True), \
-             patch.object(harness, '_find_binary', side_effect=['native-codex', 'native-agy']), \
+             patch.object(harness, '_find_binary', side_effect=['native-codex', 'native-agy', None, None]), \
              patch.object(harness, 'run_process') as runner, patch.object(harness, 'invoke_engine') as invoke:
             code, report = self.capture(harness.cmd_assess, self.args('assess', '--caller', 'codex'))
         runner.assert_not_called()
@@ -305,7 +715,7 @@ assert sys.stdin.readline() == ''
         cache.write_text('{"models": [{"slug": "cached-high"}]}', encoding='utf-8')
         response = subprocess.CompletedProcess(['agy', 'models'], 0, 'vendor-core-xhigh\tVendor Core (XHigh)\n', '')
         with patch.dict(os.environ, {}, clear=True), patch.object(harness.Path, 'home', return_value=self.root), \
-             patch.object(harness, '_find_binary', side_effect=[None, 'agy']), \
+             patch.object(harness, '_find_binary', side_effect=[None, 'agy', None, None]), \
              patch.object(harness, 'run_process', return_value=response) as runner:
             code, report = self.capture(harness.cmd_assess, self.args('assess', '--discover-models'))
         self.assertEqual(code, 0)
@@ -2186,6 +2596,65 @@ else:
             self.assertEqual(result['status'], 'failed')
             self.assertIs(result['verification_executed'], expected)
             self.assertFalse(result['scope_verified'])
+
+    def test_dsh_stream_tolerates_intermediate_tool_error_when_final_completed(self):
+        payload = json.dumps({
+            'summary': 'NOTICE 归属声明完整',
+            'content': '已核对第 1-2 行项目名与版权声明。',
+            'evidence': ['NOTICE:1', 'NOTICE:2'],
+            'unverified': [],
+        }, ensure_ascii=False)
+        stream = '\n'.join((
+            json.dumps({'type': 'session', 'sessionId': 'session-1'}),
+            '[llm-deepseek-account] model listing from https://api.deepseek.com/models loaded 2 model(s)',
+            json.dumps({'type': 'tool_call', 'callId': 'c1', 'tool': 'finish', 'input': {}}),
+            json.dumps({'type': 'tool_result', 'callId': 'c1', 'status': 'error',
+                        'error': {'name': 'ToolNotFoundError', 'code': 'UNKNOWN_TOOL'}}),
+            json.dumps({'type': 'final', 'sessionId': 'session-1', 'reason': {'kind': 'completed'}, 'text': payload}),
+        ))
+        parsed = harness._extract_json_object(stream, harness.TASK_JSON_SCHEMA)
+        self.assertEqual(parsed['summary'], 'NOTICE 归属声明完整')
+
+    def test_negated_backend_cues_dsh_non_lightweight_and_router_alias_preflight(self):
+        engines = self.four_backends()
+        engines['claude'].update(llm_source='local_router', config_home=str(self.root / 'claude-cfg'),
+                                 base_url='http://127.0.0.1:8240', model='k3.1-pro[1m]', models=[])
+        engines['dsh'].update(llm_source='deepseek-account', config_home=str(self.root / 'dsh-cfg'),
+                              model='deepseek-v4-pro',
+                              models=[{'slug': 'deepseek-v4-pro', 'supported_efforts': ['low', 'high', 'max']},
+                                      {'slug': 'deepseek-flash', 'supported_efforts': ['low', 'high', 'max']}])
+        self.assertEqual(harness.choose_engine(engines, 'antigravity', '', '不要用 codex，做代码审查'), 'claude:default')
+        self.assertEqual(harness._local_fallback_engine('codex', 'codex:default', engines, '别走 agy 和 cc'), 'dsh:default')
+        self.assertEqual(harness._local_fallback_engine('codex', 'codex:default', engines, '不要用反重力，也别用 claude code'), 'dsh:default')
+        profile = harness.resolve_execution_profile(engines, 'dsh:default', kind='polish', tier='low',
+                                                    prompt_text='不要轻量模型，润色 README')
+        self.assertEqual(profile['model'], 'deepseek-v4-pro')
+        self.assertEqual(profile['profile_source'], 'builtin_flagship')
+
+        cfg_dir = self.root / 'claude-cfg/router'
+        cfg_dir.mkdir(parents=True)
+        db_path = self.root / 'cc-switch.db'
+        with contextlib.closing(sqlite3.connect(db_path)) as con:
+            con.execute('CREATE TABLE providers (app_type TEXT, name TEXT, settings_config TEXT)')
+            con.execute('INSERT INTO providers VALUES (?, ?, ?)',
+                        ('claude', 'Kimi', json.dumps({'env': {'ANTHROPIC_AUTH_TOKEN': 'tok_kimi_fixture_active_99'}})))
+            con.execute('INSERT INTO providers VALUES (?, ?, ?)',
+                        ('claude', 'DeepSeek', json.dumps({'env': {'ANTHROPIC_AUTH_TOKEN': ''}})))
+            con.commit()
+        (cfg_dir / 'router.json').write_text(json.dumps({
+            'default_key_from_card': 'Kimi',
+            'ccswitch_db': str(db_path),
+            'routes': [{'prefix': 'deepseek', 'key_from_card': 'DeepSeek'}],
+        }), encoding='utf-8')
+        harness._verify_claude_router_card_key(engines['claude'], 'kimi')
+        with self.assertRaisesRegex(harness.HarnessError, 'DeepSeek'):
+            harness._verify_claude_router_card_key(engines['claude'], 'ds')
+
+        interop_info = {**engines['claude'], 'windows_interop': True}
+        with patch.object(harness.shutil, 'which', return_value='/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe'), \
+             patch.object(harness, 'run_process', return_value=subprocess.CompletedProcess([], 0, '', '')) as proc:
+            self.assertTrue(harness._probe_router_health(interop_info))
+            self.assertEqual(proc.call_args[0][0][0], 'powershell.exe')
 
 
 if __name__ == '__main__':

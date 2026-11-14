@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-  Antigravity、Codex 与 Claude Code 工程／科研工作流安装器
+  Antigravity、Codex、Claude Code 与 DeepSeek Harness 工程／科研工作流安装器
 ================================================================================
 功能特性：
-1. 自动探测客户端并按需部署（--app auto|all|both|antigravity|codex|claude）：
+1. 自动探测客户端并按需部署（--app auto|all|both|antigravity|codex|claude|dsh）：
    - 单反重力独立模式：部署 ~/.gemini/config/plugins/user-guard 全套插件（含双模压缩恢复与两阶段长会话交接停机门禁）、CLI 默认模型补缺与可选 Zotero MCP；
    - 单 Codex 独立模式：部署 ~/.codex/AGENTS.md（保留自定义本机硬件段）、agents/readonly-*.toml 只读子代理、
      hooks/ 原话压缩恢复和长会话交接钩子、config.toml 安全沙箱和默认模型补缺及可选 Zotero MCP；
-   - both 保持反重力加 Codex；all 同时部署三端。Claude 可选集成本地路由器与 CC Switch 提示词清理。
+   - both 保持反重力加 Codex；all 部署三端并按已安装状态接入 DSH。Claude 可选集成本地路由器与 CC Switch 提示词清理。
+   - 单 DSH 独立模式：同步 ~/.dsh/AGENTS.md 与 skills/cae-harness，不改登录凭据或 cordis.patch.yml。
 2. 当本机仅检测到单客户端时，清晰提示是否先安装另一方；选择不安装（或非交互 --yes）即单独配置当前客户端，零报错闭环。
 3. --probe-apps 探测客户端；--audit-upgrade 零写入检查资产、卡片与本地模型目录对齐状态。
 4. 以 -B 无字节码模式运行 tests/ 下全套离线与端到端回归测试。
@@ -178,6 +179,10 @@ def validate_install_target(target: Path, repo_root: Path) -> Path:
         user_root / ".gemini" / "config" / "plugins",
         user_root / ".codex",
         user_root / ".codex" / "skills",
+        user_root / ".claude",
+        user_root / ".claude" / "skills",
+        user_root / ".dsh",
+        user_root / ".dsh" / "skills",
     }
     configured_home = os.environ.get("CODEX_HOME", "").strip()
     if configured_home:
@@ -598,12 +603,22 @@ def _windows_app_binaries(home: Path, local_app: Path, name: str) -> Tuple[Optio
         cli = [local_app / "Programs" / "cc-switch" / "cc-switch.exe",
                Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "CC Switch" / "cc-switch.exe"]
         desktop = []
+    elif name == "dsh":
+        program_files = Path("/mnt/c/Program Files") if os.name != "nt" else Path(os.environ.get("ProgramFiles") or "C:/Program Files")
+        cli = [local_app / "Programs/DeepSeek Harness/resources/runtime/cli/bin/dsh.cmd",
+               program_files / "DeepSeek Harness/resources/runtime/cli/bin/dsh.cmd"]
+        desktop = []
     else:
         return None, None
     return _first_executable(cli, windows=True), _first_executable(desktop, windows=True)
 
 
 def _native_cli(name: str, home: Path) -> Optional[str]:
+    if name == "dsh":
+        override = os.environ.get("CAE_DSH_BINARY")
+        found = (shutil.which(override) or _first_executable([Path(override).expanduser()], windows=os.name == "nt")) if override else shutil.which("dsh")
+        if found and (os.name == "nt" or not (_is_mnt_windows_path(found) or found.lower().endswith((".exe", ".cmd", ".bat")))):
+            return found
     if os.name == "nt":
         local_app = Path(os.environ.get("LOCALAPPDATA") or str(home / "AppData" / "Local"))
         local_cli, _ = _windows_app_binaries(home, local_app, name)
@@ -613,6 +628,8 @@ def _native_cli(name: str, home: Path) -> Optional[str]:
         candidates.insert(0, home / (".gemini" if name == "agy" else ".cargo") / "bin" / name)
     if name == "claude":
         candidates.append(home / ".npm-global" / "bin" / name)
+    if name == "dsh":
+        candidates.append(Path("/opt/DeepSeek Harness/resources/runtime/cli/bin/dsh"))
     candidates += [Path("/usr/bin") / name, Path("/usr/local/bin") / name]
     found = _first_executable(candidates) or shutil.which(name)
     return found if found and not _is_mnt_windows_path(found) and not found.lower().endswith(".exe") else None
@@ -727,7 +744,7 @@ def _probe_windows_wsl() -> Dict[str, Any]:
 
     # --exec 不加载交互配置，不运行被探测的 CLI。
     script = (
-        'for name in agy codex claude cc-switch; do '
+        'for name in agy codex claude dsh cc-switch; do '
         '  bin=$(command -v "$name"); '
         '  for candidate in "$HOME/.gemini/bin/$name" "$HOME/.local/bin/$name" "$HOME/.cargo/bin/$name"; do '
         '    if [ -f "$candidate" ] && [ -x "$candidate" ]; then bin=$candidate; break; fi; '
@@ -738,6 +755,7 @@ def _probe_windows_wsl() -> Dict[str, Any]:
         '    [ -d "$HOME/.gemini/config" ] || [ -d "$HOME/.gemini/antigravity-cli" ] || [ -d "$HOME/.gemini/antigravity" ]; '
         '  elif [ "$name" = codex ]; then [ -d "$HOME/.codex" ]; '
         '  elif [ "$name" = claude ]; then [ -d "$HOME/.claude" ]; '
+        '  elif [ "$name" = dsh ]; then [ -d "$HOME/.dsh" ]; '
         '  else [ -f "$HOME/.cc-switch/cc-switch.db" ]; fi && trace=true; '
         '  printf "%s\\t%s\\t%s\\n" "$name" "$bin" "$trace"; '
         'done'
@@ -754,7 +772,7 @@ def _probe_windows_wsl() -> Dict[str, Any]:
                 continue
             for line in probe.stdout.splitlines():
                 fields = line.split("\t")
-                if len(fields) == 3 and fields[0] in {"agy", "codex", "claude", "cc-switch"}:
+                if len(fields) == 3 and fields[0] in {"agy", "codex", "claude", "dsh", "cc-switch"}:
                     name, binary, trace = fields
                     result["apps"].setdefault(name, []).append(
                         {"distro": distro, "binary": binary or None, "config_dir_exists": trace == "true"}
@@ -769,13 +787,14 @@ def _probe_windows_wsl() -> Dict[str, Any]:
 
 def detect_installed_apps() -> Dict[str, Any]:
     """
-    只读探测 Antigravity、Codex、Claude Code 与 CC Switch（区分本侧原生与跨子系统互操作）。
+    只读探测四端客户端与 CC Switch（区分本侧原生与跨子系统互操作）。
     """
     home = Path.home()
     gemini_root = home / ".gemini"
     configured_codex = os.environ.get("CODEX_HOME", "").strip()
     codex_root = Path(configured_codex).expanduser() if configured_codex else (home / ".codex")
     claude_root = Path(os.environ.get("CLAUDE_CONFIG_DIR") or home / ".claude").expanduser()
+    dsh_root = Path(os.environ.get("DSH_HOME") or home / ".dsh").expanduser()
     cc_db = home / ".cc-switch" / "cc-switch.db"
 
     wsl = _is_wsl()
@@ -803,7 +822,7 @@ def detect_installed_apps() -> Dict[str, Any]:
             if windows_home is not None:
                 known_cli, win_desktop = _windows_app_binaries(windows_home, windows_home / "AppData" / "Local", name)
                 win_cli = win_cli or known_cli
-                config_name = {"agy": ".gemini", "codex": ".codex", "claude": ".claude", "cc-switch": ".cc-switch"}[name]
+                config_name = {"agy": ".gemini", "codex": ".codex", "claude": ".claude", "dsh": ".dsh", "cc-switch": ".cc-switch"}[name]
                 trace = (windows_home / config_name).is_dir()
             evidence.append({"binary": win_cli, "desktop_binary": win_desktop, "config_dir_exists": trace})
         elif wsl_probe is not None:
@@ -826,15 +845,19 @@ def detect_installed_apps() -> Dict[str, Any]:
     ag = app_info("agy", any((gemini_root / sub).is_dir() for sub in ("antigravity", "antigravity-cli", "config")))
     cx = app_info("codex", codex_root.is_dir())
     cl = app_info("claude", claude_root.is_dir())
+    dsh = app_info("dsh", dsh_root.is_dir())
     cc = app_info("cc-switch", cc_db.is_file())
     ag["target_plugin_dir"] = str(gemini_root / "config" / "plugins" / "user-guard")
     cx["target_codex_home"] = str(codex_root)
     cl["target_claude_home"] = str(claude_root)
+    dsh["target_dsh_home"] = str(dsh_root)
     cc.update(db_path=str(cc_db), db_exists=cc_db.is_file())
     ag_native, cx_native = ag["native_installed"], cx["native_installed"]
     cl_native = cl["native_installed"]
 
-    if cl_native and (ag_native or cx_native):
+    if dsh["native_installed"] and (ag_native or cx_native or cl_native):
+        recommended = "all"
+    elif cl_native and (ag_native or cx_native):
         recommended = "all"
     elif ag_native and cx_native:
         recommended = "both"
@@ -844,6 +867,8 @@ def detect_installed_apps() -> Dict[str, Any]:
         recommended = "codex"
     elif cl_native:
         recommended = "claude"
+    elif dsh["native_installed"]:
+        recommended = "dsh"
     else:
         recommended = "none"
 
@@ -857,12 +882,13 @@ def detect_installed_apps() -> Dict[str, Any]:
         "antigravity": ag,
         "codex": cx,
         "claude": cl,
+        "dsh": dsh,
         "cc_switch": cc,
         "zotero_mcp_detected": zotero_exe,
         "recommended_app_mode": recommended,
         "single_app_only_on_host": (
-            sum(bool(info["native_installed"]) for info in (ag, cx, cl)) == 1
-            and all(info["native_installed"] or info["interop_status"] == "not_detected" for info in (ag, cx, cl))
+            sum(bool(info["native_installed"]) for info in (ag, cx, cl, dsh)) == 1
+            and all(info["native_installed"] or info["interop_status"] == "not_detected" for info in (ag, cx, cl, dsh))
         ),
     }
 
@@ -2124,17 +2150,20 @@ def audit_upgrade_status(
     codex_root: Optional[Path] = None, claude_root: Optional[Path] = None,
     ccswitch_db: Optional[Path] = None, *, detection: Optional[Dict[str, Any]] = None,
     is_sandbox_run: bool = False, app_scope: str = "auto", expect_cc_router: bool = False,
+    dsh_home: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """只读本地资产、模型目录和卡片状态；不刷新目录、不修改配置。"""
     explicit_ag = target_plugin_dir is not None
     explicit_cx = codex_root is not None
     explicit_cl = claude_root is not None
     explicit_cc = ccswitch_db is not None
+    explicit_dsh = dsh_home is not None
     repo_root = Path(repo_root or Path(__file__).resolve().parent)
     home = Path.home()
     target_plugin_dir = Path(target_plugin_dir or home / ".gemini/config/plugins/user-guard")
     codex_root = Path(codex_root or os.environ.get("CODEX_HOME") or home / ".codex")
     claude_root = Path(claude_root or os.environ.get("CLAUDE_CONFIG_DIR") or home / ".claude")
+    dsh_root = Path(dsh_home or os.environ.get("DSH_HOME") or home / ".dsh").expanduser().absolute()
     ccswitch_db = Path(ccswitch_db or home / ".cc-switch/cc-switch.db")
     target_plugin_dir, codex_root, claude_root, ccswitch_db = (
         path.expanduser().absolute() for path in (target_plugin_dir, codex_root, claude_root, ccswitch_db)
@@ -2190,7 +2219,7 @@ def audit_upgrade_status(
     version_tuple = lambda value: tuple(int(part) for part in re.findall(r"\d+", str(value or "")))
     ag["upgrade_recommended"] = version_tuple(ag["installed_version"]) < version_tuple(repo_version)
     ag_sources = [(source, source.relative_to(template).as_posix()) for source in _template_files(template)
-                  if source.relative_to(template).parts[0] in {"rules", "hooks", "agents"}]
+                  if source.relative_to(template).parts[0] in {"rules", "hooks", "agents", "skills"}]
     ag["drift_files"] = drift(target_plugin_dir, ag_sources)
     installed_ag_hooks = read_json(target_plugin_dir / "hooks.json")
     try:
@@ -2262,6 +2291,9 @@ def audit_upgrade_status(
     cx_sources = [(template / "rules/AGENTS.md", "AGENTS.md")]
     cx_sources += [(source, "agents/" + source.name) for source in (repo_root / "template/codex/agents").glob("*.toml")]
     cx_sources += [(template / "hooks" / name, "hooks/" + name) for name in _codex_hook_script_names(codex_mode)]
+    skill_sources = [(source, "skills/cae-harness/" + source.relative_to(template / "skills/cae-harness").as_posix())
+                     for source in _template_files(template / "skills/cae-harness")]
+    cx_sources += skill_sources
     cx["drift_files"] = drift(codex_root, cx_sources, core_rules=True)
     if not isinstance(codex_doc.get("hooks"), dict) or not codex_doc["hooks"].get("SessionStart"):
         cx["drift_files"].append("hooks.json")
@@ -2296,6 +2328,7 @@ def audit_upgrade_status(
     cl_sources = [(template / "rules/AGENTS.md", "CLAUDE.md")]
     cl_sources += [(source, "agents/" + source.name) for source in (repo_root / "template/claude/agents").glob("readonly-*.md")]
     cl_sources += [(template / "hooks" / name, "hooks/" + name) for name in _claude_hook_script_names(claude_mode)]
+    cl_sources += skill_sources
     cl["drift_files"] = drift(claude_root, cl_sources, core_rules=True)
     cl["drift_files"].extend("hooks/" + name for name in CLAUDE_RETIRED_SCRIPTS if read_raw(claude_root / "hooks" / name) is not None)
     if not cl["hooks_aligned"]:
@@ -2305,6 +2338,12 @@ def audit_upgrade_status(
     cl["router"] = {"installed": (claude_root / "router/router.py").is_file(), "drift_files": router_drift,
                     "config_exists": (claude_root / "router/router.json").is_file(),
                     "template_hashes": {relative: hashlib.sha256(source.read_bytes()).hexdigest() for source, relative in router_sources}}
+
+    dsh = _audit_cli(detection.get("dsh", {}))
+    dsh["drift_files"] = drift(dsh_root, [(template / "rules/AGENTS.md", "AGENTS.md"), *skill_sources], core_rules=True)
+    dsh["credentials_present"] = any((dsh_root / name).is_file() for name in (".credentials.yaml", ".env"))
+    dsh_active = bool(app_scope == "dsh" or explicit_dsh or app_scope in ("auto", "all") and not is_sandbox_run
+                      and (dsh.get("native_installed") or dsh_root.is_dir()))
 
     if app_scope == "all":
         ag_active, cx_active, cl_active = True, True, True
@@ -2316,13 +2355,15 @@ def audit_upgrade_status(
         ag_active, cx_active, cl_active = False, True, False
     elif app_scope == "claude":
         ag_active, cx_active, cl_active = False, False, True
-    elif explicit_ag or explicit_cx or explicit_cl:
+    elif app_scope == "dsh":
+        ag_active, cx_active, cl_active = False, False, False
+    elif explicit_ag or explicit_cx or explicit_cl or explicit_dsh:
         ag_active, cx_active, cl_active = explicit_ag, explicit_cx, explicit_cl
     else:
         ag_active = bool(ag.get("native_installed") or target_plugin_dir.is_dir())
         cx_active = bool(cx.get("native_installed") or codex_root.is_dir())
         cl_active = bool(cl.get("native_installed") or claude_root.is_dir())
-        if not (ag_active or cx_active or cl_active):
+        if not (ag_active or cx_active or cl_active or dsh_active):
             ag_active = cx_active = cl_active = True
 
     cc = _audit_cli(detection.get("cc_switch", {}))
@@ -2358,6 +2399,8 @@ def audit_upgrade_status(
             actions.append("sync_claude")
         if cl["effortLevel"] != "xhigh" or cl["locked_effort_env"]:
             actions.append("sync_claude_model_defaults")
+    if dsh_active and dsh["drift_files"]:
+        actions.append("sync_dsh")
     if router_active and (router_drift or not cl["router"]["config_exists"]):
         actions.append("sync_cc_router")
     if cc_active:
@@ -2373,9 +2416,10 @@ def audit_upgrade_status(
         actions.append("repair_unreadable_configs")
     report = {"plugin_version": repo_version,
               "host": {"platform": sys.platform, "python_version": sys.version.split()[0], "is_wsl": detection.get("is_wsl"), "wsl_probe": detection.get("wsl_probe")},
-              "antigravity": ag, "codex": cx, "claude": cl, "cc_switch": cc,
+              "antigravity": ag, "codex": cx, "claude": cl, "dsh": dsh, "cc_switch": cc,
               "summary": {"all_aligned": not actions, "recommended_actions": actions}, "read_errors": errors}
-    roots = [(home, "~"), (target_plugin_dir, "<antigravity>"), (codex_root, "<codex>"), (claude_root, "<claude>"), (repo_root, "<repo>")]
+    roots = [(home, "~"), (target_plugin_dir, "<antigravity>"), (codex_root, "<codex>"), (claude_root, "<claude>"),
+             (dsh_root, "<dsh>"), (repo_root, "<repo>")]
     return _audit_redact(report, roots, secrets)
 
 
@@ -2501,16 +2545,16 @@ def resolve_multi_app_plan(
 
 def main() -> None:
     """先解析参数、完成各端预检，再按预演或正式安装路径执行。"""
-    parser = argparse.ArgumentParser(description="Antigravity、Codex 与 Claude Code 统一工作流安装器")
+    parser = argparse.ArgumentParser(description="Antigravity、Codex、Claude Code 与 DeepSeek Harness 统一工作流安装器")
     if sys.version_info < (3, 11):
         parser.error("需要 Python 3.11 或更高版本")
     parser.add_argument(
         "--app",
-        choices=("auto", "all", "both", "antigravity", "codex", "claude"),
+        choices=("auto", "all", "both", "antigravity", "codex", "claude", "dsh"),
         default="auto",
-        help="auto 按已安装集合配置；both 仅反重力加 Codex；all 配置三端；也可单独指定客户端",
+        help="auto 按已安装集合配置；both 仅反重力加 Codex；all 配置三端并按需接入 DSH；也可单独指定客户端",
     )
-    parser.add_argument("--probe-apps", action="store_true", help="只读探测反重力、Codex、Claude Code、CC Switch 与 Zotero，输出 JSON")
+    parser.add_argument("--probe-apps", action="store_true", help="只读探测四端客户端、CC Switch 与 Zotero，输出 JSON")
     parser.add_argument("--audit-upgrade", action="store_true", help="零写入全栈升级与本地模型目录对齐体检，输出 JSON")
     parser.add_argument("-y", "--yes", action="store_true", help="非交互自动确认（仅检测到单客户端时直接单独配置已安装的一端）")
     parser.add_argument("--target-dir", type=str, default="",
@@ -2518,6 +2562,10 @@ def main() -> None:
     parser.add_argument("--codex-home", type=str, default="", help="自定义 Codex 主配置目录（默认 $CODEX_HOME 或 ~/.codex，用于沙箱全量验证）")
     parser.add_argument("--codex-skills-dir", default="", help="仅自定义 Codex 技能根目录（其下安装 cae-harness，兼容隔离验证）")
     parser.add_argument("--claude-home", default="", help="Claude Code 主目录（默认 $CLAUDE_CONFIG_DIR 或 ~/.claude）")
+    parser.add_argument("--dsh-home", default="", help="DeepSeek Harness 主目录（默认 $DSH_HOME 或 ~/.dsh）")
+    parser.add_argument("--no-dsh-rules", action="store_true", help="跳过 DSH 全局 AGENTS.md")
+    parser.add_argument("--no-dsh-skill", action="store_true", help="跳过 DSH cae-harness 技能")
+    parser.add_argument("--no-claude-skill", action="store_true", help="跳过 Claude cae-harness 技能")
     parser.add_argument("--no-claude-rules", action="store_true", help="跳过 Claude 全局 CLAUDE.md")
     parser.add_argument("--no-claude-agents", action="store_true", help="跳过 Claude 只读子代理")
     parser.add_argument("--no-claude-hooks", action="store_true", help="跳过 Claude 钩子同步")
@@ -2550,7 +2598,11 @@ def main() -> None:
         parser.error("--claude-handoff-compactions 必须为非负整数")
 
     repo_root = Path(__file__).resolve().parent
-    is_sandbox_run = bool(args.target_dir or args.codex_home or args.codex_skills_dir or args.claude_home)
+    is_sandbox_run = bool(args.target_dir or args.codex_home or args.codex_skills_dir or args.claude_home or args.dsh_home)
+    if args.app == "dsh" and (args.target_dir or args.codex_home or args.codex_skills_dir or args.claude_home):
+        parser.error("--app dsh 不能指定其他客户端目标目录")
+    if args.dsh_home and args.app in {"codex", "antigravity", "claude", "both"}:
+        parser.error(f"--app {args.app} 不能指定 --dsh-home")
     if args.audit_upgrade:
         report = audit_upgrade_status(
             repo_root, Path(args.target_dir) if args.target_dir else None,
@@ -2558,6 +2610,7 @@ def main() -> None:
             Path(args.claude_home) if args.claude_home else None,
             Path(args.ccswitch_db) if args.ccswitch_db else None, is_sandbox_run=is_sandbox_run,
             app_scope=args.app, expect_cc_router=args.with_cc_router,
+            dsh_home=Path(args.dsh_home) if args.dsh_home else None,
         )
         print(json.dumps(report, indent=2, ensure_ascii=False))
         return
@@ -2604,19 +2657,35 @@ def main() -> None:
     has_explicit_ag = bool(args.target_dir)
     has_explicit_cx = bool(args.codex_home or args.codex_skills_dir)
     has_explicit_cl = bool(args.claude_home)
+    has_explicit_dsh = bool(args.dsh_home)
+    has_legacy_dirs = has_explicit_ag or has_explicit_cx or has_explicit_cl
     try:
-        detection = detect_installed_apps() if args.app == "auto" and not (has_explicit_ag or has_explicit_cx or has_explicit_cl) else {}
+        detection = detect_installed_apps() if (args.app == "auto" and not (has_legacy_dirs or has_explicit_dsh)
+                                               or args.app == "all" and not is_sandbox_run) else {}
     except (OSError, ValueError) as exc:
         parser.error(str(exc))
     is_interactive = bool(getattr(sys.stdin, "isatty", lambda: False)())
 
-    install_ag, install_cx, install_cl = resolve_multi_app_plan(
-        args.app, has_explicit_ag=has_explicit_ag, has_explicit_cx=has_explicit_cx, has_explicit_cl=has_explicit_cl,
-        detection=detection,
-        interactive=is_interactive,
-        auto_yes=args.yes,
-        dry_run=args.dry_run,
-    )
+    default_dsh_root = Path(os.environ.get("DSH_HOME") or Path.home() / ".dsh").expanduser()
+    if args.app == "all":
+        install_dsh = has_explicit_dsh if is_sandbox_run else bool(
+            has_explicit_dsh or detection.get("dsh", {}).get("native_installed") or default_dsh_root.is_dir())
+    else:
+        install_dsh = args.app == "dsh" or args.app == "auto" and bool(
+            has_explicit_dsh or detection.get("dsh", {}).get("native_installed"))
+    if args.app == "dsh":
+        install_ag, install_cx, install_cl = False, False, False
+    elif args.app == "auto" and install_dsh and not has_legacy_dirs:
+        install_ag, install_cx, install_cl = (False, False, False) if has_explicit_dsh else tuple(
+            bool(detection.get(name, {}).get("native_installed")) for name in ("antigravity", "codex", "claude"))
+        if not (install_ag or install_cx or install_cl) and is_interactive and not (args.yes or args.dry_run):
+            if not _confirm_single_app_install("DeepSeek Harness", "Antigravity / Codex / Claude Code", True, False, False):
+                return
+    else:
+        install_ag, install_cx, install_cl = resolve_multi_app_plan(
+            args.app, has_explicit_ag=has_explicit_ag, has_explicit_cx=has_explicit_cx, has_explicit_cl=has_explicit_cl,
+            detection=detection, interactive=is_interactive, auto_yes=args.yes, dry_run=args.dry_run,
+        )
 
     default_config_root = Path.home() / ".gemini" / "config"
     configured_codex_env = os.environ.get("CODEX_HOME", "").strip()
@@ -2624,6 +2693,7 @@ def main() -> None:
     default_claude_root = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude").expanduser()
     claude_root = Path(args.claude_home).expanduser().absolute() if args.claude_home else default_claude_root.absolute()
     claude_root = claude_root if install_cl else None
+    dsh_root = (Path(args.dsh_home).expanduser().absolute() if args.dsh_home else default_dsh_root.absolute()) if install_dsh else None
     ccswitch_db = Path(args.ccswitch_db).expanduser().absolute() if args.ccswitch_db else Path.home() / ".cc-switch/cc-switch.db"
     disable_prompts = args.disable_ccswitch_prompts and (not is_sandbox_run or bool(args.ccswitch_db))
     if args.with_cc_router and not install_cl:
@@ -2674,7 +2744,7 @@ def main() -> None:
         agy_config_root = None
         if target_plugin_dir is not None:
             target_plugin_dir = validate_install_target(target_plugin_dir, repo_root)
-            for forbidden_codex in {default_codex_root.resolve(), (Path.home().resolve() / ".codex"), default_claude_root.resolve()}:
+            for forbidden_codex in {default_codex_root.resolve(), (Path.home().resolve() / ".codex"), default_claude_root.resolve(), default_dsh_root.resolve()}:
                 if target_plugin_dir == forbidden_codex or forbidden_codex in target_plugin_dir.parents:
                     raise ValueError(f"反重力插件目标目录不能位于 Codex 配置目录内: {target_plugin_dir}")
             _validate_mirror(template_dir, target_plugin_dir)
@@ -2689,10 +2759,20 @@ def main() -> None:
                     if config_root in unsafe_roots or repo_root in config_root.parents:
                         raise ValueError(f"反重力 Zotero MCP 配置目录需独立于源码仓库和系统根目录: {config_root}")
                 agy_config_root = config_root
+        def _paths_overlap(left_path: Path, right_path: Path) -> bool:
+            lp, rp = left_path.resolve(), right_path.resolve()
+            return lp == rp or lp in rp.parents or rp in lp.parents
+
+        default_plugin_root = default_config_root / "plugins" / "user-guard"
+        if target_plugin_dir is not None and any(
+            _paths_overlap(target_plugin_dir, other)
+            for other in (default_codex_root, default_claude_root, default_dsh_root)
+        ):
+            raise ValueError("反重力插件目录不能与其他客户端配置目录相互包含")
         if codex_root is not None:
             codex_root = validate_codex_home_target(codex_root, repo_root)
-            if codex_root == default_claude_root.resolve() or default_claude_root.resolve() in codex_root.parents:
-                raise ValueError("Codex 目录不能位于 Claude 配置目录内")
+            if any(_paths_overlap(codex_root, other) for other in (default_plugin_root, default_claude_root, default_dsh_root)):
+                raise ValueError("Codex 目录不能与其他客户端配置目录相互包含")
             if not args.no_codex_skill:
                 target_skill_dir = codex_root / "skills" / "cae-harness"
         if target_skill_dir is not None:
@@ -2700,9 +2780,21 @@ def main() -> None:
             _validate_mirror(template_dir / "skills" / "cae-harness", target_skill_dir)
         if claude_root is not None:
             claude_root = validate_codex_home_target(claude_root, repo_root)
-            if claude_root == default_codex_root.resolve() or default_codex_root.resolve() in claude_root.parents:
-                raise ValueError("Claude 目录不能位于 Codex 配置目录内")
-        targets = [path for path in (target_plugin_dir, codex_root, claude_root, target_skill_dir) if path is not None]
+            if any(_paths_overlap(claude_root, other) for other in (default_plugin_root, default_codex_root, default_dsh_root)):
+                raise ValueError("Claude 目录不能与其他客户端配置目录相互包含")
+            if not args.no_claude_skill:
+                claude_skill_dir = validate_install_target(claude_root / "skills" / "cae-harness", repo_root)
+                _validate_mirror(template_dir / "skills" / "cae-harness", claude_skill_dir)
+        if dsh_root is not None:
+            dsh_root = validate_codex_home_target(dsh_root, repo_root)
+            if any(_paths_overlap(dsh_root, other) for other in (default_plugin_root, default_codex_root, default_claude_root)):
+                raise ValueError("DSH 目录不能与其他客户端配置目录相互包含")
+            if not args.no_dsh_rules:
+                _decode_utf8(dsh_root / "AGENTS.md", _read_optional_bytes(dsh_root / "AGENTS.md") or b"")
+            if not args.no_dsh_skill:
+                dsh_skill_dir = validate_install_target(dsh_root / "skills" / "cae-harness", repo_root)
+                _validate_mirror(template_dir / "skills" / "cae-harness", dsh_skill_dir)
+        targets = [path for path in (target_plugin_dir, codex_root, claude_root, dsh_root, target_skill_dir) if path is not None]
         for index, left in enumerate(targets):
             for right in targets[index + 1:]:
                 if left == codex_root and right == target_skill_dir:
@@ -2747,10 +2839,10 @@ def main() -> None:
             )
     except (OSError, ValueError, sqlite3.Error) as exc:
         parser.error(str(exc))
-    mode_desc = " + ".join(name for name, enabled in (("反重力", install_ag), ("Codex", install_cx), ("Claude Code", install_cl)) if enabled)
+    mode_desc = " + ".join(name for name, enabled in (("反重力", install_ag), ("Codex", install_cx), ("Claude Code", install_cl), ("DeepSeek Harness", install_dsh)) if enabled)
 
     print("=" * 80)
-    print("  Antigravity、Codex 与 Claude Code 统一工作流安装程序")
+    print("  Antigravity、Codex、Claude Code 与 DeepSeek Harness 统一工作流安装程序")
     print("=" * 80)
     print(f"[*] 仓库根目录   : {repo_root}")
     print(f"[*] 部署目标模式 : {mode_desc}")
@@ -2762,6 +2854,8 @@ def main() -> None:
         print(f"[*] Codex 主目录 : {codex_root}")
     if claude_root is not None:
         print(f"[*] Claude 主目录: {claude_root}")
+    if dsh_root is not None:
+        print(f"[*] DSH 主目录   : {dsh_root}")
     if target_skill_dir is not None:
         print(f"[*] Codex 技能路径: {target_skill_dir}")
     print("-" * 80)
@@ -2789,6 +2883,8 @@ def main() -> None:
                     _sync_codex_hooks(template_dir / "hooks", codex_root, codex_hooks_plan, dry_run=args.dry_run)
                 _apply_file_change(codex_config_change, args.dry_run)
         if claude_root is not None:
+            if not args.no_claude_skill:
+                mirror_sync_plugin(template_dir / "skills/cae-harness", claude_root / "skills/cae-harness", dry_run=args.dry_run)
             if not args.no_claude_rules:
                 _sync_claude_global_rules(template_dir / "rules/AGENTS.md", claude_root, args.dry_run)
             if not args.no_claude_agents:
@@ -2799,6 +2895,11 @@ def main() -> None:
                 _apply_file_change(claude_settings_plan.change, args.dry_run)
             if args.with_cc_router:
                 _sync_cc_router(claude_template_dir / "router", claude_root, args.dry_run)
+        if dsh_root is not None:
+            if not args.no_dsh_rules:
+                _sync_global_rules(template_dir / "rules/AGENTS.md", dsh_root / "AGENTS.md", "DeepSeek Harness", args.dry_run)
+            if not args.no_dsh_skill:
+                mirror_sync_plugin(template_dir / "skills/cae-harness", dsh_root / "skills/cae-harness", dry_run=args.dry_run)
         if disable_prompts:
             result = ccswitch_admin.disable_prompts(ccswitch_db, dry_run=args.dry_run)
             print(f"[*] CC Switch 提示词处理: {len(result['disabled'])} 条；备份: {result['backup']}")
@@ -2821,10 +2922,16 @@ def main() -> None:
         env.pop("USER_GUARD_STATE_DIR", None)
         env.pop("USER_GUARD_LOGS_DIR", None)
         env.pop("USER_GUARD_INSTALLED_CODEX_DIR", None)
+        env.pop("USER_GUARD_INSTALLED_CLAUDE_DIR", None)
+        env.pop("USER_GUARD_INSTALLED_DSH_DIR", None)
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         env["USER_GUARD_INSTALLED_DIR"] = str(target_plugin_dir if (install_ag and target_plugin_dir is not None) else template_dir)
         if install_cx and codex_root is not None:
             env["USER_GUARD_INSTALLED_CODEX_DIR"] = str(codex_root)
+        if install_cl and claude_root is not None:
+            env["USER_GUARD_INSTALLED_CLAUDE_DIR"] = str(claude_root)
+        if install_dsh and dsh_root is not None:
+            env["USER_GUARD_INSTALLED_DSH_DIR"] = str(dsh_root)
 
         test_cmd = [
             sys.executable,

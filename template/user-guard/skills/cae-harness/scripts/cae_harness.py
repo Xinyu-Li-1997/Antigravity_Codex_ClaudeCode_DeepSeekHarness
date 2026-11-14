@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 
-"""Codex / Antigravity 双向任务、分片审计与可执行验收。"""
+"""Antigravity、Codex、Claude Code 与 DeepSeek Harness 对等任务与验收。"""
 
 
 import argparse
@@ -20,6 +20,7 @@ import queue
 import re
 import shutil
 import signal
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -29,6 +30,9 @@ import time
 import tomllib
 import uuid
 from pathlib import Path
+from urllib.error import URLError
+from urllib.parse import urlsplit
+from urllib.request import urlopen
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -53,7 +57,8 @@ EXIT_CODES = {'ok': 0, 'failed': 1, 'scope_violation': 1, 'verification_failed':
 QUOTA_ERROR_RE = re.compile(
     r"(?:hit your usage limit|usage limit|insufficient_quota|exceeded your current quota|"
     r"purchase more credits|billing_hard_limit_reached|quota[ _-]?exceeded|quota[ _-]?exhausted|"
-    r"out of quota|out of credits|resource_exhausted|daily limit exceeded)",
+    r"out of quota|out of credits|resource_exhausted|daily limit exceeded|"
+    r"credit balance is too low|insufficient[ _-]balance|余额不足|账户余额不足)",
     re.IGNORECASE,
 )
 
@@ -156,6 +161,7 @@ NON_AI_MODEL_STOPWORDS = {
     'riemann', 'roe', 'hll', 'hllc', 'hlle', 'ausm', 'rusanov', 'rk', 'bdf', 'cfl',
     'model', 'models', 'default', 'auto', 'cli', 'lite', 'lightweight',
     'codex', 'antigravity', 'agy', 'openai', 'google', 'gemini', 'gpt',
+    'claude', 'cc', 'anthropic', 'dsh', 'harness',
 }
 
 
@@ -306,6 +312,10 @@ def _find_windows_agy_in_wsl():
 
 
 def _find_binary(name):
+    if name == 'claude':
+        return _find_claude()
+    if name == 'dsh':
+        return _find_dsh()
     override = os.environ.get('CAE_' + name.upper() + '_BINARY')
     if override:
         candidate = Path(override).expanduser()
@@ -347,6 +357,91 @@ def _find_binary(name):
     return None
 
 
+def _find_windows_claude_in_wsl():
+    if not (_is_posix() and shutil.which('wslpath')):
+        return None
+    found = shutil.which('claude.exe')
+    if found:
+        return found
+    try:
+        win_home = Path(_wsl_path(_windows_env('USERPROFILE'), windows=False))
+        candidate = win_home / '.local/bin/claude.exe'
+        return str(candidate) if candidate.is_file() else None
+    except (HarnessError, OSError):
+        return None
+
+
+def _find_claude():
+    override = os.environ.get('CAE_CLAUDE_BINARY')
+    if override:
+        candidate = Path(override).expanduser()
+        found = shutil.which(override) or (str(candidate) if candidate.is_file() else None)
+        if not found:
+            raise HarnessError('指定的 claude 程序不存在')
+        return found
+    found = shutil.which('claude')
+    candidate = Path.home() / '.local/bin' / ('claude' if _is_posix() else 'claude.exe')
+    if found and not (not _is_posix() and Path(found).suffix.lower() in ('.cmd', '.bat') and candidate.is_file()):
+        return found
+    if candidate.is_file():
+        return str(candidate)
+    return _find_windows_claude_in_wsl()
+
+
+def _find_windows_dsh_in_wsl():
+    if not (_is_posix() and shutil.which('wslpath')):
+        return None
+    candidates = [Path('/mnt/c/Program Files/DeepSeek Harness/resources/runtime/cli/bin/dsh.cmd')]
+    try:
+        win_home = Path(_wsl_path(_windows_env('USERPROFILE'), windows=False))
+        candidates.insert(0, win_home / 'AppData/Local/Programs/DeepSeek Harness/resources/runtime/cli/bin/dsh.cmd')
+    except (HarnessError, OSError):
+        pass
+    return next((str(path) for path in candidates if path.is_file()), None)
+
+
+def _find_dsh():
+    override = os.environ.get('CAE_DSH_BINARY')
+    if override:
+        candidate = Path(override).expanduser()
+        found = shutil.which(override) or (str(candidate) if candidate.is_file() else None)
+        if not found:
+            raise HarnessError('指定的 dsh 程序不存在')
+        return found
+    found = shutil.which('dsh')
+    if found:
+        return found
+    if _is_posix():
+        candidates = (Path.home() / '.local/bin/dsh', Path('/usr/local/bin/dsh'),
+                      Path('/opt/DeepSeek Harness/resources/runtime/cli/bin/dsh'))
+    else:
+        candidates = (Path(os.environ.get('LOCALAPPDATA') or Path.home() / 'AppData/Local') /
+                      'Programs/DeepSeek Harness/resources/runtime/cli/bin/dsh.cmd',
+                      Path(os.environ.get('ProgramFiles') or 'C:/Program Files') /
+                      'DeepSeek Harness/resources/runtime/cli/bin/dsh.cmd')
+    return next((str(path) for path in candidates if path.is_file()), None) or _find_windows_dsh_in_wsl()
+
+
+def _claude_home(binary):
+    interop = bool(binary and _is_posix() and binary.lower().endswith('.exe'))
+    if os.environ.get('CAE_CLAUDE_HOME'):
+        return Path(os.environ['CAE_CLAUDE_HOME']).expanduser(), interop
+    if interop:
+        win_home = Path(_wsl_path(_windows_env('USERPROFILE'), windows=False))
+        return win_home / '.claude', True
+    return Path(os.environ.get('CLAUDE_CONFIG_DIR') or Path.home() / '.claude').expanduser(), False
+
+
+def _dsh_home(binary):
+    interop = bool(binary and _is_posix() and Path(binary).suffix.lower() in ('.exe', '.cmd', '.bat'))
+    if os.environ.get('CAE_DSH_HOME'):
+        return Path(os.environ['CAE_DSH_HOME']).expanduser(), interop
+    if interop:
+        win_home = Path(_wsl_path(_windows_env('USERPROFILE'), windows=False))
+        return win_home / '.dsh', True
+    return Path(os.environ.get('DSH_HOME') or Path.home() / '.dsh').expanduser(), False
+
+
 def _codex_home(binary):
     interop = bool(binary and _is_posix() and binary.lower().endswith('.exe'))
     if os.environ.get('CAE_CODEX_HOME'):
@@ -374,30 +469,44 @@ def _agy_home(binary):
 
 
 def resolve_caller(value):
-    if value != 'auto':
-        return value
-    inherited = os.environ.get('CAE_HARNESS_CALLER', '')
-    return inherited if inherited in ('codex', 'antigravity') else 'caller'
+    value = os.environ.get('CAE_HARNESS_CALLER', '') if value == 'auto' else value
+    value = {'cc': 'claude', 'agy': 'antigravity'}.get(value, value)
+    return value if value in ('codex', 'antigravity', 'claude', 'dsh') else 'caller'
 
 
 def _engine_parts(spec):
     prefix, _, model = spec.partition(':')
-    if prefix not in ('codex', 'agy'):
-        raise HarnessError('本协作机制仅支持 agy 和 codex 后端')
+    prefix = 'claude' if prefix == 'cc' else prefix
+    if prefix not in ('codex', 'agy', 'claude', 'dsh'):
+        raise HarnessError('本协作机制仅支持 agy、codex、claude (cc) 和 dsh 后端')
     if model == '1m':
         emit_event('deprecated_model_alias', engine=prefix, alias='1m', replacement='default')
         model = 'default'
     return prefix, model if model and model != 'default' else ''
 
 
-def choose_engine(backends, caller, explicit=''):
+def _peer_auto_ready(backends, name):
+    info = backends.get(name, {})
+    return bool(info.get('available') and (name not in ('claude', 'dsh') or info.get('llm_configured')))
+
+
+def choose_engine(backends, caller, explicit='', prompt_text=''):
     if explicit:
         name, _ = _engine_parts(explicit)
-    elif caller in ('codex', 'antigravity'):
-        name = 'agy' if caller == 'codex' else 'codex'
-        explicit = name + ':default'
+        explicit = name + ':' + (explicit.partition(':')[2] or 'default')
+    elif hinted := _extract_prompt_backend_hint(prompt_text):
+        name, explicit = hinted, hinted + ':default'
     else:
-        raise HarnessError('请指定 --caller，或指定 --engine/--worker/--left')
+        order = {'antigravity': ('codex', 'claude', 'dsh'), 'codex': ('agy', 'claude', 'dsh'),
+                 'claude': ('codex', 'agy', 'dsh'), 'dsh': ('codex', 'agy', 'claude', 'dsh')}.get(resolve_caller(caller))
+        if order is None:
+            raise HarnessError('请指定 --caller，或指定 --engine/--worker/--left')
+        negated = _extract_negated_backends(prompt_text)
+        allowed = [peer for peer in order if peer not in negated]
+        if not allowed:
+            raise HarnessError('提示词已排除全部候选后端，请显式指定 --engine/--worker')
+        name = next((peer for peer in allowed if _peer_auto_ready(backends, peer)), allowed[0])
+        explicit = name + ':default'
     if not backends.get(name, {}).get('available'):
         raise HarnessError(f'未发现所选后端 {name}，请配置对应运行环境')
     return explicit
@@ -494,7 +603,7 @@ def _rewrite_staged_paths(parsed, stage_dir):
     return parsed
 
 
-def _interop_command(command, work_dir, temp_dir, input_text, codex_home=None):
+def _interop_command(command, work_dir, temp_dir, input_text, codex_home=None, extra_env: dict[str, str] | None = None):
     """监督进程写入本次真实 Windows PID，供 WSL 定向清理进程树。"""
     pid_file = temp_dir / 'native.pid'
     if input_text is None:
@@ -516,9 +625,15 @@ def _interop_command(command, work_dir, temp_dir, input_text, codex_home=None):
             '[Console]::Out.Write($output.Result)', '[Console]::Error.Write($errors.Result)',
         ]
     args = subprocess.list2cmdline(command[1:])
+    executable = _wsl_path(Path(command[0]))
+    if Path(command[0]).suffix.lower() in ('.cmd', '.bat'):
+        args = '/d /s /c "' + subprocess.list2cmdline([executable, *command[1:]]) + '"'
+        executable = 'cmd.exe'
     env_lines = ["$info.EnvironmentVariables['CAE_HARNESS_DEPTH'] = '1'"]
     if codex_home:
         env_lines.insert(0, "$info.EnvironmentVariables['CODEX_HOME'] = " + _ps_literal(_wsl_path(Path(codex_home))))
+    for key, value in (extra_env or {}).items():
+        env_lines.append('$info.EnvironmentVariables[' + _ps_literal(key) + '] = ' + _ps_literal(value))
     script = '\n'.join([
         "$ErrorActionPreference='Stop'",
         "$ProgressPreference='SilentlyContinue'",
@@ -526,7 +641,7 @@ def _interop_command(command, work_dir, temp_dir, input_text, codex_home=None):
         '[IO.File]::WriteAllText(' + _ps_literal(_wsl_path(pid_file.with_suffix('.pending'))) + ', [string]$PID)',
         '[IO.File]::Move(' + _ps_literal(_wsl_path(pid_file.with_suffix('.pending'))) + ', ' + _ps_literal(_wsl_path(pid_file)) + ')',
         '$info = New-Object System.Diagnostics.ProcessStartInfo',
-        '$info.FileName = ' + _ps_literal(_wsl_path(Path(command[0]))),
+        '$info.FileName = ' + _ps_literal(executable),
         '$info.Arguments = ' + _ps_literal(args),
         '$info.WorkingDirectory = ' + _ps_literal(_wsl_path(work_dir)),
         '$info.UseShellExecute = $false', '$info.CreateNoWindow = $true',
@@ -646,6 +761,10 @@ def _model_category(prefix, record):
         return 'native'
     if prefix == 'codex' and provider in ('', 'openai') and (
             provider == 'openai' or re.match(r'^(?:gpt-[0-9]+(?:\.[0-9]+)?(?:-|$)|o[1-9]\d*(?:-|$))', slug)):
+        return 'native'
+    if prefix == 'claude' and (provider in ('', 'anthropic', 'claude_configured') or slug in ('sonnet', 'opus', 'haiku')):
+        return 'native'
+    if prefix == 'dsh' and (provider in ('', 'deepseek', 'deepseek-official', 'deepseek-account') or slug.startswith('deepseek-')):
         return 'native'
     if provider or re.match(r'^(?:claude-|gpt-oss-|deepseek-|qwen-|mistral-|llama-)', slug):
         return 'hosted_or_third_party'
@@ -823,6 +942,39 @@ def _has_positive_cue(text, cues):
     return _has_cue(text, cues)
 
 
+_BACKEND_HINT_NAMES = {
+    'claude': r'(?:claude\s*(?:code|cli)|cc(?:\s+cli)?)',
+    'dsh': r'(?:deepseek\s*harness|dsh(?:\s+cli)?)',
+    'codex': r'codex',
+    'agy': r'(?:反重力|antigravity|agy)',
+}
+
+
+def _extract_negated_backends(prompt_text):
+    text = _semantic_text(prompt_text)
+    if not text:
+        return set()
+    negated = set()
+    for clause in _CUE_BOUNDARIES.split(text):
+        for name, pattern in _BACKEND_HINT_NAMES.items():
+            for match in re.finditer(r'(?<![A-Za-z0-9_.=-])' + pattern + r'(?![A-Za-z0-9_.=-])', clause, re.I):
+                if _cue_is_negated(clause[:match.start()]):
+                    negated.add(name)
+    return negated
+
+
+def _extract_prompt_backend_hint(prompt_text):
+    text = _semantic_text(prompt_text)
+    action = r'(?:请)?(?:使用|调用|采用|切到|切换至|指定|选用|改用|交给|让|用)\s*'
+    english = r'\b(?:use|invoke|via|switch\s+to)\s+'
+    candidates = []
+    for name, pattern in _BACKEND_HINT_NAMES.items():
+        for match in re.finditer('(?:' + action + '|' + english + ')' + pattern + r'(?![A-Za-z0-9_.=-])', text, re.I):
+            if not _cue_is_negated(_CUE_BOUNDARIES.split(text[:match.start()])[-1]):
+                candidates.append((match.start(), name))
+    return min(candidates)[1] if candidates else ''
+
+
 def _extract_prompt_model_hint(prompt_text):
     text = _semantic_text(prompt_text).strip()
     if not text:
@@ -836,10 +988,13 @@ def _extract_prompt_model_hint(prompt_text):
             cand = re.sub(r'\s+', ' ', match.group(1)).strip()
             if not cand:
                 continue
+            if re.fullmatch(r'(?:claude\s*(?:code|cli)|deepseek\s*harness|cc(?:\s+cli)?|dsh(?:\s+cli)?)', cand, re.I):
+                continue
             tokens = [tok for tok in re.findall(r'[a-z0-9]+', cand.lower()) if tok]
             collapsed = re.sub(r'[^a-z0-9]+', '', cand.lower())
             # 通用名称与 CFD 格式名称应排除，完整 gpt/gemini 型号则保留。
-            provider_qualifiers = {'gpt', 'gemini', 'codex', 'agy', 'openai', 'google'}
+            provider_qualifiers = {'gpt', 'gemini', 'codex', 'agy', 'openai', 'google',
+                                   'claude', 'cc', 'anthropic', 'dsh', 'harness'}
             if collapsed in stop_words or any(tok in stop_words - provider_qualifiers for tok in tokens):
                 continue
             if collapsed in PHYSICAL_SUBSTANCE_TAGS:
@@ -961,7 +1116,8 @@ def _profile(prefix, info, spec, slug, record, tier, source, effort=None, cli_ef
     elif declared is None:
         adjustment = 'unsupported_tier_not_verified' if cli_effort == tier else 'requested_tier_not_verified'
     elif effort != tier:
-        direction = 'lower' if EFFORT_LADDER.index(effort) < EFFORT_LADDER.index(tier) else 'higher'
+        ladder = ('off', 'none', *EFFORT_LADDER)
+        direction = 'lower' if ladder.index(effort) < ladder.index(tier) else 'higher'
         adjustment = f'{direction}_catalog_effort_or_model_variant'
     else:
         adjustment = None
@@ -976,6 +1132,8 @@ def _profile(prefix, info, spec, slug, record, tier, source, effort=None, cli_ef
         'capacity': capacity, 'model_catalog': catalog,
         'model_listing': info.get('model_listing'),
         'catalog_usage': ('listing_declared' if catalog.get('source') == 'agy_models_cli' else
+                          'builtin_contract' if catalog.get('source') == 'dsh_builtin_models' else
+                          'local_configuration' if catalog.get('source') == 'claude_settings' else
                           'unverified_client_cache' if catalog.get('model_count') else 'unverified_or_missing'),
         'execution_environment': _execution_environment(info),
     }
@@ -1064,6 +1222,42 @@ def resolve_execution_profile(backends, spec, tier='max', prompt_text='', kind='
     info = backends.get(prefix, {})
     models = info.get('models', [])
     hint = _extract_prompt_model_hint(prompt_text) if not explicit_model and models else ''
+    if prefix in ('claude', 'dsh'):
+        query = explicit_model or hint
+        record = _exact_model_record(models, query) if query else {}
+        if prefix == 'dsh' and query.lower() == 'deepseek':
+            record = _exact_model_record(models, 'deepseek-v4-pro')
+        elif prefix == 'claude' and query.lower() in ('kimi', 'k3'):
+            record = next((m for m in models if m['slug'].lower().startswith(('k3', 'kimi'))), {})
+        elif prefix == 'claude' and query.lower() in ('deepseek', 'ds'):
+            record = next((m for m in models if m['slug'].lower().startswith('deepseek')), {})
+        if query and not record:
+            terms = _alias_tokens(query) - NON_AI_MODEL_STOPWORDS
+            matches = [item for item in models if terms and terms <= _alias_tokens(
+                f"{item['slug']} {item.get('display_name', '')}")]
+            record = _unique_model_matches(query, matches)
+        source = 'prompt_fuzzy_model' if hint and record else 'explicit_engine_model' if explicit_model else 'configured_model'
+        slug = record.get('slug') or explicit_model
+        if prefix == 'claude' and not record and info.get('llm_source') == 'local_router':
+            if query.lower() in ('kimi', 'k3'):
+                slug = 'k3.1-pro[1m]'
+            elif query.lower() in ('deepseek', 'ds'):
+                slug = 'deepseek-flash'
+        if not slug:
+            forbid_lightweight = _has_negated_cue(prompt_text, ('轻量', '极速', 'lite', 'mini', 'fast', 'flash', 'hydrogen', '氢'))
+            use_dsh_flash = tier in ('low', 'minimal') and not forbid_lightweight
+            slug = ('deepseek-flash' if use_dsh_flash else 'deepseek-v4-pro') if prefix == 'dsh' else info.get('model') or 'opus'
+            record = _exact_model_record(models, slug)
+            if prefix == 'dsh':
+                source = 'specialty_fast_lightweight' if use_dsh_flash else 'builtin_flagship'
+        if prefix == 'dsh' and slug.lower() == 'flash':
+            slug = 'deepseek-flash'
+            record = _exact_model_record(models, slug)
+        effort = ({'ultra': 'max', 'max': 'max', 'xhigh': 'max', 'high': 'high',
+                   'medium': 'low', 'low': 'low', 'minimal': 'low', 'off': 'off', 'none': 'off'}[tier]
+                  if prefix == 'dsh' else 'max' if tier == 'ultra' else 'low' if tier == 'minimal' else tier)
+        return _profile(prefix, info, spec, slug, record, tier, source, effort, effort,
+                        'catalog_declared' if record.get('supported_efforts') else 'unverified_request')
     if prefix == 'codex':
         if explicit_model or hint:
             try:
@@ -1323,7 +1517,231 @@ def _refresh_agy_listing(info, batch, *, refresh_model_cache, record_quota=True)
     return info
 
 
-def probe_backends(codex_input_budget=None, agy_input_budget=None, discover_models=False, *, refresh_model_cache=True):
+def _usable_credential(value):
+    return (isinstance(value, str) and bool(value.strip()) and not value.strip().upper().startswith('PASTE_')
+            and value.strip().lower() not in ('via-router', 'null', '~', '{}', '[]')
+            and not value.strip().startswith('<') and '\r' not in value and '\n' not in value)
+
+
+def _optional_text(path):
+    try:
+        return path.read_text(encoding='utf-8-sig')
+    except (OSError, UnicodeError):
+        return ''
+
+
+def _credential_scalar(value):
+    value = value.strip()
+    if value.startswith('#'):
+        return ''
+    if value.startswith(('"', "'")):
+        quote = value[0]
+        end = value.find(quote, 1)
+        return value[1:end] if end > 0 else ''
+    return re.split(r'\s+#', value, maxsplit=1)[0].strip()
+
+
+def _claude_info(binary, requested=None):
+    root, interop = _claude_home(binary)
+    settings_file = root / 'settings.json'
+    settings = _read_json(settings_file)
+    settings = settings if isinstance(settings, dict) else {}
+    router_cfg = _read_json(root / 'router/router.json')
+    env = settings.get('env', {})
+    env = env if isinstance(env, dict) else {}
+    env = {**os.environ, **env}
+    tokens = [env[key] for key in ('ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_API_KEY') if key in env]
+    base_url = str(env.get('ANTHROPIC_BASE_URL') or '')
+    try:
+        local_router = urlsplit(base_url).hostname in ('127.0.0.1', 'localhost', '::1')
+    except ValueError:
+        local_router = False
+    configured = settings.get('model') or env.get('ANTHROPIC_MODEL')
+    configured_window = _positive_int(env.get('CLAUDE_CODE_MAX_CONTEXT_TOKENS'))
+    compact_window = _positive_int(env.get('CLAUDE_CODE_AUTO_COMPACT_WINDOW'))
+    helper = settings.get('apiKeyHelper')
+    source = ('local_router' if local_router else 'settings_env' if _usable_credential(env.get('ANTHROPIC_AUTH_TOKEN') or env.get('ANTHROPIC_API_KEY'))
+              or isinstance(helper, str) and helper.strip() else 'placeholder_token' if tokens
+              else 'credentials_file' if (root / '.credentials.json').is_file() else 'unconfigured')
+    model_names = [configured, *(env.get(key) for key in ('ANTHROPIC_DEFAULT_OPUS_MODEL', 'ANTHROPIC_DEFAULT_SONNET_MODEL',
+                    'ANTHROPIC_DEFAULT_HAIKU_MODEL', 'CLAUDE_CODE_SUBAGENT_MODEL'))]
+    models = [{'slug': name, 'display_name': name, 'provider': 'claude_configured', 'priority': i,
+               'max_context_window': 1_000_000 if '[1m]' in name.lower() else configured_window,
+               'supported_efforts': ['low', 'medium', 'high', 'xhigh', 'max']}
+              for i, name in enumerate(dict.fromkeys(name for name in model_names if isinstance(name, str) and name.strip()))]
+    if not models and source not in ('local_router', 'settings_env', 'placeholder_token'):
+        models = [{'slug': alias, 'display_name': alias, 'provider': 'claude_builtin_alias', 'priority': i,
+                   'max_context_window': configured_window, 'supported_efforts': ['low', 'medium', 'high', 'xhigh', 'max']}
+                  for i, alias in enumerate(('opus', 'sonnet', 'haiku'))]
+    return {'available': bool(binary), 'detected': bool(binary), 'binary': binary, 'family': 'claude',
+            'config_home': str(root), 'windows_interop': interop, 'model': configured, 'models': models,
+            'base_url': base_url, 'router_configured': bool(router_cfg),
+            'llm_source': source, 'llm_configured': source in ('local_router', 'settings_env', 'credentials_file'),
+            'configured_window_tokens': configured_window, 'effective_compaction_tokens': compact_window,
+            'verified_status': 'unverified', 'authentication_status': 'not_checked',
+            'requested_input_budget_tokens': requested, 'capability_source': 'local_settings',
+            'model_catalog': _catalog_metadata(settings_file, settings, models, 'claude_settings',
+                                              datetime.datetime.now(datetime.timezone.utc))}
+
+
+def _dsh_info(binary, requested=None):
+    root, interop = _dsh_home(binary)
+    api_key = _usable_credential(os.environ.get('DEEPSEEK_API_KEY'))
+    for line in _optional_text(root / '.env').splitlines():
+        if line.strip().startswith('#'):
+            continue
+        key, equal, value = line.partition('=')
+        if equal and key.strip() == 'DEEPSEEK_API_KEY':
+            api_key = api_key or _usable_credential(_credential_scalar(value))
+    account = False
+    # 仅识别凭据文件中两种官方提供方及其密钥字段，不实现通用 YAML 解析器。
+    scopes = []
+    for line in _optional_text(root / '.credentials.yaml').splitlines():
+        match = re.match(r'''^(\s*)(?:['"]([^'"]+)['"]|([^:#\s][^:]*)):\s*(.*?)\s*$''', line)
+        if not match:
+            continue
+        indent, quoted, plain, value = match.groups()
+        key = (quoted or plain).strip()
+        while scopes and len(indent) <= scopes[-1][0]:
+            scopes.pop()
+        path = [name for _indent, name in scopes] + [key]
+        value = _credential_scalar(value)
+        official = any(name in ('deepseek-official', 'deepseek-official/DEEPSEEK_API_KEY') for name in path) or key == 'DEEPSEEK_API_KEY'
+        platform = any(name.startswith('deepseek-account-platform/') for name in path)
+        credential_key = key in ('DEEPSEEK_API_KEY', 'deepseek-official/DEEPSEEK_API_KEY', 'token', 'secret', 'access_token', 'api_key', 'value')
+        if _usable_credential(value) and (credential_key or key == 'deepseek-official' or key.startswith('deepseek-account-platform/')):
+            api_key = api_key or official
+            account = account or platform
+        if not value:
+            scopes.append((len(indent), key))
+    source = 'api_key' if api_key else 'deepseek_account' if account else 'unconfigured'
+    models = [{'slug': slug, 'display_name': label, 'provider': 'deepseek', 'category': 'native', 'priority': i,
+               'context_window': 1_048_576, 'max_context_window': 1_048_576, 'supported_efforts': ['off', 'low', 'high', 'max']}
+              for i, (slug, label) in enumerate((('deepseek-v4-pro', 'DeepSeek-V4-Pro'), ('deepseek-flash', 'DeepSeek-V4.1-Flash')))]
+    return {'available': bool(binary), 'detected': bool(binary), 'binary': binary, 'family': 'dsh',
+            'config_home': str(root), 'windows_interop': interop, 'model': 'deepseek-v4-pro', 'models': models,
+            'llm_source': source, 'dsh_provider': 'deepseek-official' if api_key else 'deepseek-account' if account else None,
+            'llm_configured': source != 'unconfigured', 'verified_status': 'unverified', 'authentication_status': 'not_checked',
+            'requested_input_budget_tokens': requested, 'capability_source': 'dsh_builtin_models',
+            'model_catalog': {'source': 'dsh_builtin_models', 'model_count': len(models), 'freshness': 'builtin_contract'}}
+
+
+def _run_claude_auth(info):
+    command = [info['binary'], 'auth', 'status']
+    if not info.get('windows_interop'):
+        env = os.environ.copy()
+        env['CLAUDE_CONFIG_DIR'] = info['config_home']
+        return run_process(command, Path.cwd(), timeout_sec=15, env=env)
+    if not shutil.which('powershell.exe') or not shutil.which('taskkill.exe'):
+        raise HarnessError('WSL 跨端认证查询需要 powershell.exe 与 taskkill.exe')
+    windows_temp = _wsl_path(Path(_windows_env('TEMP')), windows=False)
+    with tempfile.TemporaryDirectory(prefix='cae-harness-', dir=windows_temp) as temp:
+        path = Path(temp)
+        command, pid_file = _interop_command(command, path, path, '', extra_env={
+            'CLAUDE_CONFIG_DIR': _wsl_path(Path(info['config_home']))})
+        return run_process(command, path, timeout_sec=15, native_pid_file=pid_file)
+
+
+def _probe_router_health(info):
+    health_url = info['base_url'].rstrip('/') + '/__router/health'
+    if info.get('windows_interop'):
+        if not shutil.which('powershell.exe'):
+            return False
+        script = (f"try {{ $r = Invoke-RestMethod -Uri {_ps_literal(health_url)} -TimeoutSec 2; "
+                  "if ($r.ok -eq $true) { exit 0 } else { exit 1 } } catch { exit 1 }")
+        try:
+            return run_process(['powershell.exe', '-NoProfile', '-Command', script], Path.cwd(), timeout_sec=5).returncode == 0
+        except HarnessError:
+            return False
+    try:
+        with urlopen(health_url, timeout=2.0) as response:
+            return response.status == 200 and json.load(response).get('ok') is True
+    except (OSError, URLError, ValueError, AttributeError):
+        return False
+
+
+def _verify_claude_router_card_key(info, model_name):
+    cfg = _read_json(Path(info['config_home']) / 'router/router.json')
+    if not isinstance(cfg, dict) or not isinstance(cfg.get('routes', []), list):
+        raise HarnessError('Claude Code 路由配置格式无效，请检查 router/router.json')
+    model = (model_name or info.get('model') or '').strip()
+    if model.lower() in ('kimi', 'k3'):
+        model = 'k3.1-pro[1m]'
+    elif model.lower() in ('deepseek', 'ds'):
+        model = 'deepseek-flash'
+    card = cfg.get('default_key_from_card')
+    for route in cfg.get('routes', []):
+        if isinstance(route, dict) and route.get('prefix') and model.lower().startswith(str(route['prefix']).lower()):
+            card = route.get('key_from_card')
+            break
+    if not card:
+        return
+    db_value = str(cfg.get('ccswitch_db') or '~/.cc-switch/cc-switch.db')
+    if info.get('windows_interop') and db_value.startswith('~/'):
+        db = Path(info['config_home']).parent / db_value[2:]
+    elif info.get('windows_interop') and ntpath.isabs(db_value) and not posixpath.isabs(db_value):
+        db = Path(_wsl_path(Path(db_value), windows=False))
+    else:
+        db = Path(db_value).expanduser()
+    try:
+        con = sqlite3.connect(db.absolute().as_uri() + '?mode=ro', uri=True, timeout=2)
+        try:
+            rows = con.execute("SELECT settings_config FROM providers WHERE app_type='claude' AND name=? LIMIT 2", (card,)).fetchall()
+        finally:
+            con.close()
+        env = json.loads(rows[0][0]).get('env', {}) if len(rows) == 1 else {}
+        usable = _usable_credential(env.get('ANTHROPIC_AUTH_TOKEN') or env.get('ANTHROPIC_API_KEY'))
+    except (sqlite3.Error, ValueError, TypeError, AttributeError):
+        usable = False
+    if not usable:
+        raise HarnessError(f'Claude Code 路由卡片 {card} 缺少有效 API 凭据，请先在 CC Switch 配置密钥')
+
+
+def _verify_claude_llm_ready(info, requested_model='', batch=None):
+    source = info.get('llm_source', 'unconfigured')
+    if source == 'placeholder_token':
+        raise HarnessError('Claude Code 配置中的 API 凭据为空或仍为占位符，请先在 CC Switch 填入有效 API Key 并切换卡片',
+                           execution_environment=_execution_environment(info))
+    if source == 'local_router':
+        if not _probe_router_health(info):
+            raise HarnessError('Claude Code 本地路由器未就绪，请先启动路由器并检查 /__router/health')
+        _verify_claude_router_card_key(info, requested_model)
+    elif source != 'settings_env':
+        if not info.get('binary'):
+            raise HarnessError('未发现 Claude Code CLI，请先安装或指定 CAE_CLAUDE_BINARY')
+        first = info
+        while True:
+            _enforce_preflight_quota({'claude': info}, ('claude:default',), batch=batch)
+            result = _run_claude_auth(info)
+            try:
+                logged_in = result.returncode == 0 and json.loads(result.stdout).get('loggedIn') is True
+            except (ValueError, AttributeError):
+                logged_in = False
+            if logged_in:
+                break
+            if info is first and _is_posix() and not info.get('windows_interop') and not os.environ.get('CAE_CLAUDE_BINARY'):
+                binary = _find_windows_claude_in_wsl()
+                if binary and binary != info['binary']:
+                    info = _claude_info(binary, info.get('requested_input_budget_tokens'))
+                    continue
+            raise HarnessError('Claude Code 未登录且未配置有效 API 凭据，请先运行 claude auth login 或在 CC Switch 切换有效卡片',
+                               execution_environment=_execution_environment(info))
+        if info is not first:
+            info.update(fallback_from=_execution_environment(first), fallback_reason='native_authentication_required')
+            first.update(info)
+        first['authentication_status'] = 'authenticated'
+        first['llm_configured'] = True
+    info['llm_configured'] = True
+
+
+def _verify_dsh_llm_ready(info):
+    if info.get('llm_configured') is not True or info.get('llm_source') not in ('api_key', 'deepseek_account'):
+        raise HarnessError('DeepSeek Harness (dsh) 未检测到已登录的 DeepSeek 账号或有效的 DEEPSEEK_API_KEY，请先在 DSH 登录或在 ~/.dsh/.env 配置密钥',
+                           execution_environment=_execution_environment(info))
+
+
+def probe_backends(codex_input_budget=None, agy_input_budget=None, discover_models=False, *, refresh_model_cache=True,
+                   claude_input_budget=None, dsh_input_budget=None):
     """普通探测只读文件，程序发现和缓存均不代表认证或线上容量验证。"""
     now = datetime.datetime.now(datetime.timezone.utc)
     binary = _find_binary('codex')
@@ -1361,7 +1779,9 @@ def probe_backends(codex_input_budget=None, agy_input_budget=None, discover_mode
     if discover_models:
         agy = _refresh_agy_listing(agy, _QuotaBatch(), refresh_model_cache=refresh_model_cache,
                                    record_quota=refresh_model_cache)
-    result_map = {'codex': codex, 'agy': agy}
+    claude = _claude_info(_find_binary('claude'), claude_input_budget or _positive_int(os.environ.get('CAE_CLAUDE_INPUT_BUDGET')))
+    dsh = _dsh_info(_find_binary('dsh'), dsh_input_budget or _positive_int(os.environ.get('CAE_DSH_INPUT_BUDGET')))
+    result_map = {'codex': codex, 'agy': agy, 'claude': claude, 'dsh': dsh}
     for name, info in result_map.items():
         info['execution_side'] = _execution_side(info)
         prof = resolve_execution_profile(result_map, name + ':default', 'max', kind='code')
@@ -1369,7 +1789,7 @@ def probe_backends(codex_input_budget=None, agy_input_budget=None, discover_mode
         fast_prof = resolve_execution_profile(result_map, name + ':default', 'low', kind='review')
         info['frontier_model'] = prof['model']
         info['max_reasoning_effort'] = prof['reasoning_effort']
-        info['auto_selectable'] = bool(info['detected'] and not prof['execution_blocked_reason'])
+        info['auto_selectable'] = bool(_peer_auto_ready(result_map, name) and not prof['execution_blocked_reason'])
         info['specialty_routing'] = {
             'engineering_workhorse': {'model': prof['model'], 'reasoning_effort': prof['reasoning_effort']},
             'deep_reasoning': {'model': deep_prof['model'], 'reasoning_effort': deep_prof['reasoning_effort']},
@@ -1404,7 +1824,8 @@ def _capability_matrix(prefix, info):
             'declared_efforts': efforts, 'declared_default_effort': record.get('default_reasoning_level'),
             'effort_source': ('fixed_configuration' if category == 'fixed_composite' else
                               'agy_catalog_slug_suffix' if variant else
-                              'codex_client_cache_reasoning_levels' if efforts else 'unknown'),
+                              'dsh_builtin_model_contract' if prefix == 'dsh' and efforts else
+                              'codex_client_cache_reasoning_levels' if prefix == 'codex' and efforts else 'unknown'),
             'fixed_configuration': 'same_agent_planning_review_and_execution' if category == 'fixed_composite' else None,
             'capacity': _execution_budget(prefix, info, record),
             'catalog_source': info['model_catalog'].get('source'),
@@ -1672,15 +2093,15 @@ def _enforce_preflight_quota(backends, specs, retry_quota=False, *, batch=None, 
                                **_quota_user_choices(prefix, cooldown))
 
 
-def _local_fallback_engine(caller, engine, backends):
-    fallback = {'antigravity': 'agy:default', 'codex': 'codex:default'}.get(caller)
-    if not fallback:
-        return None
+def _local_fallback_engine(caller, engine, backends, prompt_text=''):
     cur_prefix, _ = _engine_parts(engine)
-    fb_prefix, _ = _engine_parts(fallback)
-    if cur_prefix == fb_prefix or not backends.get(fb_prefix, {}).get('available'):
-        return None
-    return fallback
+    negated = _extract_negated_backends(prompt_text)
+    local = {'antigravity': 'agy', 'codex': 'codex', 'claude': 'claude', 'dsh': 'dsh'}.get(resolve_caller(caller))
+    for candidate in dict.fromkeys((local, 'agy', 'codex', 'claude', 'dsh')):
+        if (candidate and candidate != cur_prefix and candidate not in negated
+                and _peer_auto_ready(backends, candidate) and not _active_quota_record(candidate, backends[candidate])):
+            return candidate + ':default'
+    return None
 
 
 def _quota_fallback_record(from_engine, to_engine, details):
@@ -1999,7 +2420,11 @@ def _parse_agy_error_line(line):
 
 
 def _check_output_status(parsed):
-    """只解释协议错误，不把工具读出的额度说明当作后端额度错误。"""
+    """只解释协议错误，不把工具读出的额度说明或中间工具调用异常当作后端终止错误。"""
+    if parsed.get('event', parsed.get('type')) in ('tool_call', 'tool_result'):
+        return
+    if parsed.get('type') == 'final' and not (isinstance(parsed.get('reason'), dict) and parsed['reason'].get('kind') == 'completed'):
+        raise HarnessError('后端返回未完成状态', 'failed', reason=parsed.get('reason'))
     finished_reason = str(parsed.get('finished_reason', '')).lower()
     if finished_reason == 'print_timeout':
         raise HarnessError('后端输出因超时截断', 'timeout', finished_reason=finished_reason)
@@ -2046,8 +2471,16 @@ def _decode_output_json(raw_text):
                 if re.match(r'^(?:\[agy\]\s+print timeout after\b|error:\s+print timeout after\b)', stripped, re.I):
                     saw_timeout_diag = True
                     continue
+                if stripped.startswith('[llm-'):
+                    continue
                 events.append(json.loads(stripped))
         except (ValueError, RecursionError) as decode_error:
+            fence = re.search(r'```(?:json)?\s*(\{[\s\S]*?\})\s*```', raw)
+            if fence:
+                try:
+                    return json.loads(fence.group(1))
+                except (ValueError, RecursionError):
+                    pass
             raise OutputParseError('子任务输出不是合法 JSON') from decode_error
         for agy_err in agy_errors:
             reason = str(agy_err.get('reason') or '').lower()
@@ -2066,7 +2499,7 @@ def _decode_output_json(raw_text):
             if not isinstance(event, dict):
                 raise OutputParseError('输出流事件必须为对象') from exc
             _check_output_status(event)
-            if event.get('event') == 'result':
+            if event.get('event') == 'result' or event.get('type') == 'final':
                 results.append(event)
         if len(results) != 1:
             raise OutputParseError('输出流必须包含一个最终 result 回执') from exc
@@ -2304,7 +2737,11 @@ def _quota_startup_only(stdout):
         if not isinstance(event, dict):
             return False
         kind = event.get('event', event.get('type'))
-        if kind in ('init', 'thread.started', 'turn.started', 'turn.failed', 'error'):
+        if kind in ('init', 'session', 'thread.started', 'turn.started', 'turn.failed', 'error'):
+            continue
+        if kind == 'status' and event.get('phase') in ('turn_start', 'step_start'):
+            continue
+        if kind == 'final' and not event.get('text'):
             continue
         if kind == 'system' and event.get('subtype') == 'init':
             continue
@@ -2380,8 +2817,10 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
     binary = info['binary']
     if prefix == 'agy' and not info.get('execution_config_supported', True):
         raise HarnessError('CAE_AGY_HOME 仅用于离线配置探测，执行请使用当前 CLI 的真实用户配置')
-    if Path(binary).suffix.lower() in ('.cmd', '.bat'):
-        raise HarnessError('请通过 CAE_CODEX_BINARY / CAE_AGY_BINARY 指定原生可执行文件')
+    if prefix in ('codex', 'agy', 'claude') and Path(binary).suffix.lower() in ('.cmd', '.bat'):
+        raise HarnessError('请通过 CAE_CODEX_BINARY / CAE_AGY_BINARY / CAE_CLAUDE_BINARY 指定原生可执行文件')
+    if prefix == 'claude' and info.get('llm_source') == 'local_router':
+        _verify_claude_router_card_key(info, model)
     interop = info.get('windows_interop', False)
     temp_parent = None
     if interop:
@@ -2398,6 +2837,12 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
         env['CAE_HARNESS_DEPTH'] = '1'
         if prefix == 'codex' and info.get('config_home') and not interop:
             env['CODEX_HOME'] = info['config_home']
+        if prefix == 'claude' and not interop and (os.environ.get('CAE_CLAUDE_HOME') or os.environ.get('CLAUDE_CONFIG_DIR')):
+            env['CLAUDE_CONFIG_DIR'] = info['config_home']
+        if prefix == 'dsh':
+            env['DSH_TELEMETRY_DISABLED'] = '1'
+            if info.get('config_home') and not interop:
+                env['DSH_HOME'] = info['config_home']
         native_pid_file = None
         exec_dir = target_dir
         stage_dir = None
@@ -2406,8 +2851,8 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
         win_target = translate(target_dir)
         if interop and win_target.startswith('\\\\'):
             if not readonly:
-                cli_label = 'codex.exe' if prefix == 'codex' else 'agy.exe'
-                native_hint = '安装原生 codex' if prefix == 'codex' else '登录原生 agy'
+                cli_label = Path(binary).name
+                native_hint = f'安装并登录原生 {prefix}'
                 raise HarnessError(f'WSL 纯 Linux 文件系统路径无法在 Windows {cli_label} 沙箱内直接写入；请在 WSL {native_hint}，或在 /mnt/<盘符> 工作区执行写入任务')
             stage_dir = _stage_wsl_readonly_workspace(target_dir, temp_path, stage_files)
             exec_dir = stage_dir
@@ -2426,7 +2871,7 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
                 command.extend(['-c', f'model_context_window={context_window}'])
             command.append('-')
             input_text = exec_prompt
-        else:
+        elif prefix == 'agy':
             command = [binary, '--input-format', 'stream-json', '--output-format', 'stream-json',
                        '--print-timeout', f'{timeout_sec}s', '--json-schema', translate(schema_file),
                        '--disable-slash-commands', '--sandbox']
@@ -2439,11 +2884,42 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
             else:
                 command.extend(['--mode', 'accept-edits', '--dangerously-skip-permissions'])
             input_text = json.dumps({'event': 'user', 'message': {'content': exec_prompt}}, ensure_ascii=False) + '\n'
+        elif prefix == 'claude':
+            command = [binary, '-p', '--output-format', 'json', '--json-schema', json.dumps(schema, ensure_ascii=False),
+                       '--no-session-persistence']
+            if model:
+                command.extend(['--model', model])
+            if effort in ('low', 'medium', 'high', 'xhigh', 'max'):
+                command.extend(['--effort', effort])
+            if readonly:
+                command.extend(['--tools', 'Read,Grep,Glob', '--permission-prompts', 'none'])
+            else:
+                command.extend(['--permission-mode', 'bypassPermissions', '--tools', 'Read,Grep,Glob,Edit,Write,Bash'])
+            input_text = exec_prompt
+        else:
+            patch_file = temp_path / 'dsh-headless.patch.yml'
+            provider = 'deepseek-official' if info.get('dsh_provider') == 'deepseek-official' else 'deepseek-account'
+            patch_file.write_text(
+                '- id: credentials\n  disabled: false\n- id: authorization\n  disabled: false\n'
+                '- id: deepseek-account\n  disabled: false\n- id: agent-default-model\n'
+                "  name: '@deepseek-ai/dsh-agent-default-model'\n  config:\n"
+                f'    provider: {provider}\n    model: {json.dumps(model or "deepseek-v4-pro")}\n'
+                f'    reasoningEffort: {effort or "high"}\n', encoding='utf-8')
+            command = [binary, '--profile', 'headless', '--patch', translate(patch_file), '--json', '--permission-mode',
+                       'read-only' if readonly else 'workspace-write', '--approval-policy', 'never', '-']
+            exec_prompt = f'{exec_prompt}\n\n请仅输出一个严格符合以下 JSON Schema 的 JSON 对象，不要输出任何额外解释：\n{json.dumps(schema, ensure_ascii=False)}'
+            input_text = exec_prompt
         receipt.update(argv=list(command), work_dir=str(exec_dir), staged_readonly_workspace=stage_dir is not None,
                        command_transport='windows_interop' if interop else 'native')
         if interop:
+            extra_env = {}
+            if prefix == 'claude':
+                extra_env['CLAUDE_CONFIG_DIR'] = _wsl_path(Path(info['config_home']))
+            elif prefix == 'dsh':
+                extra_env = {'DSH_HOME': _wsl_path(Path(info['config_home'])), 'DSH_TELEMETRY_DISABLED': '1'}
             command, native_pid_file = _interop_command(command, exec_dir, temp_path, input_text,
-                                                        info.get('config_home') if prefix == 'codex' else None)
+                                                        info.get('config_home') if prefix == 'codex' else None,
+                                                        extra_env=extra_env)
             input_text = None
         # Queued units must recheck after staging. A success already in flight
         # cannot clear a failure recorded by another unit in this same batch.
@@ -2505,6 +2981,12 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
                                    **_quota_user_choices(prefix, cooldown)) from exc
             raise
         _mark_quota_success(prefix, info, batch)
+        if prefix == 'claude':
+            envelope = _decode_output_json(raw)
+            model_usage = envelope.get('modelUsage') if isinstance(envelope, dict) else None
+            if isinstance(model_usage, dict) and model_usage:
+                receipt['actual_model'] = next(iter(model_usage))
+                receipt['actual_model_source'] = 'claude_result_model_usage'
         if prefix == 'agy':
             for line in (result.stdout or '').splitlines():
                 try:
@@ -2755,20 +3237,25 @@ def _budget_for_spec(backends, spec):
     return resolve_execution_profile(backends, spec, kind='audit')['capacity']['input_budget_tokens']
 
 
-def _audit_engines(backends, dual_blind, left_override, right_override, allow_unconfigured, caller):
-    if not left_override and caller == 'caller':
-        available = [name for name in ('codex', 'agy') if backends.get(name, {}).get('available')]
+def _audit_engines(backends, dual_blind, left_override, right_override, allow_unconfigured, caller, prompt_text=''):
+    negated = _extract_negated_backends(prompt_text)
+    if not left_override and caller == 'caller' and not _extract_prompt_backend_hint(prompt_text):
+        available = [name for name in ('codex', 'agy', 'claude', 'dsh') if name not in negated and _peer_auto_ready(backends, name)]
         if not available:
             if allow_unconfigured:
                 return None, None
-            raise HarnessError('未发现 agy 或 codex 后端')
+            raise HarnessError('未发现已就绪的 agy、codex、claude 或 dsh 后端')
         left_override = available[0] + ':default'
-    left = choose_engine(backends, caller, left_override)
+    left = choose_engine(backends, caller, left_override, prompt_text)
     right = None
     if dual_blind:
         name, _ = _engine_parts(left)
-        right = right_override or ('agy:default' if name == 'codex' else 'codex:default')
-        choose_engine(backends, caller, right)
+        candidates = [peer for peer in ('agy', 'codex', 'claude', 'dsh') if peer != name and peer not in negated]
+        if not right_override and not candidates:
+            raise HarnessError('提示词已排除其余候选后端，无法组建双路审查')
+        other = next((peer for peer in candidates if _peer_auto_ready(backends, peer)),
+                     candidates[0] if candidates else ('agy' if name == 'codex' else 'codex'))
+        right = choose_engine(backends, caller, right_override or other + ':default')
         if left == right:
             raise HarnessError('双路审查需要两个不同引擎或显式模型')
     return left, right
@@ -2781,12 +3268,12 @@ def select_audit_plan(total_tokens, file_records, backends, strategy='auto', dua
     if strategy == 'whole-1m':
         strategy = 'single-pass'
     left, right = engines if engines is not None else _audit_engines(
-        backends, dual_blind, left_override, right_override, allow_unconfigured, caller)
+        backends, dual_blind, left_override, right_override, allow_unconfigured, caller, focus)
     if not left:
         return {'mode': 'unconfigured', 'caller': caller, 'handoff_to_caller': True,
                 'total_files': len(file_records), 'total_estimated_tokens': total_tokens,
                 'left_engine': None, 'right_engine': None, 'left_units': [], 'right_units': [],
-                'skipped_files': [], 'execution_profiles': {}, 'notice': '未发现 agy 或 codex，当前只提供未就绪计划。'}
+                'skipped_files': [], 'execution_profiles': {}, 'notice': '未发现已就绪的四端后端，当前只提供未就绪计划。'}
     if profiles is None:
         tier, _ = select_task_tier(kind='audit', text=focus)
         paths = [record['rel_path'] for record in file_records]
@@ -2994,7 +3481,8 @@ def run_physics_gate_loop(target_dir, task_desc, verify_cmd, worker_fn, verify_f
 
 
 def _args_backends(args):
-    return probe_backends(args.codex_input_budget, args.agy_input_budget, getattr(args, 'discover_models', False))
+    return probe_backends(args.codex_input_budget, args.agy_input_budget, getattr(args, 'discover_models', False),
+                          claude_input_budget=args.claude_input_budget, dsh_input_budget=args.dsh_input_budget)
 
 
 def _target(args):
@@ -3036,6 +3524,19 @@ def _prepare_execution(backends, specs, batch, *, dry_run=False):
         return
     # Check all selected sides before sending even a model-listing request.
     _enforce_preflight_quota(backends, specs, batch=batch)
+    for spec in specs:
+        if not spec:
+            continue
+        prefix, model = _engine_parts(spec)
+        try:
+            if prefix == 'claude':
+                _verify_claude_llm_ready(backends[prefix], model, batch)
+            elif prefix == 'dsh':
+                _verify_dsh_llm_ready(backends[prefix])
+        except HarnessError as exc:
+            exc.details.setdefault('requested_engine', spec)
+            exc.details.setdefault('execution_environment', _execution_environment(backends[prefix]))
+            raise
     codex_spec = next((spec for spec in specs if spec and _engine_parts(spec)[0] == 'codex'), None)
     if codex_spec and not _current_catalog(backends['codex']):
         try:
@@ -3137,7 +3638,7 @@ def _run_gate_with_fallback(args, root, requested_target, text, caller, engine, 
     if (result.get('status') != 'quota_exhausted' or not getattr(args, 'fallback_on_quota', False)
             or 'quota_fallback' in meta or not _gate_can_replay(result, before, root)):
         return result
-    fallback = _local_fallback_engine(caller, engine, backends)
+    fallback = _local_fallback_engine(caller, engine, backends, text)
     if not fallback:
         return result
     meta['quota_fallback'] = _quota_fallback_record(engine, fallback, result)
@@ -3171,9 +3672,10 @@ def cmd_probe(args):
 
 def cmd_assess(args):
     backends = probe_backends(args.codex_input_budget, args.agy_input_budget, args.discover_models,
-                              refresh_model_cache=False)
+                              refresh_model_cache=False, claude_input_budget=args.claude_input_budget,
+                              dsh_input_budget=args.dsh_input_budget)
     caller = resolve_caller(args.caller)
-    local_backend = {'codex': 'codex', 'antigravity': 'agy'}.get(caller)
+    local_backend = {'codex': 'codex', 'antigravity': 'agy', 'claude': 'claude', 'dsh': 'dsh'}.get(caller)
     scenarios = {kind: (kind, '') for kind in ('review', 'direction', 'polish', 'math', 'code', 'audit', 'gate')}
     scenarios['surface_review'] = ('review', '检查注释拼写')
     scenarios['economy_review'] = ('review', '省额度做常规代码审查')
@@ -3186,11 +3688,13 @@ def cmd_assess(args):
         info['capability_matrix'] = _capability_matrix(name, info)
         info['model_metadata_sources'] = {
             'context': 'codex_client_cache_context_fields' if name == 'codex' and any(
-                model.get('context_window') or model.get('max_context_window') for model in info['models']) else None,
+                model.get('context_window') or model.get('max_context_window') for model in info['models']) else
+                'dsh_builtin_model_contract' if name == 'dsh' else None,
             'effort': ('codex_client_cache_reasoning_levels' if name == 'codex' and any(
                 model.get('supported_efforts') for model in info['models']) else
                 'agy_catalog_slug_suffix' if name == 'agy' and any(
-                    _agy_slug_tier(model['slug'])[1] for model in info['models']) else None),
+                    _agy_slug_tier(model['slug'])[1] for model in info['models']) else
+                'dsh_builtin_model_contract' if name == 'dsh' else None),
             'runtime_verified': False,
         }
         recommendations[name] = {}
@@ -3215,7 +3719,7 @@ def cmd_audit(args):
     if not records:
         raise HarnessError('目标范围没有可审查文件', skipped_files=skipped)
     total_tokens = sum(item['tokens'] for item in records)
-    engines = _audit_engines(backends, not args.single, args.left, args.right, args.dry_run, caller)
+    engines = _audit_engines(backends, not args.single, args.left, args.right, args.dry_run, caller, args.focus)
     tier, tier_reason = select_task_tier(args.tier, 'audit', args.focus, len(records), total_tokens)
     meta = {'caller': caller, 'handoff_to_caller': True, 'requested_tier': args.tier,
             'selected_tier': tier, 'tier_reason': tier_reason, 'target': str(root)}
@@ -3225,7 +3729,7 @@ def cmd_audit(args):
         _prepare_execution(backends, engines, batch, dry_run=args.dry_run)
     except HarnessError as exc:
         q_backend = exc.details.get('quota_backend') or ''
-        fb_engine = _local_fallback_engine(caller, f'{q_backend}:default', backends) if (
+        fb_engine = _local_fallback_engine(caller, f'{q_backend}:default', backends, args.focus) if (
             exc.status == 'quota_exhausted' and q_backend and getattr(args, 'fallback_on_quota', False)
             and _workspace_unchanged(fallback_before, root)
         ) else None
@@ -3344,7 +3848,7 @@ def cmd_gate(args):
     text = _task_text(args)
     backends = _args_backends(args)
     caller = resolve_caller(args.caller)
-    engine = choose_engine(backends, caller, args.worker)
+    engine = choose_engine(backends, caller, args.worker, text)
     scopes = _scope_patterns(args.write_scope)
     if requested_target.is_file() and not scopes:
         scopes = [requested_target.relative_to(root).as_posix()]
@@ -3358,7 +3862,7 @@ def cmd_gate(args):
     try:
         _prepare_execution(backends, (engine,), batch, dry_run=args.dry_run)
     except HarnessError as exc:
-        fb_engine = _local_fallback_engine(caller, engine, backends) if (
+        fb_engine = _local_fallback_engine(caller, engine, backends, text) if (
             exc.status == 'quota_exhausted' and getattr(args, 'fallback_on_quota', False)
             and _workspace_unchanged(fallback_before, root)
         ) else None
@@ -3396,7 +3900,7 @@ def cmd_task(args):
     text = _task_text(args)
     caller = resolve_caller(args.caller)
     backends = _args_backends(args)
-    engine = choose_engine(backends, caller, args.engine)
+    engine = choose_engine(backends, caller, args.engine, text)
     scopes = _scope_patterns(args.write_scope)
     readonly = args.kind != 'code'
     if readonly and (scopes or args.verify_cmd):
@@ -3422,7 +3926,7 @@ def cmd_task(args):
     try:
         _prepare_execution(backends, (engine,), batch, dry_run=args.dry_run)
     except HarnessError as exc:
-        fb_engine = _local_fallback_engine(caller, engine, backends) if (
+        fb_engine = _local_fallback_engine(caller, engine, backends, text) if (
             exc.status == 'quota_exhausted' and getattr(args, 'fallback_on_quota', False)
             and _workspace_unchanged(fallback_before, root)
         ) else None
@@ -3470,7 +3974,7 @@ def cmd_task(args):
                                    readonly, args.timeout, 'readonly-collaborator', stage_files, profile['cli_effort'], args.retry_quota,
                                    profile=profile, batch=batch, receipt=invocation)
         except HarnessError as exc:
-            fb_engine = _local_fallback_engine(caller, engine, backends) if (
+            fb_engine = _local_fallback_engine(caller, engine, backends, text) if (
                 getattr(exc, 'status', None) == 'quota_exhausted'
                 and getattr(args, 'fallback_on_quota', False)
                 and 'quota_fallback' not in payload
@@ -3517,7 +4021,7 @@ def _positive_arg(raw):
 
 
 def build_arg_parser():
-    parser = argparse.ArgumentParser(description='Codex / Antigravity 双向任务与审计编排')
+    parser = argparse.ArgumentParser(description='Antigravity / Codex / Claude Code / DeepSeek Harness 对等任务与审计编排')
     sub = parser.add_subparsers(dest='subcommand', required=True)
     probe = sub.add_parser('probe', help='只读探测程序与配置，认证和执行能力分别验证')
     probe.add_argument('--discover-models', action='store_true', help='显式执行 agy models 查询并刷新本地模型目录缓存')
@@ -3528,17 +4032,17 @@ def build_arg_parser():
     audit.add_argument('--focus', default='')
     audit.add_argument('--strategy', choices=['auto', 'single-pass', 'whole-1m', 'sharded'], default='auto')
     audit.add_argument('--single', action='store_true')
-    audit.add_argument('--left', default='', help='左路引擎与模型规格（如 codex:default、agy:default，支持精确 slug、显示名或模糊别名如 agy:carbon）')
-    audit.add_argument('--right', default='', help='右路引擎与模型规格（如 agy:default、codex:default，支持精确 slug、显示名或模糊别名）')
+    audit.add_argument('--left', default='', help='左路引擎与模型规格（agy、codex、claude/cc、dsh；支持精确 slug、显示名或模糊模型别名）')
+    audit.add_argument('--right', default='', help='右路引擎与模型规格（agy、codex、claude/cc、dsh；支持精确 slug、显示名或模糊模型别名）')
     audit.add_argument('--shard-tokens', type=_positive_arg, default=120_000)
     gate = sub.add_parser('gate', help='修改后运行明确验收命令')
     gate.add_argument('--target', required=True)
-    gate.add_argument('--worker', default='', help='执行引擎与模型规格（如 codex:default、agy:default，支持精确 slug、显示名或模糊别名）')
+    gate.add_argument('--worker', default='', help='执行引擎与模型规格（agy、codex、claude/cc、dsh；支持精确 slug、显示名或模糊模型别名）')
     gate.add_argument('--verify-cmd', required=True)
     task = sub.add_parser('task', help='通用审查、方向、润色、数学和代码任务')
     task.add_argument('--target', required=True)
     task.add_argument('--kind', required=True, choices=['review', 'direction', 'polish', 'math', 'code'])
-    task.add_argument('--engine', default='', help='后端与模型规格（如 codex:default、agy:default，支持精确 slug、显示名或模糊别名如 agy:carbon）')
+    task.add_argument('--engine', default='', help='后端与模型规格（agy、codex、claude/cc、dsh；支持精确 slug、显示名或模糊模型别名）')
     task.add_argument('--base-commit')
     task.add_argument('--verify-cmd')
     for command in (gate, task):
@@ -3548,16 +4052,18 @@ def build_arg_parser():
         command.add_argument('--write-scope', action='append', default=[])
         command.add_argument('--max-rounds', type=_positive_arg, default=3)
     for command in (probe, assess, audit, gate, task):
-        command.add_argument('--caller', choices=['auto', 'codex', 'antigravity'], default='auto')
+        command.add_argument('--caller', choices=['auto', 'codex', 'antigravity', 'claude', 'cc', 'dsh'], default='auto')
         command.add_argument('--codex-input-budget', type=_positive_arg)
         command.add_argument('--agy-input-budget', type=_positive_arg)
+        command.add_argument('--claude-input-budget', type=_positive_arg)
+        command.add_argument('--dsh-input-budget', type=_positive_arg)
     for command in (audit, gate, task):
         command.add_argument('--tier', choices=list(TIER_CHOICES), default='auto',
                              help='挡位策略：auto 默认启用旗舰专长模型与单模型最高挡 max（短润色用 medium、长润色用 high）；仅当用户显式或模糊要求降挡／省 token 时切换分级自适应（常规 high、表面检查轻量模型 + low）')
         command.add_argument('--retry-quota', action='store_true',
                              help='用户确认已充值或额度恢复后，忽略本地额度冷却记录重试发起')
         command.add_argument('--fallback-on-quota', action='store_true',
-                             help='跨端目标触发额度熔断且未修改工作区时，自动切回发起方本侧合适的模型与挡位执行')
+                              help='目标触发额度熔断且未修改工作区时，优先回退发起方，再选择其他已就绪且未冷却的端')
         command.add_argument('--timeout', type=_positive_arg, default=600)
         command.add_argument('--dry-run', action='store_true')
     return parser

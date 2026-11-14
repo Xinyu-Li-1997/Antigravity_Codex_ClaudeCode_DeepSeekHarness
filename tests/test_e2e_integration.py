@@ -145,6 +145,9 @@ def _create_directory_link(link: Path, target: Path) -> None:
 
 
 def _system_temp_is_usable() -> bool:
+    # 仓库内临时目录需要复制安装器源码，避免安装目标与源码重叠。
+    if REPO_ROOT == Path(tempfile.gettempdir()).resolve() or REPO_ROOT in Path(tempfile.gettempdir()).resolve().parents:
+        return False
     try:
         with tempfile.TemporaryDirectory(prefix="user-guard-probe-") as tmp:
             probe = Path(tmp) / "probe.tmp"
@@ -218,6 +221,11 @@ class TestEndToEndIntegration(unittest.TestCase):
         self.assertEqual(plugin_json.get("name"), "user-guard")
         self.assertEqual(plugin_json.get("$schema"), "https://antigravity.google/schemas/v1/plugin.json")
         self.assertEqual(plugin_json.get("license"), "Apache-2.0")
+        notice = REPO_ROOT / "NOTICE"
+        self.assertTrue(notice.is_file())
+        notice_text = notice.read_text(encoding="utf-8")
+        self.assertIn("Antigravity_Codex_ClaudeCode_DeepSeekHarness", notice_text)
+        self.assertIn("Xinyu Li (Xinyu-Li-1997)", notice_text)
         self.assertEqual(plugin_json.get("logo"), "assets/logo.svg")
         self.assertTrue((ACTIVE_PLUGIN_DIR / "assets" / "logo.svg").is_file(), "plugin.json 声明的 logo.svg 必须存在")
         self.assertTrue(set(plugin_json.keys()).issubset(allowed_keys), "plugin.json 不可包含未定义顶层字段")
@@ -348,7 +356,7 @@ class TestEndToEndIntegration(unittest.TestCase):
             "/home/alice/work", "C:/Users/bob/work", "/home/charlie/work", "/Users/<user>/work",
             "CPU GPU Intel Core AMD Ryzen Threadripper Xeon EPYC NVIDIA RTX GTX",
             '"api_key": "<placeholder>"', "refresh_token = None", "user@example.com",
-            "https://github.com/Xinyu-Li-1997/Antigravity_Codex_configuration", "Apache License 2.0",
+            "https://github.com/Xinyu-Li-1997/Antigravity_Codex_ClaudeCode_DeepSeekHarness", "Apache License 2.0",
             HARDCODED_HOME_PATTERNS[0].pattern, HARDCODED_HOME_PATTERNS[1].pattern,
         ):
             with self.subTest(text=text):
@@ -406,6 +414,25 @@ class TestEndToEndIntegration(unittest.TestCase):
                         proc = subprocess.run([sys.executable, "-B", "-X", "utf8", str(script), "--help"], env=env, capture_output=True, text=True, encoding="utf-8", timeout=15)
                         self.assertEqual(proc.returncode, 0, proc.stderr)
                         self.assertIn("assess", proc.stdout)
+
+    def test_dsh_installer_guard_cli_checks_all_peer_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            env = {**os.environ, 'CAE_HARNESS_DEPTH': '1', 'PLUGIN_DATA': str(root / 'guard-data')}
+            for flags, expected in (
+                ('--app dsh --dsh-home inside/dsh', 'allow'),
+                ('--app dsh', 'deny'),
+                ('--app all --target-dir inside/agy --codex-home inside/codex --claude-home inside/claude --dsh-home /outside/dsh', 'deny'),
+            ):
+                with self.subTest(flags=flags):
+                    payload = {'conversationId': 'dsh-cli-guard', 'cwd': str(root), 'workspacePaths': [str(root)],
+                               'toolCall': {'name': 'run_command', 'args': {'CommandLine':
+                                   'python -B install.py ' + flags + ' --no-zotero --skip-test'}}}
+                    result = subprocess.run([sys.executable, '-B', '-X', 'utf8', str(ACTIVE_PLUGIN_DIR / 'hooks/status_guard.py')],
+                                            cwd=root, env=env, input=json.dumps(payload), capture_output=True,
+                                            text=True, encoding='utf-8', timeout=15)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(json.loads(result.stdout)['decision'], expected)
 
     def test_03_full_cli_subprocess_utf8_pipeline(self) -> None:
         """通过真实操作系统子进程管道运行全部 4 个生命周期事件，验证 UTF-8 稳定性与协同契约"""
@@ -986,7 +1013,7 @@ class TestEndToEndIntegration(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()):
                 INSTALLER._sync_codex_global_rules(tpl_rules, codex_dir, dry_run=False)
             synced = codex_agents.read_text(encoding="utf-8")
-            self.assertIn("R3.1. 并行子代理与双向协作编排", synced)
+            self.assertIn("R3.1. 四端对等层级与按专长协作编排", synced)
             self.assertIn("R3.6. 验收红线与诚实披露", synced)
             self.assertTrue(synced.endswith("\n\n" + custom_env_tail + "\n"))
             self.assertNotIn("## 工具与运行环境", synced)

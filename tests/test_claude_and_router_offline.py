@@ -1214,11 +1214,166 @@ class TestClaudeInstallerAndUpgradeAudit(OfflineSandbox):
         self.prompts(host_db)
         before = host_db.read_bytes(), host_db.stat().st_mtime_ns
         args = ["--app", "claude", "--claude-home", self.claude_home, "--disable-ccswitch-prompts",
-                "--no-claude-hooks", "--no-claude-rules", "--no-claude-agents", "--no-model-config"]
+                "--no-claude-hooks", "--no-claude-rules", "--no-claude-agents", "--no-claude-skill", "--no-model-config"]
         self.install(*args)
         self.assertEqual((host_db.read_bytes(), host_db.stat().st_mtime_ns), before)
         self.assertFalse(self.claude_home.exists())
         self.assertEqual(list(host_db.parent.iterdir()), [host_db])
+
+    def test_dsh_standalone_rules_tail_skill_sync_and_readonly_drift_audit(self):
+        dsh = self.root / 'target/dsh'
+        dsh.mkdir(parents=True)
+        tail = '## 工具与本机\n保留用户自定义工具。\n'
+        rules = dsh / 'AGENTS.md'
+        rules.write_text('旧规则\n\n' + tail, encoding='utf-8')
+        cordis = dsh / 'cordis.patch.yml'
+        cordis.write_text('# user config must survive\n', encoding='utf-8')
+        credentials = dsh / '.credentials.yaml'
+        credentials.write_text('deepseek-official:\n  DEEPSEEK_API_KEY: fixture-secret\n', encoding='utf-8')
+        dotenv = dsh / '.env'
+        dotenv.write_text('DEEPSEEK_API_KEY=fixture-dotenv-secret\n', encoding='utf-8')
+        protected = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in (cordis, credentials, dotenv)}
+        args = ['--app', 'dsh', '--dsh-home', dsh]
+        before = self.snapshot()
+        self.install(*args, '--dry-run')
+        self.assertEqual(self.snapshot(), before)
+        self.install(*args)
+        self.assertTrue(rules.read_text(encoding='utf-8').endswith(tail))
+        script = dsh / 'skills/cae-harness/scripts/cae_harness.py'
+        self.assertEqual(script.read_bytes(), (REPO_ROOT / 'template/user-guard/skills/cae-harness/scripts/cae_harness.py').read_bytes())
+        self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in protected}, protected)
+        self.assertFalse((dsh / 'settings.json').exists())
+        self.assertFalse((dsh / 'hooks').exists())
+        self.assertFalse(self.default_codex.exists())
+        self.assertFalse(self.claude_home.exists())
+
+        def audit():
+            return installer.audit_upgrade_status(REPO_ROOT, dsh_home=dsh, app_scope='dsh',
+                                                  detection={}, is_sandbox_run=True)
+
+        before = self.snapshot()
+        report = audit()
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(report['dsh']['drift_files'], [])
+        self.assertTrue(report['dsh']['credentials_present'])
+        self.assertTrue(report['summary']['all_aligned'])
+        self.assertEqual(report['summary']['recommended_actions'], [])
+        serialized = json.dumps(report)
+        for value in ('fixture-secret', 'fixture-dotenv-secret', str(dsh)):
+            self.assertNotIn(value, serialized)
+        script.write_text('# drift\n', encoding='utf-8')
+        rules.write_text('drift\n\n' + tail, encoding='utf-8')
+        report = audit()
+        self.assertEqual(set(report['dsh']['drift_files']), {'AGENTS.md', 'skills/cae-harness/scripts/cae_harness.py'})
+        self.assertEqual(report['summary']['recommended_actions'], ['sync_dsh'])
+        self.install(*args)
+        self.assertTrue(audit()['summary']['all_aligned'])
+        before = self.snapshot()
+        self.install(*args)
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in protected}, protected)
+
+    def test_dsh_opt_outs_invalid_combinations_and_four_directory_all_install(self):
+        dsh = self.root / 'target/dsh'
+        self.install('--app', 'dsh', '--dsh-home', dsh, '--no-dsh-rules', '--no-dsh-skill')
+        self.assertFalse(dsh.exists())
+        for mode in ('codex', 'antigravity', 'claude', 'both'):
+            with self.subTest(mode=mode):
+                before = self.snapshot()
+                self.install('--app', mode, '--dsh-home', dsh, code=2)
+                self.assertEqual(self.snapshot(), before)
+        for flag, target in (('--target-dir', self.plugin), ('--codex-home', self.codex), ('--claude-home', self.claude_home)):
+            with self.subTest(flag=flag):
+                self.install('--app', 'dsh', '--dsh-home', dsh, flag, target, code=2)
+        self.install(*self.all_args())
+        self.assertFalse((self.home / '.dsh').exists())
+        self.assertTrue((self.claude_home / 'skills/cae-harness/SKILL.md').is_file())
+        self.install(*self.all_args(), '--dsh-home', dsh)
+        self.assertTrue((dsh / 'AGENTS.md').is_file())
+        self.assertTrue((dsh / 'skills/cae-harness/SKILL.md').is_file())
+        self.assertFalse((dsh / 'cordis.patch.yml').exists())
+        self.assertFalse((dsh / '.credentials.yaml').exists())
+        before = self.snapshot()
+        self.install(*self.all_args(), '--dsh-home', self.codex / 'nested', code=2)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_dsh_auto_planning_handles_standalone_explicit_and_detected_peers(self):
+        dsh = self.home / '.dsh'
+        detection = {name: {'native_installed': name == 'dsh', 'interop_available': False, 'interop_status': 'not_detected'}
+                     for name in ('antigravity', 'codex', 'claude', 'dsh')}
+
+        def run_main(tokens, detected):
+            with mock.patch.object(installer, '__file__', str(self.source / 'install.py')), \
+                 mock.patch.object(installer, 'detect_installed_apps', return_value=detected), \
+                 mock.patch.object(installer, 'detect_hook_python_command', return_value=f'"{sys.executable}" -X utf8 -I -B'), \
+                 mock.patch.object(installer, 'detect_zotero_mcp_executable', return_value=None), \
+                 mock.patch.object(sys, 'argv', ['install.py', *tokens, '--yes', '--skip-test', '--no-zotero']), \
+                 redirect_stdout(io.StringIO()):
+                installer.main()
+
+        run_main(['--app', 'auto'], detection)
+        self.assertTrue((dsh / 'AGENTS.md').is_file())
+        self.assertFalse(self.claude_home.exists())
+        self.assertFalse(self.default_codex.exists())
+        explicit = self.root / 'explicit-dsh'
+        run_main(['--app', 'auto', '--dsh-home', str(explicit)], {})
+        self.assertTrue((explicit / 'skills/cae-harness/SKILL.md').is_file())
+        detection['claude']['native_installed'] = True
+        run_main(['--app', 'auto'], detection)
+        self.assertTrue((self.claude_home / 'CLAUDE.md').is_file())
+        self.assertTrue((self.claude_home / 'skills/cae-harness/SKILL.md').is_file())
+        (dsh / 'AGENTS.md').write_text('stale\n', encoding='utf-8')
+        run_main(['--app', 'all'], detection)
+        self.assertEqual(installer._rules_core((dsh / 'AGENTS.md').read_bytes()),
+                         installer._rules_core((REPO_ROOT / 'template/user-guard/rules/AGENTS.md').read_bytes()))
+
+    def test_audit_reports_harness_drift_on_each_installed_peer(self):
+        dsh = self.root / 'target/dsh'
+        self.install(*self.all_args(), '--dsh-home', dsh)
+        paths = {'antigravity': self.plugin / 'skills/cae-harness/scripts/cae_harness.py',
+                 'codex': self.codex / 'skills/cae-harness/scripts/cae_harness.py',
+                 'claude': self.claude_home / 'skills/cae-harness/scripts/cae_harness.py',
+                 'dsh': dsh / 'skills/cae-harness/scripts/cae_harness.py'}
+        for path in paths.values():
+            path.write_text('# drift\n', encoding='utf-8')
+        report = installer.audit_upgrade_status(REPO_ROOT, self.plugin, self.codex, self.claude_home,
+                                               self.root / 'missing.db', detection={}, is_sandbox_run=True,
+                                               app_scope='all', dsh_home=dsh)
+        for name in paths:
+            self.assertIn('skills/cae-harness/scripts/cae_harness.py', report[name]['drift_files'])
+        self.assertIn('sync_dsh', report['summary']['recommended_actions'])
+
+    def test_symmetric_root_overlap_and_missing_skill_drift_detection(self):
+        dsh = self.root / 'target/dsh'
+        self.install(*self.all_args(), '--dsh-home', dsh)
+        shutil.rmtree(self.codex / 'skills/cae-harness')
+        shutil.rmtree(self.claude_home / 'skills/cae-harness')
+        report = installer.audit_upgrade_status(REPO_ROOT, self.plugin, self.codex, self.claude_home,
+                                               self.root / 'missing.db', detection={}, is_sandbox_run=True,
+                                               app_scope='all', dsh_home=dsh)
+        self.assertIn('skills/cae-harness/scripts/cae_harness.py', report['codex']['drift_files'])
+        self.assertIn('skills/cae-harness/scripts/cae_harness.py', report['claude']['drift_files'])
+        nested_dsh = self.home / '.codex/skills/cae-harness/dsh-sub'
+        with mock.patch.dict(os.environ, {'DSH_HOME': str(nested_dsh)}), \
+             mock.patch.object(installer.Path, 'home', return_value=self.home):
+            self.install('--app', 'codex', code=2)
+
+    def test_dsh_detection_and_protected_global_skill_roots(self):
+        with mock.patch.object(installer.Path, 'home', return_value=self.home), \
+             mock.patch.object(installer, '_native_cli', side_effect=lambda name, home: 'fixture-dsh' if name == 'dsh' else None), \
+             mock.patch.object(installer, '_windows_app_binaries', return_value=(None, None)), \
+             mock.patch.object(installer, '_find_windows_codex_package', return_value=(None, None)), \
+             mock.patch.object(installer, '_first_executable', return_value=None), \
+             mock.patch.object(installer, '_probe_windows_wsl', return_value={'apps': {}, 'status': 'checked'}), \
+             mock.patch.object(installer, '_is_wsl', return_value=False), \
+             mock.patch.object(installer, 'detect_zotero_mcp_executable', return_value=None):
+            report = installer.detect_installed_apps()
+            self.assertTrue(report['dsh']['native_installed'])
+            self.assertEqual(report['recommended_app_mode'], 'dsh')
+            self.assertTrue(report['single_app_only_on_host'])
+            for relative in ('.claude', '.claude/skills', '.dsh', '.dsh/skills'):
+                with self.subTest(relative=relative), self.assertRaises(ValueError):
+                    installer.validate_install_target(self.home / relative, self.source)
 
     def test_handoff_policy_persists_and_model_defaults_are_explicit(self):
         args = ["--app", "claude", "--claude-home", self.claude_home]

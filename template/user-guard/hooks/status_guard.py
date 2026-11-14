@@ -2119,7 +2119,7 @@ def _detect_command_external_mutation(
         ):
             return "创建项目外 Git 工作树 (git worktree add)", wt_path, _compact_snippet(m_wt.group(0))
 
-    # 2. 专项拦截: 执行生产级全局安装脚本 (默认改写 ~/.gemini/config、~/.codex、~/.claude 或 ~/.cc-switch)
+    # 2. 专项拦截: 执行生产级全局安装脚本 (默认改写四端全局配置或 ~/.cc-switch)
     for m_inst in _INSTALLER_INVOKE_RE.finditer(shell_masked):
         if _pos_inside_quotes(shell_masked, m_inst.start()):
             continue
@@ -2129,7 +2129,7 @@ def _detect_command_external_mutation(
         tail_args = m_inst.group(1) or ""
         arg_tokens = _safe_split_tokens(tail_args)
         value_flags = {
-            "--app", "--target-dir", "--codex-home", "--codex-skills-dir", "--claude-home",
+            "--app", "--target-dir", "--codex-home", "--codex-skills-dir", "--claude-home", "--dsh-home",
             "--ccswitch-db", "--zotero-cmd", "--codex-handoff-mode", "--codex-handoff-compactions",
             "--claude-handoff-mode", "--claude-handoff-compactions",
         }
@@ -2153,25 +2153,27 @@ def _detect_command_external_mutation(
         skills_dirs = options["--codex-skills-dir"]
         codex_homes = options["--codex-home"]
         claude_homes = options["--claude-home"]
+        dsh_homes = options["--dsh-home"]
         ccswitch_dbs = options["--ccswitch-db"]
         app = options["--app"][-1] if options["--app"] else "auto"
         complete = {
             "all": bool(target_dirs and (codex_homes or skills_dirs) and claude_homes),
-            "both": bool(target_dirs and (codex_homes or skills_dirs) and not claude_homes),
-            "antigravity": bool(target_dirs and not (codex_homes or skills_dirs or claude_homes)),
-            "codex": bool((codex_homes or skills_dirs) and not (target_dirs or claude_homes)),
-            "claude": bool(claude_homes and not (target_dirs or codex_homes or skills_dirs)),
-            "auto": bool(target_dirs or codex_homes or skills_dirs or claude_homes),
+            "both": bool(target_dirs and (codex_homes or skills_dirs) and not (claude_homes or dsh_homes)),
+            "antigravity": bool(target_dirs and not (codex_homes or skills_dirs or claude_homes or dsh_homes)),
+            "codex": bool((codex_homes or skills_dirs) and not (target_dirs or claude_homes or dsh_homes)),
+            "claude": bool(claude_homes and not (target_dirs or codex_homes or skills_dirs or dsh_homes)),
+            "dsh": bool(dsh_homes and not (target_dirs or codex_homes or skills_dirs or claude_homes)),
+            "auto": bool(target_dirs or codex_homes or skills_dirs or claude_homes or dsh_homes),
         }.get(app, False)
         if complete and "--no-zotero" in switches:
-            sandbox_targets = target_dirs + skills_dirs + codex_homes + claude_homes + ccswitch_dbs
+            sandbox_targets = target_dirs + skills_dirs + codex_homes + claude_homes + dsh_homes + ccswitch_dbs
             if all(value and _is_write_target_allowed(
                 value, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp, wsl_distribution
             ) for value in sandbox_targets):
                 continue
         return (
-            "执行全局配置同步安装 (将更新本机 ~/.gemini/config、~/.codex 与/或 ~/.claude)",
-            "~/.gemini/config/plugins/user-guard, ~/.codex, ~/.claude",
+            "执行全局配置同步安装 (将更新本机 ~/.gemini/config、~/.codex、~/.claude 与/或 ~/.dsh)",
+            "~/.gemini/config/plugins/user-guard, ~/.codex, ~/.claude, ~/.dsh",
             _compact_snippet(m_inst.group(0)),
         )
 

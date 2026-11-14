@@ -2,9 +2,9 @@
   "$schema": "https://antigravity.google/schemas/v1/plugin.json",
   "name": "user-guard",
   "displayName": "User Guard & Scientific Standards",
-  "version": "1.8.0",
-  "description": "Unified engineering and scientific workflow for Antigravity, Codex, Claude Code, and CC Switch with compaction recovery, boundary guards, read-only subagents, and upgrade regression auditing.",
+  "version": "1.9.0",
+  "description": "Unified engineering and scientific harness for Antigravity, Codex, Claude Code, and DeepSeek Harness with compaction recovery, boundary guards, read-only subagents, local routing, and cross-agent verification.",
   "license": "Apache-2.0",
   "logo": "assets/logo.svg",
-  "repository": "https://github.com/Xinyu-Li-1997/Antigravity_Codex_configuration"
+  "repository": "https://github.com/Xinyu-Li-1997/Antigravity_Codex_ClaudeCode_DeepSeekHarness"
 }
