@@ -2963,6 +2963,86 @@ else:
         ]
         self.assertEqual(harness.resolve_execution_profile(engines, 'codex:code', 'max', kind='code')['model'], 'gpt-6.1-sol')
 
+    def test_symmetric_dynamic_roles_workspace_mode_and_zero_blacklist_grounding(self):
+        # 1) 五个角色槽位与 <client>:@<role> 对称动态选路，且 role:orchestrator 读取 recommended_tier
+        engines = self.four_backends()
+        engines['agy']['models'] = [
+            {'slug': 'gemini-4-carbon-high', 'display_name': 'Gemini 4 Carbon (High)', 'supported_efforts': ['high']},
+            {'slug': 'gemini-4-hydrogen-low', 'display_name': 'Gemini 4 Hydrogen (Low)', 'supported_efforts': ['low']},
+        ]
+        engines['codex']['models'] = [
+            {'slug': 'gpt-6-astra', 'priority': 1, 'visibility': 'list', 'description': 'Deep reasoning model',
+             'supported_efforts': ['low', 'medium', 'high', 'max']},
+            {'slug': 'gpt-6.1-sol', 'priority': 2, 'visibility': 'list', 'description': 'Agentic coding model',
+             'supported_efforts': ['low', 'medium', 'high', 'max']},
+            {'slug': 'gpt-6-luna', 'priority': 3, 'visibility': 'list', 'description': 'Fast and affordable model',
+             'supported_efforts': ['low', 'medium', 'high']},
+        ]
+        tier_orch, reason_orch = harness.select_task_tier('auto', 'review', '梳理总体方案', engine='role:orchestrator')
+        self.assertEqual((tier_orch, reason_orch), ('high', 'role_profile_orchestrator_high'))
+        self.assertEqual(harness._resolve_role_engine(engines, 'codex', 'role:orchestrator'), 'agy:@orchestrator')
+        self.assertEqual(harness._resolve_role_engine(engines, 'antigravity', 'role:orchestrator'), 'codex:@orchestrator')
+        self.assertEqual(harness.resolve_execution_profile(engines, 'agy:@orchestrator', 'high')['model'], 'gemini-4-carbon-high')
+        self.assertEqual(harness.resolve_execution_profile(engines, 'agy:@fast', 'low')['model'], 'gemini-4-hydrogen-low')
+        self.assertEqual(harness.resolve_execution_profile(engines, 'codex:@fast', 'low')['model'], 'gpt-6-luna')
+        self.assertEqual(harness.resolve_execution_profile(engines, 'codex:@orchestrator', 'high')['model'], 'gpt-6.1-sol')
+
+        # 2) 工作区身份硬判别：上游配置仓库 vs 通用课题项目
+        repo_root = Path(__file__).resolve().parent.parent
+        up_mode = harness.detect_workspace_mode(repo_root)
+        self.assertEqual(up_mode['mode'], 'upstream_config_repo')
+        self.assertTrue(up_mode['is_upstream_config_repo'])
+        self.assertEqual(up_mode['upstream_only_capabilities'], [])
+
+        solver_dir = self.root / 'cfd_solver_project'
+        (solver_dir / 'src').mkdir(parents=True)
+        (solver_dir / 'src' / 'hllc_flux.py').write_text(
+            'import argparse\n'
+            'DEFAULT_MAX_STEPS = 5000\n'
+            'def compute_cfd_euler_flux():\n'
+            '    """二维可压缩流体有限体积通量分裂求解器"""\n'
+            '    p = argparse.ArgumentParser()\n'
+            '    p.add_argument("--cfl-limit", type=float, default=0.8)\n'
+            '    return DEFAULT_MAX_STEPS\n',
+            encoding='utf-8',
+        )
+        gen_mode = harness.detect_workspace_mode(solver_dir)
+        self.assertEqual(gen_mode['mode'], 'general_project')
+        self.assertFalse(gen_mode['is_upstream_config_repo'])
+        self.assertIn('fleet_evolve_full_hygiene_audit', gen_mode['upstream_only_capabilities'])
+
+        # 3) 零黑名单确定性事实锚定核验：干净文档通过，虚构缩写/虚构举例/失步数字/不存在参数全部被确定性拦截
+        readme = solver_dir / 'README.md'
+        readme.write_text(
+            '# 二维流体有限体积求解器\n\n'
+            '支持 `--cfl-limit` 参数调节，面向流体有限体积通量分裂计算。\n',
+            encoding='utf-8',
+        )
+        clean_rep = harness.audit_doc_grounding(solver_dir, solver_dir)
+        self.assertTrue(clean_rep['ok'], clean_rep)
+
+        readme.write_text(
+            '# 二维流体有限体积求解器\n\n'
+            '面向流体通量分裂、刀轨干涉检查与 NURBS 加工，支持 `--ghost-magic-flag` 且缓存上限为 777,777 token。\n',
+            encoding='utf-8',
+        )
+        rc_fail, strict_rep = self.capture(
+            harness.cmd_check_grounding,
+            self.args('check-grounding', '--target', str(solver_dir), '--root', str(solver_dir), '--strict'),
+        )
+        self.assertEqual(rc_fail, 2)
+        self.assertEqual(strict_rep['status'], 'verification_failed')
+        cats = set(strict_rep['counts_by_category'])
+        self.assertIn('ungrounded_acronym', cats)
+        self.assertIn('ungrounded_exemplar', cats)
+        self.assertIn('ungrounded_identifier', cats)
+        self.assertIn('ungrounded_number', cats)
+
+        # 4) 全仓真实文档与 SVG 通过零黑名单事实锚定核验
+        repo_rep = harness.audit_doc_grounding(repo_root, repo_root)
+        self.assertTrue(repo_rep['ok'], repo_rep['findings'])
+        self.assertEqual(repo_rep['finding_count'], 0)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

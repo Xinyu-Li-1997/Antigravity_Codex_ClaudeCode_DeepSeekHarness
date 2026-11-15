@@ -34,7 +34,7 @@ import user_words  # noqa: E402
 
 user_words.ensure_utf8_stdio()
 
-# 阶段预算默认值
+# 阶段预算默认值（支持由 fleet_profile.json runtime_tunables.handoff_thresholds 动态同步，并兼容单测属性覆盖）
 DEFAULT_DRAIN_INVOCATIONS = 4
 DEFAULT_DRAIN_ACTIONS = 8
 
@@ -68,6 +68,7 @@ BANNER_PLAUSIBLE_IMAGE_BYTES = 30 * 1024 * 1024
 OVERRIDE_SNOOZE_CPS = 3
 OVERRIDE_SNOOZE_STEPS = 120
 MAX_TRACKED_IMAGES = 2000
+_CLAUDE_DRAIN_ACTIONS = 4
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
 
@@ -188,11 +189,97 @@ CODEX_READ_TOOLS = {
 }
 CODEX_DELEGATION_TOOLS = {"spawn_agent", "agent", "followup_task", "send_message", "create_thread"}
 
+_HANDOFF_BUILTINS: Dict[str, Any] = {
+    "DEFAULT_DRAIN_INVOCATIONS": DEFAULT_DRAIN_INVOCATIONS,
+    "DEFAULT_DRAIN_ACTIONS": DEFAULT_DRAIN_ACTIONS,
+    "ADVISORY_CP_THRESHOLD": ADVISORY_CP_THRESHOLD,
+    "ADVISORY_TRANSCRIPT_BYTES": ADVISORY_TRANSCRIPT_BYTES,
+    "ADVISORY_THRASH_MIN_CP": ADVISORY_THRASH_MIN_CP,
+    "ADVISORY_THRASH_AVG_INTERVAL": ADVISORY_THRASH_AVG_INTERVAL,
+    "ADVISORY_MEDIA_STEPS": ADVISORY_MEDIA_STEPS,
+    "ADVISORY_IMAGE_CALLS": ADVISORY_IMAGE_CALLS,
+    "ADVISORY_IMAGE_BYTES": ADVISORY_IMAGE_BYTES,
+    "DRAIN_CP_THRESHOLD": DRAIN_CP_THRESHOLD,
+    "DRAIN_THRASH_MIN_CP": DRAIN_THRASH_MIN_CP,
+    "DRAIN_THRASH_AVG_INTERVAL": DRAIN_THRASH_AVG_INTERVAL,
+    "DRAIN_TRANSCRIPT_BYTES": DRAIN_TRANSCRIPT_BYTES,
+    "DRAIN_MEDIA_STEPS": DRAIN_MEDIA_STEPS,
+    "DRAIN_MEDIA_MIN_CP": DRAIN_MEDIA_MIN_CP,
+    "DRAIN_IMAGE_CALLS": DRAIN_IMAGE_CALLS,
+    "DRAIN_IMAGE_BYTES": DRAIN_IMAGE_BYTES,
+    "OVERRIDE_SNOOZE_CPS": OVERRIDE_SNOOZE_CPS,
+    "OVERRIDE_SNOOZE_STEPS": OVERRIDE_SNOOZE_STEPS,
+    "MAX_TRACKED_IMAGES": MAX_TRACKED_IMAGES,
+    "CODEX_DRAIN_ACTIONS": CODEX_DRAIN_ACTIONS,
+    "_CLAUDE_DRAIN_ACTIONS": _CLAUDE_DRAIN_ACTIONS,
+}
+_ACTIVE_HANDOFF_BASELINE: Dict[str, Any] = dict(_HANDOFF_BUILTINS)
+_LAST_HANDOFF_PROFILE_ID: Optional[int] = None
+
+
+def _pos_float(raw: Any, fallback: float) -> float:
+    if isinstance(raw, bool):
+        return fallback
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return fallback
+    return val if val > 0 else fallback
+
+
+def _sync_handoff_tunables() -> Dict[str, Any]:
+    """从 fleet_profile.json 同步交接门禁参数；若单测通过 monkeypatch 覆盖了模块属性则保留覆盖值。"""
+    global _LAST_HANDOFF_PROFILE_ID
+    profile = user_words.load_fleet_profile(HOOKS_DIR)
+    ht = user_words.get_runtime_tunables("handoff_thresholds", HOOKS_DIR)
+    profile_id = id(profile)
+    if _LAST_HANDOFF_PROFILE_ID == profile_id:
+        return ht
+    _LAST_HANDOFF_PROFILE_ID = profile_id
+    agy = ht.get("antigravity") if isinstance(ht.get("antigravity"), dict) else {}
+    codex = ht.get("codex") if isinstance(ht.get("codex"), dict) else {}
+    claude = ht.get("claude") if isinstance(ht.get("claude"), dict) else {}
+    comp_agy = user_words.get_compaction_tunables("antigravity", HOOKS_DIR)
+    resolved: Dict[str, Any] = {
+        "DEFAULT_DRAIN_INVOCATIONS": user_words._coerce_pos_int(agy.get("default_drain_invocations"), _HANDOFF_BUILTINS["DEFAULT_DRAIN_INVOCATIONS"]),
+        "DEFAULT_DRAIN_ACTIONS": user_words._coerce_pos_int(agy.get("default_drain_actions"), _HANDOFF_BUILTINS["DEFAULT_DRAIN_ACTIONS"]),
+        "ADVISORY_CP_THRESHOLD": user_words._coerce_pos_int(agy.get("advisory_cp_threshold"), _HANDOFF_BUILTINS["ADVISORY_CP_THRESHOLD"]),
+        "ADVISORY_TRANSCRIPT_BYTES": user_words._coerce_pos_int(agy.get("advisory_transcript_mib"), 4) * 1024 * 1024,
+        "ADVISORY_THRASH_MIN_CP": user_words._coerce_pos_int(agy.get("advisory_thrash_min_cp"), _HANDOFF_BUILTINS["ADVISORY_THRASH_MIN_CP"]),
+        "ADVISORY_THRASH_AVG_INTERVAL": _pos_float(agy.get("advisory_thrash_avg_interval_sec"), _HANDOFF_BUILTINS["ADVISORY_THRASH_AVG_INTERVAL"]),
+        "ADVISORY_MEDIA_STEPS": user_words._coerce_pos_int(agy.get("advisory_media_steps"), _HANDOFF_BUILTINS["ADVISORY_MEDIA_STEPS"]),
+        "ADVISORY_IMAGE_CALLS": user_words._coerce_pos_int(agy.get("advisory_image_calls"), _HANDOFF_BUILTINS["ADVISORY_IMAGE_CALLS"]),
+        "ADVISORY_IMAGE_BYTES": user_words._coerce_pos_int(agy.get("advisory_image_mib"), 50) * 1024 * 1024,
+        "DRAIN_CP_THRESHOLD": user_words._coerce_pos_int(agy.get("drain_cp_threshold"), _HANDOFF_BUILTINS["DRAIN_CP_THRESHOLD"]),
+        "DRAIN_THRASH_MIN_CP": user_words._coerce_pos_int(agy.get("drain_thrash_min_cp"), _HANDOFF_BUILTINS["DRAIN_THRASH_MIN_CP"]),
+        "DRAIN_THRASH_AVG_INTERVAL": _pos_float(agy.get("drain_thrash_avg_interval_sec"), _HANDOFF_BUILTINS["DRAIN_THRASH_AVG_INTERVAL"]),
+        "DRAIN_TRANSCRIPT_BYTES": user_words._coerce_pos_int(agy.get("drain_transcript_mib"), 6) * 1024 * 1024,
+        "DRAIN_MEDIA_STEPS": user_words._coerce_pos_int(agy.get("drain_media_steps"), _HANDOFF_BUILTINS["DRAIN_MEDIA_STEPS"]),
+        "DRAIN_MEDIA_MIN_CP": user_words._coerce_pos_int(agy.get("drain_media_min_cp"), _HANDOFF_BUILTINS["DRAIN_MEDIA_MIN_CP"]),
+        "DRAIN_IMAGE_CALLS": user_words._coerce_pos_int(agy.get("drain_image_calls"), _HANDOFF_BUILTINS["DRAIN_IMAGE_CALLS"]),
+        "DRAIN_IMAGE_BYTES": user_words._coerce_pos_int(agy.get("drain_image_mib"), 100) * 1024 * 1024,
+        "OVERRIDE_SNOOZE_CPS": user_words._coerce_pos_int(agy.get("override_snooze_cps"), _HANDOFF_BUILTINS["OVERRIDE_SNOOZE_CPS"]),
+        "OVERRIDE_SNOOZE_STEPS": user_words._coerce_pos_int(agy.get("override_snooze_steps"), _HANDOFF_BUILTINS["OVERRIDE_SNOOZE_STEPS"]),
+        "MAX_TRACKED_IMAGES": int(comp_agy.get("max_tracked_images", _HANDOFF_BUILTINS["MAX_TRACKED_IMAGES"])),
+        "CODEX_DRAIN_ACTIONS": user_words._coerce_pos_int(codex.get("enforce_drain_actions"), _HANDOFF_BUILTINS["CODEX_DRAIN_ACTIONS"]),
+        "_CLAUDE_DRAIN_ACTIONS": user_words._coerce_pos_int(claude.get("enforce_drain_actions"), _HANDOFF_BUILTINS["_CLAUDE_DRAIN_ACTIONS"]),
+    }
+    mod_globals = globals()
+    for name, new_val in resolved.items():
+        if mod_globals[name] == _ACTIVE_HANDOFF_BASELINE[name]:
+            mod_globals[name] = new_val
+        _ACTIVE_HANDOFF_BASELINE[name] = new_val
+    return ht
+
+
+_sync_handoff_tunables()
+
 
 # ② 会话状态、路径定位与图片请求登记
 
 def default_gate_state(conversation_id: str) -> Dict[str, Any]:
     """生成初始长会话交接门禁状态"""
+    _sync_handoff_tunables()
     return {
         "version": 1,
         "gateSchemaVersion": 3,
@@ -1030,6 +1117,7 @@ def _merge_telemetry(
 
 def _evaluate_triggers(tel: Dict[str, Any], user_text: str) -> Tuple[List[str], List[str]]:
     """计算当前满足的 Stage-1 (advisory) 与 Stage-2 (drain) 触发条件列表"""
+    _sync_handoff_tunables()
     advisory_hits: List[str] = []
     stage2_hits: List[str] = []
 
@@ -2019,6 +2107,12 @@ def handle_claude_handoff(payload: Dict[str, Any], state_dir: Path, mode: str = 
 
 def _handle_native_handoff(payload: Dict[str, Any], state_dir: Path, mode: str,
                            compact_limit: int, client: str) -> Dict[str, Any]:
+    _sync_handoff_tunables()
+    client_drain_actions = (
+        CODEX_DRAIN_ACTIONS
+        if CODEX_DRAIN_ACTIONS != _ACTIVE_HANDOFF_BASELINE["CODEX_DRAIN_ACTIONS"]
+        else (_CLAUDE_DRAIN_ACTIONS if client == "claude" else CODEX_DRAIN_ACTIONS)
+    )
     label = "Claude" if client == "claude" else "Codex"
     event = str(payload.get("hook_event_name") or "")
     if event not in CODEX_EVENTS or mode == "off":
@@ -2052,7 +2146,7 @@ def _handle_native_handoff(payload: Dict[str, Any], state_dir: Path, mode: str,
         else:
             state = {"client": client, "version": 1, "conversationId": sid, "phase": "normal",
                      "compactionKeys": [], "compactionCount": 0, "observedEvents": [],
-                     "drainActionsRemaining": CODEX_DRAIN_ACTIONS, "overrideUntilCount": -1,
+                     "drainActionsRemaining": client_drain_actions, "overrideUntilCount": -1,
                      "lastUserEvent": "", "stopCorrectionRequested": False, "handoffRecorded": False}
         if event not in state["observedEvents"]:
             state["observedEvents"].append(event)
@@ -2088,7 +2182,7 @@ def _handle_native_handoff(payload: Dict[str, Any], state_dir: Path, mode: str,
                 elif mode == "enforce" and CODEX_HANDOFF_REQUEST_RE.fullmatch(prompt):
                     enter_drain = state["phase"] not in ("drain", "freeze")
         if enter_drain:
-            state.update(phase="drain", drainActionsRemaining=CODEX_DRAIN_ACTIONS,
+            state.update(phase="drain", drainActionsRemaining=client_drain_actions,
                          stopCorrectionRequested=False, handoffRecorded=False, toolDecisions={},
                          handoffFileBaselines={})
         phase = state["phase"]
@@ -2146,15 +2240,24 @@ def _handle_native_handoff(payload: Dict[str, Any], state_dir: Path, mode: str,
 def main() -> None:
     parser = argparse.ArgumentParser(description="Codex & Claude Code 长会话交接事件适配；反重力使用既有模块接口")
     parser.add_argument("--client", choices=("codex", "claude"), required=True)
-    parser.add_argument("--mode", choices=("advisory", "enforce", "off"), default="advisory")
-    parser.add_argument("--compact-limit", type=int, default=0)
+    parser.add_argument("--mode", choices=("advisory", "enforce", "off"), default=None)
+    parser.add_argument("--compact-limit", type=int, default=None)
     parser.add_argument("--state-dir", default=str(HOOKS_DIR / "state" / "handoff"))
     args = parser.parse_args()
+    ht = _sync_handoff_tunables()
+    client_cfg = ht.get(args.client) if isinstance(ht.get(args.client), dict) else {}
+    cfg_mode = str(client_cfg.get("default_mode") or "advisory").strip().lower()
+    mode = args.mode if args.mode is not None else (cfg_mode if cfg_mode in ("advisory", "enforce", "off") else "advisory")
+    compact_limit = (
+        args.compact_limit
+        if args.compact_limit is not None
+        else user_words._coerce_pos_int(client_cfg.get("default_compact_limit"), 0, minimum=0)
+    )
     try:
         payload = user_words.read_hook_payload()
         handler = handle_claude_handoff if args.client == "claude" else handle_codex_handoff
         state_dir = Path(args.state_dir).expanduser()
-        response = handler(payload, state_dir, args.mode, args.compact_limit)
+        response = handler(payload, state_dir, mode, compact_limit)
     except Exception as exc:
         # 状态/协议异常时不伪装已受保护，不在失败的钩子中无限继续。
         label = "Claude" if args.client == "claude" else "Codex"

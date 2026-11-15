@@ -4,55 +4,57 @@
   "evaluated_at": "2026-11-15",
   "evaluation_policy": {
     "bidirectional_strength_and_defect_audit": true,
-    "defect_veto_priority": "同步评估各客户端与模型的优势与短板；优势决定角色选型，严重短板（平台访问受限、高频会话配额上限、协议转换丢包、自动派生子代理阻塞、长对话压缩丢失早期约束）作为排除或参数隔离依据。",
+    "all_roles_dynamic": true,
+    "dynamic_tunables_enabled": true,
+    "dynamic_matrix_policy": "五个角色槽位（orchestrator、math、code、review、fast）与运行期定量参数（runtime_tunables）均随客户端协议、模型能力、上下文压缩特性与配额策略由 fleet-evolve 动态重算，不与单一客户端、固定模型或静态死数字永久绑定；当前快照仅反映现阶段实测趋势。",
+    "defect_veto_priority": "同步评估各客户端与模型的优势与短板；优势决定当前角色分工，严重短板（平台访问受限、高频会话配额上限、协议转换丢包、自动派生子代理阻塞、长对话压缩丢失早期约束）作为排除或参数隔离依据。",
     "user_approval_required_before_apply": true,
     "approval_checkpoints": [
-      "生成或调整推荐的客户端 × 模型 × 推理挡位搭配表时须停下请用户拍板",
-      "向宿主机全局目录写入配置（install.py 正式执行）或切换主控客户端时须先获用户批准（R4）",
+      "生成或调整推荐的客户端 × 模型 × 推理挡位矩阵及运行期定量参数（runtime_tunables）时须停下请用户拍板",
+      "向宿主机全局目录写入配置（install.py 正式执行）或切换主会话客户端时须先获用户批准（R4）",
       "涉及系统级 Python 跨次版本、CUDA 跨大版本或 WSL 跨 LTS 发行版等 ABI 强耦合升级时须发出警告并交由用户决定",
       "执行 git push 推送远端仓库前须停下等待用户明确指令"
     ]
   },
   "roles": {
     "orchestrator": {
-      "candidates": ["agy:default", "codex:default", "claude:default", "dsh:default"],
+      "candidates": ["agy:@orchestrator", "codex:@orchestrator", "claude:@orchestrator", "dsh:@orchestrator"],
       "recommended_client": "antigravity",
       "recommended_model_family": "carbon",
       "recommended_tier": "high",
-      "dynamic_role_note": "主控客户端并非永久绑定 Antigravity；当后续评估表明其他客户端与主力模型在中文表达清晰度、长对话稳定性与订阅成本上综合更合适时，通过 fleet-evolve 经用户批准后切换。",
-      "strengths": "中文自然语言理解与日常工程沟通平实清晰，适合承担需求澄清、方案权衡与主会话协调；Gemini 4 Carbon 在客户端目录中的最高单模型挡位即为 High，且直接使用客户端订阅内含的模型组滚动配额（5 小时窗口与 7 天周期额度），无需单独按量采购 API。",
-      "defects_and_mitigations": "交互式单会话在约 20 万至 26 万 token 附近会触发自动检查点压缩，且 agy models 命令行不返回整数窗口字段；通过 R9 钩子自动归档恢复历轮用户原话与最近 4 次子代理返回摘要，在 cae_harness.py 中按 120,000 token 保守单分片预算规划审查，并通过 blocked_auto_tokens 跳过共享窗口 Orchestrator 及独立配额池的第三方模型。"
+      "strengths": "现阶段中文自然语言理解与日常工程沟通平实清晰，适合承担需求澄清、方案权衡与主会话协调；Gemini 4 Carbon 在客户端目录中的最高单模型挡位为 High，直接使用客户端订阅内含的模型组滚动配额（5 小时窗口与 7 天周期额度），无需单独按量采购 API。",
+      "defects_and_mitigations": "交互式单会话在约 20 万至 26 万 token 附近会触发自动检查点压缩，且 agy models 命令行不返回整数窗口字段；通过 R9 钩子按 runtime_tunables.compaction_recovery.per_client.antigravity 动态恢复历轮原话与高价值子代理返回摘要，在 cae_harness.py 中按保守单分片预算规划审查，并通过 blocked_auto_tokens 跳过共享窗口 Orchestrator 及异池第三方模型。"
     },
     "math": {
-      "candidates": ["codex:math", "codex:code", "agy:default", "dsh:default", "claude:default"],
+      "candidates": ["codex:math", "codex:code", "agy:@math", "dsh:math", "claude:math"],
       "recommended_client": "codex",
       "recommended_model_family": "astra",
       "recommended_tier": "max",
-      "strengths": "擅长长链条偏微分方程离散推导、几何不变量证明、雅可比矩阵求导与边界条件相容性分析；客户端缓存声明最大窗口 872,000 token（有效窗口比例 95%，脚本单次规划预算 745,560 token），连续工具调用可自动复用服务端前缀缓存，支持 ChatGPT 订阅额度（5 小时滚动窗口与周度上限）或按量 API。",
-      "defects_and_mitigations": "客户端缓存默认推理挡位为 medium、默认窗口为 272,000 token，不显式传参无法用满窗口与推理预算；开启 ultra 委派挡位则会自动派生多层子代理引发轮询超时。由 install.py 与 cae_harness.py 显式声明 872,000 窗口与单模型非委派最高挡 max，并在只读任务前后比对工作区文件哈希快照。"
+      "strengths": "现阶段擅长长链条偏微分方程离散推导、守恒与熵稳定条件证明、雅可比矩阵求导与边界条件相容性分析；客户端缓存声明最大窗口 872,000 token（有效窗口比例 95%，单分片安全预算 745,560 token），连续工具调用自动复用服务端前缀缓存，支持 ChatGPT 订阅配额（5 小时滚动窗口与周度上限）或按量 API。",
+      "defects_and_mitigations": "客户端缓存默认推理挡位为 medium、默认窗口为 272,000 token，不显式传参无法用满窗口与推理预算；开启 ultra 委派挡位会自动派生多层子代理引发轮询超时。由 install.py 与 cae_harness.py 显式声明最大窗口与单模型非委派最高挡 max，并在只读任务前后比对工作区文件哈希快照。"
     },
     "code": {
-      "candidates": ["codex:code", "codex:math", "claude:default", "agy:default", "dsh:default"],
+      "candidates": ["codex:code", "codex:math", "claude:code", "agy:@code", "dsh:code"],
       "recommended_client": "codex",
       "recommended_model_family": "sol",
       "recommended_tier": "max",
-      "strengths": "适合核心算法实现、跨模块重构与配合验证命令（gate --verify-cmd）自动迭代闭环修复；客户端缓存声明最大窗口 872,000 token（单次规划预算 745,560 token），多文件补丁生成稳定。",
-      "defects_and_mitigations": "客户端缓存默认推理挡位为 low、默认窗口为 500,000 token，且在 Windows 下不限定目标目录遍历大型仓库时易因进程调用开销触发超时；脚本显式传入 max 挡位与 872,000 窗口，派发任务须配合 --write-scope 与必读行号限定范围。"
+      "strengths": "现阶段适合核心数值算法实现、跨模块重构以及配合验证命令（gate --verify-cmd）执行多轮自动迭代修复；客户端缓存声明最大窗口 872,000 token（单分片安全预算 745,560 token），多文件补丁生成稳定。",
+      "defects_and_mitigations": "客户端缓存默认推理挡位为 low、默认窗口为 500,000 token，且在 Windows 下无范围遍历大型目录时易因进程调用开销触发超时；脚本显式传入 max 挡位与最大窗口，派发任务须配合 --write-scope 与精确行号限定范围。"
     },
     "review": {
-      "candidates": ["claude:default", "codex:code", "agy:default", "dsh:default"],
+      "candidates": ["claude:default", "codex:review", "agy:@review", "dsh:review"],
       "recommended_client": "claude",
       "recommended_model_family": "k3.1-pro[1m]+deepseek-flash",
       "recommended_tier": "max",
-      "strengths": "Claude Code 客户端提供完整的五类生命周期钩子与原生 --json-schema 结构化输出校验；经本地 router.py（或 CC Switch 直连卡片）接入原生实现 Anthropic Messages API（/v1/messages）的 Kimi 与 DeepSeek 官方接口（均支持 1M 上下文窗口，单次规划预算 900,000 token），按 API 余额与速率等级计费并自动享受前缀缓存折扣。",
+      "strengths": "现阶段 Claude Code 客户端提供完整的五类生命周期钩子与原生 --json-schema 结构化输出校验；经本地 router.py（或 CC Switch 直连卡片）接入原生实现 Anthropic Messages API（/v1/messages）的 Kimi 与 DeepSeek 官方接口（均支持 1M 上下文窗口，单分片安全预算 900,000 token），按 API 余额与速率等级计费并自动享受前缀缓存折扣。",
       "defects_and_mitigations": "严禁接入第三方 Responses API 协议转换反代（易因工具调用 ID 映射不一致触发 HTTP 422 或流式响应中断）；无头只读调用固定附加 --permission-mode dontAsk，避免触发 auto 权限模式的额外安全分类器限流报错。"
     },
     "fast": {
-      "candidates": ["dsh:fast", "claude:@fast", "agy:fast", "codex:@fast"],
+      "candidates": ["dsh:fast", "claude:fast", "agy:@fast", "codex:@fast"],
       "recommended_client": "dsh",
       "recommended_model_family": "deepseek-flash",
       "recommended_tier": "low",
-      "strengths": "通过官方账号登录（deepseek-account）或 DEEPSEEK_API_KEY（~/.dsh/.credentials.yaml 或 .env）即可直连，内置 DeepSeek-V4-Pro 与 DeepSeek-V4.1-Flash 均声明 1,048,576 token 窗口（单次规划预算 943,718 token，支持 off/low/high/max 四挡）；既可单客户端独立使用，也可在显式省额度或其他客户端进入配额冷却时接替。",
+      "strengths": "现阶段通过官方账号登录（deepseek-account）或 DEEPSEEK_API_KEY（~/.dsh/.credentials.yaml 或 .env）即可直连，内置 DeepSeek-V4-Pro 与 DeepSeek-V4.1-Flash 均声明 1,048,576 token 窗口（单分片安全预算 943,718 token，支持 off/low/high/max 四挡）；既可单客户端独立使用，也可在显式省额度或其他客户端进入配额冷却时无损接替。",
       "defects_and_mitigations": "DSH 命令行暂未内置生命周期钩子与原生 --json-schema 参数，偶发附带底层工具停止标记；由 cae_harness.py 自动注入单 JSON 输出约束并清洗尾随 DSML 标记，且轻量挡仅用于显式省额度或快速表面检查，不静默替代高严谨度推导与核心审查。"
     }
   },
@@ -82,6 +84,7 @@
     },
     "claude": {
       "default_fallback_alias": "opus",
+      "default_interactive_effort": "xhigh",
       "router_primary_model": "k3.1-pro[1m]",
       "router_subagent_model": "deepseek-flash",
       "max_context_tokens": 1048576,
@@ -125,5 +128,134 @@
     "codex": ["agy", "claude", "dsh"],
     "claude": ["codex", "agy", "dsh"],
     "dsh": ["codex", "agy", "claude", "dsh"]
+  },
+  "runtime_tunables": {
+    "compaction_recovery": {
+      "calibration_note": "按各主会话客户端的上下文窗口上限与自动压缩触发频率动态设定内联恢复预算及子代理筛选策略：优先保留最新一次返回与窗口内达到实质长度阈值的审查/推导结论，避免短状态回执挤占高价值证据。",
+      "defaults": {
+        "inline_total_chars": 8000,
+        "inline_user_item_chars": 1200,
+        "inline_guaranteed_head_turns": 1,
+        "recent_subagent_returns": 4,
+        "recent_subagent_window": 12,
+        "min_substantive_subagent_chars": 64,
+        "priority_subagent_keywords": ["auditor", "collaborator", "reader", "review", "math", "audit"],
+        "subagent_head_ratio": 0.58,
+        "inline_subagent_total_chars": 1400,
+        "inline_subagent_item_chars": 280,
+        "archive_subagent_item_chars": 1200,
+        "archive_retry_interval_sec": 30,
+        "max_tracked_images": 2000
+      },
+      "per_client": {
+        "antigravity": {
+          "inline_total_chars": 7600,
+          "inline_user_item_chars": 1200,
+          "inline_guaranteed_head_turns": 1,
+          "recent_subagent_returns": 4,
+          "recent_subagent_window": 12,
+          "min_substantive_subagent_chars": 64,
+          "inline_subagent_total_chars": 1400,
+          "inline_subagent_item_chars": 280,
+          "archive_subagent_item_chars": 1200
+        },
+        "codex": {
+          "inline_total_chars": 8000,
+          "inline_user_item_chars": 1400,
+          "inline_guaranteed_head_turns": 2,
+          "recent_subagent_returns": 5,
+          "recent_subagent_window": 15,
+          "min_substantive_subagent_chars": 64,
+          "inline_subagent_total_chars": 1700,
+          "inline_subagent_item_chars": 320,
+          "archive_subagent_item_chars": 1500
+        },
+        "claude": {
+          "inline_total_chars": 8000,
+          "inline_user_item_chars": 1400,
+          "inline_guaranteed_head_turns": 2,
+          "recent_subagent_returns": 5,
+          "recent_subagent_window": 15,
+          "min_substantive_subagent_chars": 64,
+          "inline_subagent_total_chars": 1700,
+          "inline_subagent_item_chars": 320,
+          "archive_subagent_item_chars": 1500
+        }
+      }
+    },
+    "handoff_thresholds": {
+      "antigravity": {
+        "default_drain_invocations": 4,
+        "default_drain_actions": 8,
+        "advisory_cp_threshold": 11,
+        "advisory_transcript_mib": 4,
+        "advisory_thrash_min_cp": 6,
+        "advisory_thrash_avg_interval_sec": 90.0,
+        "advisory_media_steps": 60,
+        "advisory_image_calls": 35,
+        "advisory_image_mib": 50,
+        "drain_cp_threshold": 16,
+        "drain_thrash_min_cp": 10,
+        "drain_thrash_avg_interval_sec": 75.0,
+        "drain_transcript_mib": 6,
+        "drain_media_steps": 160,
+        "drain_media_min_cp": 6,
+        "drain_image_calls": 65,
+        "drain_image_mib": 100,
+        "override_snooze_cps": 3,
+        "override_snooze_steps": 120
+      },
+      "codex": {
+        "default_mode": "advisory",
+        "default_compact_limit": 0,
+        "enforce_drain_actions": 4
+      },
+      "claude": {
+        "default_mode": "advisory",
+        "default_compact_limit": 0,
+        "enforce_drain_actions": 4
+      }
+    },
+    "loop_guards": {
+      "reply_repeat": {
+        "max_short_reply_chars": 300,
+        "tail_scan_kib": 256,
+        "similarity_threshold": 0.80,
+        "core_similarity_threshold": 0.75,
+        "consecutive_wait_limit": 3
+      },
+      "status_guard": {
+        "large_file_threshold_mib": 4,
+        "chunk_sample_mib": 1,
+        "max_workflow_script_mib": 1,
+        "task_no_log_cooldown_sec": 30.0
+      },
+      "lifecycle_log": {
+        "max_log_mib": 2,
+        "trim_to_mib": 1
+      }
+    },
+    "headless_dispatch": {
+      "input_budget_safety_ratio": 0.90,
+      "unlisted_window_fallback_tokens": 120000,
+      "default_shard_tokens": 120000,
+      "default_timeout_sec": 600,
+      "default_gate_max_rounds": 3,
+      "quota_default_cooldown_sec": 3600,
+      "quota_max_horizon_days": 45,
+      "catalog_max_age_days": 7,
+      "clean_room_inline_snapshot_kib": 256,
+      "polish_short_max_files": 3,
+      "polish_short_max_tokens": 4000,
+      "polish_short_max_chars": 2500,
+      "router": {
+        "port": 8240,
+        "timeout_sec": 900,
+        "max_body_mib": 64,
+        "max_inflight": 64,
+        "windows_proxy_ttl_sec": 5,
+        "key_cache_ttl_sec": 60
+      }
+    }
   }
 }

@@ -2505,6 +2505,72 @@ class TestEndToEndIntegration(unittest.TestCase):
             self.assertEqual(stale_appr.returncode, 2)
             self.assertEqual(json.loads(stale_appr.stdout)["reason"], "repo_or_profile_changed_since_propose")
 
+    def test_45_workspace_mode_guard_grounding_gate_and_csc_funding(self) -> None:
+        # 1. 验证 fleet_profile.json 全动态策略、runtime_tunables 结构与致谢声明
+        profile_path = TEMPLATE_DIR / "skills" / "cae-harness" / "fleet_profile.json"
+        profile = json.loads(profile_path.read_text(encoding="utf-8"))
+        policy = profile.get("evaluation_policy", {})
+        self.assertTrue(policy.get("all_roles_dynamic"))
+        self.assertTrue(policy.get("dynamic_tunables_enabled"))
+        tunables = profile.get("runtime_tunables", {})
+        for group_key in ("compaction_recovery", "handoff_thresholds", "loop_guards", "headless_dispatch"):
+            self.assertIn(group_key, tunables)
+        for role_name in ("orchestrator", "math", "code", "review", "fast"):
+            self.assertIn("recommended_tier", profile["roles"][role_name])
+
+        readme_text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn("中国国家留学基金委", readme_text)
+        self.assertIn("China Scholarship Council", readme_text)
+        self.assertIn("202506280162", readme_text)
+        self.assertIn("留金选[2025]37号", readme_text)
+        self.assertIn("general_project", readme_text)
+        self.assertIn("upstream_config_repo", readme_text)
+
+        # 2. 验证安装后的 fleet_state.py 在通用课题目录返回结构化退出码 2，且终审归位强制校验文档事实锚定
+        state_py = TEMPLATE_DIR / "skills" / "fleet-evolve" / "scripts" / "fleet_state.py"
+        harness_py = TEMPLATE_DIR / "skills" / "cae-harness" / "scripts" / "cae_harness.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_root = Path(tmp)
+            env = {**os.environ, "CAE_FLEET_STATE_DIR": str(tmp_root / "fleet_state")}
+
+            general_proj = tmp_root / "my_cfd_project"
+            general_proj.mkdir()
+            installed_state = tmp_root / "installed_skills" / "fleet_state.py"
+            installed_state.parent.mkdir(parents=True)
+            installed_state.write_bytes(state_py.read_bytes())
+
+            gen_res = subprocess.run(
+                [sys.executable, "-B", "-X", "utf8", str(installed_state), "status"],
+                cwd=general_proj, capture_output=True, text=True, encoding="utf-8", env=env, timeout=15,
+            )
+            self.assertEqual(gen_res.returncode, 2)
+            gen_json = json.loads(gen_res.stdout)
+            self.assertEqual(gen_json["workspace_mode"], "general_project")
+            self.assertEqual(gen_json["reason"], "not_upstream_config_repo")
+
+            # 构造最小上游仓库副本并注入虚构制造术语，验证 clear --verified --readback-done 硬拦截
+            fake_repo = tmp_root / "fake_upstream"
+            (fake_repo / "template" / "user-guard" / "skills" / "cae-harness" / "scripts").mkdir(parents=True)
+            (fake_repo / "template" / "user-guard" / "skills" / "fleet-evolve").mkdir(parents=True)
+            (fake_repo / "install.py").write_text("# installer\n", encoding="utf-8")
+            (fake_repo / "template" / "user-guard" / "plugin.json").write_text('{"version": "1.13.0"}\n', encoding="utf-8")
+            (fake_repo / "template" / "user-guard" / "skills" / "fleet-evolve" / "SKILL.md").write_text("# Skill\n", encoding="utf-8")
+            (fake_repo / "template" / "user-guard" / "skills" / "cae-harness" / "fleet_profile.json").write_bytes(profile_path.read_bytes())
+            (fake_repo / "template" / "user-guard" / "skills" / "cae-harness" / "scripts" / "cae_harness.py").write_bytes(harness_py.read_bytes())
+            (fake_repo / "README.md").write_text(
+                "# 说明\n\n面向流体求解器、CAM 刀轨规划与曲面求交。\n",
+                encoding="utf-8",
+            )
+            bad_clear = subprocess.run(
+                [sys.executable, "-B", "-X", "utf8", str(state_py), "--repo", str(fake_repo), "clear", "--verified", "--readback-done"],
+                capture_output=True, text=True, encoding="utf-8", env=env, timeout=20,
+            )
+            self.assertEqual(bad_clear.returncode, 2)
+            bad_json = json.loads(bad_clear.stdout)
+            self.assertFalse(bad_json["readback_verified"])
+            self.assertEqual(bad_json["reason"], "grounding_check_failed")
+            self.assertGreaterEqual(bad_json["finding_count"], 1)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -4,6 +4,26 @@
 
 ---
 
+## [1.13.0] - 2026-11-15
+
+完成五类角色槽位与运行期定量参数（`runtime_tunables`）全动态收口、压缩后高价值子代理实质筛选、零黑名单文档事实锚定硬门禁（`check-grounding`）、通用课题项目与上游配置仓库双场景分类隔离，以及全仓图文文档校准与国家留学基金委资助致谢补充：
+
+- **五类角色槽位对称动态选路与 `runtime_tunables` 死数字收口（`fleet_profile.json`、`user_words.py`、`session_context_loader.py`、`handoff_gate.py`、`reply_repeat_guard.py`、`status_guard.py`、`router.py`、`cae_harness.py`、`install.py`）**：
+  - 统一 `orchestrator`、`math`、`code`、`review`、`fast` 五个角色槽位为全动态对称结构（均支持 `role:<slot>` 与 `<client>:@<slot>` 选路及 `recommended_tier` 读取，不将任何角色与单一客户端或模型永久绑定）；
+  - 在 `fleet_profile.json` 中新增 `runtime_tunables`（支持 `CAE_FLEET_PROFILE` 离线覆盖并按文件 `mtime_ns` 缓存，同时保留单元测试属性打桩优先级），统一收口各客户端压缩恢复字符预算（`per_client`：Antigravity `7,600` 字符、Codex／Claude Code `8,000` 字符）、长会话交接阈值（`handoff_thresholds`）、空等与日志轮询阈值（`loop_guards`）、无头分片安全系数／超时／验证轮数／润色长短篇阈值及本地分流代理默认并发与缓存参数；
+  - 新增压缩前子代理返回实质筛选函数 `select_recent_subagent_returns`，在候选窗口（`recent_subagent_window`）内无条件保留最新一条返回，并按实质字数阈值（`min_substantive_subagent_chars = 64`）、审查／推导角色关键词与时间先后择优保留高价值结论，防止简短状态回执挤占关键行号证据。
+- **零黑名单确定性文档事实锚定门禁（`cae_harness.py`、`fleet_state.py`、`rules/AGENTS.md`）**：
+  - 彻底清除前序重写阶段混入仓库规则与文档的无源码依据制造术语（`CAM`、刀轨、曲面求交等）；
+  - 在 `cae_harness.py` 中新增通用零黑名单事实锚定子命令 `check-grounding`（支持 `--target`、`--root`、`--base-ref`、`--allow-from-file`、`--strict`），自动扫描目标工作区源码与配置文件构建标识符、`--flag`、数值与派生单位及中文双字词干集合，逐行拦截无依据命令行标志／文件名、陌生全大写缩写、失步容量数字与虚构领域举例；
+  - 在 `cae_harness.py task --kind polish` 中以改写前原稿为基线自动输出 `grounding_audit` 核验结果，并在 `fleet_state.py clear --verified --readback-done` 终审归位前强制调用 `audit_doc_grounding` 硬门禁。
+- **通用课题项目与上游配置仓库双场景分类及工作区身份硬隔离（`cae_harness.py`、`fleet_state.py`、`fleet-evolve/SKILL.md`、`README.md`）**：
+  - 在 `cae_harness.py`（`probe`、`assess`、`check-grounding`）中新增 `detect_workspace_mode`（区分 `general_project` 与 `upstream_config_repo`），在 `fleet_state.py` 中对非上游仓库无 `--repo` 调用返回结构化退出码 `2`（`reason: "not_upstream_config_repo"`），并收窄 `fleet-evolve` 触发条件，确保日常课题研发说出“全量优化代码和文档”时仅在项目内闭环，绝不误触全局元更新；
+  - 将 `README.md` 第四章表二重构为“通用课题与工程项目日常研发（部分功能）”与“维护本上游配置仓库（全功能：全面更新 `full` 与全量优化 `hygiene` 双闭环）”两张分类对照表。
+- **图文文档全量校准、致谢补充与回归单测扩展（`README.md`、`docs/`、`docs/assets/*.svg`、`tests/`）**：
+  - 整篇重写校准 `README.md`、`AGENTS.md`、`template/user-guard/rules/AGENTS.md`、两份 `SKILL.md`、`docs/*.md` 及两张 SVG 架构管线图，在 `README.md` 第六章中英文部分补充**中国国家留学基金委（China Scholarship Council, CSC）**唯一资助致谢（学号：`202506280162`，批准文号：`留金选[2025]37号`），并新增动态参数覆盖、实质子代理筛选、对称角色路由、双工作区硬拦截与 `check-grounding` 防幻觉回归单测。
+
+---
+
 ## [1.12.0] - 2026-11-15
 
 完成常驻规则脚本与模型评估配置两层解耦、压缩后“历轮用户原话 + 最近子代理返回摘要”三端双路有界恢复、推荐搭配表用户审批状态锁、无头调用限流与分类器故障修复，以及图文分层文档重构、窗口／配额／缓存实证校准与静态／运行期脱敏加固：

@@ -89,6 +89,48 @@ CHUNK_SAMPLE_BYTES = 1 * 1024 * 1024    # 1 MB
 MAX_WORKFLOW_SCRIPT_BYTES = 1 * 1024 * 1024  # 1 MB
 TASK_NO_LOG_COOLDOWN_SEC = 30.0
 
+_STATUS_BUILTINS: Dict[str, Any] = {
+    "LARGE_FILE_THRESHOLD": LARGE_FILE_THRESHOLD,
+    "CHUNK_SAMPLE_BYTES": CHUNK_SAMPLE_BYTES,
+    "MAX_WORKFLOW_SCRIPT_BYTES": MAX_WORKFLOW_SCRIPT_BYTES,
+    "TASK_NO_LOG_COOLDOWN_SEC": TASK_NO_LOG_COOLDOWN_SEC,
+}
+_ACTIVE_STATUS_BASELINE: Dict[str, Any] = dict(_STATUS_BUILTINS)
+_LAST_STATUS_PROFILE_ID: Optional[int] = None
+
+
+def _sync_status_tunables() -> None:
+    """从 fleet_profile.json 同步文件指纹采样与无日志冷却参数，同时兼容单测属性覆盖。"""
+    global _LAST_STATUS_PROFILE_ID
+    profile = user_words.load_fleet_profile(HOOKS_DIR)
+    profile_id = id(profile)
+    if _LAST_STATUS_PROFILE_ID == profile_id:
+        return
+    _LAST_STATUS_PROFILE_ID = profile_id
+    lg = user_words.get_runtime_tunables("loop_guards", HOOKS_DIR)
+    cfg = lg.get("status_guard") if isinstance(lg.get("status_guard"), dict) else {}
+    raw_cd = cfg.get("task_no_log_cooldown_sec")
+    try:
+        cd_val = float(raw_cd) if not isinstance(raw_cd, bool) else 30.0
+    except (TypeError, ValueError):
+        cd_val = 30.0
+    if cd_val <= 0:
+        cd_val = 30.0
+    resolved: Dict[str, Any] = {
+        "LARGE_FILE_THRESHOLD": user_words._coerce_pos_int(cfg.get("large_file_threshold_mib"), 4, minimum=1) * 1024 * 1024,
+        "CHUNK_SAMPLE_BYTES": user_words._coerce_pos_int(cfg.get("chunk_sample_mib"), 1, minimum=1) * 1024 * 1024,
+        "MAX_WORKFLOW_SCRIPT_BYTES": user_words._coerce_pos_int(cfg.get("max_workflow_script_mib"), 1, minimum=1) * 1024 * 1024,
+        "TASK_NO_LOG_COOLDOWN_SEC": cd_val,
+    }
+    mod_globals = globals()
+    for name, new_val in resolved.items():
+        if mod_globals[name] == _ACTIVE_STATUS_BASELINE[name]:
+            mod_globals[name] = new_val
+        _ACTIVE_STATUS_BASELINE[name] = new_val
+
+
+_sync_status_tunables()
+
 DENY_REASON_TEXT = (
     "【user-guard 防空转门禁阻断】目标证据文件内容与查询参数自上次读取后未发生任何变化。"
     "反重力具备后台任务就绪通知机制（Reactive Wakeup），严禁在此原地空转轮询！"
@@ -2414,6 +2456,7 @@ def _build_boundary_violation_response(
 
 def handle_pre_tool_use(payload: Dict[str, Any]) -> Dict[str, Any]:
     """处理 PreToolUse 门禁请求"""
+    _sync_status_tunables()
     conversation_id = str(payload.get("conversationId") or "unknown_session").strip()
     workspace_paths = payload.get("workspacePaths") if isinstance(payload.get("workspacePaths"), list) else []
     transcript_path_str = payload.get("transcriptPath")
@@ -2682,6 +2725,7 @@ def _claude_check_polling(tool_name: str, args: Dict[str, Any], sid: str, cwd: O
 def handle_claude_pre_tool_use(payload: Dict[str, Any], state_dir: Optional[Path] = None,
                                logs_dir: Optional[Path] = None) -> Dict[str, Any]:
     """Claude PreToolUse：项目边界与证据查询门禁，放行使用空对象。"""
+    _sync_status_tunables()
     sid = str(payload.get("session_id") or "unknown_session").strip()
     home = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude").expanduser()
     state_dir = Path(state_dir).expanduser() if state_dir is not None else home / "hooks" / "state"

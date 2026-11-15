@@ -34,6 +34,44 @@ MAX_SHORT_REPLY_CHARS = 300
 TAIL_SCAN_BYTES = 256 * 1024  # 256 KB
 SIMILARITY_THRESHOLD = 0.80
 CORE_SIMILARITY_THRESHOLD = 0.75
+CONSECUTIVE_WAIT_LIMIT = 3
+
+_REPEAT_BUILTINS: Dict[str, Any] = {
+    "MAX_SHORT_REPLY_CHARS": MAX_SHORT_REPLY_CHARS,
+    "TAIL_SCAN_BYTES": TAIL_SCAN_BYTES,
+    "SIMILARITY_THRESHOLD": SIMILARITY_THRESHOLD,
+    "CORE_SIMILARITY_THRESHOLD": CORE_SIMILARITY_THRESHOLD,
+    "CONSECUTIVE_WAIT_LIMIT": CONSECUTIVE_WAIT_LIMIT,
+}
+_ACTIVE_REPEAT_BASELINE: Dict[str, Any] = dict(_REPEAT_BUILTINS)
+_LAST_REPEAT_PROFILE_ID: Optional[int] = None
+
+
+def _sync_repeat_tunables() -> None:
+    """从 fleet_profile.json 同步重复等待门禁参数，同时兼容单测属性覆盖。"""
+    global _LAST_REPEAT_PROFILE_ID
+    profile = user_words.load_fleet_profile(HOOKS_DIR)
+    profile_id = id(profile)
+    if _LAST_REPEAT_PROFILE_ID == profile_id:
+        return
+    _LAST_REPEAT_PROFILE_ID = profile_id
+    lg = user_words.get_runtime_tunables("loop_guards", HOOKS_DIR)
+    cfg = lg.get("reply_repeat") if isinstance(lg.get("reply_repeat"), dict) else {}
+    resolved: Dict[str, Any] = {
+        "MAX_SHORT_REPLY_CHARS": user_words._coerce_pos_int(cfg.get("max_short_reply_chars"), 300, minimum=50),
+        "TAIL_SCAN_BYTES": user_words._coerce_pos_int(cfg.get("tail_scan_kib"), 256, minimum=16) * 1024,
+        "SIMILARITY_THRESHOLD": user_words._coerce_ratio(cfg.get("similarity_threshold"), 0.80, low=0.50, high=0.98),
+        "CORE_SIMILARITY_THRESHOLD": user_words._coerce_ratio(cfg.get("core_similarity_threshold"), 0.75, low=0.45, high=0.98),
+        "CONSECUTIVE_WAIT_LIMIT": user_words._coerce_pos_int(cfg.get("consecutive_wait_limit"), 3, minimum=2),
+    }
+    mod_globals = globals()
+    for name, new_val in resolved.items():
+        if mod_globals[name] == _ACTIVE_REPEAT_BASELINE[name]:
+            mod_globals[name] = new_val
+        _ACTIVE_REPEAT_BASELINE[name] = new_val
+
+
+_sync_repeat_tunables()
 
 WAIT_KEYWORDS = (
     "仍在运行",
@@ -480,7 +518,7 @@ def _handle_stop_locked(payload: Dict[str, Any], state_dir: Path, conversation_i
     sig = hashlib.sha256(curr_norm.encode("utf-8")).hexdigest()[:16]
 
     # fullyIdle=false 仍可能需要交接，也允许单次防重复提醒。它只表示存在后台任务。
-    if count >= 3 and not blocked_sigs:
+    if count >= CONSECUTIVE_WAIT_LIMIT and not blocked_sigs:
         blocked_sigs.append(sig)
         _save_repeat_state(state_file, state, conversation_id)
         log_event(
@@ -497,13 +535,14 @@ def _handle_stop_locked(payload: Dict[str, Any], state_dir: Path, conversation_i
     log_event(
         "Stop:reply_repeat_guard",
         conversation_id,
-        f"ALLOWED short wait reply (count={count}/3) in {turn_key}",
+        f"ALLOWED short wait reply (count={count}/{CONSECUTIVE_WAIT_LIMIT}) in {turn_key}",
     )
     return {"decision": "allow"}
 
 
 def handle_stop_repeat_guard(payload: Dict[str, Any]) -> Dict[str, Any]:
     """处理 Stop 事件防复读刷屏检测"""
+    _sync_repeat_tunables()
     conversation_id = str(payload.get("conversationId") or "unknown_session").strip()
     termination_reason = str(payload.get("terminationReason") or "").strip().casefold()
 
@@ -618,6 +657,7 @@ def _claude_turn_reply(payload: Dict[str, Any]) -> Tuple[str, Optional[int], str
 
 def handle_claude_stop_repeat_guard(payload: Dict[str, Any], state_dir: Optional[Path] = None,
                                    logs_dir: Optional[Path] = None) -> Dict[str, Any]:
+    _sync_repeat_tunables()
     if payload.get("stop_hook_active") is True:
         return {}
     sid, _, _, skip = user_words.claude_hook_session(payload)
@@ -649,7 +689,7 @@ def handle_claude_stop_repeat_guard(payload: Dict[str, Any], state_dir: Optional
                 record["lastNormalizedReply"] = normalized
             else:
                 record.update(consecutiveShortWaitCount=0, lastNormalizedReply="")
-            block = record["consecutiveShortWaitCount"] >= 3 and not record["blockedSignatures"]
+            block = record["consecutiveShortWaitCount"] >= CONSECUTIVE_WAIT_LIMIT and not record["blockedSignatures"]
             if block:
                 record["blockedSignatures"].append(hashlib.sha256(record["lastNormalizedReply"].encode("utf-8")).hexdigest()[:16])
             _save_repeat_state(state_file, state, sid)

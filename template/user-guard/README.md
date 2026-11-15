@@ -7,19 +7,20 @@
 | 子路径 | 作用与分发范围 |
 | :--- | :--- |
 | [plugin.json](plugin.json)、[hooks.json](hooks.json)、[assets/logo.svg](assets/logo.svg) | Antigravity 原生插件清单（唯一版本号来源）、事件绑定配置与插件图标 |
-| [rules/AGENTS.md](rules/AGENTS.md) | 常驻全局工程规则 `R0–R11`（不含特定时期模型名称），同步至四个客户端的全局规则文件并保留用户自定义尾段 |
+| [rules/AGENTS.md](rules/AGENTS.md) | 常驻全局工程规则 `R0–R11`（不含特定时期模型名称或静态死数字），同步至四个客户端的全局规则文件并保留用户自定义尾段 |
 | [agents/](agents/) | Antigravity 原生只读子代理（`readonly-reader`、`readonly-auditor`、`readonly-collaborator`，均默认 `inherit` 跟随主会话模型）；Codex 与 Claude Code 对应模板位于 `template/codex/agents/` 与 `template/claude/agents/` |
-| [hooks/](hooks/) | 纯 Python 3.11+ 标准库编写的五个生命周期钩子脚本：历轮原话与最近 `4` 次已完成子代理摘要双路提取核（`user_words.py`）、压缩后有界恢复注入器（`session_context_loader.py`）、写路径边界与重复读日志拦截（`status_guard.py`）、防空等短句重复拦截（`reply_repeat_guard.py`）及长会话分段交接门禁（`handoff_gate.py`），分别适配 Antigravity、Codex 与 Claude Code 事件协议 |
-| [skills/cae-harness/](skills/cae-harness/) | 跨客户端无头命令行角色路由与定量验证技能（含 [fleet_profile.json](skills/cae-harness/fleet_profile.json) 模型评估配置与 [cae_harness.py](skills/cae-harness/scripts/cae_harness.py)），同步至四个客户端的全局 `skills/` 目录 |
-| [skills/fleet-evolve/](skills/fleet-evolve/) | 客户端升级检查、模型与配额选型重算及代码文档整理技能（含 [fleet_state.py](skills/fleet-evolve/scripts/fleet_state.py) 审批与重启重入状态锁），同步至四个客户端的全局 `skills/` 目录 |
+| [hooks/](hooks/) | 纯 Python 3.11+ 标准库编写的五个生命周期钩子脚本：历轮原话与按 `fleet_profile.json` 动态筛选的实质子代理返回双路提取核（`user_words.py`）、压缩后有界恢复注入器（`session_context_loader.py`）、写路径边界与重复读日志拦截（`status_guard.py`）、防空等短句重复拦截（`reply_repeat_guard.py`）及长会话分段交接门禁（`handoff_gate.py`），定量阈值统一读取 `runtime_tunables` |
+| [skills/cae-harness/](skills/cae-harness/) | 通用课题与上游仓库共用的动态角色路由、零黑名单文档事实锚定核验（`check-grounding`）及后台定量验证技能（含 [fleet_profile.json](skills/cae-harness/fleet_profile.json) 与 [cae_harness.py](skills/cae-harness/scripts/cae_harness.py)），同步至四个客户端的全局 `skills/` 目录 |
+| [skills/fleet-evolve/](skills/fleet-evolve/) | 上游配置仓库专属的“全面更新”（`full`）与“全量优化”（`hygiene`）双循环维护技能（含 [fleet_state.py](skills/fleet-evolve/scripts/fleet_state.py) 审批锁、重启重入锁与工作区身份拦截），同步至四个客户端的全局 `skills/` 目录 |
 
 ## 本地校验与预览
 
-在仓库根目录执行插件结构校验与空跑预览：
+在仓库根目录执行插件结构校验、事实锚定核验与空跑预览：
 
 ```bash
 agy plugin validate --strict template/user-guard
+python3 -B template/user-guard/skills/cae-harness/scripts/cae_harness.py check-grounding --target . --strict
 python3 -B install.py --dry-run --yes
 ```
 
-完整架构图、双路压缩恢复时序、四个客户端能力边界及日常用法详见仓库根目录 [README.md](../../README.md)、[架构与钩子说明](../../docs/architecture-and-hooks.md) 与 [工作流实战指南](../../docs/workflow-guide.md)。
+完整架构图、双路压缩恢复时序、通用项目与上游仓库两类调用矩阵详见仓库根目录 [README.md](../../README.md)、[架构与钩子说明](../../docs/architecture-and-hooks.md) 与 [工作流实战指南](../../docs/workflow-guide.md)。

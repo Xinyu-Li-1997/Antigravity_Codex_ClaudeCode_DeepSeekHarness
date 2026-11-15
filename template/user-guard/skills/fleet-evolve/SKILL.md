@@ -1,91 +1,102 @@
 ---
 name: fleet-evolve
 description: >
-  Upgrade non-active CLI toolchains with ABI coupling checks, recalculate client-model pairings,
-  and refactor repository code and documentation in natural engineering Chinese across Antigravity,
-  Codex, Claude Code (plus CC Switch), and DeepSeek Harness. Trigger with highest priority when the
-  user asks to comprehensively upgrade, audit, refactor, or run full regression checks.
+  Maintain the upstream multi-agent configuration repository (Antigravity_Codex_ClaudeCode_DeepSeekHarness)
+  via two autonomous loops: "全面更新" (full: non-active CLI upgrades with ABI coupling checks + dynamic
+  5-role and runtime_tunables recalibration) and "全量优化" (hygiene: codebase hardening, clean-room
+  engineering Chinese documentation rewrite, zero-blacklist grounding verification, and sandbox regression).
+  Trigger ONLY inside the upstream config repository or when explicitly asked to evolve global host configs;
+  never trigger for routine refactoring inside general scientific/engineering project repositories.
 ---
 
-# 客户端工具升级、模型选型重算与仓库整理流程（`fleet-evolve`）
+# 上游配置仓“全面更新”与“全量优化”双循环规程（`fleet-evolve`）
 
-当用户提出全面更新、重新调研校准最新模型与配额推荐表，或全量整理优化仓库代码与图文文档时，优先启用本技能。支持三种运行模式：
+本技能**专用于维护上游全局配置仓库**（`workspace_mode == "upstream_config_repo"`，即工作区同时包含 `install.py` 与 `template/user-guard/plugin.json`）或用户显式指明演进宿主机四端全局工具链的场景。若当前处于普通课题项目（`workspace_mode == "general_project"`）且用户仅要求优化当前项目代码或文档，严禁调用本技能或 `fleet_state.py`，应直接使用 `cae-harness` 与同端 `readonly-*` 子代理在项目目录内完成。
 
-- **`full`（默认完整流程：本机缓存与外部模型调研 -> 用户拍板 -> 非当前客户端升级与全局同步 -> 本机实际环境验证与全仓回归）**
-- **`audit`（仅只读检查：核查 Windows 与 WSL2 环境下的配置差异、工具链二进制接口耦合风险、报错冷却记录与外部模型变动，不修改任何文件）**
-- **`hygiene`（代码审查与图文文档重写：排查钩子与编排边界缺陷，按 `--clean-room` 空上下文盲读、平实工程中文分层重写与逐行技术脱敏核对三步更新文档，跑通全套离线与沙箱测试）**
+在上游配置仓库中，日常维护收敛为两大自主闭环与一种只读检查模式：
+
+- **`full`（“全面更新”闭环）**：采集本机四端探测缓存、运行报错日志与官方文档 -> 重新评估全部五个动态角色槽位（`orchestrator`、`math`、`code`、`review`、`fast`）及运行期定量参数（`runtime_tunables`） -> 登记草案并停机请用户拍板 -> 执行获批的非当前客户端升级与宿主机全局同步 -> 本机无头实测与全仓回归。
+- **`hygiene`（“全量优化”闭环）**：在不升级外部工具的前提下，基于当前已审定客户端与模型配置校准 `runtime_tunables`、消除散落死数字并加固钩子与编排脚本边界 -> 按“`--clean-room` 空上下文盲读挑刺 -> 平实工程中文图文重写 -> `check-grounding --strict` 零黑名单事实锚定核验 + `readonly-auditor` 逐行技术与脱敏复核”重构全仓文档与矢量图 -> 跑通六模式沙箱与全套离线单测 -> 如需同步宿主机全局目录，附 `--dry-run` 清单停机请用户拍板。
+- **`audit`（只读漂移与 ABI 巡检）**：全程零磁盘写入，核查 Windows 与 WSL2 下的四端配置对齐度、CC Switch 卡片状态、报错冷却记录及全局科学计算扩展包 ABI 耦合风险。
 
 ---
 
-## 一、代码约束与工程规则分工
+## 一、两层解耦架构与全动态参数收口范围
 
-为避免每次大模型换代或配额规则调整都要改动常驻规则与 Python 分支，系统划分为代码约束层与工程规则层：
+为使常驻治理代码在模型换代与客户端上下文策略变化时保持零返工，所有动态选型与定量运行阈值统一收口至 [fleet_profile.json](../cae-harness/fleet_profile.json)：
 
-| 层级 | 组成模块 | 职责范围 |
+| 分层 | 受控文件与模块 | 维护职责与硬约束 |
 | :--- | :--- | :--- |
-| **代码与配置约束层** | [fleet_profile.json](../cae-harness/fleet_profile.json)、`cae_harness.py`、`fleet_state.py`、`install.py`、五类生命周期钩子、`tests/` 离线测试集 | 集中维护角色候选、窗口预算与模型评估快照；校验读写白名单快照、配额冷却记录、推荐表审批状态锁（`propose`、`approve`）、主会话客户端切换重入锁（`record-pass1`、`verify-pass2`）、项目外写操作拦截，以及压缩后历轮原话与最近 `4` 次已完成子代理摘要的双路有界恢复。 |
-| **工程规则与审阅流程层** | [AGENTS.md](../../rules/AGENTS.md)、技能说明、只读子代理配置、三步文档校核流程 | 约束优缺点双向实证评估标准、自然工程书面语与图文结构要求、无实测依据不臆测百分比（`R5`）及主会话亲自核对原文件行号（`R6`）。 |
+| **常驻机制与门禁层** | `cae_harness.py`、`fleet_state.py`、`install.py`、`router.py`、`ccswitch_admin.py`、五类生命周期钩子、`tests/` | 零时期性模型名硬编码、零单一主控端锁死、零散落业务魔数；提供工作区身份识别（`workspace_mode`）、文件读写白名单哈希快照、运行侧配额冷却、事实锚定核验（`check-grounding`）及审批／重启重入状态锁。 |
+| **全动态评估与参数层** | [fleet_profile.json](../cae-harness/fleet_profile.json)（人工审阅视图见根目录 [README.md](../../../../README.md) 表一与架构说明表） | 1) **五类全动态角色槽位**：`orchestrator`、`math`、`code`、`review`、`fast` 的客户端候选顺序、推荐模型系列、推荐推理挡位与短板隔离策略；<br>2) **运行期定量参数（`runtime_tunables`）**：各端压缩后内联恢复总字数、实质子代理筛选窗口与最小有效字数、长会话交接阈值、空等与日志轮询阈值、无头分片安全系数、润色长短篇分界及本地路由并发／缓存上限。 |
+| **工程规则与审阅层** | [AGENTS.md](../../rules/AGENTS.md)、技能说明、`readonly-*` 子代理、三步文档校核规程 | 约束优缺点同步实证评估、自然工程书面语、防无声放大（`R5`）及主会话亲自核对原文件精确行号（`R6`）。 |
 
 ---
 
-## 二、选型校准原则与四个必停拍板节点
+## 二、全角色与定量参数动态校准原则及四个必停拍板节点
 
-1. **严格基于代码与官方实证校准，同步评估优势与严重短板**：
-   - 采集本机客户端探测结果（`probe --discover-models`）、运行期报错日志与官方文档时，每条关于窗口大小、出厂默认挡位、订阅滚动／周度配额池或 API 前缀缓存计费的陈述均须与本地缓存及源码公式逐一对齐，严禁编写未经核实的经验百分比或夸大形容词。
-   - **实证优势决定角色分工**：重点核对中文自然语言表达清晰度、长链条公式推导严密性、跨文件补丁与定量验证收敛效率、生命周期钩子与原生 `--json-schema`／`--output-schema` 支持度，以及客户端订阅配额（如 5 小时滚动窗口与 7 天周期配额）与按量 API 前缀缓存的成本特征。
-   - **严重短板作为排除或代码隔离依据**：凡存在平台区域访问限制、高频会话／周度配额上限、出厂默认推理挡位或上下文窗口偏保守、第三方 `Responses API` 协议转换反代引发 `HTTP 422` 工具调用 ID 错位与断流、开启 `ultra` 委派挡位派生多层子代理导致轮询超时，或较低上下文阈值触发自动压缩丢失早期约束及子代理结论等问题，均须如实记入 [fleet_profile.json](../cae-harness/fleet_profile.json)；不满足稳定运行条件的直接暂缓接入，可通过参数或钩子规避的在代码层固化隔离。
-2. **主会话与后台角色槽位均支持动态重算切换**：主会话槽位（`orchestrator`）不与特定客户端永久绑定；若评估表明其他客户端与主力模型组合更合适，生成草案后交由用户确认切换。
-3. **四个必停用户拍板节点**：严格执行 [AGENTS.md](../../rules/AGENTS.md) `R3.1.4` 规定的四类停机确认门禁（生成或调整推荐搭配表、向宿主机全局配置目录写入变更或切换主会话客户端、系统级 Python／CUDA／WSL 跨大版本 ABI 强耦合升级、以及远端 `git push`），获明确批准前严禁跨步执行。
+1. **五类角色槽位全部动态评估（非仅主控端动态）**：
+   - `orchestrator`、`math`、`code`、`review`、`fast` 五个槽位均无永久绑定的客户端或模型家族；文档、矩阵与矢量图表述必须与 `<client>:@<role>`／`role:*` 代码路由机制严格一致，明确区分“恒定架构机制”与“现阶段实测趋势”。
+   - **实证优势决定当前分工，严重短板决定排除或参数隔离**：核对中文表达清晰度、长链条公式推导严密性、多文件补丁与定量验证收敛率、生命周期钩子与原生 `--json-schema`／`--output-schema` 支持度、以及客户端订阅滚动／周度配额与 API 自动前缀缓存计费；对平台区域限制、高频配额上限、出厂默认窗口／挡位偏保守、第三方 `Responses API` 转换反代 `HTTP 422` 断流、`ultra` 自动委派死等及低阈值自动压缩丢上下文等问题，在 `fleet_profile.json` 中逐项绑定隔离参数。
+2. **`runtime_tunables` 按主会话客户端与子代理特性定量整定**：
+   - **压缩恢复参数（`compaction_recovery`）**：结合各客户端交互式自动压缩触发频率与可用窗口设定 `per_client` 内联预算，并通过 `(recent_subagent_window, recent_subagent_returns, min_substantive_subagent_chars, priority_subagent_keywords)` 动态决定重读哪些子代理结果——始终保留最新一次返回，并在候选窗口内优先保留达到实质字数阈值的审查／推导报告，防止简短状态回执挤掉关键行号证据。
+   - **交接、防轮询与无头派工参数（`handoff_thresholds`、`loop_guards`、`headless_dispatch`）**：统一由 `handoff_gate.py`、`reply_repeat_guard.py`、`status_guard.py`、`router.py`、`cae_harness.py` 与 `install.py` 读取，支持通过环境变量 `CAE_FLEET_PROFILE` 在离线沙箱中独立验证，同时保留单元测试属性打桩兼容。
+3. **四个必停用户拍板门禁（`R3.1.4`／`R4`）**：
+   - ① 生成或调整推荐的 `客户端 × 模型 × 推理挡位` 矩阵或 `runtime_tunables` 定量参数时（执行 `fleet_state.py propose` 登记待审）；
+   - ② 向宿主机全局配置目录写入变更（正式运行 `install.py`）或切换主会话客户端时；
+   - ③ 涉及装有 `jax`、`scipy`、`mpi4py` 等编译扩展的系统级 Python 跨次版本升级、CUDA 跨大版本升级或 WSL 跨 LTS 发行版升级时；
+   - ④ 执行 `git push` 推送远端仓库前。
 
 ---
 
-## 三、状态锁命令（`scripts/fleet_state.py`）
+## 三、状态锁与事实锚定门禁命令（`scripts/fleet_state.py`）
 
-审批与升级重入状态保存在宿主机本地状态目录（Windows 默认位于 `%LOCALAPPDATA%\cae-harness\fleet-evolve\state.windows.json`，WSL2 或 Linux 默认位于 `${XDG_STATE_HOME:-~/.local/state}/cae-harness/fleet-evolve/state.posix.json`），不写入 Git 工作区：
+状态锁保存在宿主机本地状态目录（Windows 默认 `%LOCALAPPDATA%\cae-harness\fleet-evolve\state.windows.json`，WSL2／Linux 默认 `${XDG_STATE_HOME:-~/.local/state}/cae-harness/fleet-evolve/state.posix.json`），不污染 Git 工作区；在非上游仓库目录未传 `--repo` 调用时会直接返回退出码 `2`（`not_upstream_config_repo`）：
 
 ```bash
-# 查看当前阶段（IDLE | AWAITING_USER_APPROVAL | AWAITING_MASTER_RELOAD）及核心文件 SHA-256
+# 1. 查看当前阶段（IDLE | AWAITING_USER_APPROVAL | AWAITING_MASTER_RELOAD）与工作区身份
 python -B -X utf8 <skill_dir>/scripts/fleet_state.py --repo <repo_root> status
 
-# 登记新版推荐搭配表草案并暂停等待用户拍板
+# 2. 登记候选角色矩阵或 runtime_tunables 调整草案并停机等待用户拍板
 python -B -X utf8 <skill_dir>/scripts/fleet_state.py --repo <repo_root> propose --session-id <sid> --summary "<草案摘要>"
 
-# 用户明确批准推荐表后解锁
+# 3. 获用户明确批准后解锁（校验 profile_sha256 与 core_sha256 未被中途篡改）
 python -B -X utf8 <skill_dir>/scripts/fleet_state.py --repo <repo_root> approve --session-id <sid>
+
+# 4. 终审归位（加 --verified --readback-done 时自动联动 audit_doc_grounding 硬门禁，检出虚构术语或失步数字直接拒绝通过）
+python -B -X utf8 <skill_dir>/scripts/fleet_state.py --repo <repo_root> clear --verified --readback-done
 ```
 
 ---
 
-## 四、四阶段执行步骤
+## 四、四阶段执行步骤（`full` 与 `hygiene` 共用骨架）
 
-### 第 1 阶段：只读状态采集与盲读审查（`IDLE` 首次进入或 `audit` 模式）
+### 第 1 阶段：只读基线采集与空上下文盲读（`IDLE` 进入或 `audit` 模式）
 
-1. **环境与依赖耦合检查**：在可用的 Windows 与 WSL2 环境中运行 `install.py --probe-apps`、`install.py --audit-upgrade --with-cc-router`、`cae_harness.py probe --discover-models` 与 `cae_harness.py assess --caller auto`，检查各客户端命令行、CC Switch（供应商卡片管理工具）、Python 启动器以及全局科学计算编译扩展包的二进制接口（ABI）耦合状态。
-2. **运行日志与外部变更核对**：核查近期无头调用报错类型、配额限流报文格式、模型缓存默认参数与官方更新说明；涉及模型选型调整时，本机实际复现的故障记录优先级高于外部基准分数。
-3. **代码边界审查与 `--clean-room` 空上下文盲读**：并发使用只读子代理与限定文件范围的后台只读任务检查代码边界漏洞与冗余死代码；重构核心文档前，先通过 `cae_harness.py task --kind review --clean-room` 在空上下文环境中从新读者视角挑出晦涩黑话、无依据断言、跨文件重复段落与阅读断层。
+1. **状态锁与环境探测**：确认 `fleet_state.py status` 处于 `upstream_config_repo`；运行 `install.py --probe-apps`、`install.py --audit-upgrade --with-cc-router`、`cae_harness.py probe`（`full` 模式加 `--discover-models`）与 `cae_harness.py assess --caller auto`。
+2. **差异分流**：`full` 模式同步核查外部模型变更、报错冷却记录与三级工具链升级项；`hygiene` 模式跳过外部工具升级，聚焦当前配置下的 `runtime_tunables` 死数字收口、钩子／路由边界加固与文档重写。
+3. **空上下文盲读挑刺**：重构重要文档前，可调用 `cae_harness.py task --kind review --clean-room` 从零预设新读者视角挑出术语断层、跨文件重复与潜在幻觉表述。
 
-### 第 2 阶段：仓库内修订、全量离线测试与提请用户拍板
+### 第 2 阶段：工作区加固、文档重写、确定性锚定核验与提请拍板
 
-1. **更新仓库源码、评估配置与图文文档**：
-   - 主会话按 `R6` 核对源码精确行号后完成修改，并在需要调整模型选型时更新 [fleet_profile.json](../cae-harness/fleet_profile.json)；
-   - 按“空上下文盲读挑刺 -> 主会话重写层次清晰、图文并茂（配合 `docs/assets/*.svg` 纯 ASCII 路径矢量图、Mermaid 图与结构化矩阵）且紧扣仓库代码的工程中文 -> `readonly-auditor` 逐行核对技术事实与脱敏”三步更新 [README.md](../../../../README.md) 与 `docs/` 文档。
-2. **写入宿主机前先在仓库与临时沙箱跑通全套离线测试**：
-   - 在临时目录完整验证六种 `--app` 安装模式（`antigravity`、`codex`、`claude`、`dsh`、`both`、`all`）及 `install.py --audit-upgrade --with-cc-router` 零配置漂移；
-   - 运行 `agy plugin validate --strict template/user-guard`（本机已安装 `agy` 时必跑）；
-   - 运行 `python -B -X utf8 -m unittest discover -s tests -p "test_*.py" -v` 确保全部离线单元测试通过；
-   - 核验两份 `AGENTS.md < 16,000 B`、`plugin.json` 唯一版本号、Markdown 与 SVG 本地相对链接有效性、UTF-8 无 BOM + `LF` 编码规范（`install.ps1` 保持 UTF-8 BOM + `CRLF`）及全文件脱敏。
-3. **非主控工具三级升级评估与停机确认**：
-   - **第一级（独立工具）**：无外部编译依赖的非当前客户端 CLI、`py.exe` 启动器、GitHub Actions 版本；
-   - **第二级（同系列补丁）**：同次版本 Python 小补丁、`wsl --update`，须先确认无正在运行的求解算例或后台任务；
-   - **第三级（强耦合跨大版本）**：装有 `jax`、`scipy`、`mpi4py` 等编译扩展的系统级 Python 跨次版本升级、CUDA 跨大版本升级、WSL 跨 LTS 发行版升级，必须发出明确依赖破坏警告并交由用户裁决。
-   - 若修改了推荐搭配表，执行 `fleet_state.py propose`；汇总变更说明、升级分级建议与 `install.py --dry-run` 宿主机写入预览清单呈交用户确认，原地暂停。
+1. **代码与配置修订**：按 `R6` 核对源码精确行号后完成修订，收口散落定量阈值至 [fleet_profile.json](../cae-harness/fleet_profile.json)。
+2. **三步文档与矢量图重构**：主会话抛开旧措辞整篇重写 `README.md`、`docs/*.md` 与 `docs/assets/*.svg`（确保区分“通用项目日常研发”与“上游配置仓维护”两类矩阵）；随后**必须运行零黑名单确定性事实锚定核验**：
+   ```bash
+   python -B -X utf8 template/user-guard/skills/cae-harness/scripts/cae_harness.py check-grounding --target . --strict
+   ```
+   确认零无依据标识符、零陌生大写缩写、零失步容量数字、零虚构领域举例，并由 `readonly-auditor` 完成逐行技术与脱敏复核。
+3. **全套离线与沙箱回归测试**：
+   - 运行 `agy plugin validate --strict template/user-guard`（本机装有 `agy` 时必跑）；
+   - 运行 `python -B -X utf8 -m unittest discover -s tests -p "test_*.py" -v`（含六种 `--app` 沙箱安装、`--audit-upgrade` 零漂移、压缩恢复动态预算、角色对称路由与 `check-grounding` 拦截单测）；
+   - 核验两份 `AGENTS.md < 16,000 B`、SVG XML 与右边界留白 `>= 8px`、UTF-8 无 BOM + `LF` 编码及 `R4` 公开脱敏。
+4. **停机提请用户拍板**：若调整了 `fleet_profile.json` 或需同步宿主机全局目录，运行 `fleet_state.py propose` 与 `install.py --dry-run --yes`，向用户一次汇报变更摘要、三级 ABI 升级评估（`full` 模式）及拟写入路径清单，原地暂停等待用户指令。
 
-### 第 3 阶段：获批后执行升级、全局同步与本机验证
+### 第 3 阶段：获批后执行全局同步与本机实测验收
 
-1. 获用户明确批准后，若存在待审草案则先运行 `fleet_state.py approve`，完成获批的非主控工具升级（不强行终止当前正在运行的主会话客户端进程），并在本机目标环境执行 `install.py` 同步全局配置。
-2. 验证已就绪客户端状态与无头调用连通性，确认 `install.py --audit-upgrade` 返回 `summary.all_aligned == true`。
-3. 若主会话客户端自身需升级或切换，运行 `fleet_state.py record-pass1 --session-id <sid> --target-master "<目标客户端>"` 给出简明手动重启步骤后暂停；重启后在新会话中运行 `verify-pass2` 完成复核。
+1. 用户明确批准后，运行 `fleet_state.py approve`（若有待审草案），执行获批的非当前客户端升级（`full` 模式）及 `install.py` 宿主机同步。
+2. 核验 `install.py --audit-upgrade` 返回 `summary.all_aligned == true` 及已就绪客户端无头连通性。
+3. 若主会话客户端自身版本或推荐槽位发生变更，执行 `fleet_state.py record-pass1 --session-id <sid> --target-master "<目标端>"` 提示用户手动重启客户端，并在重启后运行 `verify-pass2` 完成复核。
 
-### 第 4 阶段：终审登记与等待推送指令
+### 第 4 阶段：终审归位与等待推送指令
 
-运行独立只读代码复核并由主会话核对行号，执行 `fleet_state.py clear --verified --readback-done`，输出 `git status -sb`、`git diff --stat` 与测试结果摘要，未获用户明确推送授权前不自动执行 `git push`。
+运行 `fleet_state.py clear --verified --readback-done`（自动再次执行全仓 `audit_doc_grounding` 硬校验），输出 `git status -sb`、`git diff --stat` 与验证等级摘要，未获用户明确指令前严禁自动执行 `git push`。

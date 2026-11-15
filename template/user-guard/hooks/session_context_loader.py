@@ -27,12 +27,37 @@ import user_words  # noqa: E402
 
 user_words.ensure_utf8_stdio()
 
-MAX_INLINE_TOTAL_CHARS = 8000
-MAX_INLINE_ITEM_CHARS = 1200
-MAX_INLINE_SUBAGENT_TOTAL_CHARS = 1400
-MAX_INLINE_SUBAGENT_ITEM_CHARS = 280
-MAX_TRANSCRIPT_TRACKED_IMAGES = 2000
-ARCHIVE_RETRY_INTERVAL_SEC = 30
+_DEFAULT_MAX_INLINE_TOTAL_CHARS = 8000
+_DEFAULT_MAX_INLINE_ITEM_CHARS = 1200
+_DEFAULT_MAX_INLINE_SUBAGENT_TOTAL_CHARS = 1400
+_DEFAULT_MAX_INLINE_SUBAGENT_ITEM_CHARS = 280
+_DEFAULT_MAX_TRANSCRIPT_TRACKED_IMAGES = 2000
+_DEFAULT_ARCHIVE_RETRY_INTERVAL_SEC = 30
+
+MAX_INLINE_TOTAL_CHARS = _DEFAULT_MAX_INLINE_TOTAL_CHARS
+MAX_INLINE_ITEM_CHARS = _DEFAULT_MAX_INLINE_ITEM_CHARS
+MAX_INLINE_SUBAGENT_TOTAL_CHARS = _DEFAULT_MAX_INLINE_SUBAGENT_TOTAL_CHARS
+MAX_INLINE_SUBAGENT_ITEM_CHARS = _DEFAULT_MAX_INLINE_SUBAGENT_ITEM_CHARS
+MAX_TRANSCRIPT_TRACKED_IMAGES = _DEFAULT_MAX_TRANSCRIPT_TRACKED_IMAGES
+ARCHIVE_RETRY_INTERVAL_SEC = _DEFAULT_ARCHIVE_RETRY_INTERVAL_SEC
+
+
+def _resolve_loader_policy(client: str = "") -> Dict[str, Any]:
+    """合并 fleet_profile.json 中按主会话客户端校准的恢复参数，并兼容单测模块级常量覆盖。"""
+    policy = user_words.get_compaction_tunables(client, HOOKS_DIR)
+    if MAX_INLINE_TOTAL_CHARS != _DEFAULT_MAX_INLINE_TOTAL_CHARS:
+        policy["inline_total_chars"] = max(400, int(MAX_INLINE_TOTAL_CHARS))
+    if MAX_INLINE_ITEM_CHARS != _DEFAULT_MAX_INLINE_ITEM_CHARS:
+        policy["inline_user_item_chars"] = max(200, int(MAX_INLINE_ITEM_CHARS))
+    if MAX_INLINE_SUBAGENT_TOTAL_CHARS != _DEFAULT_MAX_INLINE_SUBAGENT_TOTAL_CHARS:
+        policy["inline_subagent_total_chars"] = max(120, int(MAX_INLINE_SUBAGENT_TOTAL_CHARS))
+    if MAX_INLINE_SUBAGENT_ITEM_CHARS != _DEFAULT_MAX_INLINE_SUBAGENT_ITEM_CHARS:
+        policy["inline_subagent_item_chars"] = max(120, int(MAX_INLINE_SUBAGENT_ITEM_CHARS))
+    if MAX_TRANSCRIPT_TRACKED_IMAGES != _DEFAULT_MAX_TRANSCRIPT_TRACKED_IMAGES:
+        policy["max_tracked_images"] = max(10, int(MAX_TRANSCRIPT_TRACKED_IMAGES))
+    if ARCHIVE_RETRY_INTERVAL_SEC != _DEFAULT_ARCHIVE_RETRY_INTERVAL_SEC:
+        policy["archive_retry_interval_sec"] = max(1, int(ARCHIVE_RETRY_INTERVAL_SEC))
+    return policy
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
 UI_BANNER_PHRASE = "this conversation grew too large, so the history before this point may be missing or incomplete"
@@ -326,8 +351,10 @@ def _scan_transcript_incrementally(
     host_banner_step = int(state.get("hostBannerStep", -1))
     latest_step = max(int(state.get("latestStepIndex", -1)), latest_scanned_step)
 
+    max_tracked_images = int(_resolve_loader_policy("antigravity")["max_tracked_images"])
+
     def _stat_image_uri(raw_uri: str, image_map: Dict[str, int], is_image_media: bool = False) -> None:
-        if not raw_uri or len(image_map) >= MAX_TRANSCRIPT_TRACKED_IMAGES:
+        if not raw_uri or len(image_map) >= max_tracked_images:
             return
         cleaned = _decode_proto_str(raw_uri)
         if cleaned.startswith("file://"):
@@ -457,9 +484,16 @@ def _truncate_single_item(content: str, turn: int, max_chars: int = MAX_INLINE_I
     )
 
 
-def _format_inline_subagent_section(subagent_returns: List[Dict[str, Any]]) -> str:
+def _format_inline_subagent_section(
+    subagent_returns: List[Dict[str, Any]],
+    policy: Optional[Dict[str, Any]] = None,
+) -> str:
     if not subagent_returns:
         return ""
+    cfg = policy if isinstance(policy, dict) else _resolve_loader_policy("")
+    sub_total_cap = int(cfg["inline_subagent_total_chars"])
+    sub_item_cap = int(cfg["inline_subagent_item_chars"])
+    sub_head_ratio = float(cfg.get("subagent_head_ratio", 0.58))
     title = "【最近子代理返回摘要（采纳前须按 R6 核对原文件或子代理日志）】"
     chosen_blocks: List[str] = []
     used = len(title) + 2
@@ -467,10 +501,10 @@ def _format_inline_subagent_section(subagent_returns: List[Dict[str, Any]]) -> s
         label = str(item.get("label") or item.get("agent_id") or "subagent").strip()
         trunc_tag = " | 轨迹截断" if item.get("truncated") else ""
         log_hint = f"\n原始日志：{item['log_path']}" if item.get("log_path") else ""
-        body = user_words.summarize_subagent_return(item.get("content", ""), MAX_INLINE_SUBAGENT_ITEM_CHARS)
+        body = user_words.summarize_subagent_return(item.get("content", ""), sub_item_cap, sub_head_ratio)
         blk = f"· [{label} | Step {item['step_index']}{trunc_tag}]{log_hint}\n{body}"
         cost = len(blk) + (2 if chosen_blocks else 1)
-        if used + cost > MAX_INLINE_SUBAGENT_TOTAL_CHARS:
+        if used + cost > sub_total_cap:
             break
         chosen_blocks.append(blk)
         used += cost
@@ -490,8 +524,14 @@ def build_compaction_system_message(
     source_paths: Optional[List[str]] = None,
     header: str = "",
     subagent_returns: Optional[List[Dict[str, Any]]] = None,
+    client: str = "",
+    policy: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """构造带预算上限保护与归档文件指针的原话及最近子代理摘要回溯消息"""
+    """构造带动态预算上限保护与归档文件指针的原话及最近子代理摘要回溯消息"""
+    cfg = policy if isinstance(policy, dict) else _resolve_loader_policy(client)
+    total_cap = int(cfg["inline_total_chars"])
+    user_item_cap = int(cfg["inline_user_item_chars"])
+    head_turns = max(1, int(cfg.get("inline_guaranteed_head_turns", 1)))
     archive_str = str(saved_md_path) if saved_md_path else "未落盘"
     total_turns = len(words)
     recent_returns = list(subagent_returns or [])
@@ -517,8 +557,8 @@ def build_compaction_system_message(
     header_lines.append("请按全局规则 R9 核对原始轨迹、归档状态及用户最新裁定，汇报现状后继续。")
     header_text = "\n".join(header_lines) + "\n\n"
 
-    subagent_section = _format_inline_subagent_section(recent_returns)
-    words_total_budget = MAX_INLINE_TOTAL_CHARS - len(subagent_section)
+    subagent_section = _format_inline_subagent_section(recent_returns, cfg)
+    words_total_budget = total_cap - len(subagent_section)
 
     formatted_blocks: List[str] = []
     for w in words:
@@ -528,7 +568,7 @@ def build_compaction_system_message(
             kind_label += " [截断正文待补]"
         if w.get("provenance_verified") is False:
             kind_label += " [用户角色，来源未核实]"
-        body = _truncate_single_item(w["content"], w["turn"], MAX_INLINE_ITEM_CHARS)
+        body = _truncate_single_item(w["content"], w["turn"], user_item_cap)
         if w.get("attachments") and w.get("source_path"):
             body += f"\n附件来源：{w['source_path']}"
         block = f"【第 {w['turn']} 轮指令】{kind_label} (Step {w['step_index']}{time_tag})\n{body}"
@@ -537,34 +577,43 @@ def build_compaction_system_message(
     joined_all = "\n\n".join(formatted_blocks)
     if len(header_text) + len(joined_all) <= words_total_budget or not formatted_blocks:
         combined = header_text + joined_all + subagent_section
-        return combined if len(combined) <= MAX_INLINE_TOTAL_CHARS else (header_text + joined_all)[:MAX_INLINE_TOTAL_CHARS]
+        return combined if len(combined) <= total_cap else (header_text + joined_all)[:total_cap]
 
-    # 超出总预算时：必保第 1 轮立项总纲 + 逆序尽可能多地保留最近定论轮次
-    first_block = formatted_blocks[0]
-    budget_left = words_total_budget - len(header_text) - len(first_block) - 180
+    # 超出总预算时：按策略保留开篇立项轮次 + 逆序尽可能多地保留最近定论轮次
+    kept_head = formatted_blocks[:1]
+    for cand_blk in formatted_blocks[1:head_turns]:
+        cand_head_text = "\n\n".join(kept_head + [cand_blk])
+        if len(header_text) + len(cand_head_text) + 260 <= words_total_budget:
+            kept_head.append(cand_blk)
+        else:
+            break
+    head_count = len(kept_head)
+    head_joined = "\n\n".join(kept_head)
+    budget_left = words_total_budget - len(header_text) - len(head_joined) - 180
     tail_blocks: List[str] = []
     used = 0
-    for blk in reversed(formatted_blocks[1:]):
+    for blk in reversed(formatted_blocks[head_count:]):
         if used + len(blk) + 2 > budget_left:
             break
         tail_blocks.append(blk)
         used += len(blk) + 2
     tail_blocks.reverse()
 
-    omitted_count = len(formatted_blocks) - 1 - len(tail_blocks)
+    omitted_count = len(formatted_blocks) - head_count - len(tail_blocks)
     if omitted_count > 0:
-        end_omitted_turn = 1 + omitted_count
+        start_omitted_turn = head_count + 1
+        end_omitted_turn = head_count + omitted_count
         omit_notice = (
-            f"...（中间第 2～{end_omitted_turn} 轮共 {omitted_count} 条历史指令因上下文预算省略内联；"
+            f"...（中间第 {start_omitted_turn}～{end_omitted_turn} 轮共 {omitted_count} 条历史指令因上下文预算省略内联；"
             "请按 R9 查阅轨迹和已保存的归档）..."
         )
-        words_rendered = header_text + "\n\n".join([first_block, omit_notice] + tail_blocks)
-        if len(words_rendered) + len(subagent_section) <= MAX_INLINE_TOTAL_CHARS:
+        words_rendered = header_text + "\n\n".join(kept_head + [omit_notice] + tail_blocks)
+        if len(words_rendered) + len(subagent_section) <= total_cap:
             return words_rendered + subagent_section
-        return words_rendered[:MAX_INLINE_TOTAL_CHARS]
+        return words_rendered[:total_cap]
 
     combined_fallback = header_text + joined_all + subagent_section
-    return combined_fallback[:MAX_INLINE_TOTAL_CHARS]
+    return combined_fallback[:total_cap]
 
 
 # ⑤ Antigravity 恢复流程与兼容入口
@@ -601,6 +650,7 @@ def _handle_context_locked(conversation_id: str, event_name: str, explicit_sourc
         log_event(f"{event_name}:handoff_gate_error", conversation_id, f"交接门禁状态异常，继续原话恢复（{exc}）")
         gate_res = {"phase": "normal", "advisoryNotice": None, "mandateMessage": None}
 
+    agy_policy = _resolve_loader_policy("antigravity")
     trigger_reason: Optional[str] = None
     pending = state.get("pendingArchive")
     pending = pending if isinstance(pending, dict) else {}
@@ -616,7 +666,7 @@ def _handle_context_locked(conversation_id: str, event_name: str, explicit_sourc
         last_scan = last_scan if isinstance(last_scan, (float, int)) else 0
         old_signatures = pending.get("sources")
         full_changed = isinstance(old_signatures, list) and len(old_signatures) == 2 and old_signatures[1] != signatures[1]
-        if full_changed or time.time() - last_scan >= ARCHIVE_RETRY_INTERVAL_SEC:
+        if full_changed or time.time() - last_scan >= int(agy_policy["archive_retry_interval_sec"]):
             trigger_reason = "原话归档缺口复核"
 
     injected_blocks: List[str] = []
@@ -648,7 +698,7 @@ def _handle_context_locked(conversation_id: str, event_name: str, explicit_sourc
         else:
             saved_md_path = (
                 user_words.save_user_words_markdown(
-                    state_dir, conversation_id, words, issues, subagent_returns=subagent_returns
+                    state_dir, conversation_id, words, issues, subagent_returns=subagent_returns, policy=agy_policy
                 )
                 if update_notice or not existing.is_file()
                 else existing
@@ -670,7 +720,7 @@ def _handle_context_locked(conversation_id: str, event_name: str, explicit_sourc
             injected_blocks.append(build_compaction_system_message(
                 words, saved_md_path, trigger_reason, archive_status=archive_status, issues=issues,
                 source_paths=[str(transcript_path), str(transcript_path.parent / "transcript_full.jsonl")],
-                subagent_returns=subagent_returns,
+                subagent_returns=subagent_returns, client="antigravity", policy=agy_policy,
             ))
             state["lastInjectedAt"] = get_current_iso_time()
             state["lastInjectedWordCount"] = len(words)
@@ -802,15 +852,17 @@ def handle_codex_session_start(
         lines.append("本会话用户原话文件：尚无已确认可读的归档文档")
         lines.append("已保存记录范围：尚未核实")
 
+    codex_policy = _resolve_loader_policy("codex")
+    codex_cap = int(codex_policy["inline_total_chars"])
     source_paths = result["segments"] or [item["path"] for item in saved.get("sources") or []]
     full_context = build_compaction_system_message(
         words, Path(saved["file"]) if saved.get("available") else None, f"Codex {source}",
         header="\n".join(lines), issues=result.get("issues"), source_paths=source_paths,
-        subagent_returns=result.get("subagent_returns"),
+        subagent_returns=result.get("subagent_returns"), client="codex", policy=codex_policy,
     )
-    if len(full_context) > MAX_INLINE_TOTAL_CHARS:
+    if len(full_context) > codex_cap:
         suffix = "\n（内联内容已截断，请查阅原话档案。）"
-        full_context = full_context[:MAX_INLINE_TOTAL_CHARS - len(suffix)] + suffix
+        full_context = full_context[:codex_cap - len(suffix)] + suffix
 
     _append_codex_log(
         log_path,
@@ -861,15 +913,17 @@ def handle_claude_session_start(
         lines.append("文件状态：归档完整性未验证")
     if saved.get("available"):
         lines.append(f"校验清单：{result['meta_path']}")
+    claude_policy = _resolve_loader_policy("claude")
+    claude_cap = int(claude_policy["inline_total_chars"])
     full_context = build_compaction_system_message(
         result["words"], Path(saved["file"]) if saved.get("available") else None, f"Claude {source}",
         header="\n".join(lines), issues=result["issues"], source_paths=result["segments"],
-        subagent_returns=result.get("subagent_returns"),
+        subagent_returns=result.get("subagent_returns"), client="claude", policy=claude_policy,
     )
     # 路径、来源和时间戳也可能很长，最终输出仍须遵守 SessionStart 字符预算。
-    if len(full_context) > MAX_INLINE_TOTAL_CHARS:
+    if len(full_context) > claude_cap:
         suffix = "\n（内联内容已截断，请查阅原话档案。）"
-        full_context = full_context[:MAX_INLINE_TOTAL_CHARS - len(suffix)] + suffix
+        full_context = full_context[:claude_cap - len(suffix)] + suffix
     if log_path_str:
         user_words.append_jsonl_log(Path(log_path_str).expanduser(), {
             "ts": get_current_iso_time(), "event": "SessionStart", "client": "claude",
@@ -911,7 +965,8 @@ def main() -> None:
                 }
             }
             if args.client == "claude":
-                response["hookSpecificOutput"]["additionalContext"] = response["hookSpecificOutput"]["additionalContext"][:MAX_INLINE_TOTAL_CHARS]
+                err_cap = int(_resolve_loader_policy("claude")["inline_total_chars"])
+                response["hookSpecificOutput"]["additionalContext"] = response["hookSpecificOutput"]["additionalContext"][:err_cap]
         sys.stdout.write(json.dumps(response, ensure_ascii=False) + "\n")
         sys.stdout.flush()
         return

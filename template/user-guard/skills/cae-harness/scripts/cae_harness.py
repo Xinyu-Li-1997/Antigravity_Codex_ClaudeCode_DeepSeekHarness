@@ -72,13 +72,14 @@ EFFORT_LADDER = ('minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra')
 TIER_CHOICES = ('auto', 'ultra', 'max', 'xhigh', 'high', 'medium', 'low')
 
 
-CATALOG_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
+_DEFAULT_CATALOG_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
+CATALOG_MAX_AGE_SECONDS = _DEFAULT_CATALOG_MAX_AGE_SECONDS
 
 
 HIGH_COMPLEXITY_CUES = (
     '守恒', 'conservation', '通量', '通量重构', '黎曼', 'riemann', '雅可比', 'jacobian',
-    '熵稳定', 'entropy stability', 'dgsem', 'weno', '高阶格式', '间断伽辽金',
-    '收敛阶', 'order of convergence', '数值稳定性', '边界条件', '特征分解', '特征值',
+    '熵稳定', 'entropy stability', 'dgsem', 'weno', '高阶格式', '间断伽辽金', '有限元',
+    '收敛阶', 'order of convergence', '制造解', '数值稳定性', '边界条件', '特征分解', '特征值',
     '数学公式', '公式推导', '控制方程', '偏微分方程', '本构', '线性化', '牛顿法', 'newton',
     '证明', 'prove', '定理', '引理', '推导', 'derive', '变分',
     '根因', 'root cause', '死锁', 'deadlock', '竞态', 'race condition', '并发', 'concurrency',
@@ -187,6 +188,62 @@ def _catalog_rules(prefix):
     return entry if isinstance(entry, dict) else {}
 
 
+def _headless_tunables():
+    tunables = _fleet_profile().get('runtime_tunables')
+    hd = tunables.get('headless_dispatch') if isinstance(tunables, dict) else None
+    return hd if isinstance(hd, dict) else {}
+
+
+def _catalog_max_age_seconds():
+    if CATALOG_MAX_AGE_SECONDS != _DEFAULT_CATALOG_MAX_AGE_SECONDS:
+        return CATALOG_MAX_AGE_SECONDS
+    days = _headless_tunables().get('catalog_max_age_days')
+    if isinstance(days, int) and not isinstance(days, bool) and days > 0:
+        return days * 24 * 60 * 60
+    return CATALOG_MAX_AGE_SECONDS
+
+
+GENERAL_PROJECT_CAPABILITIES = (
+    'global_rules_R0_R11',
+    'lifecycle_hooks',
+    'readonly_subagents',
+    'cae_harness_probe_assess',
+    'cae_harness_task_gate_audit',
+    'cae_harness_check_grounding',
+    'ccswitch_admin',
+)
+
+UPSTREAM_ONLY_CAPABILITIES = (
+    'fleet_evolve_full_hygiene_audit',
+    'fleet_state_lock',
+    'host_global_sync_install_py',
+)
+
+
+def detect_workspace_mode(target_dir=None):
+    """识别当前工作区属于通用课题项目（部分功能）还是本配置上游维护仓库（全功能）。"""
+    base = Path(target_dir).expanduser().resolve() if target_dir is not None else Path.cwd().resolve()
+    if base.is_file():
+        base = base.parent
+    matched_root = None
+    for candidate in (base, *base.parents):
+        if (candidate / 'install.py').is_file() and (candidate / 'template' / 'user-guard' / 'plugin.json').is_file():
+            matched_root = candidate
+            break
+    is_upstream = matched_root is not None
+    return {
+        'mode': 'upstream_config_repo' if is_upstream else 'general_project',
+        'is_upstream_config_repo': is_upstream,
+        'inspected_path': str(base),
+        'upstream_repo_root': str(matched_root) if matched_root else None,
+        'available_capabilities': list(
+            GENERAL_PROJECT_CAPABILITIES + UPSTREAM_ONLY_CAPABILITIES
+            if is_upstream else GENERAL_PROJECT_CAPABILITIES
+        ),
+        'upstream_only_capabilities': [] if is_upstream else list(UPSTREAM_ONLY_CAPABILITIES),
+    }
+
+
 def _fast_model_tags(prefix=None):
     if prefix:
         tags = _catalog_rules(prefix).get('fast_tags')
@@ -209,7 +266,7 @@ NON_AI_MODEL_STOPWORDS = {
     'turbulence', 'rans', 'les', 'dns', 'sst', 'kepsilon', 'komega', 'spalart', 'allmaras',
     'epsilon', 'navier', 'stokes', 'euler', 'boltzmann', 'bgk', 'muscl', 'tvd', 'godunov',
     'smagorinsky', 'vreman', 'courant', 'knudsen', 'reynolds', 'prandtl', 'mach',
-    'weno', 'cweno', 'eno', 'dg', 'dgsem', 'fvm', 'fem', 'fdm', 'cfd', 'cae', 'eos',
+    'weno', 'cweno', 'eno', 'dg', 'dgsem', 'fvm', 'fem', 'fea', 'fdm', 'cfd', 'cae', 'pde', 'hpc', 'mms', 'eoc', 'gcl', 'eos',
     'riemann', 'roe', 'hll', 'hllc', 'hlle', 'ausm', 'rusanov', 'rk', 'bdf', 'cfl',
     'model', 'models', 'default', 'auto', 'cli', 'lite', 'lightweight',
     'codex', 'antigravity', 'agy', 'openai', 'google', 'gemini', 'gpt',
@@ -1121,8 +1178,24 @@ def _is_fast_engine_spec(engine):
     return False
 
 
+def _role_recommended_tier(engine):
+    raw = str(engine or '').strip().lower()
+    role_name = ''
+    if raw.startswith('role:'):
+        role_name = raw.split(':', 1)[1].strip()
+    elif ':' in raw:
+        prefix, _, suffix = raw.partition(':')
+        role_name = _per_backend_role_target(prefix, suffix)
+    if not role_name:
+        return '', ''
+    roles = _fleet_profile().get('roles')
+    role_cfg = roles.get(role_name) if isinstance(roles, dict) else None
+    rec = str((role_cfg or {}).get('recommended_tier') or '').strip().lower() if isinstance(role_cfg, dict) else ''
+    return role_name, (rec if rec in TIER_CHOICES and rec not in ('auto', 'ultra') else '')
+
+
 def select_task_tier(requested_tier='auto', kind='review', text='', file_count=1, estimated_tokens=0, *, engine=''):
-    """默认选用单模型最高挡位；显式挡位、role:fast、节省额度意图与非 ultra 环境默认值可覆盖自动策略。"""
+    """默认选用单模型非委派最高挡位；显式挡位、角色槽位推荐挡位、节省额度意图与环境默认值可覆盖自动策略。"""
     if requested_tier and requested_tier != 'auto':
         return requested_tier, 'explicit_tier_flag'
     sample = (text or '').strip()
@@ -1137,13 +1210,19 @@ def select_task_tier(requested_tier='auto', kind='review', text='', file_count=1
     for level, cues in prose_requests.items():
         if _has_positive_cue(sample, cues):
             return level, 'user_description_' + level
+    role_name, role_tier = _role_recommended_tier(engine)
     if _is_fast_engine_spec(engine):
-        return 'low', 'role_fast_low'
+        fast_tier = role_tier or 'low'
+        return fast_tier, ('role_fast_low' if fast_tier == 'low' else f'role_profile_fast_{fast_tier}')
     env_tier = os.environ.get('CAE_DEFAULT_TIER', '').strip().lower()
     if env_tier in TIER_CHOICES and env_tier not in ('auto', 'ultra'):
         return env_tier, 'env_default_tier'
+    hd = _headless_tunables()
+    short_max_files = _positive_int(hd.get('polish_short_max_files')) or 3
+    short_max_tokens = _positive_int(hd.get('polish_short_max_tokens')) or 4_000
+    short_max_chars = _positive_int(hd.get('polish_short_max_chars')) or 2_500
     if kind == 'polish' and not _has_positive_cue(sample, ('证明', '推导', '根因', 'prove', 'derive')):
-        if file_count <= 3 and estimated_tokens <= 4_000 and len(sample) <= 2_500:
+        if file_count <= short_max_files and estimated_tokens <= short_max_tokens and len(sample) <= short_max_chars:
             return 'medium', 'complexity_lightweight_polish'
         return 'high', 'complexity_long_polish'
     if _has_positive_cue(sample, ECONOMY_DOWNGRADE_CUES):
@@ -1157,6 +1236,8 @@ def select_task_tier(requested_tier='auto', kind='review', text='', file_count=1
                 sample, ('降挡', '降档', '降一挡', '降一档', '适当降挡', '适当降档', '降低挡位', '降低档位', 'lower tier', 'lower effort')):
             return 'max', f'task_specialty_{kind}_max' if kind in ('math', 'direction') else 'complexity_high_domain_max'
         return 'high', 'economy_adaptive_high'
+    if role_tier and role_tier != 'max':
+        return role_tier, f'role_profile_{role_name}_{role_tier}'
     if kind in ('math', 'direction'):
         return 'max', f'task_specialty_{kind}_max'
     if _has_positive_cue(sample, HIGH_COMPLEXITY_CUES):
@@ -1177,6 +1258,7 @@ def _execution_environment(info):
 
 
 def _execution_budget(prefix, info, record):
+    hd = _headless_tunables()
     default = _positive_int(record.get('context_window'))
     maximum = _positive_int(record.get('max_context_window'))
     configured = _positive_int(info.get('configured_window_tokens'))
@@ -1188,7 +1270,13 @@ def _execution_budget(prefix, info, record):
     effective_window = window * percent // 100 if window is not None and percent is not None else None
     model_limit = effective_window if effective_window is not None else window
     requested = _positive_int(info.get('requested_input_budget_tokens'))
-    policy_cap = 120_000
+    policy_cap = _positive_int(hd.get('unlisted_window_fallback_tokens')) or 120_000
+    raw_ratio = hd.get('input_budget_safety_ratio')
+    ratio_permille = (
+        int(round(float(raw_ratio) * 1000))
+        if isinstance(raw_ratio, (int, float)) and not isinstance(raw_ratio, bool) and 0.50 <= float(raw_ratio) <= 1.0
+        else 900
+    )
     cap = min((v for v in (model_limit, compact) if v is not None), default=None)
     if cap is None:
         budget = requested or policy_cap
@@ -1196,10 +1284,11 @@ def _execution_budget(prefix, info, record):
     elif requested:
         budget, source = min(requested, cap), 'explicit_planning_budget_capped'
     else:
-        budget = min(cap, max(1, cap * 9 // 10))
+        budget = min(cap, max(1, cap * ratio_permille // 1000))
         if not window:
             budget = min(budget, policy_cap)
-        source = ('policy_estimate_90pct_of_planning_cap' if window else
+        source = ('policy_estimate_90pct_of_planning_cap' if window and ratio_permille == 900 else
+                  f'policy_estimate_{ratio_permille}permille_of_planning_cap' if window else
                   'conservative_estimate_capped_by_configured_compaction')
     return {
         'model_default_window_tokens': default, 'model_declared_max_window_tokens': maximum,
@@ -1337,10 +1426,10 @@ def _per_backend_role_target(prefix, raw_model):
     token = str(raw_model or '').strip().lower()
     if token.startswith('@'):
         role = token[1:]
-        return role if role in ('math', 'code', 'review', 'fast') else ''
-    if prefix == 'codex' and token in ('math', 'code', 'review'):
+        return role if role in ('orchestrator', 'math', 'code', 'review', 'fast') else ''
+    if prefix in ('codex', 'dsh', 'agy', 'claude') and token in ('math', 'code', 'review'):
         return token
-    if prefix in ('dsh', 'agy', 'claude') and token in ('math', 'code', 'review', 'fast'):
+    if prefix in ('dsh', 'claude') and token == 'fast':
         return token
     return ''
 
@@ -1356,6 +1445,8 @@ def resolve_execution_profile(backends, spec, tier='max', prompt_text='', kind='
             tier = 'low'
             kind = 'review'
             prompt_text = ''
+        elif role_target == 'orchestrator':
+            kind = 'review'
         else:
             kind = role_target
     hint = _extract_prompt_model_hint(prompt_text) if not explicit_model and not role_target and models else ''
@@ -1476,6 +1567,7 @@ def resolve_execution_profile(backends, spec, tier='max', prompt_text='', kind='
 
 
 def _catalog_metadata(path, data, models, source, now):
+    max_age = _catalog_max_age_seconds()
     exists = path.is_file() if path else False
     fetched_at = data.get('fetched_at') if isinstance(data, dict) else None
     stamp = None
@@ -1493,12 +1585,12 @@ def _catalog_metadata(path, data, models, source, now):
     elif age < 0:
         freshness = 'future_timestamp'
     else:
-        freshness = 'stale' if age >= CATALOG_MAX_AGE_SECONDS else 'within_assessment_window'
+        freshness = 'stale' if age >= max_age else 'within_assessment_window'
     return {'source': source, 'path': str(path) if path else None, 'cache_file_exists': exists,
             'fetched_at': stamp.isoformat() if stamp else None,
             'timestamp_source': ('cli_query_time_utc' if path is None else 'cache_fetched_at_field') if stamp else None,
             'age_seconds': int(age) if age is not None and age >= 0 else None,
-            'freshness': freshness, 'assessment_window_seconds': CATALOG_MAX_AGE_SECONDS,
+            'freshness': freshness, 'assessment_window_seconds': max_age,
             'model_count': len(models)}
 
 
@@ -2124,10 +2216,13 @@ def _parse_quota_reset(text, now=None):
                         epoch = now_ts + hrs * 3600 + mins * 60 + secs
                     except (ValueError, OverflowError):
                         epoch = None
-    if epoch is not None and now_ts < epoch <= now_ts + 45 * 86400:
+    hd = _headless_tunables()
+    horizon_days = _positive_int(hd.get('quota_max_horizon_days')) or 45
+    default_cd = _positive_int(hd.get('quota_default_cooldown_sec')) or 3600
+    if epoch is not None and now_ts < epoch <= now_ts + horizon_days * 86400:
         until, source = epoch, 'parsed_reset_time'
     else:
-        until, source = now_ts + 3600, 'default_ttl_3600s'
+        until, source = now_ts + default_cd, f'default_ttl_{default_cd}s'
     return {'reset_hint': hint or None, 'cooldown_until_epoch': round(until, 3), 'cooldown_source': source}
 
 
@@ -3170,7 +3265,8 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
             if clean_room and prefix == 'codex':
                 staged_records = collect_target_files(stage_dir)
                 total_bytes = sum(item['bytes'] for item in staged_records)
-                if staged_records and total_bytes <= 262_144:
+                inline_cap = (_positive_int(_headless_tunables().get('clean_room_inline_snapshot_kib')) or 256) * 1024
+                if staged_records and total_bytes <= inline_cap:
                     blocks = []
                     for item in staged_records:
                         try:
@@ -4010,14 +4106,359 @@ def _fleet_profile_summary():
     return {
         'profile_id': prof.get('profile_id'),
         'evaluated_at': prof.get('evaluated_at'),
+        'evaluation_policy': prof.get('evaluation_policy'),
         'roles': prof.get('roles'),
         'excluded_or_retiring': prof.get('excluded_or_retiring'),
+        'runtime_tunables': prof.get('runtime_tunables'),
     }
+
+
+_GROUNDING_GENERIC_ACRONYMS = frozenset({
+    'API', 'CLI', 'CPU', 'GPU', 'RAM', 'OOM', 'ROM', 'SSD', 'SSH', 'SSL', 'TLS', 'TCP', 'UDP', 'DNS', 'URL', 'URI',
+    'HTTP', 'HTTPS', 'JSON', 'JSONL', 'YAML', 'TOML', 'XML', 'HTML', 'CSS', 'SVG', 'PNG', 'JPG', 'PDF', 'UTF', 'BOM',
+    'CRLF', 'EOF', 'EOL', 'AST', 'PID', 'TID', 'UID', 'GID', 'WSL', 'POSIX', 'GNU', 'MIT', 'BSD', 'SHA', 'RSA',
+    'LLM', 'IDE', 'SDK', 'MCP', 'SSE', 'RPC', 'IPC', 'ABI', 'ENV', 'CWD', 'TMP', 'DIR', 'WIN', 'MAC', 'APP',
+    'PRO', 'MAX', 'MIN', 'AVG', 'TTL', 'LRU', 'RPM', 'TPM', 'QPS', 'TUN', 'NAT', 'LAN', 'WAN', 'VPN', 'RFC', 'ISO',
+    'UTC', 'GMT', 'CSC', 'ASCII', 'OAUTH',
+})
+
+_GROUNDING_EXTERNAL_CLIS = frozenset({
+    'git', 'agy', 'codex', 'claude', 'cc', 'dsh', 'python', 'python3', 'py', 'wsl', 'powershell', 'pwsh',
+    'bash', 'sh', 'cmd', 'curl', 'uv', 'pip', 'npm', 'npx', 'cargo', 'cmake', 'ctest', 'pytest', 'mpirun', 'mpiexec',
+})
+
+_GROUNDING_STOP_CJK2 = frozenset({
+    '计算', '科学', '工程', '系统', '软件', '分析', '数值', '规划', '方法', '模型', '算法', '项目', '求解', '问题',
+    '检查', '判据', '连续', '容差', '有限', '二维', '三维', '复杂', '高可', '可靠', '靠系', '统软', '件研', '研发',
+    '程研', '靠工', '发中', '算流', '体力', '元分', '性有', '线性', '非线', '解器', '器或', '库中', '领域', '标准',
+    '术语', '日常', '课题', '常见', '场景', '模块', '功能',
+})
+
+_GROUNDING_ANCHOR_EXTS = frozenset({
+    '.py', '.f90', '.f95', '.f03', '.f08', '.f', '.for', '.c', '.cpp', '.cc', '.cxx', '.cu', '.cuh',
+    '.h', '.hpp', '.hh', '.jl', '.rs', '.go', '.ts', '.js', '.cmake', '.toml', '.yaml', '.yml', '.json',
+    '.sh', '.bash', '.ps1', '.cfg', '.ini',
+})
+
+
+def _extract_cjk_2grams(text):
+    return {
+        run[idx : idx + 2]
+        for run in re.findall(r'[\u4e00-\u9fff]{2,}', text or '')
+        for idx in range(len(run) - 1)
+    }
+
+
+def _extract_anchor_numbers(text):
+    nums = {'0', '1', '2', '3', '4', '5', '7', '8', '10', '16', '32', '64', '100', '128', '256', '512', '1024'}
+    for raw in re.findall(r'(?<![A-Za-z_])\d[\d_,]*(?:\.\d+)?(?![A-Za-z_])', text or ''):
+        cleaned = raw.replace(',', '').replace('_', '')
+        nums.add(cleaned)
+        if '.' in cleaned:
+            try:
+                fval = float(cleaned)
+                nums.add(f'{fval:g}')
+                if 0.0 < fval <= 1.0:
+                    nums.add(str(int(round(fval * 100))))
+            except ValueError:
+                pass
+        else:
+            try:
+                ival = int(cleaned)
+                if ival >= 1024 and ival % 1024 == 0:
+                    nums.add(str(ival // 1024))
+                    if ival >= 1024 * 1024 and ival % (1024 * 1024) == 0:
+                        nums.add(str(ival // (1024 * 1024)))
+                if ival >= 10_000:
+                    nums.add(str(ival * 9 // 10))
+                    nums.add(str((ival * 95 // 100) * 9 // 10))
+                    if ival % 1000 == 0:
+                        nums.add(str(ival // 1000))
+            except ValueError:
+                pass
+    return nums
+
+
+def _build_grounding_anchor(root_dir, exclude_rels, allow_files=None, extra_allowed_text=''):
+    root_dir = Path(root_dir).resolve()
+    anchor_chunks = []
+    repo_names = set()
+    dynamic_file_globs = set()
+    for dirpath, dirs, files in os.walk(root_dir, followlinks=False):
+        dirs[:] = sorted(d for d in dirs if d not in IGNORED_DIRS)
+        dpath = Path(dirpath)
+        for fname in sorted(files):
+            fpath = dpath / fname
+            if _is_link(fpath):
+                continue
+            rel = fpath.relative_to(root_dir).as_posix()
+            repo_names.add(fname.lower())
+            repo_names.add(fpath.stem.lower())
+            repo_names.add(rel.lower())
+            if rel in exclude_rels or rel.startswith('tests/'):
+                continue
+            is_agent_contract = (
+                (rel.startswith('template/user-guard/agents/') or rel.startswith('template/claude/agents/')
+                 or rel.startswith('.claude/agents/') or rel.startswith('.codex/agents/'))
+                and fpath.suffix.lower() in ('.md', '.toml')
+            )
+            if fpath.suffix.lower() in _GROUNDING_ANCHOR_EXTS or is_agent_contract or rel in ('NOTICE', 'CMakeLists.txt'):
+                txt = _optional_text(fpath)
+                if txt:
+                    anchor_chunks.append(txt)
+                    for pat in re.findall(r'([A-Za-z0-9_.-]*\{[^}\r\n]{1,32}\}[A-Za-z0-9_.-]*\.[A-Za-z0-9]+)', txt):
+                        dynamic_file_globs.add(re.sub(r'\{[^}]+\}', '*', pat).lower())
+    for extra_file in (allow_files or ()):
+        ep = Path(extra_file).expanduser()
+        if not ep.is_absolute():
+            ep = root_dir / ep
+        if ep.is_file() and not _is_link(ep):
+            anchor_chunks.append(_optional_text(ep))
+    if extra_allowed_text:
+        anchor_chunks.append(str(extra_allowed_text))
+    combined = '\n'.join(anchor_chunks)
+    low = combined.lower()
+    words = set(re.findall(r'[a-z0-9]+(?:[._-][a-z0-9]+)*', low)) | set(re.findall(r'[a-z0-9]+', low))
+    flags = set(re.findall(r'(?<![a-z0-9])(--[a-z0-9][a-z0-9_-]*)', low))
+    cjk2 = _extract_cjk_2grams(combined)
+    numbers = _extract_anchor_numbers(combined)
+    return {
+        'words': words,
+        'flags': flags,
+        'cjk2': cjk2,
+        'numbers': numbers,
+        'repo_names': repo_names,
+        'dynamic_file_globs': dynamic_file_globs,
+    }
+
+
+def _iter_visible_doc_lines(rel_path, raw_text):
+    """提取文档或 SVG 中需要做事实锚定核验的可见文本行（跳过代码块围栏，SVG 仅提取 <text> 节点）。"""
+    if rel_path.lower().endswith('.svg'):
+        for m in re.finditer(r'<text\b[^>]*>([\s\S]*?)</text>', raw_text, re.I):
+            line_no = raw_text.count('\n', 0, m.start()) + 1
+            plain = re.sub(r'<[^>]+>', ' ', m.group(1))
+            plain = (plain.replace('&lt;', '<').replace('&gt;', '>').replace('&amp;', '&')
+                     .replace('&quot;', '"').replace('&#39;', "'")).strip()
+            if plain:
+                yield line_no, plain
+        return
+    fence_marker = ''
+    fence_len = 0
+    for line_no, line in enumerate(raw_text.splitlines(), 1):
+        stripped = line.lstrip()
+        m_fence = re.match(r'^(`{3,}|~{3,})', stripped)
+        if m_fence:
+            tok = m_fence.group(1)
+            if not fence_marker:
+                fence_marker, fence_len = tok[0], len(tok)
+                continue
+            if tok[0] == fence_marker and len(tok) >= fence_len and not stripped[len(tok):].strip():
+                fence_marker, fence_len = '', 0
+                continue
+        if not fence_marker:
+            yield line_no, line
+
+
+def _audit_single_doc_text(rel_path, doc_text, anchor, baseline_text=''):
+    findings = []
+    seen = set()
+    baseline_words = set(re.findall(r'[a-z0-9]+', baseline_text.lower())) if baseline_text else set()
+    baseline_cjk2 = _extract_cjk_2grams(baseline_text) if baseline_text else set()
+    baseline_nums = _extract_anchor_numbers(baseline_text) if baseline_text else set()
+
+    def record(line_no, category, token, reason):
+        key = (rel_path, line_no, category, token)
+        if key not in seen:
+            seen.add(key)
+            findings.append({
+                'file': rel_path,
+                'line': line_no,
+                'category': category,
+                'token': token,
+                'reason': reason,
+            })
+
+    for line_no, raw_line in _iter_visible_doc_lines(rel_path, doc_text):
+        # 剔除行内数学公式 $...$ 与反面示例引号 “...” 以免误报被禁止的夸大词示例
+        no_math = re.sub(r'\$\$?[^$\n]+\$\$?', ' ', raw_line)
+        no_anti_quote = re.sub(r'“[^”\n]{1,60}”', ' ', no_math)
+
+        # 1. 行内代码标识符（CLI 选项与源码/配置文件名）
+        for span in re.findall(r'`([^`\n]+)`', no_math):
+            span_clean = span.strip()
+            if not span_clean or '<' in span_clean or '>' in span_clean:
+                continue
+            head_tok = re.split(r'[\s/\\]+', span_clean, maxsplit=1)[0].strip('"\'').lower()
+            head_stem = Path(head_tok).stem.lower()
+            is_external_cmd = head_tok in _GROUNDING_EXTERNAL_CLIS or head_stem in _GROUNDING_EXTERNAL_CLIS
+            if not is_external_cmd:
+                for flag in re.findall(r'(?<![A-Za-z0-9])(--[a-z0-9][a-z0-9_-]*)', span_clean.lower()):
+                    if flag not in anchor['flags']:
+                        record(line_no, 'ungrounded_identifier', flag, '行内代码引用的 CLI 选项未在仓库脚本或配置中声明')
+            else:
+                # 对 python install.py / cae_harness.py / fleet_state.py / ccswitch_admin.py 调用仍严格校验参数
+                if any(s in span_clean.lower() for s in ('install.py', 'cae_harness.py', 'fleet_state.py', 'ccswitch_admin.py', 'handoff_gate.py', 'router.py')):
+                    for flag in re.findall(r'(?<![A-Za-z0-9])(--[a-z0-9][a-z0-9_-]*)', span_clean.lower()):
+                        if flag not in anchor['flags']:
+                            record(line_no, 'ungrounded_identifier', flag, '仓库脚本调用参数未在源码 argparse 中声明')
+            if not is_external_cmd:
+                for fn in re.findall(r'\b([A-Za-z0-9_.*-]+(?:/[A-Za-z0-9_.*-]+)*\.(?:py|json|toml|yaml|yml|svg|sh|ps1))\b', span_clean):
+                    fn_low = fn.lower().lstrip('./')
+                    base_low = Path(fn_low).name
+                    if '*' in base_low:
+                        continue
+                    if (fn_low in anchor['repo_names'] or base_low in anchor['repo_names']
+                            or base_low in anchor['words'] or base_low.lstrip('.') in anchor['words']
+                            or any(fnmatch.fnmatchcase(base_low, pat) for pat in anchor['dynamic_file_globs'])):
+                        continue
+                    record(line_no, 'ungrounded_identifier', fn, '行内代码引用的脚本或配置文件名在仓库与锚点语料中均不存在')
+
+        # 2. 全大写领域缩写词（零黑名单：必须存在于锚点语料、仓库文件名或基础计算机协议集合中）
+        prose_no_code = re.sub(r'`[^`\n]+`', ' ', no_anti_quote)
+        prose_no_urls = re.sub(r'https?://\S+', ' ', prose_no_code)
+        for acro in re.findall(r'\b([A-Z][A-Z0-9]{2,})\b', prose_no_urls):
+            if (acro in _GROUNDING_GENERIC_ACRONYMS
+                    or re.fullmatch(r'(?:R\d{1,2}|L\d+|V\d+|\d+M|\d+K|\d+G)', acro)
+                    or acro.lower() in anchor['repo_names']
+                    or acro.lower() in anchor['words']
+                    or acro.lower() in baseline_words):
+                continue
+            record(line_no, 'ungrounded_acronym', acro, '大写技术缩写在仓库源码、配置与允许锚点中无对应依据')
+
+        # 3. 带容量/比例/阈值单位的定量数字（防止重写时编造死数字或与 fleet_profile.json 失步）
+        for num_m in re.finditer(r'(?<![A-Za-z0-9_.-])(\d{1,3}(?:,\d{3})+|\d{2,}(?:\.\d+)?)\s*(token|tokens|字符|KB|KiB|MB|MiB|%)', prose_no_urls, re.I):
+            raw_num, unit = num_m.group(1), num_m.group(2)
+            # 跳过区间近似表达（如 200k–260k）以外的精确数字前先归一化
+            norm_num = raw_num.replace(',', '')
+            if norm_num in anchor['numbers'] or norm_num in baseline_nums:
+                continue
+            record(line_no, 'ungrounded_number', f'{raw_num} {unit}', '定量数值未在 fleet_profile.json 或源码常量中找到对应依据')
+
+        # 4. 举例与括注并列枚举短语（例如/比如/涵盖/面向... 及全角括号枚举）：零黑名单检测无源码锚点的虚构领域词
+        clean_prose = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', no_anti_quote)
+        enum_clauses = [
+            ex_m.group(1)
+            for ex_m in re.finditer(r'(?:例如|比如|譬如|涵盖|面向)[:：]?\s*([^。；\n|]{4,160})', clean_prose)
+        ] + [
+            paren_m.group(1)
+            for paren_m in re.finditer(r'（([^（）\n]{6,160})）', clean_prose)
+        ]
+        for clause in enum_clauses:
+            if '、' not in clause:
+                continue
+            items = [
+                seg.strip()
+                for seg in re.split(
+                    r'[、，,]|(?:\s+(?:与|和|及|或|以及)\s+)|(?:(?<=[\u4e00-\u9fff）\)])(?:与|和|及|或|以及)(?=[\u4e00-\u9fffA-Za-z]))',
+                    clause,
+                )
+                if seg.strip()
+            ]
+            if len(items) < 2:
+                continue
+            for item in items:
+                ascii_toks = [tok.lower() for tok in re.findall(r'[A-Za-z][A-Za-z0-9_.-]{1,}', item)]
+                if any(tok in anchor['words'] or tok in anchor['repo_names'] or tok in baseline_words for tok in ascii_toks):
+                    continue
+                stripped_item = re.sub(r'（[^）]*）|\([^)]*\)|`[^`]*`', ' ', item)
+                grams = _extract_cjk_2grams(stripped_item) - _GROUNDING_STOP_CJK2
+                if len(grams) >= 2 and not (grams & anchor['cjk2']) and not (grams & baseline_cjk2):
+                    record(line_no, 'ungrounded_exemplar', item, '举例或适用范围枚举项在仓库源码、配置与允许锚点中无词干依据')
+
+        # 5. 若提供了改写前基线（如 polish 原稿或 --base-ref），额外拦截改写过程中凭空新增的无依据并列技术名词
+        if baseline_text and '、' in clean_prose:
+            for part in re.split(r'[、，,。；;|：:]|(?:\s*(?:与|和|及|或|以及)\s*)', clean_prose):
+                part = part.strip()
+                if len(part) < 4:
+                    continue
+                ascii_toks = [tok.lower() for tok in re.findall(r'[A-Za-z][A-Za-z0-9_.-]{1,}', part)]
+                if any(tok in anchor['words'] or tok in baseline_words for tok in ascii_toks):
+                    continue
+                stripped_part = re.sub(r'（[^）]*）|\([^)]*\)|`[^`]*`', ' ', part)
+                grams = _extract_cjk_2grams(stripped_part) - _GROUNDING_STOP_CJK2
+                if len(grams) >= 3 and not (grams & anchor['cjk2']) and not (grams & baseline_cjk2):
+                    record(line_no, 'ungrounded_rewrite_addition', part, '润色或重写阶段新增了原稿与仓库锚点均未出现的陌生领域短语')
+
+    return findings
+
+
+def audit_doc_grounding(target_path, root_dir=None, *, base_ref=None, allow_files=None, extra_allowed_text=''):
+    """对目标文档或目录执行零黑名单确定性事实锚定核验（标识符、缩写、容量数字与举例词干）。"""
+    target = Path(target_path).expanduser().resolve()
+    if not target.exists():
+        raise HarnessError(f'目标路径不存在: {target}')
+    if root_dir is not None:
+        root = Path(root_dir).expanduser().resolve()
+    else:
+        mode_info = detect_workspace_mode(target)
+        root = Path(mode_info['upstream_repo_root']) if mode_info['upstream_repo_root'] else (
+            target if target.is_dir() else target.parent
+        )
+    doc_files = []
+    if target.is_file():
+        rel = target.relative_to(root).as_posix() if target.is_relative_to(root) else target.name
+        doc_files.append((target, rel))
+    else:
+        skip_rels = {'CHANGELOG.md', 'LICENSE', 'NOTICE'}
+        for dirpath, dirs, files in os.walk(target, followlinks=False):
+            dirs[:] = sorted(d for d in dirs if d not in IGNORED_DIRS)
+            dpath = Path(dirpath)
+            for fname in sorted(files):
+                fpath = dpath / fname
+                if _is_link(fpath) or fpath.suffix.lower() not in ('.md', '.svg', '.rst'):
+                    continue
+                rel = fpath.relative_to(root).as_posix()
+                if (rel in skip_rels or rel.startswith('tests/')
+                        or rel.startswith('template/user-guard/agents/')
+                        or rel.startswith('template/claude/agents/')
+                        or rel == 'template/user-guard/assets/logo.svg'):
+                    continue
+                doc_files.append((fpath, rel))
+    exclude_rels = {rel for _, rel in doc_files}
+    anchor = _build_grounding_anchor(root, exclude_rels, allow_files=allow_files, extra_allowed_text=extra_allowed_text)
+    all_findings = []
+    checked_files = []
+    for fpath, rel in doc_files:
+        checked_files.append(rel)
+        baseline_txt = ''
+        if base_ref:
+            proc = subprocess.run(
+                ['git', '-C', str(root), 'show', f'{base_ref}:{rel}'],
+                capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=10,
+            )
+            if proc.returncode == 0:
+                baseline_txt = proc.stdout
+        all_findings.extend(_audit_single_doc_text(rel, _optional_text(fpath), anchor, baseline_txt))
+    by_category = collections.Counter(item['category'] for item in all_findings)
+    return {
+        'ok': not all_findings,
+        'root': str(root),
+        'target': str(target),
+        'base_ref': base_ref or None,
+        'checked_file_count': len(checked_files),
+        'checked_files': checked_files,
+        'finding_count': len(all_findings),
+        'counts_by_category': dict(sorted(by_category.items())),
+        'findings': all_findings,
+    }
+
+
+def cmd_check_grounding(args):
+    report = audit_doc_grounding(
+        args.target,
+        args.root or None,
+        base_ref=args.base_ref or None,
+        allow_files=args.allow_from_file or (),
+    )
+    status = 'verification_failed' if (args.strict and not report['ok']) else 'ok'
+    return _print({'status': status, 'workspace_mode': detect_workspace_mode(args.root or args.target), **report})
 
 
 def cmd_probe(args):
     refresh = bool(getattr(args, 'discover_models', False))
     return _print({'status': 'ok', 'caller': resolve_caller(args.caller),
+                   'workspace_mode': detect_workspace_mode(),
                    'fleet_profile': _fleet_profile_summary(),
                    'backends': _args_backends(args, refresh_model_cache=refresh)})
 
@@ -4055,20 +4496,27 @@ def cmd_assess(args):
             recommendations[name][scenario] = {**profile, 'requested_tier': 'auto', 'tier_reason': reason,
                                                 'backend_detected': detected}
     resolved_roles = {}
+    roles_cfg = (_fleet_profile().get('roles') or {}) if isinstance(_fleet_profile().get('roles'), dict) else {}
     for role_name in ('orchestrator', 'math', 'code', 'review', 'fast'):
         try:
             role_spec = _resolve_role_engine(backends, caller, f'role:{role_name}')
-            role_tier = 'low' if role_name == 'fast' else 'max'
+            cfg_entry = roles_cfg.get(role_name) if isinstance(roles_cfg.get(role_name), dict) else {}
+            rec_tier = str(cfg_entry.get('recommended_tier') or '').strip().lower()
+            role_tier = (rec_tier if rec_tier in TIER_CHOICES and rec_tier not in ('auto', 'ultra')
+                         else ('low' if role_name == 'fast' else 'max'))
             role_kind = 'review' if role_name in ('fast', 'orchestrator') else role_name
             role_prof = resolve_execution_profile(backends, role_spec, role_tier, kind=role_kind)
             resolved_roles[role_name] = {
                 'selected_engine': role_spec,
                 'model': role_prof['model'],
                 'reasoning_effort': role_prof['reasoning_effort'],
+                'recommended_tier': role_tier,
+                'dynamic_slot': True,
             }
         except HarnessError as exc:
-            resolved_roles[role_name] = {'selected_engine': None, 'blocked_reason': str(exc)}
-    return _print({'status': 'ok', 'caller': caller, 'fleet_profile': _fleet_profile_summary(),
+            resolved_roles[role_name] = {'selected_engine': None, 'blocked_reason': str(exc), 'dynamic_slot': True}
+    return _print({'status': 'ok', 'caller': caller, 'workspace_mode': detect_workspace_mode(),
+                   'fleet_profile': _fleet_profile_summary(),
                    'resolved_roles': resolved_roles,
                    'backends': backends,
                    'recommendations': recommendations,
@@ -4336,10 +4784,15 @@ def cmd_task(args):
     before = snapshot_files(root)
     rel_hint = f'（相对路径: {rel_single_file}）' if rel_single_file else ''
     stage_files = [rel_single_file] if (readonly and rel_single_file) else None
+    polish_guard = (
+        '【润色防幻觉硬约束】严禁新增原稿与任务说明中不存在的陌生学科术语、虚构算例名称（如未在代码中出现的领域词）、'
+        '未声明的命令行参数、文件名或无依据的定量数字；仅优化表达清晰度与逻辑结构。\n'
+        if args.kind == 'polish' else ''
+    )
     prompt = (f'任务类型 {args.kind}。当前总控 {caller}。工作目录为当前目录。任务目标 {requested_target}{rel_hint}。\n'
               + ('只读完成任务，正文通过回执返回。' if readonly else f"允许写入范围 {scopes or '调用方授权的目标工作目录'}。")
               + '严禁在目标工作目录外创建、修改或删除任何文件或目录（含严禁向目录外执行 git worktree add）。'
-              + '不要调用本编排器，不要修改其他会话或全局配置。\n' + text
+              + '不要调用本编排器，不要修改其他会话或全局配置。\n' + polish_guard + text
               + '\n按给定 JSON Schema 返回正文、证据及未验证事项。')
     result, error, status, invocation = {}, {}, 'ok', {}
     try:
@@ -4384,6 +4837,16 @@ def cmd_task(args):
         error.setdefault('error', scope.get('scope_error') or '工作区快照核对失败')
     elif scope['scope_violations']:
         status = 'scope_violation'
+    if args.kind == 'polish' and status == 'ok' and isinstance(result, dict) and isinstance(result.get('content'), str):
+        orig_doc = _optional_text(requested_target) if requested_target.is_file() else ''
+        rel_label = rel_single_file or requested_target.name
+        anchor = _build_grounding_anchor(root, {rel_label} if rel_single_file else set(), extra_allowed_text=text)
+        drift_hits = _audit_single_doc_text(rel_label, result['content'], anchor, baseline_text=orig_doc)
+        payload['grounding_audit'] = {
+            'ok': not drift_hits,
+            'finding_count': len(drift_hits),
+            'findings': drift_hits,
+        }
     return _print({'status': status, **payload, 'invocation': invocation, 'result': result, **error, **scope})
 
 
@@ -4395,28 +4858,38 @@ def _positive_arg(raw):
 
 
 def build_arg_parser():
+    hd = _headless_tunables()
+    default_shard = int(hd.get('default_shard_tokens') or 120_000)
+    default_rounds = int(hd.get('default_gate_max_rounds') or 3)
+    default_timeout = int(hd.get('default_timeout_sec') or 600)
     parser = argparse.ArgumentParser(description='Antigravity / Codex / Claude Code / DeepSeek Harness 对等任务与审计编排')
     sub = parser.add_subparsers(dest='subcommand', required=True)
     probe = sub.add_parser('probe', help='只读探测程序与配置，认证和执行能力分别验证')
     probe.add_argument('--discover-models', action='store_true', help='显式执行 agy models 查询并刷新本地模型目录缓存')
     assess = sub.add_parser('assess', help='只读评估程序、目录元数据和任务选路')
     assess.add_argument('--discover-models', action='store_true', help='显式执行 agy models 查询，结果仅用于本次评估')
+    grounding = sub.add_parser('check-grounding', help='文档与重写润色阶段的零黑名单确定性事实锚定核验')
+    grounding.add_argument('--target', default='.', help='待核验的文档文件或目录路径')
+    grounding.add_argument('--root', default='', help='锚点扫描根目录（省略时按工作区类型自动推断）')
+    grounding.add_argument('--base-ref', default='', help='可选 Git 基线引用（如 HEAD），额外拦截改写期间新增的无依据领域短语')
+    grounding.add_argument('--allow-from-file', action='append', default=[], help='额外纳入允许锚点语料的说明或需求文件路径')
+    grounding.add_argument('--strict', action='store_true', help='检出任何无依据标识符、缩写、定量数字或举例词干时返回非零退出码')
     audit = sub.add_parser('audit', help='单路或双路文件审计')
     audit.add_argument('--target', required=True)
     audit.add_argument('--focus', default='')
     audit.add_argument('--strategy', choices=['auto', 'single-pass', 'whole-1m', 'sharded'], default='auto')
     audit.add_argument('--single', action='store_true')
-    audit.add_argument('--left', default='', help='左路引擎与模型规格（agy、codex、claude/cc、dsh；支持精确 slug、显示名或模糊模型别名）')
-    audit.add_argument('--right', default='', help='右路引擎与模型规格（agy、codex、claude/cc、dsh；支持精确 slug、显示名或模糊模型别名）')
-    audit.add_argument('--shard-tokens', type=_positive_arg, default=120_000)
+    audit.add_argument('--left', default='', help='左路引擎与模型规格（agy、codex、claude/cc、dsh；支持 role:*、<client>:<role>、精确 slug 或模糊别名）')
+    audit.add_argument('--right', default='', help='右路引擎与模型规格（agy、codex、claude/cc、dsh；支持 role:*、<client>:<role>、精确 slug 或模糊别名）')
+    audit.add_argument('--shard-tokens', type=_positive_arg, default=default_shard)
     gate = sub.add_parser('gate', help='修改后运行明确验收命令')
     gate.add_argument('--target', required=True)
-    gate.add_argument('--worker', default='', help='执行引擎与模型规格（agy、codex、claude/cc、dsh；支持精确 slug、显示名或模糊模型别名）')
+    gate.add_argument('--worker', default='', help='执行引擎与模型规格（agy、codex、claude/cc、dsh；支持 role:*、<client>:<role>、精确 slug 或模糊别名）')
     gate.add_argument('--verify-cmd', required=True)
     task = sub.add_parser('task', help='通用审查、方向、润色、数学和代码任务')
     task.add_argument('--target', required=True)
     task.add_argument('--kind', required=True, choices=['review', 'direction', 'polish', 'math', 'code'])
-    task.add_argument('--engine', default='', help='后端与模型规格（agy、codex、claude/cc、dsh；支持精确 slug、显示名或模糊模型别名）')
+    task.add_argument('--engine', default='', help='后端与模型规格（agy、codex、claude/cc、dsh；支持 role:*、<client>:<role>、精确 slug 或模糊别名）')
     task.add_argument('--base-commit')
     task.add_argument('--verify-cmd')
     task.add_argument('--clean-room', action='store_true',
@@ -4426,21 +4899,22 @@ def build_arg_parser():
         group.add_argument('--task')
         group.add_argument('--task-file')
         command.add_argument('--write-scope', action='append', default=[])
-        command.add_argument('--max-rounds', type=_positive_arg, default=3)
-    for command in (probe, assess, audit, gate, task):
+        command.add_argument('--max-rounds', type=_positive_arg, default=default_rounds)
+    for command in (probe, assess, grounding, audit, gate, task):
         command.add_argument('--caller', choices=['auto', 'codex', 'antigravity', 'claude', 'cc', 'dsh'], default='auto')
-        command.add_argument('--codex-input-budget', type=_positive_arg)
-        command.add_argument('--agy-input-budget', type=_positive_arg)
-        command.add_argument('--claude-input-budget', type=_positive_arg)
-        command.add_argument('--dsh-input-budget', type=_positive_arg)
+        if command is not grounding:
+            command.add_argument('--codex-input-budget', type=_positive_arg)
+            command.add_argument('--agy-input-budget', type=_positive_arg)
+            command.add_argument('--claude-input-budget', type=_positive_arg)
+            command.add_argument('--dsh-input-budget', type=_positive_arg)
     for command in (audit, gate, task):
         command.add_argument('--tier', choices=list(TIER_CHOICES), default='auto',
-                             help='挡位策略：auto 默认启用旗舰专长模型与单模型最高挡 max（短润色用 medium、长润色用 high）；仅当用户显式或模糊要求降挡／省 token 时切换分级自适应（常规 high、表面检查轻量模型 + low）')
+                             help='挡位策略：auto 默认按角色槽位或单模型非委派最高挡选路（短润色用 medium、长润色用 high）；仅当用户要求降挡／省额度时切换分级自适应')
         command.add_argument('--retry-quota', action='store_true',
                              help='用户确认已充值或额度恢复后，忽略本地额度冷却记录重试发起')
         command.add_argument('--fallback-on-quota', action='store_true',
                               help='目标触发额度熔断且未修改工作区时，优先回退发起方，再选择其他已就绪且未冷却的端')
-        command.add_argument('--timeout', type=_positive_arg, default=600)
+        command.add_argument('--timeout', type=_positive_arg, default=default_timeout)
         command.add_argument('--dry-run', action='store_true')
     return parser
 
@@ -4455,12 +4929,19 @@ def main():
     with QUOTA_LOCK:
         _SESSION_QUOTA_BLOCKED.clear()
     args = build_arg_parser().parse_args()
-    if os.environ.get('CAE_HARNESS_DEPTH') and args.subcommand not in ('probe', 'assess'):
+    if os.environ.get('CAE_HARNESS_DEPTH') and args.subcommand not in ('probe', 'assess', 'check-grounding'):
         sys.exit(_print({'status': 'failed', 'error': '子任务再次调用本编排器会形成递归派工，已拒绝'}))
     for signum in (signal.SIGINT, signal.SIGTERM):
         signal.signal(signum, _cancel_signal)
     try:
-        handler = {'probe': cmd_probe, 'assess': cmd_assess, 'audit': cmd_audit, 'gate': cmd_gate, 'task': cmd_task}[args.subcommand]
+        handler = {
+            'probe': cmd_probe,
+            'assess': cmd_assess,
+            'check-grounding': cmd_check_grounding,
+            'audit': cmd_audit,
+            'gate': cmd_gate,
+            'task': cmd_task,
+        }[args.subcommand]
         code = handler(args)
     except HarnessError as exc:
         code = _print({'status': exc.status, 'error': str(exc), 'caller': resolve_caller(args.caller), **exc.details})

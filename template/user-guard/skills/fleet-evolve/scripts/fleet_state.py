@@ -58,6 +58,10 @@ def _validated_state_file(repo_root: Path) -> Path:
     return state_dir / f"state.{_side()}.json"
 
 
+class NotUpstreamRepoError(ValueError):
+    """当前目录并非上游配置维护仓库，且未显式传入有效的 --repo。"""
+
+
 def _is_upstream_repo(candidate: Path) -> bool:
     return (candidate / "install.py").is_file() and (candidate / "template" / "user-guard" / "plugin.json").is_file()
 
@@ -66,13 +70,30 @@ def _resolve_repo_root(raw_repo: str | None) -> Path:
     if raw_repo:
         root = Path(raw_repo).expanduser().resolve()
         if not _is_upstream_repo(root):
-            raise ValueError(f"--repo is not an upstream repository root (missing install.py or plugin.json): {root}")
+            raise NotUpstreamRepoError(
+                f"--repo 指向的路径不是上游配置维护仓库（缺少 install.py 或 template/user-guard/plugin.json）: {root}"
+            )
         return root
     for seed in (Path.cwd().resolve(), Path(__file__).resolve().parent):
         for candidate in (seed, *seed.parents):
             if _is_upstream_repo(candidate):
                 return candidate
-    raise ValueError("Cannot auto-detect upstream repository root; pass --repo <path> explicitly")
+    raise NotUpstreamRepoError(
+        "当前工作区属于通用课题项目（general_project），fleet-evolve 与 fleet_state.py 仅用于维护上游配置仓库；如需跨目录查看请显式传入 --repo <path>"
+    )
+
+
+def _run_repo_grounding_gate(repo_root: Path) -> Dict[str, Any]:
+    harness_py = repo_root / "template" / "user-guard" / "skills" / "cae-harness" / "scripts" / "cae_harness.py"
+    if not harness_py.is_file():
+        return {"ok": True, "skipped": True}
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("_cae_harness_grounding", harness_py)
+    if spec is None or spec.loader is None:
+        return {"ok": True, "skipped": True}
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.audit_doc_grounding(repo_root, repo_root)
 
 
 def _repo_meta(repo_root: Path) -> Dict[str, str]:
@@ -232,7 +253,16 @@ def main(argv: list[str] | None = None) -> int:
     p_clr.add_argument("--readback-done", action="store_true", help="Confirm cold full-file readback pass completed")
 
     args = parser.parse_args(argv)
-    repo_root = _resolve_repo_root(args.repo)
+    try:
+        repo_root = _resolve_repo_root(args.repo)
+    except NotUpstreamRepoError as exc:
+        print(json.dumps({
+            "ok": False,
+            "workspace_mode": "general_project",
+            "reason": "not_upstream_config_repo",
+            "error": str(exc),
+        }, ensure_ascii=False, indent=2))
+        return 2
     state_file = _validated_state_file(repo_root)
     meta = _repo_meta(repo_root)
     now = int(time.time())
@@ -266,6 +296,7 @@ def main(argv: list[str] | None = None) -> int:
                 stale_reason = "expired_ttl"
         effective_phase = raw_phase if (raw_phase in active_phases and stale_reason is None) else "IDLE"
         print(json.dumps({
+            "workspace_mode": "upstream_config_repo",
             "phase": effective_phase,
             "raw_phase": raw_phase,
             "execution_side": _side(),
@@ -397,6 +428,18 @@ def main(argv: list[str] | None = None) -> int:
                 _atomic_write_json(state_file, saved)
         print(json.dumps({"ok": ok, "reason": reason or "ready_for_pass2", "saved": saved}, ensure_ascii=False, indent=2))
         return 0 if ok else 2
+
+    if args.verified and args.readback_done:
+        grounding = _run_repo_grounding_gate(repo_root)
+        if not grounding.get("ok", True):
+            print(json.dumps({
+                "ok": False,
+                "readback_verified": False,
+                "reason": "grounding_check_failed",
+                "finding_count": grounding.get("finding_count", 0),
+                "findings": grounding.get("findings", []),
+            }, ensure_ascii=False, indent=2))
+            return 2
 
     with _state_lock(state_file):
         if args.verified:

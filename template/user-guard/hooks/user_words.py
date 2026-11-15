@@ -54,11 +54,175 @@ CODEX_ARCHIVE_FORMAT = "user-guard-codex-v2"
 CODEX_LEGACY_ARCHIVE_FORMAT = "user-guard-codex-v1"
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
-MAX_LOG_BYTES = 2 * 1024 * 1024
-TRIM_LOG_BYTES = 1 * 1024 * 1024
+_DEFAULT_MAX_LOG_BYTES = 2 * 1024 * 1024
+_DEFAULT_TRIM_LOG_BYTES = 1 * 1024 * 1024
+MAX_LOG_BYTES = _DEFAULT_MAX_LOG_BYTES
+TRIM_LOG_BYTES = _DEFAULT_TRIM_LOG_BYTES
 
-MAX_RECENT_SUBAGENT_RETURNS = 4
-MAX_ARCHIVE_SUBAGENT_ITEM_CHARS = 1200
+_DEFAULT_MAX_RECENT_SUBAGENT_RETURNS = 4
+_DEFAULT_MAX_ARCHIVE_SUBAGENT_ITEM_CHARS = 1200
+MAX_RECENT_SUBAGENT_RETURNS = _DEFAULT_MAX_RECENT_SUBAGENT_RETURNS
+MAX_ARCHIVE_SUBAGENT_ITEM_CHARS = _DEFAULT_MAX_ARCHIVE_SUBAGENT_ITEM_CHARS
+
+_FLEET_PROFILE_CACHE: Dict[str, Any] = {"key": None, "data": {}}
+
+DEFAULT_COMPACTION_TUNABLES: Dict[str, Any] = {
+    "inline_total_chars": 8000,
+    "inline_user_item_chars": 1200,
+    "inline_guaranteed_head_turns": 1,
+    "recent_subagent_returns": 4,
+    "recent_subagent_window": 12,
+    "min_substantive_subagent_chars": 64,
+    "priority_subagent_keywords": ["auditor", "collaborator", "reader", "review", "math", "audit"],
+    "subagent_head_ratio": 0.58,
+    "inline_subagent_total_chars": 1400,
+    "inline_subagent_item_chars": 280,
+    "archive_subagent_item_chars": 1200,
+    "archive_retry_interval_sec": 30,
+    "max_tracked_images": 2000,
+}
+
+
+def _is_link_or_reparse(path: Path) -> bool:
+    try:
+        st = path.lstat()
+    except OSError:
+        return False
+    attrs = getattr(st, "st_file_attributes", 0) or 0
+    return stat.S_ISLNK(st.st_mode) or bool(attrs & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
+
+
+def load_fleet_profile(anchor_dir: Optional[Path] = None) -> Dict[str, Any]:
+    """按 mtime 缓存读取 fleet_profile.json（支持 CAE_FLEET_PROFILE 覆盖，异常时安全降级为空字典）。"""
+    env_override = os.environ.get("CAE_FLEET_PROFILE", "").strip()
+    anchor = Path(anchor_dir).resolve() if anchor_dir is not None else Path(__file__).resolve().parent
+    candidates: List[Path] = []
+    if env_override:
+        candidates.append(Path(env_override).expanduser())
+    candidates.extend([
+        anchor.parent / "skills" / "cae-harness" / "fleet_profile.json",
+        anchor / "fleet_profile.json",
+    ])
+    for cand in candidates:
+        try:
+            if not cand.is_file() or _is_link_or_reparse(cand):
+                continue
+            st = cand.stat()
+            cache_key = (str(cand), st.st_mtime_ns, st.st_size)
+            if _FLEET_PROFILE_CACHE.get("key") == cache_key:
+                return _FLEET_PROFILE_CACHE["data"]
+            parsed = json.loads(cand.read_text(encoding="utf-8-sig"))
+            if isinstance(parsed, dict) and parsed.get("schema_version") == 1:
+                _FLEET_PROFILE_CACHE["key"] = cache_key
+                _FLEET_PROFILE_CACHE["data"] = parsed
+                return parsed
+        except (OSError, UnicodeError, ValueError, RecursionError):
+            continue
+    return {}
+
+
+def get_runtime_tunables(section: str = "", anchor_dir: Optional[Path] = None) -> Dict[str, Any]:
+    """读取 fleet_profile.json 中的 runtime_tunables（或指定子节）。"""
+    tunables = load_fleet_profile(anchor_dir).get("runtime_tunables")
+    if not isinstance(tunables, dict):
+        return {}
+    if not section:
+        return tunables
+    sub = tunables.get(section)
+    return sub if isinstance(sub, dict) else {}
+
+
+def _coerce_pos_int(raw: Any, fallback: int, minimum: int = 1) -> int:
+    if isinstance(raw, bool):
+        return fallback
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        return fallback
+    return val if val >= minimum else fallback
+
+
+def _coerce_ratio(raw: Any, fallback: float, low: float = 0.20, high: float = 0.85) -> float:
+    if isinstance(raw, bool):
+        return fallback
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return fallback
+    return min(max(val, low), high)
+
+
+def get_compaction_tunables(client: str = "antigravity", anchor_dir: Optional[Path] = None) -> Dict[str, Any]:
+    """合并内置兜底值、fleet_profile 默认值与当前主会话客户端专属压缩恢复参数。"""
+    merged: Dict[str, Any] = dict(DEFAULT_COMPACTION_TUNABLES)
+    comp = get_runtime_tunables("compaction_recovery", anchor_dir)
+    defaults_cfg = comp.get("defaults")
+    if isinstance(defaults_cfg, dict):
+        merged.update(defaults_cfg)
+    per_client = comp.get("per_client")
+    client_key = str(client or "").strip().lower()
+    if isinstance(per_client, dict) and client_key and isinstance(per_client.get(client_key), dict):
+        merged.update(per_client[client_key])
+
+    recent_limit = _coerce_pos_int(
+        merged.get("recent_subagent_returns"), DEFAULT_COMPACTION_TUNABLES["recent_subagent_returns"], minimum=0
+    )
+    if MAX_RECENT_SUBAGENT_RETURNS != _DEFAULT_MAX_RECENT_SUBAGENT_RETURNS:
+        recent_limit = max(0, int(MAX_RECENT_SUBAGENT_RETURNS))
+    archive_item_chars = _coerce_pos_int(
+        merged.get("archive_subagent_item_chars"), DEFAULT_COMPACTION_TUNABLES["archive_subagent_item_chars"], minimum=120
+    )
+    if MAX_ARCHIVE_SUBAGENT_ITEM_CHARS != _DEFAULT_MAX_ARCHIVE_SUBAGENT_ITEM_CHARS:
+        archive_item_chars = max(120, int(MAX_ARCHIVE_SUBAGENT_ITEM_CHARS))
+    raw_kws = merged.get("priority_subagent_keywords")
+    kws = [str(k).strip().lower() for k in raw_kws if str(k).strip()] if isinstance(raw_kws, list) else list(
+        DEFAULT_COMPACTION_TUNABLES["priority_subagent_keywords"]
+    )
+    return {
+        "inline_total_chars": _coerce_pos_int(merged.get("inline_total_chars"), 8000, minimum=600),
+        "inline_user_item_chars": _coerce_pos_int(merged.get("inline_user_item_chars"), 1200, minimum=200),
+        "inline_guaranteed_head_turns": _coerce_pos_int(merged.get("inline_guaranteed_head_turns"), 1, minimum=1),
+        "recent_subagent_returns": recent_limit,
+        "recent_subagent_window": max(recent_limit, _coerce_pos_int(merged.get("recent_subagent_window"), 12, minimum=0)),
+        "min_substantive_subagent_chars": _coerce_pos_int(merged.get("min_substantive_subagent_chars"), 64, minimum=1),
+        "priority_subagent_keywords": kws,
+        "subagent_head_ratio": _coerce_ratio(merged.get("subagent_head_ratio"), 0.58),
+        "inline_subagent_total_chars": _coerce_pos_int(merged.get("inline_subagent_total_chars"), 1400, minimum=160),
+        "inline_subagent_item_chars": _coerce_pos_int(merged.get("inline_subagent_item_chars"), 280, minimum=120),
+        "archive_subagent_item_chars": archive_item_chars,
+        "archive_retry_interval_sec": _coerce_pos_int(merged.get("archive_retry_interval_sec"), 30, minimum=1),
+        "max_tracked_images": _coerce_pos_int(merged.get("max_tracked_images"), 2000, minimum=10),
+    }
+
+
+def select_recent_subagent_returns(
+    candidates: List[Dict[str, Any]],
+    policy: Optional[Dict[str, Any]] = None,
+    *,
+    body_getter: Any = None,
+    label_getter: Any = None,
+) -> List[Dict[str, Any]]:
+    """按动态窗口筛选最有恢复价值的子代理返回：必保最新一条，其余优先保留实质长度与审查/推导角色并恢复时间序。"""
+    cfg = policy if isinstance(policy, dict) else get_compaction_tunables()
+    limit = int(cfg.get("recent_subagent_returns", DEFAULT_COMPACTION_TUNABLES["recent_subagent_returns"]))
+    if limit <= 0 or not candidates:
+        return []
+    window_size = max(limit, int(cfg.get("recent_subagent_window", limit)))
+    window_items = list(candidates[-window_size:]) if window_size > 0 else list(candidates)
+    if len(window_items) <= limit:
+        return window_items
+    min_chars = int(cfg.get("min_substantive_subagent_chars", 64))
+    priority_kws = tuple(str(k).lower() for k in (cfg.get("priority_subagent_keywords") or ()) if k)
+    scored: List[Tuple[int, int, int]] = []
+    for idx, item in enumerate(window_items[:-1]):
+        body = str(body_getter(item) if body_getter is not None else item.get("content") or "").strip()
+        label = str(label_getter(item) if label_getter is not None else item.get("label") or "").strip().lower()
+        substantive = 1 if (item.get("needs_full") or len(body) >= min_chars) else 0
+        priority = 1 if (priority_kws and any(kw in label for kw in priority_kws)) else 0
+        scored.append((substantive, priority, idx))
+    scored.sort(reverse=True)
+    chosen_indices = sorted([entry[2] for entry in scored[: limit - 1]] + [len(window_items) - 1])
+    return [window_items[i] for i in chosen_indices]
 
 AGY_SUBAGENT_CREATED_RE = re.compile(
     r"Created the following subagent:\s*(\{[\s\S]*?\})",
@@ -260,17 +424,31 @@ def current_iso_time() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat()
 
 
+def _effective_log_limits(anchor_dir: Optional[Path] = None) -> Tuple[int, int]:
+    log_cfg = get_runtime_tunables("loop_guards", anchor_dir).get("lifecycle_log")
+    max_bytes = MAX_LOG_BYTES
+    trim_bytes = TRIM_LOG_BYTES
+    if isinstance(log_cfg, dict):
+        if MAX_LOG_BYTES == _DEFAULT_MAX_LOG_BYTES and "max_log_mib" in log_cfg:
+            max_bytes = _coerce_pos_int(log_cfg.get("max_log_mib"), 2, minimum=1) * 1024 * 1024
+        if TRIM_LOG_BYTES == _DEFAULT_TRIM_LOG_BYTES and "trim_to_mib" in log_cfg:
+            trim_bytes = _coerce_pos_int(log_cfg.get("trim_to_mib"), 1, minimum=1) * 1024 * 1024
+    trim_bytes = min(trim_bytes, max_bytes)
+    return max_bytes, trim_bytes
+
+
 def append_jsonl_log(log_path: Path, entry: Dict[str, Any]) -> None:
     """日志共用独立锁；裁剪仅读尾部，避免大会话日志全量入内存或并发丢行。"""
     try:
+        max_bytes, trim_bytes = _effective_log_limits()
         row = json.dumps(entry, ensure_ascii=False) + "\n"
         lock_id = "log-" + hashlib.sha256(_canonical_path_key(log_path).encode("utf-8")).hexdigest()[:24]
         with session_state_lock(log_path.parent, lock_id):
-            if log_path.exists() and log_path.stat().st_size > MAX_LOG_BYTES:
+            if log_path.exists() and log_path.stat().st_size > max_bytes:
                 with log_path.open("rb") as stream:
-                    stream.seek(-TRIM_LOG_BYTES, os.SEEK_END)
+                    stream.seek(-trim_bytes, os.SEEK_END)
                     stream.readline()  # 丢掉裁剪边界上的半行。
-                    tail = stream.read(TRIM_LOG_BYTES)
+                    tail = stream.read(trim_bytes)
                 atomic_write_text(log_path, tail.decode("utf-8", errors="replace"))
             with log_path.open("a", encoding="utf-8", newline="\n") as stream:
                 stream.write(row)
@@ -286,7 +464,7 @@ def append_lifecycle_log(
     message: str,
     payload_summary: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """向 logs/lifecycle.log 追加结构化 JSONL 日志，附带 2MB 自动滚动裁剪防无限膨胀"""
+    """向 logs/lifecycle.log 追加结构化 JSONL 日志，按配置上限自动滚动裁剪防无限膨胀"""
     _, logs_dir = resolve_data_dirs(hooks_dir)
     append_jsonl_log(logs_dir / "lifecycle.log", {
         "timestamp": current_iso_time(), "event": event_name,
@@ -390,14 +568,20 @@ def has_goal_cancel_marker(text: str) -> bool:
     return bool(lines and lines[-1] == marker and list(markdown_unquoted_lines(text.rstrip()))[-1] == marker)
 
 
-def summarize_subagent_return(content: str, max_chars: int = MAX_ARCHIVE_SUBAGENT_ITEM_CHARS) -> str:
+def summarize_subagent_return(
+    content: str,
+    max_chars: Optional[int] = None,
+    head_ratio: Optional[float] = None,
+) -> str:
     """对子代理返回正文做首尾双端摘要裁剪，兼顾开篇核查范围与末尾缺陷表／结论。"""
     cleaned = str(content or "").strip()
-    if len(cleaned) <= max_chars:
+    cap = MAX_ARCHIVE_SUBAGENT_ITEM_CHARS if max_chars is None else max(120, int(max_chars))
+    if len(cleaned) <= cap:
         return cleaned
+    ratio = _coerce_ratio(head_ratio, 0.58) if head_ratio is not None else 0.58
     marker = "\n...[中间部分已省略，详见子代理日志或源码]...\n"
-    usable = max(max_chars - len(marker), 120)
-    head_len = max(int(usable * 0.58), 70)
+    usable = max(cap - len(marker), 120)
+    head_len = max(int(usable * ratio), 60)
     tail_len = max(usable - head_len, 50)
     return f"{cleaned[:head_len].rstrip()}{marker}{cleaned[-tail_len:].lstrip()}"
 
@@ -419,8 +603,12 @@ def format_user_words_markdown(
     words: List[Dict[str, Any]],
     issues: Optional[List[str]] = None,
     subagent_returns: Optional[List[Dict[str, Any]]] = None,
+    policy: Optional[Dict[str, Any]] = None,
 ) -> str:
     """将提取出的用户原话及最近子代理返回摘要格式化为持久留痕 Markdown 文档"""
+    cfg = policy if isinstance(policy, dict) else get_compaction_tunables()
+    item_cap = int(cfg.get("archive_subagent_item_chars", MAX_ARCHIVE_SUBAGENT_ITEM_CHARS))
+    head_ratio = float(cfg.get("subagent_head_ratio", 0.58))
     recent_returns = list(subagent_returns or [])
     lines = [
         "# 会话用户原话归档",
@@ -469,7 +657,7 @@ def format_user_words_markdown(
             if item.get("log_path"):
                 lines.append(f"- **原始日志**: `{item['log_path']}`")
             lines.append("")
-            lines.append(summarize_subagent_return(item.get("content", ""), MAX_ARCHIVE_SUBAGENT_ITEM_CHARS))
+            lines.append(summarize_subagent_return(item.get("content", ""), item_cap, head_ratio))
             lines.append("")
             lines.append("---")
             lines.append("")
@@ -483,6 +671,7 @@ def save_user_words_markdown(
     words: List[Dict[str, Any]],
     issues: Optional[List[str]] = None,
     subagent_returns: Optional[List[Dict[str, Any]]] = None,
+    policy: Optional[Dict[str, Any]] = None,
 ) -> Optional[Path]:
     """将用户原话列表与最近子代理返回摘要原子保存至 state/<conversationId>_user_words.md"""
     if not words:
@@ -490,7 +679,9 @@ def save_user_words_markdown(
     if not valid_session_id(conversation_id):
         raise ValueError("会话标识缺失或不合法")
     out_file = state_dir / f"{conversation_id}_user_words.md"
-    md_text = format_user_words_markdown(conversation_id, words, issues, subagent_returns=subagent_returns)
+    md_text = format_user_words_markdown(
+        conversation_id, words, issues, subagent_returns=subagent_returns, policy=policy
+    )
     atomic_write_text(out_file, md_text)
     return out_file
 
@@ -794,7 +985,18 @@ def extract_agy_archive(
     except OSError as exc:
         result["issues"].append(f"读取 {transcript_path.name} 失败（{exc}）")
 
-    recent_sub_candidates = raw_subagent_returns[-MAX_RECENT_SUBAGENT_RETURNS:]
+    agy_policy = get_compaction_tunables("antigravity")
+
+    def _agy_cand_label(item: Dict[str, Any]) -> str:
+        meta = subagent_registry.get(item["sender"], {})
+        return f"{meta.get('type_name') or ''} {meta.get('role') or ''} {item['sender']}".strip()
+
+    recent_sub_candidates = select_recent_subagent_returns(
+        raw_subagent_returns,
+        agy_policy,
+        body_getter=lambda item: item.get("fallback_body") or "",
+        label_getter=_agy_cand_label,
+    )
     subagent_truncated_needed = {
         item["step_index"] for item in recent_sub_candidates if item["needs_full"]
     }
@@ -837,6 +1039,8 @@ def extract_agy_archive(
         )
 
     subagent_returns: List[Dict[str, Any]] = []
+    agy_archive_cap = int(agy_policy["archive_subagent_item_chars"])
+    agy_head_ratio = float(agy_policy["subagent_head_ratio"])
     for sub_item in recent_sub_candidates:
         s_idx = sub_item["step_index"]
         sender_id = sub_item["sender"]
@@ -861,7 +1065,7 @@ def extract_agy_archive(
                 "agent_id": sender_id,
                 "label": label,
                 "log_path": meta.get("log_path") or "",
-                "content": summarize_subagent_return(body_text, MAX_ARCHIVE_SUBAGENT_ITEM_CHARS),
+                "content": summarize_subagent_return(body_text, agy_archive_cap, agy_head_ratio),
                 "truncated": still_truncated,
             }
         )
@@ -1477,6 +1681,7 @@ def extract_codex_session_words(
                                     if dedup_key in seen_subagent_keys:
                                         continue
                                     seen_subagent_keys.add(dedup_key)
+                                    codex_policy = get_compaction_tunables("codex")
                                     raw_subagent_returns.append(
                                         {
                                             "step_index": step_no,
@@ -1485,7 +1690,9 @@ def extract_codex_session_words(
                                             "label": sub_label,
                                             "log_path": sub_log,
                                             "content": summarize_subagent_return(
-                                                sub_body, MAX_ARCHIVE_SUBAGENT_ITEM_CHARS
+                                                sub_body,
+                                                int(codex_policy["archive_subagent_item_chars"]),
+                                                float(codex_policy["subagent_head_ratio"]),
                                             ),
                                             "truncated": False,
                                         }
@@ -1541,10 +1748,11 @@ def extract_codex_session_words(
     for index, item in enumerate(words, start=1):
         item["turn"] = index
 
+    codex_policy = get_compaction_tunables("codex")
     return {
         "session_id": resolved_sid or session_id or "unknown",
         "words": words,
-        "subagent_returns": raw_subagent_returns[-MAX_RECENT_SUBAGENT_RETURNS:],
+        "subagent_returns": select_recent_subagent_returns(raw_subagent_returns, codex_policy),
         "segments": [str(p) for p in segments],
         "sources": sources,
         "issues": issues,
@@ -1698,7 +1906,9 @@ def refresh_codex_session_archive(
         can_update_partial = parsed["provenance_corrected"] or (bool(words) and (not previous["available"] or (
             previous["manifest_verified"] and not previous["verified"] and len(words) >= previous["count"]
         )))
-        md_text = format_user_words_markdown(sid, words, issues, subagent_returns=subagent_returns)
+        md_text = format_user_words_markdown(
+            sid, words, issues, subagent_returns=subagent_returns, policy=get_compaction_tunables("codex")
+        )
         md_sha = hashlib.sha256(md_text.encode("utf-8")).hexdigest()
         body_sha = previous.get("body_sha256")
         can_restore_manifest = bool(body_sha and body_sha == md_sha and parsed["sources"])
@@ -1988,6 +2198,7 @@ def _extract_claude_subagent_returns_from_user(
             label = f"{sub_type} ({desc})"
         else:
             label = sub_type or desc or agent_id or "Agent"
+        claude_policy = get_compaction_tunables("claude")
         returns.append(
             {
                 "step_index": line_index,
@@ -1995,7 +2206,11 @@ def _extract_claude_subagent_returns_from_user(
                 "agent_id": agent_id,
                 "label": label,
                 "log_path": _resolve_claude_subagent_log(transcript_path, agent_id, explicit_log),
-                "content": summarize_subagent_return(body_text, MAX_ARCHIVE_SUBAGENT_ITEM_CHARS),
+                "content": summarize_subagent_return(
+                    body_text,
+                    int(claude_policy["archive_subagent_item_chars"]),
+                    float(claude_policy["subagent_head_ratio"]),
+                ),
                 "truncated": False,
             }
         )
@@ -2064,9 +2279,10 @@ def extract_claude_user_words(transcript_path: Path) -> Dict[str, Any]:
                         "observed_size": before.st_size, "sha256": digest.hexdigest()})
     except OSError as exc:
         issues.append(f"读取 Claude 轨迹失败（{exc}）")
+    claude_policy = get_compaction_tunables("claude")
     return {
         "words": words,
-        "subagent_returns": subagent_returns[-MAX_RECENT_SUBAGENT_RETURNS:],
+        "subagent_returns": select_recent_subagent_returns(subagent_returns, claude_policy),
         "issues": issues,
         "sources": sources,
         "complete": not issues,
@@ -2101,7 +2317,9 @@ def archive_claude_session_words(payload: Dict[str, Any], state_dir: Path) -> Di
         can_update_partial = bool(words) and (not previous["available"] or (
             previous["manifest_verified"] and not previous["verified"] and len(words) >= previous["count"]
         ))
-        md_text = format_user_words_markdown(sid, words, issues, subagent_returns=subagent_returns)
+        md_text = format_user_words_markdown(
+            sid, words, issues, subagent_returns=subagent_returns, policy=get_compaction_tunables("claude")
+        )
         md_sha = hashlib.sha256(md_text.encode("utf-8")).hexdigest()
         body_sha = previous.get("body_sha256")
         can_restore_manifest = bool(body_sha and body_sha == md_sha and sources and not previous.get("legacy_hash_mismatch"))

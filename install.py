@@ -84,6 +84,26 @@ def _load_fleet_profile(repo_root: Optional[Path] = None) -> Dict[str, Any]:
     return {}
 
 
+def _default_claude_effort(repo_root: Optional[Path] = None) -> str:
+    rules = _load_fleet_profile(repo_root).get("client_catalog_rules")
+    cl_rules = rules.get("claude") if isinstance(rules, dict) else None
+    val = str((cl_rules or {}).get("default_interactive_effort") or "xhigh").strip().lower() if isinstance(cl_rules, dict) else "xhigh"
+    return val if val in {"low", "medium", "high", "xhigh", "max"} else "xhigh"
+
+
+def _default_handoff_policy(client: str, repo_root: Optional[Path] = None) -> Tuple[str, int]:
+    tunables = _load_fleet_profile(repo_root).get("runtime_tunables")
+    ht = tunables.get("handoff_thresholds") if isinstance(tunables, dict) else None
+    cfg = ht.get(client) if isinstance(ht, dict) else None
+    if not isinstance(cfg, dict):
+        return "advisory", 0
+    raw_mode = str(cfg.get("default_mode") or "advisory").strip().lower()
+    mode = raw_mode if raw_mode in {"advisory", "enforce", "off"} else "advisory"
+    raw_lim = cfg.get("default_compact_limit")
+    limit = int(raw_lim) if isinstance(raw_lim, int) and not isinstance(raw_lim, bool) and raw_lim >= 0 else 0
+    return mode, limit
+
+
 def _is_mnt_windows_path(path_str: Optional[str]) -> bool:
     """在 POSIX/WSL 下判断可执行文件路径是否位于 /mnt/<盘符>/ 挂载的 Windows 侧"""
     if os.name == "nt" or not path_str:
@@ -1673,8 +1693,9 @@ def _codex_handoff_policy(
     limits = {limit for _, limit in policies}
     if (requested_mode is None and len(modes) > 1) or (requested_limit is None and len(limits) > 1):
         raise ValueError("Codex 钩子交接策略不一致，请用 --codex-handoff-mode 和 --codex-handoff-compactions 指定需要保留的值")
-    mode = requested_mode if requested_mode is not None else next(iter(modes), "advisory")
-    limit = requested_limit if requested_limit is not None else next(iter(limits), 0)
+    def_mode, def_limit = _default_handoff_policy("codex")
+    mode = requested_mode if requested_mode is not None else next(iter(modes), def_mode)
+    limit = requested_limit if requested_limit is not None else next(iter(limits), def_limit)
     marker = f"[user-guard codex-handoff v1 mode={mode} compact_limit={limit}]"
     if markers:
         lines = description.split("\n")
@@ -1976,7 +1997,8 @@ def _claude_handoff_policy(
     modes, limits = {item[0] for item in policies}, {item[1] for item in policies}
     if (mode is None and len(modes) > 1) or (compact_limit is None and len(limits) > 1):
         raise ValueError("Claude 交接策略不一致，请显式指定 --claude-handoff-mode 和 --claude-handoff-compactions")
-    return mode or next(iter(modes), "advisory"), compact_limit if compact_limit is not None else next(iter(limits), 0)
+    def_mode, def_limit = _default_handoff_policy("claude")
+    return mode or next(iter(modes), def_mode), compact_limit if compact_limit is not None else next(iter(limits), def_limit)
 
 
 def _plan_claude_settings(
@@ -1995,7 +2017,7 @@ def _plan_claude_settings(
         raise ValueError(f"{settings_path} 的 env 必须是对象")
     if include_model:
         if overwrite_model or "effortLevel" not in doc:
-            doc["effortLevel"] = "xhigh"
+            doc["effortLevel"] = _default_claude_effort()
         if overwrite_model:
             env.pop("CLAUDE_CODE_EFFORT_LEVEL", None)
     if include_hooks:
@@ -2077,7 +2099,8 @@ def _plan_claude_settings(
                 existing.append(target)
             target["hooks"].extend(desired)
     else:
-        mode, compact_limit = mode or "advisory", compact_limit or 0
+        def_mode, def_limit = _default_handoff_policy("claude")
+        mode, compact_limit = mode or def_mode, compact_limit if compact_limit is not None else def_limit
     content = _preserve_text_format(_json_bytes(doc), original)
     return CodexHooksPlan(FileChange(settings_path, original, content) if doc != initial else None, mode, compact_limit)
 
@@ -2678,7 +2701,7 @@ def audit_upgrade_status(
     if cl_active:
         if cl["drift_files"]:
             actions.append("sync_claude")
-        if cl["effortLevel"] != "xhigh" or cl["locked_effort_env"]:
+        if cl["effortLevel"] != _default_claude_effort(repo_root) or cl["locked_effort_env"]:
             actions.append("sync_claude_model_defaults")
     if dsh_active and dsh["drift_files"]:
         actions.append("sync_dsh")
@@ -2696,8 +2719,14 @@ def audit_upgrade_status(
     if errors:
         actions.append("repair_unreadable_configs")
     toolchain = _audit_host_toolchain(is_sandbox_run=is_sandbox_run, detection=detection)
+    eval_policy = fleet_profile.get("evaluation_policy") if isinstance(fleet_profile.get("evaluation_policy"), dict) else {}
     report = {"plugin_version": repo_version,
-              "fleet_profile": {"profile_id": fleet_profile.get("profile_id"), "evaluated_at": fleet_profile.get("evaluated_at")},
+              "fleet_profile": {
+                  "profile_id": fleet_profile.get("profile_id"),
+                  "evaluated_at": fleet_profile.get("evaluated_at"),
+                  "all_roles_dynamic": bool(eval_policy.get("all_roles_dynamic", True)),
+                  "dynamic_tunables_enabled": bool(eval_policy.get("dynamic_tunables_enabled", isinstance(fleet_profile.get("runtime_tunables"), dict))),
+              },
               "host": {"platform": sys.platform, "python_version": sys.version.split()[0], "is_wsl": detection.get("is_wsl"),
                        "wsl_probe": detection.get("wsl_probe"), "toolchain": toolchain},
               "antigravity": ag, "codex": cx, "claude": cl, "dsh": dsh, "cc_switch": cc,

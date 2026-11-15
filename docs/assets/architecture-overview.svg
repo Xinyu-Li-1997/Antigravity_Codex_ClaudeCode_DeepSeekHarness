@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 584" width="1080" height="584" role="img" aria-labelledby="arch-title arch-desc">
-  <title id="arch-title">两层解耦配置与四客户端对等协作总览</title>
-  <desc id="arch-desc">展示常驻机制层与动态模型评估配置层的解耦关系、四个必停用户拍板门禁，以及 Antigravity、Codex、Claude Code 与 DeepSeek Harness 四个对等客户端的全局目录挂载方式。</desc>
+  <title id="arch-title">两层解耦配置与四客户端全动态协作总览</title>
+  <desc id="arch-desc">展示常驻机制层与全动态角色及运行期参数配置层的解耦关系、双工作区识别、四个必停用户拍板门禁，以及 Antigravity、Codex、Claude Code 与 DeepSeek Harness 四个对等客户端的全局目录挂载方式。</desc>
   <defs>
     <style>
       .bg { fill: #f8fafc; stroke: #cbd5e1; stroke-width: 1.5; }
@@ -31,29 +31,29 @@
 
   <rect x="8" y="8" width="1064" height="568" rx="12" class="bg"/>
   <text x="540" y="35" text-anchor="middle" class="title">两层解耦全局配置与四客户端对等协作架构</text>
-  <text x="540" y="55" text-anchor="middle" class="subtitle">课题业务仓库零侵入 · Python 3.11+ 纯标准库实现 · 常驻工程契约与动态模型快照严格分离</text>
+  <text x="540" y="55" text-anchor="middle" class="subtitle">课题业务仓库零侵入 · Python 3.11+ 纯标准库 · 通用课题与上游配置仓双模式隔离 · 全角色与定量参数动态校准</text>
 
   <!-- Layer 1 Left: Permanent Layer -->
   <rect x="28" y="72" width="500" height="184" rx="9" class="box-perm"/>
-  <text x="44" y="96" class="hdr-perm">1. 常驻机制层（跨模型换代稳定，零时期性模型名硬编码）</text>
+  <text x="44" y="96" class="hdr-perm">1. 常驻机制层（零时期性模型名 · 零散落业务魔数）</text>
   <text x="44" y="118" class="body">• 全局规则模板：template/user-guard/rules/AGENTS.md（R0–R11）</text>
   <text x="44" y="138" class="body">• 生命周期钩子：user_words · session_context_loader · status_guard</text>
   <text x="58" y="156" class="body">reply_repeat_guard · handoff_gate（短进程 JSON 协议，平时零驻留）</text>
-  <text x="44" y="176" class="body">• 幂等分发与审计：install.py（保留自定义尾段 · --audit-upgrade 耦合检查）</text>
-  <text x="44" y="196" class="body">• 角色路由与门禁：cae_harness.py（快照保护 / --write-scope / --verify-cmd）</text>
-  <text x="58" y="214" class="body">fleet_state.py（推荐表审批锁 propose/approve · 重启重入锁 pass1/pass2）</text>
+  <text x="44" y="176" class="body">• 角色编排与事实锚定：cae_harness.py（gate / audit / check-grounding）</text>
+  <text x="44" y="196" class="body">• 上游专属工具（workspace_mode 硬隔离）：install.py · fleet_state.py</text>
+  <text x="58" y="214" class="body">（推荐表审批锁 propose/approve · 重启重入锁 · 终审锚定门禁）</text>
   <text x="44" y="236" class="body">• 只读子代理：readonly-reader · readonly-collaborator · readonly-auditor</text>
 
   <!-- Layer 1 Right: Dynamic Fleet Profile Layer -->
   <rect x="552" y="72" width="500" height="184" rx="9" class="box-dyn"/>
-  <text x="568" y="96" class="hdr-dyn">2. 模型评估快照层（随客户端与模型迭代动态校准）</text>
+  <text x="568" y="96" class="hdr-dyn">2. 全动态评估与参数层（随客户端与模型特性重算）</text>
   <text x="568" y="118" class="body">• 唯一机器可读配置：skills/cae-harness/fleet_profile.json</text>
-  <text x="568" y="138" class="body">• 五类抽象角色槽位（主控端同样支持重算切换，非永久绑定）：</text>
+  <text x="568" y="138" class="body">• 五类对等角色槽位全部动态选路（均无永久客户端或模型绑定）：</text>
   <rect x="568" y="148" width="466" height="24" rx="5" class="tag"/>
   <text x="801" y="164" text-anchor="middle" class="mono">role:orchestrator | role:math | role:code | role:review | role:fast</text>
-  <text x="568" y="192" class="body">• 双向实证记录：各客户端/模型优势依据 + 严重短板隔离参数（过滤 ultra、</text>
-  <text x="582" y="211" class="body">跳过共享窗口复合路由、显式最大窗口预算、暂缓区域受限或退役模型）</text>
-  <text x="568" y="236" class="body">• 动态校准入口：fleet-evolve（结合本机探测缓存、报错日志与官方文档重算）</text>
+  <text x="568" y="192" class="body">• 受控定量参数 runtime_tunables：各端压缩恢复预算、实质子代理</text>
+  <text x="582" y="211" class="body">筛选窗口、交接与防轮询阈值、分片安全系数、路由并发与缓存上限</text>
+  <text x="568" y="236" class="body">• 上游双循环入口：fleet-evolve（全面更新 full · 全量优化 hygiene）</text>
 
   <!-- Cross link between layers -->
   <path d="M 552 164 L 530 164" class="arrow-dyn"/>
@@ -61,7 +61,7 @@
   <!-- Middle Approval Gate -->
   <rect x="28" y="274" width="1024" height="74" rx="8" class="box-gate"/>
   <text x="44" y="296" class="hdr-gate">必停用户拍板门禁（R3.1.4 / R4，未获明确批准严禁跨步执行）</text>
-  <text x="44" y="317" class="body">① 生成或调整推荐搭配表（fleet_state.py propose）   ·   ② 向宿主机全局配置目录写入变更（install.py 正式执行）或切换主控客户端</text>
+  <text x="44" y="317" class="body">① 生成或调整动态角色矩阵与 runtime_tunables（fleet_state.py propose）  ·  ② 写入宿主机全局目录（install.py）或切换主会话端</text>
   <text x="44" y="337" class="body">③ 系统级 Python 跨次版本、CUDA 跨大版本或 WSL 跨 LTS 发行版等 ABI 强耦合升级   ·   ④ git push 推送远端仓库前</text>
 
   <!-- Arrows down to 4 Peer Clients -->
@@ -79,8 +79,8 @@
   <text x="40" y="437" class="body">• 挂载 4 类钩子（存 PLUGIN_DATA）</text>
   <text x="40" y="456" class="body">• 3 个 inherit 原生只读子代理</text>
   <text x="40" y="475" class="body">• 订阅按模型组计 5h / 7d 滚动配额</text>
-  <text x="40" y="494" class="body">• CLI 不输出窗口整数，分片按 120k</text>
-  <text x="52" y="513" class="body">保守预算规划，过滤复合与异池模型</text>
+  <text x="40" y="494" class="body">• CLI 不输出窗口整数，读取回退预</text>
+  <text x="52" y="513" class="body">算规划分片，过滤复合与异池模型</text>
   <text x="40" y="534" class="body">• 严格校验：agy plugin validate</text>
 
   <!-- Peer 2: Codex -->

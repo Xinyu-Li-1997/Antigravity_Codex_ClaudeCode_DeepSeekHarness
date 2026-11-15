@@ -27,7 +27,10 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 HOOKS_DIR = Path(os.environ.get("USER_GUARD_INSTALLED_DIR", str(REPO_ROOT / "template" / "user-guard"))) / "hooks"
 sys.path.insert(0, str(HOOKS_DIR))
 
+import handoff_gate  # noqa: E402
+import reply_repeat_guard  # noqa: E402
 import session_context_loader  # noqa: E402
+import status_guard  # noqa: E402
 import user_words  # noqa: E402
 
 
@@ -2052,6 +2055,90 @@ class TestCodexHandoffAdapter(unittest.TestCase):
         manifest = json.loads(meta_path.read_text(encoding="utf-8"))
         self.assertEqual(manifest["sha256"], hashlib.sha256(md_path.read_bytes()).hexdigest())
         self.assertEqual(manifest["count"], 1)
+
+    def test_dynamic_runtime_tunables_and_substantive_subagent_selection(self) -> None:
+        # 1. 验证窗口内实质子代理筛选：最新 1 条无条件保留，前序高价值审查结论不被简短状态回执挤掉
+        items = [
+            {
+                "step_index": 10,
+                "agent_label": "readonly-auditor (Core Auditor #1)",
+                "content": "完成 src/flux/hllc.py 第 12-88 行逐行审查：质量与总能离散守恒残差均为 1.1e-15，未见容差放宽。",
+            },
+            {
+                "step_index": 20,
+                "agent_label": "readonly-collaborator (Math Check #2)",
+                "content": "完成三维曲网格离散几何守恒律（GCL）体积度量对称性推导，边界求积阶数需满足 p >= 2m。",
+            },
+            {"step_index": 30, "agent_label": "helper-ping-1", "content": "已收到。"},
+            {"step_index": 40, "agent_label": "helper-ping-2", "content": "无异常。"},
+            {"step_index": 50, "agent_label": "helper-ping-3", "content": "继续等待。"},
+            {"step_index": 60, "agent_label": "helper-ping-4", "content": "状态正常。"},
+        ]
+        selected = user_words.select_recent_subagent_returns(
+            items,
+            {"recent_subagent_returns": 3, "recent_subagent_window": 10, "min_substantive_subagent_chars": 40},
+        )
+        self.assertEqual([it["step_index"] for it in selected], [10, 20, 60])
+
+        # 2. 验证 CAE_FLEET_PROFILE 动态覆盖各端压缩恢复参数与钩子阈值，同时保留 mock.patch.object 优先级
+        custom_profile = self.root / "custom_fleet_profile.json"
+        custom_profile.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "runtime_tunables": {
+                        "compaction_recovery": {
+                            "defaults": {
+                                "inline_total_chars": 5200,
+                                "recent_subagent_returns": 2,
+                                "recent_subagent_window": 8,
+                                "min_substantive_subagent_chars": 48,
+                                "inline_subagent_total_chars": 900,
+                                "inline_subagent_item_chars": 220,
+                            },
+                            "per_client": {
+                                "antigravity": {"inline_total_chars": 4800, "recent_subagent_returns": 2},
+                                "codex": {"inline_total_chars": 6400, "recent_subagent_returns": 4},
+                            },
+                        },
+                        "handoff_thresholds": {"antigravity": {"advisory_cp_threshold": 9, "drain_cp_threshold": 14}},
+                        "loop_guards": {
+                            "reply_repeat": {"consecutive_wait_limit": 4, "max_short_reply_chars": 260},
+                            "status_guard": {"task_no_log_cooldown_sec": 42.0},
+                        },
+                    },
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        with mock.patch.dict(os.environ, {"CAE_FLEET_PROFILE": str(custom_profile)}):
+            ag_pol = user_words.get_compaction_tunables("antigravity")
+            cx_pol = user_words.get_compaction_tunables("codex")
+            self.assertEqual(ag_pol["inline_total_chars"], 4800)
+            self.assertEqual(ag_pol["recent_subagent_returns"], 2)
+            self.assertEqual(cx_pol["inline_total_chars"], 6400)
+            self.assertEqual(cx_pol["recent_subagent_returns"], 4)
+
+            handoff_gate._sync_handoff_tunables()
+            self.assertEqual(handoff_gate.ADVISORY_CP_THRESHOLD, 9)
+            self.assertEqual(handoff_gate.DRAIN_CP_THRESHOLD, 14)
+            with mock.patch.object(handoff_gate, "ADVISORY_CP_THRESHOLD", 3):
+                handoff_gate._sync_handoff_tunables()
+                self.assertEqual(handoff_gate.ADVISORY_CP_THRESHOLD, 3)
+
+            reply_repeat_guard._sync_repeat_tunables()
+            self.assertEqual(reply_repeat_guard.CONSECUTIVE_WAIT_LIMIT, 4)
+            self.assertEqual(reply_repeat_guard.MAX_SHORT_REPLY_CHARS, 260)
+
+            status_guard._sync_status_tunables()
+            self.assertEqual(status_guard.TASK_NO_LOG_COOLDOWN_SEC, 42.0)
+        # 退出自定义环境变量后自动恢复默认快照校准值
+        handoff_gate._sync_handoff_tunables()
+        reply_repeat_guard._sync_repeat_tunables()
+        status_guard._sync_status_tunables()
+        self.assertEqual(handoff_gate.ADVISORY_CP_THRESHOLD, 11)
+        self.assertEqual(reply_repeat_guard.CONSECUTIVE_WAIT_LIMIT, 3)
 
 
 if __name__ == "__main__":

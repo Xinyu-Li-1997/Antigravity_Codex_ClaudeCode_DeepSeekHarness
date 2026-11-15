@@ -67,11 +67,60 @@ $settings = Get-ItemProperty -LiteralPath 'HKCU:\Software\Microsoft\Windows\Curr
 _key_cache = {}
 _key_lock = threading.Lock()
 WINDOWS_PROXY_TTL = 5
+KEY_CACHE_TTL = 60
 _FAKE_IP_NETWORKS = (ipaddress.ip_network("198.18.0.0/15"), ipaddress.ip_network("2001:2::/48"))
 _proxy_cache = None
 _proxy_lock = threading.Lock()
 _log_lock = threading.Lock()
 _INFLIGHT_SEM = threading.BoundedSemaphore(64)
+
+
+def _load_fleet_router_tunables():
+    """读取 fleet_profile.json 中的 router 运行期默认参数（router.json 显式配置优先）。"""
+    env_p = os.environ.get("CAE_FLEET_PROFILE", "").strip()
+    candidates = []
+    if env_p:
+        candidates.append(Path(env_p).expanduser())
+    here_path = Path(HERE)
+    candidates.extend([
+        here_path.parent / "skills" / "cae-harness" / "fleet_profile.json",
+        here_path.parent.parent / "user-guard" / "skills" / "cae-harness" / "fleet_profile.json",
+    ])
+    for cand in candidates:
+        try:
+            if not cand.is_file() or cand.is_symlink():
+                continue
+            data = json.loads(cand.read_text(encoding="utf-8-sig"))
+            if not isinstance(data, dict) or data.get("schema_version") != 1:
+                continue
+            rt = (((data.get("runtime_tunables") or {}).get("headless_dispatch") or {}).get("router") or {})
+            return rt if isinstance(rt, dict) else {}
+        except (OSError, UnicodeError, ValueError):
+            continue
+    return {}
+
+
+def _apply_fleet_router_defaults():
+    global WINDOWS_PROXY_TTL, KEY_CACHE_TTL, _INFLIGHT_SEM
+    rt = _load_fleet_router_tunables()
+    if not rt:
+        return
+    if isinstance(rt.get("port"), int) and rt["port"] > 0:
+        DEFAULTS["port"] = rt["port"]
+    if isinstance(rt.get("timeout_sec"), int) and rt["timeout_sec"] > 0:
+        DEFAULTS["timeout_s"] = rt["timeout_sec"]
+    if isinstance(rt.get("max_body_mib"), int) and rt["max_body_mib"] > 0:
+        DEFAULTS["max_body_bytes"] = rt["max_body_mib"] * 1024 * 1024
+    if isinstance(rt.get("max_inflight"), int) and rt["max_inflight"] > 0:
+        DEFAULTS["max_inflight"] = rt["max_inflight"]
+        _INFLIGHT_SEM = threading.BoundedSemaphore(rt["max_inflight"])
+    if isinstance(rt.get("windows_proxy_ttl_sec"), int) and rt["windows_proxy_ttl_sec"] > 0:
+        WINDOWS_PROXY_TTL = rt["windows_proxy_ttl_sec"]
+    if isinstance(rt.get("key_cache_ttl_sec"), int) and rt["key_cache_ttl_sec"] > 0:
+        KEY_CACHE_TTL = rt["key_cache_ttl_sec"]
+
+
+_apply_fleet_router_defaults()
 
 
 def default_config_path():
@@ -83,6 +132,7 @@ def default_config_path():
 
 
 def load_config(path):
+    _apply_fleet_router_defaults()
     cfg = copy.deepcopy(DEFAULTS)
     if path and os.path.exists(path):
         with open(path, encoding="utf-8-sig") as f:
@@ -247,12 +297,13 @@ def end_to_end_headers(headers):
 
 
 def card_key(cfg, card_name):
-    """API key of a cc-switch Claude provider card, read-only, cached for 60 s."""
+    """API key of a cc-switch Claude provider card, read-only, cached for KEY_CACHE_TTL s."""
     db = Path(cfg["ccswitch_db"]).expanduser().resolve()
     cache_id = (os.path.normcase(str(db)), card_name)
+    ttl = max(1, int(cfg.get("key_cache_ttl_s", KEY_CACHE_TTL)))
     with _key_lock:
         hit = _key_cache.get(cache_id)
-        if hit and time.monotonic() - hit[1] < 60:
+        if hit and time.monotonic() - hit[1] < ttl:
             return hit[0]
         try:
             con = sqlite3.connect(db.as_uri() + "?mode=ro", uri=True, timeout=5)
