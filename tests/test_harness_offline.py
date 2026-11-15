@@ -3061,12 +3061,12 @@ else:
         self.assertEqual(harness._extract_json_object(noisy_stream, harness.TASK_JSON_SCHEMA), nested_task)
         unescaped_win_latex = (
             '{"summary": "核对通过", '
-            '"content": "控制方程 \\partial_t U + \\Omega = 0，路径 C:\\users\\demo\\NOTICE 与已转义 D:\\\\Data\\\\demo 一致。", '
-            '"evidence": ["C:\\users\\demo\\NOTICE#L1-L6"], '
+            '"content": "控制方程 \\partial_t U + \\Omega = 0，路径 C:\\users\\user\\NOTICE 与已转义 D:\\\\Data\\\\demo 一致。", '
+            '"evidence": ["C:\\users\\user\\NOTICE#L1-L6"], '
             '"unverified": ["D:\\Data\\demo\\LICENSE"]}'
         )
         repaired_obj = harness._extract_json_object(unescaped_win_latex, harness.TASK_JSON_SCHEMA)
-        self.assertIn('C:\\users\\demo\\NOTICE', repaired_obj['content'])
+        self.assertIn('C:\\users\\user\\NOTICE', repaired_obj['content'])
         self.assertIn('D:\\Data\\demo', repaired_obj['content'])
         self.assertEqual(repaired_obj['unverified'], ['D:\\Data\\demo\\LICENSE'])
 
@@ -3120,6 +3120,115 @@ else:
         bad_rep = harness.audit_doc_grounding(edge_dir, edge_dir)
         self.assertFalse(bad_rep['ok'])
         self.assertIn('ungrounded_acronym', {f['category'] for f in bad_rep['findings']})
+
+    def test_specialty_role_preserves_flagship_on_low_tier_staged_scope_and_winapps_codex(self):
+        # 1) 显式指定非 fast 专长槽位（codex:code / codex:math / codex:review / dsh:code / agy:@math）传 low 挡不静默换为轻量模型
+        engines = self.four_backends()
+        engines['codex']['models'] = [
+            {'slug': 'gpt-6-astra', 'priority': 1, 'visibility': 'list', 'description': 'Deep reasoning model',
+             'context_window': 272000, 'max_context_window': 872000, 'supported_efforts': ['low', 'medium', 'high', 'max']},
+            {'slug': 'gpt-6.1-sol', 'priority': 2, 'visibility': 'list', 'description': 'Agentic coding model',
+             'context_window': 500000, 'max_context_window': 872000, 'supported_efforts': ['low', 'medium', 'high', 'max']},
+            {'slug': 'gpt-6-luna', 'priority': 3, 'visibility': 'list', 'description': 'Fast and affordable model',
+             'context_window': 272000, 'max_context_window': 872000, 'supported_efforts': ['low', 'medium', 'high']},
+        ]
+        engines['agy']['models'] = [
+            {'slug': 'gemini-4-carbon-low', 'display_name': 'Gemini 4 Carbon (Low)', 'supported_efforts': ['low']},
+            {'slug': 'gemini-4-carbon-high', 'display_name': 'Gemini 4 Carbon (High)', 'supported_efforts': ['high']},
+            {'slug': 'gemini-4-hydrogen-low', 'display_name': 'Gemini 4 Hydrogen (Low)', 'supported_efforts': ['low']},
+        ]
+        p_cx_code_low = harness.resolve_execution_profile(engines, 'codex:code', 'low', kind='review')
+        self.assertEqual(p_cx_code_low['model'], 'gpt-6.1-sol')
+        self.assertEqual(p_cx_code_low['cli_effort'], 'low')
+        self.assertEqual(p_cx_code_low['profile_source'], 'role_specialty_code')
+
+        p_cx_math_low = harness.resolve_execution_profile(engines, 'codex:math', 'low', kind='math')
+        self.assertEqual(p_cx_math_low['model'], 'gpt-6-astra')
+        self.assertEqual(p_cx_math_low['cli_effort'], 'low')
+
+        p_cx_fast = harness.resolve_execution_profile(engines, 'codex:@fast', 'low', kind='review')
+        self.assertEqual(p_cx_fast['model'], 'gpt-6-luna')
+        self.assertEqual(harness.resolve_execution_profile(engines, 'codex:default', 'low', kind='review')['model'], 'gpt-6-luna')
+
+        p_dsh_code_low = harness.resolve_execution_profile(engines, 'dsh:code', 'low', kind='code')
+        self.assertEqual(p_dsh_code_low['model'], 'deepseek-v4-pro')
+        self.assertEqual(harness.resolve_execution_profile(engines, 'dsh:fast', 'low', kind='review')['model'], 'deepseek-flash')
+
+        p_agy_math_low = harness.resolve_execution_profile(engines, 'agy:@math', 'low', kind='math')
+        self.assertEqual(p_agy_math_low['model'], 'gemini-4-carbon-low')
+        self.assertEqual(harness.resolve_execution_profile(engines, 'agy:@fast', 'low', kind='review')['model'], 'gemini-4-hydrogen-low')
+
+        # 2) cmd_task 在 --clean-room (staged_readonly_workspace) 下对 stage_dir 校验快照：
+        #    主目录并发改动不误报 scope_violation；但若子进程篡改 stage_dir 内文件则仍准确拦截为 scope_violation
+        proj = self.root / 'staged_scope_proj'
+        proj.mkdir()
+        (proj / 'README.md').write_text('original doc\n', encoding='utf-8')
+        (proj / 'plugin.json').write_text('{"version": "1.0.0"}\n', encoding='utf-8')
+        cl_home = self.root / 'clean-cl-home'
+        cl_home.mkdir()
+        (cl_home / 'settings.json').write_text('{"env": {"ANTHROPIC_API_KEY": "k-ok"}}', encoding='utf-8')
+        engines['claude']['config_home'] = str(cl_home)
+
+        def concurrent_host_edit_run(command, cwd, input_text, timeout_sec, env=None, native_pid_file=None):
+            # 模拟主会话在子进程运行期间合法编辑 root 下的 plugin.json，而隔离目录 cwd 保持只读零改动
+            (proj / 'plugin.json').write_text('{"version": "1.0.1"}\n', encoding='utf-8')
+            return subprocess.CompletedProcess(command, 0, json.dumps({'structured_output': TASK}), '')
+
+        args_clean = self.args('task', '--target', str(proj), '--caller', 'antigravity',
+                               '--engine', 'claude:default', '--kind', 'review', '--clean-room', '--task', '盲读文档')
+        with patch.object(harness, '_args_backends', return_value=engines), \
+             patch.object(harness, '_prepare_execution'), \
+             patch.object(harness, 'run_process', side_effect=concurrent_host_edit_run):
+            rc_ok, rep_ok = self.capture(harness.cmd_task, args_clean)
+        self.assertEqual(rc_ok, 0, rep_ok)
+        self.assertEqual(rep_ok['status'], 'ok')
+        self.assertEqual(rep_ok['scope_violations'], [])
+
+        def rogue_staged_write_run(command, cwd, input_text, timeout_sec, env=None, native_pid_file=None):
+            (Path(cwd) / 'README.md').write_text('tampered inside stage_dir\n', encoding='utf-8')
+            return subprocess.CompletedProcess(command, 0, json.dumps({'structured_output': TASK}), '')
+
+        with patch.object(harness, '_args_backends', return_value=engines), \
+             patch.object(harness, '_prepare_execution'), \
+             patch.object(harness, 'run_process', side_effect=rogue_staged_write_run):
+            rc_bad, rep_bad = self.capture(harness.cmd_task, args_clean)
+        self.assertNotEqual(rc_bad, 0)
+        self.assertEqual(rep_bad['status'], 'scope_violation')
+        self.assertIn('README.md', rep_bad['scope_violations'])
+
+        # 暂存建立后若复检额度抛出异常，且主目录并发改动，仍保留原异常状态 quota_exhausted 而不误报 scope_violation
+        call_idx = {'n': 0}
+
+        def quota_fail_on_second_check(*_a, **_kw):
+            call_idx['n'] += 1
+            if call_idx['n'] >= 2:
+                (proj / 'plugin.json').write_text('{"version": "1.0.2"}\n', encoding='utf-8')
+                raise harness.HarnessError('配额冷却中', 'quota_exhausted', preflight_blocked=True)
+
+        with patch.object(harness, '_args_backends', return_value=engines), \
+             patch.object(harness, '_prepare_execution'), \
+             patch.object(harness, '_enforce_preflight_quota', side_effect=quota_fail_on_second_check):
+            rc_q, rep_q = self.capture(harness.cmd_task, args_clean)
+        self.assertEqual(rc_q, 5)
+        self.assertEqual(rep_q['status'], 'quota_exhausted')
+        self.assertEqual(rep_q['scope_violations'], [])
+
+        # 3) Windows 下 _find_binary('codex') 对比 AppData\Local\OpenAI\Codex\bin 与 WindowsApps MSIX 择新，且保留 .local/bin 优先级
+        fake_home = self.root / 'win-home'
+        old_bin = fake_home / 'AppData' / 'Local' / 'OpenAI' / 'Codex' / 'bin' / 'oldhash' / 'codex.exe'
+        msix_bin = self.root / 'winapps' / 'OpenAI.Codex_26.1111_x64' / 'app' / 'resources' / 'codex.exe'
+        old_bin.parent.mkdir(parents=True)
+        msix_bin.parent.mkdir(parents=True)
+        old_bin.write_bytes(b'MZ-old')
+        msix_bin.write_bytes(b'MZ-new')
+        os.utime(old_bin, ns=(1_700_000_000_000_000_000, 1_700_000_000_000_000_000))
+        os.utime(msix_bin, ns=(1_800_000_000_000_000_000, 1_800_000_000_000_000_000))
+        with patch.object(harness, '_is_posix', return_value=False), \
+             patch.object(harness.Path, 'home', return_value=fake_home), \
+             patch.object(harness.shutil, 'which', return_value=str(old_bin)), \
+             patch.object(harness, '_find_windows_codex_package_cli', return_value=msix_bin), \
+             patch.dict(os.environ, {'LOCALAPPDATA': str(fake_home / 'AppData' / 'Local')}, clear=True):
+            self.assertEqual(harness._find_binary('codex'), str(msix_bin))
 
 
 if __name__ == '__main__':

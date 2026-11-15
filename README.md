@@ -176,7 +176,7 @@ flowchart TB
 
 ### 2. 表二：日常中文需求分类指令表（通用课题项目 vs 上游配置仓维护）
 
-安装本套全局配置后，系统通过**轻量工作区身份硬判别（`workspace_mode`）**严格隔离两类使用场景，防止在普通 CFD 或 FEA 课题仓库中说出“全量优化代码和文档”时误触宿主机全局配置演进：
+安装本套全局配置后，系统通过**轻量工作区身份硬判别**（`workspace_mode`）严格隔离两类使用场景，防止在普通 CFD 或 FEA 课题仓库中说出“全量优化代码和文档”时误触宿主机全局配置演进：
 - **判别规则**：仅当目标工作区同时包含 `install.py` 与 `template/user-guard/plugin.json` 时识别为 `upstream_config_repo`（开放全功能）；其他一切业务仓库均识别为 `general_project`（仅开放通用课题研发能力，`fleet_state.py` 在未传 `--repo` 调用时直接返回退出码 `2` 拒绝执行，`fleet-evolve` 亦不触发）。
 
 #### （一）通用课题与工程项目日常研发（`workspace_mode: "general_project"`，任意项目开箱即用）
@@ -192,12 +192,12 @@ flowchart TB
 
 #### （二）维护本上游配置仓库（`workspace_mode: "upstream_config_repo"`，含两大自主维护闭环）
 
-在本仓库内除了可使用上述全部通用能力外，专享**“全面更新”**与**“全量优化”**两大自主维护闭环及宿主机同步工具：
+在本仓库内除了可使用上述全部通用能力外，专享“**全面更新**”与“**全量优化**”两大自主维护闭环及宿主机同步工具：
 
 | 上游维护目标 | 简明触发指令（仅在本仓库或明确演进全局配置时生效） | 专属模块与精确命令 | 硬门禁与四个必停用户拍板节点 |
 | :--- | :--- | :--- | :--- |
-| **全面更新（外部升级 + 动态矩阵重算）** | **“全面更新”**／“升级所有用到的工具并重算最新模型与参数推荐表” | **`fleet-evolve`**（`full` 模式）+ **`fleet_state.py propose / approve`** | 探测四端新模型缓存、报错日志与三级 ABI 耦合，重算五个角色槽位与 `runtime_tunables`；**调整推荐表、写宿主机全局目录（`R4`）、跨大版本 ABI 升级及 `git push` 四节点必停待批** |
-| **全量优化（现配校准 + 代码文档加固）** | **“全量优化”**／“先不升级外部工具，按当前配置全仓优化代码文档并做技术与脱敏回归” | **`fleet-evolve hygiene`** + **`cae_harness.py check-grounding --target . --strict`** | 基于当前配置收口散落死数字、加固钩子与路由边界、三步整篇重写图文文档并通过 `check-grounding --strict`、六模式沙箱与全套单测；终审 `clear --verified --readback-done` 自动复核事实锚定 |
+| **全面更新（外部升级 + 动态矩阵重算）** | “**全面更新**”／“升级所有用到的工具并重算最新模型与参数推荐表” | **`fleet-evolve`**（`full` 模式）+ **`fleet_state.py propose / approve`** | 探测四端新模型缓存、报错日志与三级 ABI 耦合，重算五个角色槽位与 `runtime_tunables`；**调整推荐表、写宿主机全局目录（`R4`）、跨大版本 ABI 升级及 `git push` 四节点必停待批** |
+| **全量优化（现配校准 + 代码文档加固）** | “**全量优化**”／“先不升级外部工具，按当前配置全仓优化代码文档并做技术与脱敏回归” | **`fleet-evolve hygiene`** + **`cae_harness.py check-grounding --target . --strict`** | 基于当前配置收口散落死数字、加固钩子与路由边界、三步整篇重写图文文档并通过 `check-grounding --strict`、六模式沙箱与全套单测；终审 `clear --verified --readback-done` 自动复核事实锚定 |
 | **只读漂移与工具链 ABI 巡检** | “检查 Windows 和 WSL 四端全局配置与 Python 科学计算包有没有漂移或耦合冲突” | **`fleet-evolve audit`** 或 **`install.py --audit-upgrade`** | 全程零磁盘写入，输出脱敏后的四端配置差异、模型退役提醒、CC Switch 旧记录残留与编译扩展 ABI 警告 |
 | **首次部署本机或同步全局配置** | “帮我把这台电脑和 WSL 的全局客户端环境同步好” | **`install.py`**（先 `--probe-apps` 与 `--dry-run --yes`，获批后正式执行） | 先展示拟写入的宿主机全局目录、现有模型与自定义尾段保留策略，**获用户 `R4` 明确批准后写入** |
 
@@ -249,10 +249,10 @@ Antigravity_Codex_ClaudeCode_DeepSeekHarness/
 
 ## 六、致谢、English Overview & License
 
-**致谢（Acknowledgments）**：本项目获**中国国家留学基金委（China Scholarship Council, CSC）**资助（学号：`202506280162`，批准文号：`留金选[2025]37号`；目前唯一资助来源）。
+**致谢（Acknowledgments）**：本项目获**中国国家留学基金委**（**China Scholarship Council, CSC**）资助（学号：`202506280162`，批准文号：`留金选[2025]37号`；目前唯一资助来源）。
 
 > **English Overview** — `Antigravity_Codex_ClaudeCode_DeepSeekHarness` provides unified engineering rules, deterministic session lifecycle hooks, zero-blacklist document grounding checks, and headless CLI verification scripts across **Google Antigravity (`agy`)**, **OpenAI Codex (`codex`)**, **Claude Code (`claude` / `cc`, with CC Switch)**, and **DeepSeek Harness (`dsh`)** for **scientific computing, CAE / CFD / FEA / PDE numerical solvers, HPC, and high-reliability systems engineering**.
 > - **Two-Layer Decoupled & Fully Dynamic Configuration**: Permanent governance rules (`R0–R11`), five lifecycle hook modules, workspace-mode guards (`general_project` vs `upstream_config_repo`), and verification scripts (`cae-harness`, `fleet-evolve`) contain **zero hardcoded seasonal model names** and **no permanent client lock-in for any role**. All five role slots (`orchestrator`, `math`, `code`, `review`, `fast`) and quantitative `runtime_tunables` (including per-client post-compaction recovery budgets and substantive subagent digest selection) are dynamically calibrated in [`fleet_profile.json`](template/user-guard/skills/cae-harness/fleet_profile.json) and applied only after explicit user approval.
-> - **Pure Python 3.11+ Standard Library & Funding**: Runs natively on Windows and WSL2/Linux without third-party packages. Network connectivity, official client installation, OAuth login, and API keys are prepared by the user. Built-in rule templates are written in Simplified Chinese. **Supported solely by the China Scholarship Council (CSC, No. `202506280162`, Approval No. `留金选[2025]37号`).**
+> - **Pure Python 3.11+ Standard Library & Funding**: Runs natively on Windows and WSL2/Linux without third-party packages. Network connectivity, official client installation, OAuth login, and API keys are prepared by the user. Built-in rule templates are written in Simplified Chinese. **Currently supported solely by the China Scholarship Council (CSC, No. `202506280162`, Approval No. `留金选[2025]37号`).**
 
 本仓库仅调用用户通过官方渠道安装并自行配置凭据的客户端命令行与本地工具，不内置任何第三方反代中转、私有凭据或绕过官方权限与计费的逻辑。本项目采用 [Apache License 2.0](LICENSE) 开源许可，衍生分发须按协议第 4(d) 条完整保留根目录下的 [NOTICE](NOTICE) 原创归属声明（`Copyright 2026 Xinyu Li (Xinyu-Li-1997)`）。

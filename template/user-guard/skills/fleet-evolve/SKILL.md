@@ -16,7 +16,7 @@ description: >
 在上游配置仓库中，维护工作收敛为两大自主闭环与一种只读巡检模式：
 
 - **`full`（“全面更新”闭环）**：采集本机四端探测缓存、运行报错日志与官方文档 -> 重新评估五个动态角色槽位（`orchestrator`、`math`、`code`、`review`、`fast`）及运行期定量参数（`runtime_tunables`） -> 登记草案并停机请用户拍板 -> 执行获批的非当前客户端升级与宿主机全局同步 -> 本机无头实测与全仓回归。
-- **`hygiene`（“全量优化”闭环）**：在不升级外部工具的前提下，基于当前已审定配置收口散落死数字并加固钩子、编排器与路由边界 -> 按“`--clean-room` 空上下文盲读挑刺 -> 平实工程中文整篇重写文档与矢量图 -> `check-grounding --strict` 零黑名单事实锚定核验 + `readonly-auditor` 逐行技术与脱敏复核”完成重构 -> 跑通六模式沙箱与全套离线单测 -> 如需同步宿主机全局目录，附 `--dry-run` 清单停机请用户拍板。
+- **`hygiene`（“全量优化”闭环）**：在不升级外部工具的前提下，基于当前已审定配置收口散落死数字并加固钩子、编排器与路由边界 -> 按“`--clean-room` 空上下文盲读挑刺 -> 平实工程中文整篇重写文档与矢量图 -> `check-grounding --strict` 零黑名单事实锚定核验 + 对等客户端无头交叉审查（`cae_harness.py` 的 `role:review` 或 `audit`）+ `readonly-auditor` 逐行技术与脱敏复核”完成重构 -> 跑通六模式沙箱与全套离线单测 -> 如需同步宿主机全局目录，附 `--dry-run` 清单停机请用户拍板。
 - **`audit`（只读漂移与 ABI 巡检）**：全程零磁盘写入，核查 Windows 与 WSL2 下的四端配置对齐度、CC Switch 卡片状态、报错冷却记录及装有编译型科学计算包的系统级 Python 二进制接口（ABI）耦合风险。
 
 ---
@@ -84,7 +84,7 @@ python -B -X utf8 <skill_dir>/scripts/fleet_state.py --repo <repo_root> clear --
    ```bash
    python -B -X utf8 template/user-guard/skills/cae-harness/scripts/cae_harness.py check-grounding --target . --strict
    ```
-   确认零无依据标识符、零陌生大写缩写、零失步定量数字、零虚构领域举例，并由 `readonly-auditor` 完成逐行技术与脱敏复核。
+   确认零无依据标识符、零陌生大写缩写、零失步定量数字、零虚构领域举例；在本机多客户端凭据就绪时调用 `cae_harness.py`（`role:review`、`role:code` 或 `audit`）执行跨模型独立审查，配合 `readonly-auditor` 完成逐行技术与脱敏复核，并由主会话按 `R6` 核对原文件精确行号。
 3. **全套离线与沙箱回归测试**：
    - 运行 `agy plugin validate --strict template/user-guard`（本机装有 `agy` 时必跑）；
    - 运行 `python -B -X utf8 -m unittest discover -s tests -p "test_*.py" -v`（覆盖六种 `--app` 沙箱安装、`--audit-upgrade` 对齐校验、压缩恢复动态预算、角色对称路由与 `check-grounding` 拦截单测）；

@@ -428,23 +428,69 @@ def _find_windows_agy_in_wsl():
     return None
 
 
+def _rank_codex_candidates(paths):
+    scored = []
+    seen = set()
+    for item in paths:
+        if item is None:
+            continue
+        p = Path(item)
+        key = str(p).lower()
+        if key in seen:
+            continue
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        if stat.S_ISREG(st.st_mode):
+            seen.add(key)
+            scored.append((st.st_mtime_ns, str(p), p))
+    scored.sort(key=lambda row: (row[0], row[1]), reverse=True)
+    return [row[2] for row in scored]
+
+
 def _sorted_codex_binaries(root):
     if not root.is_dir():
         return []
-    scored = []
     try:
         entries = list(root.rglob('codex.exe'))
     except OSError:
         return []
-    for item in entries:
-        try:
-            st = item.stat()
-        except OSError:
-            continue
-        if stat.S_ISREG(st.st_mode):
-            scored.append((st.st_mtime_ns, str(item), item))
-    scored.sort(key=lambda row: (row[0], row[1]), reverse=True)
-    return [row[2] for row in scored]
+    return _rank_codex_candidates(entries)
+
+
+def _find_windows_codex_package_cli():
+    if _is_posix():
+        return None
+    try:
+        import winreg
+        key_path = r'Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages'
+        locations = []
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path) as root_key:
+            count = winreg.QueryInfoKey(root_key)[0]
+            for idx in range(count):
+                try:
+                    sub_name = winreg.EnumKey(root_key, idx)
+                except OSError:
+                    continue
+                if not sub_name.lower().startswith('openai.codex_'):
+                    continue
+                try:
+                    with winreg.OpenKey(root_key, sub_name) as sub_key:
+                        loc, _ = winreg.QueryValueEx(sub_key, 'PackageRootFolder')
+                except OSError:
+                    continue
+                if isinstance(loc, str) and loc.strip():
+                    parts = sub_name.split('_')
+                    ver = tuple(int(part) for part in parts[1].split('.') if part.isdigit()) if len(parts) > 1 else ()
+                    locations.append((ver, loc.strip()))
+        for _, location in sorted(locations, reverse=True):
+            cli = Path(location) / 'app' / 'resources' / 'codex.exe'
+            if cli.is_file():
+                return cli
+    except (ImportError, OSError, ValueError):
+        pass
+    return None
 
 
 def _find_binary(name):
@@ -465,19 +511,27 @@ def _find_binary(name):
         if name == 'codex' and not _is_posix():
             local_app = Path(os.environ.get('LOCALAPPDATA') or (home / 'AppData' / 'Local'))
             codex_bin_root = local_app / 'OpenAI' / 'Codex' / 'bin'
+            found_path = Path(found)
+            found_norm = found_path.as_posix().lower()
             try:
-                in_desktop_bin = Path(found).resolve().is_relative_to(codex_bin_root.resolve())
+                in_desktop_bin = found_path.resolve().is_relative_to(codex_bin_root.resolve())
             except OSError:
                 in_desktop_bin = False
-            if in_desktop_bin:
-                ranked = _sorted_codex_binaries(codex_bin_root)
+            in_winapps = 'windowsapps' in found_norm and 'openai.codex_' in found_norm
+            if in_desktop_bin or in_winapps:
+                pkg_cli = _find_windows_codex_package_cli() if not os.environ.get('CAE_CODEX_HOME') else None
+                ranked = _rank_codex_candidates([*_sorted_codex_binaries(codex_bin_root), pkg_cli, found_path])
                 if ranked:
                     return str(ranked[0])
         return found
     candidates = [home / '.gemini' / 'bin' / ('agy' if _is_posix() else 'agy.exe')] if name == 'agy' else []
     if name == 'codex' and not _is_posix():
+        for standalone in (home / '.local' / 'bin' / 'codex.exe', home / '.cargo' / 'bin' / 'codex.exe'):
+            if standalone.is_file():
+                return str(standalone)
         local_app = Path(os.environ.get('LOCALAPPDATA') or (home / 'AppData' / 'Local'))
-        candidates.extend(_sorted_codex_binaries(local_app / 'OpenAI' / 'Codex' / 'bin'))
+        pkg_cli = _find_windows_codex_package_cli() if not os.environ.get('CAE_CODEX_HOME') else None
+        candidates.extend(_rank_codex_candidates([*_sorted_codex_binaries(local_app / 'OpenAI' / 'Codex' / 'bin'), pkg_cli]))
     candidates.append(home / '.local' / 'bin' / (name if _is_posix() else name + '.exe'))
     for candidate in candidates:
         if candidate.is_file():
@@ -1429,7 +1483,7 @@ def _select_codex_frontier_record(models):
     return min(native, key=_catalog_order) if native else {}
 
 
-def _select_codex_specialty_record(info, kind, tier, prompt_text, estimated_tokens, *, prefer_fast=False):
+def _select_codex_specialty_record(info, kind, tier, prompt_text, estimated_tokens, *, prefer_fast=False, allow_tier_fast=True):
     models = [item for item in info.get('models', []) if _model_category('codex', item) == 'native']
     eligible = sorted((item for item in models if not _only_delegating_efforts(item, tier)), key=_catalog_order)
     # 同一产品线只自动采用最新一代；目录优先级仍用于不同产品线之间的选择。
@@ -1450,7 +1504,8 @@ def _select_codex_specialty_record(info, kind, tier, prompt_text, estimated_toke
     def budget(record):
         return _execution_budget('codex', info, record)['input_budget_tokens']
 
-    if prefer_fast or (tier == 'low' and not _has_negated_cue(prompt_text, tuple({'轻量', '极速'} | _fast_model_tags('codex')))):
+    if prefer_fast or (allow_tier_fast and tier == 'low'
+                       and not _has_negated_cue(prompt_text, tuple({'轻量', '极速'} | _fast_model_tags('codex')))):
         fast = [item for item in eligible if _model_specialty(item) == 'fast' and estimated_tokens <= budget(item)]
         if fast:
             return fast[0], 'specialty_fast_lightweight'
@@ -1533,7 +1588,7 @@ def resolve_execution_profile(backends, spec, tier='max', prompt_text='', kind='
         if not slug:
             light_cues = tuple({'轻量', '极速'} | _fast_model_tags())
             forbid_lightweight = _has_negated_cue(prompt_text, light_cues)
-            use_fast_slot = (role_target == 'fast') or (tier in ('low', 'minimal') and not forbid_lightweight)
+            use_fast_slot = (role_target == 'fast') or (not role_target and tier in ('low', 'minimal') and not forbid_lightweight)
             fallback_claude = str(claude_rules.get('default_fallback_alias') or 'default')
             if prefix == 'dsh':
                 slug = dsh_fast if use_fast_slot else dsh_default
@@ -1569,7 +1624,8 @@ def resolve_execution_profile(backends, spec, tier='max', prompt_text='', kind='
                           else 'explicit_fuzzy_model')
                 return _codex_profile(info, spec, record, slug, tier, source)
         record, source = _select_codex_specialty_record(
-            info, kind, tier, prompt_text, estimated_tokens, prefer_fast=(role_target == 'fast')
+            info, kind, tier, prompt_text, estimated_tokens,
+            prefer_fast=(role_target == 'fast'), allow_tier_fast=(not role_target),
         )
         if record:
             return _codex_profile(info, spec, record, record['slug'], tier,
@@ -1609,12 +1665,12 @@ def resolve_execution_profile(backends, spec, tier='max', prompt_text='', kind='
             normal = [name for name in eligible if not is_fast(name)]
             light_cues = tuple({'轻量', '极速'} | _fast_model_tags())
             forbid_lightweight = _has_negated_cue(prompt_text, light_cues)
-            if not normal and role_target != 'fast' and (tier != 'low' or forbid_lightweight):
+            if not normal and role_target != 'fast' and (bool(role_target) or tier != 'low' or forbid_lightweight):
                 return _profile(prefix, info, spec, None, {}, tier, 'no_native_catalog_candidate',
                                 error='未找到原生旗舰模型，请刷新目录或显式指定模型。')
             normal = normal or eligible
             chosen, source = normal[0], 'frontier_catalog'
-            if role_target == 'fast' or (tier == 'low' and not forbid_lightweight):
+            if role_target == 'fast' or (not role_target and tier == 'low' and not forbid_lightweight):
                 fast = [name for name in eligible if is_fast(name)]
                 if fast:
                     chosen, source = fast[0], 'specialty_fast_lightweight'
@@ -3465,189 +3521,196 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
         native_pid_file = None
         exec_dir = target_dir
         stage_dir = None
+        stage_before = None
         exec_prompt = prompt
         translate = _wsl_path if interop else str
         win_target = translate(target_dir)
-        if (interop and win_target.startswith('\\\\')) or clean_room:
-            if not readonly:
-                cli_label = Path(binary).name
-                native_hint = f'安装并登录原生 {prefix}'
-                raise HarnessError(f'WSL 纯 Linux 文件系统路径无法在 Windows {cli_label} 沙箱内直接写入；请在 WSL {native_hint}，或在 /mnt/<盘符> 工作区执行写入任务')
-            stage_dir = _stage_wsl_readonly_workspace(
-                target_dir, temp_path, stage_files, exclude_agent_instructions=bool(clean_room)
-            )
-            exec_dir = stage_dir
-            win_target = translate(stage_dir)
-            exec_prompt = prompt + STAGED_PROMPT_SUFFIX
-            if clean_room and prefix == 'codex':
-                staged_records = collect_target_files(stage_dir)
-                total_bytes = sum(item['bytes'] for item in staged_records)
-                inline_cap = (_positive_int(_headless_tunables().get('clean_room_inline_snapshot_kib')) or 256) * 1024
-                if staged_records and total_bytes <= inline_cap:
-                    blocks = []
-                    for item in staged_records:
-                        try:
-                            lines = item['path'].read_text(encoding='utf-8').splitlines()
-                        except (OSError, UnicodeDecodeError):
-                            continue
-                        numbered = '\n'.join(f'{idx}: {line}' for idx, line in enumerate(lines, 1))
-                        blocks.append(f"=== FILE: {item['rel_path']} ===\n{numbered}")
-                    if blocks:
-                        exec_prompt += '\n\n【只读目标文件带行号原文快照（可直接阅读，无需调用外部命令）】\n' + '\n\n'.join(blocks)
-        if prefix == 'codex':
-            command = [binary, 'exec', '-s', 'read-only' if readonly else 'workspace-write',
-                       '-c', 'approval_policy="never"', '--ephemeral',
-                       '--skip-git-repo-check', '-C', win_target, '--output-schema', translate(schema_file), '-o', translate(output_file)]
-            if model:
-                command.extend(['-m', model])
-            if effort:
-                command.extend(['-c', f'model_reasoning_effort="{effort}"'])
-            context_window = profile['capacity']['cli_context_window_tokens']
-            if context_window:
-                command.extend(['-c', f'model_context_window={context_window}'])
-            command.append('-')
-            input_text = exec_prompt
-        elif prefix == 'agy':
-            command = [binary, '--input-format', 'stream-json', '--output-format', 'stream-json',
-                       '--print-timeout', f'{timeout_sec}s', '--json-schema', translate(schema_file),
-                       '--disable-slash-commands', '--sandbox']
-            if model:
-                command.extend(['--model', model])
-            if effort and profile.get('effort_option_supported') is not False and not _agy_slug_tier(model)[1]:
-                command.extend(['--effort', effort])
-            if readonly:
-                command.extend(['--agent', agent])
-            else:
-                command.extend(['--mode', 'accept-edits', '--dangerously-skip-permissions'])
-            input_text = json.dumps({'event': 'user', 'message': {'content': exec_prompt}}, ensure_ascii=False) + '\n'
-        elif prefix == 'claude':
-            command = [binary, '-p', '--output-format', 'json', '--json-schema', json.dumps(schema, ensure_ascii=False),
-                       '--no-session-persistence']
-            if clean_room:
-                command.append('--bare')
-                if clean_claude_settings is not None:
-                    command.extend(['--settings', translate(clean_claude_settings)])
-            if model:
-                command.extend(['--model', model])
-            if effort in ('low', 'medium', 'high', 'xhigh', 'max'):
-                command.extend(['--effort', effort])
-            if readonly:
-                command.extend(['--permission-mode', 'dontAsk', '--tools', 'Read,Grep,Glob', '--permission-prompts', 'none'])
-            else:
-                command.extend(['--permission-mode', 'bypassPermissions', '--tools', 'Read,Grep,Glob,Edit,Write,Bash'])
-            input_text = exec_prompt
-        else:
-            patch_file = temp_path / 'dsh-headless.patch.yml'
-            provider = 'deepseek-official' if info.get('dsh_provider') == 'deepseek-official' else 'deepseek-account'
-            dsh_default_slug = str(_catalog_rules('dsh').get('default_model') or info.get('model') or 'default')
-            patch_file.write_text(
-                '- id: credentials\n  disabled: false\n- id: authorization\n  disabled: false\n'
-                '- id: deepseek-account\n  disabled: false\n- id: agent-default-model\n'
-                "  name: '@deepseek-ai/dsh-agent-default-model'\n  config:\n"
-                f'    provider: {provider}\n    model: {json.dumps(model or dsh_default_slug)}\n'
-                f'    reasoningEffort: {effort or "high"}\n', encoding='utf-8')
-            command = [binary, '--profile', 'headless', '--patch', translate(patch_file), '--json', '--permission-mode',
-                       'read-only' if readonly else 'workspace-write', '--approval-policy', 'never', '-']
-            req_keys = ', '.join(schema.get('required', ()))
-            exec_prompt = (f'{exec_prompt}\n\n请仅输出一个以 {{ 开头、以 }} 结尾且严格符合以下 JSON Schema 的单行或多行 JSON 对象'
-                           f'（必含顶层键：{req_keys}；JSON 字符串内的反斜杠如 Windows 路径与 LaTeX 公式必须转义为双反斜杠 \\\\），'
-                           f'严禁输出外层 Markdown 代码块围栏或任何额外解释文字：\n'
-                           f'{json.dumps(schema, ensure_ascii=False)}')
-            input_text = exec_prompt
-        receipt.update(argv=list(command), work_dir=str(exec_dir), staged_readonly_workspace=stage_dir is not None,
-                       clean_room=bool(clean_room),
-                       command_transport='windows_interop' if interop else 'native')
-        if interop:
-            extra_env = {}
-            if prefix == 'claude':
-                extra_env['CLAUDE_CONFIG_DIR'] = _wsl_path(Path(info['config_home']))
-            elif prefix == 'dsh' and effective_dsh_home:
-                extra_env = {'DSH_HOME': _wsl_path(Path(effective_dsh_home)), 'DSH_TELEMETRY_DISABLED': '1'}
-            command, native_pid_file = _interop_command(command, exec_dir, temp_path, input_text,
-                                                        effective_codex_home if prefix == 'codex' else None,
-                                                        extra_env=extra_env)
-            input_text = None
-        # Queued units must recheck after staging. A success already in flight
-        # cannot clear a failure recorded by another unit in this same batch.
-        _enforce_preflight_quota(backends, (spec,), batch=batch)
-        receipt['launch_attempted'] = True
-        agy_grace = _positive_int(_headless_tunables().get('agy_timeout_grace_sec')) or 15
-        proc_timeout = timeout_sec + agy_grace if prefix == 'agy' else timeout_sec
         try:
-            result = run_process(command, exec_dir, input_text, proc_timeout, env=env, native_pid_file=native_pid_file)
-        except HarnessError as exc:
-            receipt['invocation_started'] = bool(exc.details.get('process_started'))
-            raise
-        receipt['invocation_started'] = True
-        receipt['returncode'] = result.returncode
-        startup_stderr = all(not line.strip() or _is_quota_exhausted(line)
-                             for line in (result.stderr or '').splitlines())
-        receipt['startup_only'] = (_quota_startup_only(result.stdout) and startup_stderr
-                                   and not (output_file.exists() and output_file.stat().st_size))
-        if prefix == 'agy' and result.returncode == 0:
-            # 仅解释 stderr 中明确的终止诊断；普通警告不参与失败分类。
-            diagnostics = [line.strip() for line in (result.stderr or '').splitlines()
-                           if _parse_agy_error_line(line) is not None or re.match(
-                               r'^(?:\[agy\]\s+print timeout after\b|error:\s+print timeout after\b)', line.strip(), re.I)]
-            if diagnostics:
-                detail = '\n'.join(diagnostics)
-                redacted_detail = _redact_runtime_secret(detail)
-                if _is_agy_print_timeout_text(detail):
-                    raise HarnessError('agy 执行触发 --print-timeout 超时', 'timeout',
-                                       returncode=0, finished_reason='print_timeout', stderr=redacted_detail[-2000:])
-                if _is_quota_exhausted(detail):
+            if (interop and win_target.startswith('\\\\')) or clean_room:
+                if not readonly:
+                    cli_label = Path(binary).name
+                    native_hint = f'安装并登录原生 {prefix}'
+                    raise HarnessError(f'WSL 纯 Linux 文件系统路径无法在 Windows {cli_label} 沙箱内直接写入；请在 WSL {native_hint}，或在 /mnt/<盘符> 工作区执行写入任务')
+                stage_dir = _stage_wsl_readonly_workspace(
+                    target_dir, temp_path, stage_files, exclude_agent_instructions=bool(clean_room)
+                )
+                stage_before = snapshot_files(stage_dir)
+                receipt['staged_readonly_workspace'] = True
+                exec_dir = stage_dir
+                win_target = translate(stage_dir)
+                exec_prompt = prompt + STAGED_PROMPT_SUFFIX
+                if clean_room and prefix == 'codex':
+                    staged_records = collect_target_files(stage_dir)
+                    total_bytes = sum(item['bytes'] for item in staged_records)
+                    inline_cap = (_positive_int(_headless_tunables().get('clean_room_inline_snapshot_kib')) or 256) * 1024
+                    if staged_records and total_bytes <= inline_cap:
+                        blocks = []
+                        for item in staged_records:
+                            try:
+                                lines = item['path'].read_text(encoding='utf-8').splitlines()
+                            except (OSError, UnicodeDecodeError):
+                                continue
+                            numbered = '\n'.join(f'{idx}: {line}' for idx, line in enumerate(lines, 1))
+                            blocks.append(f"=== FILE: {item['rel_path']} ===\n{numbered}")
+                        if blocks:
+                            exec_prompt += '\n\n【只读目标文件带行号原文快照（可直接阅读，无需调用外部命令）】\n' + '\n\n'.join(blocks)
+            if prefix == 'codex':
+                command = [binary, 'exec', '-s', 'read-only' if readonly else 'workspace-write',
+                           '-c', 'approval_policy="never"', '--ephemeral',
+                           '--skip-git-repo-check', '-C', win_target, '--output-schema', translate(schema_file), '-o', translate(output_file)]
+                if model:
+                    command.extend(['-m', model])
+                if effort:
+                    command.extend(['-c', f'model_reasoning_effort="{effort}"'])
+                context_window = profile['capacity']['cli_context_window_tokens']
+                if context_window:
+                    command.extend(['-c', f'model_context_window={context_window}'])
+                command.append('-')
+                input_text = exec_prompt
+            elif prefix == 'agy':
+                command = [binary, '--input-format', 'stream-json', '--output-format', 'stream-json',
+                           '--print-timeout', f'{timeout_sec}s', '--json-schema', translate(schema_file),
+                           '--disable-slash-commands', '--sandbox']
+                if model:
+                    command.extend(['--model', model])
+                if effort and profile.get('effort_option_supported') is not False and not _agy_slug_tier(model)[1]:
+                    command.extend(['--effort', effort])
+                if readonly:
+                    command.extend(['--agent', agent])
+                else:
+                    command.extend(['--mode', 'accept-edits', '--dangerously-skip-permissions'])
+                input_text = json.dumps({'event': 'user', 'message': {'content': exec_prompt}}, ensure_ascii=False) + '\n'
+            elif prefix == 'claude':
+                command = [binary, '-p', '--output-format', 'json', '--json-schema', json.dumps(schema, ensure_ascii=False),
+                           '--no-session-persistence']
+                if clean_room:
+                    command.append('--bare')
+                    if clean_claude_settings is not None:
+                        command.extend(['--settings', translate(clean_claude_settings)])
+                if model:
+                    command.extend(['--model', model])
+                if effort in ('low', 'medium', 'high', 'xhigh', 'max'):
+                    command.extend(['--effort', effort])
+                if readonly:
+                    command.extend(['--permission-mode', 'dontAsk', '--tools', 'Read,Grep,Glob', '--permission-prompts', 'none'])
+                else:
+                    command.extend(['--permission-mode', 'bypassPermissions', '--tools', 'Read,Grep,Glob,Edit,Write,Bash'])
+                input_text = exec_prompt
+            else:
+                patch_file = temp_path / 'dsh-headless.patch.yml'
+                provider = 'deepseek-official' if info.get('dsh_provider') == 'deepseek-official' else 'deepseek-account'
+                dsh_default_slug = str(_catalog_rules('dsh').get('default_model') or info.get('model') or 'default')
+                patch_file.write_text(
+                    '- id: credentials\n  disabled: false\n- id: authorization\n  disabled: false\n'
+                    '- id: deepseek-account\n  disabled: false\n- id: agent-default-model\n'
+                    "  name: '@deepseek-ai/dsh-agent-default-model'\n  config:\n"
+                    f'    provider: {provider}\n    model: {json.dumps(model or dsh_default_slug)}\n'
+                    f'    reasoningEffort: {effort or "high"}\n', encoding='utf-8')
+                command = [binary, '--profile', 'headless', '--patch', translate(patch_file), '--json', '--permission-mode',
+                           'read-only' if readonly else 'workspace-write', '--approval-policy', 'never', '-']
+                req_keys = ', '.join(schema.get('required', ()))
+                exec_prompt = (f'{exec_prompt}\n\n请仅输出一个以 {{ 开头、以 }} 结尾且严格符合以下 JSON Schema 的单行或多行 JSON 对象'
+                               f'（必含顶层键：{req_keys}；JSON 字符串内的反斜杠如 Windows 路径与 LaTeX 公式必须转义为双反斜杠 \\\\），'
+                               f'严禁输出外层 Markdown 代码块围栏或任何额外解释文字：\n'
+                               f'{json.dumps(schema, ensure_ascii=False)}')
+                input_text = exec_prompt
+            receipt.update(argv=list(command), work_dir=str(exec_dir), staged_readonly_workspace=stage_dir is not None,
+                           clean_room=bool(clean_room),
+                           command_transport='windows_interop' if interop else 'native')
+            if interop:
+                extra_env = {}
+                if prefix == 'claude':
+                    extra_env['CLAUDE_CONFIG_DIR'] = _wsl_path(Path(info['config_home']))
+                elif prefix == 'dsh' and effective_dsh_home:
+                    extra_env = {'DSH_HOME': _wsl_path(Path(effective_dsh_home)), 'DSH_TELEMETRY_DISABLED': '1'}
+                command, native_pid_file = _interop_command(command, exec_dir, temp_path, input_text,
+                                                            effective_codex_home if prefix == 'codex' else None,
+                                                            extra_env=extra_env)
+                input_text = None
+            # Queued units must recheck after staging. A success already in flight
+            # cannot clear a failure recorded by another unit in this same batch.
+            _enforce_preflight_quota(backends, (spec,), batch=batch)
+            receipt['launch_attempted'] = True
+            agy_grace = _positive_int(_headless_tunables().get('agy_timeout_grace_sec')) or 15
+            proc_timeout = timeout_sec + agy_grace if prefix == 'agy' else timeout_sec
+            try:
+                result = run_process(command, exec_dir, input_text, proc_timeout, env=env, native_pid_file=native_pid_file)
+            except HarnessError as exc:
+                receipt['invocation_started'] = bool(exc.details.get('process_started'))
+                raise
+            receipt['invocation_started'] = True
+            receipt['returncode'] = result.returncode
+            startup_stderr = all(not line.strip() or _is_quota_exhausted(line)
+                                 for line in (result.stderr or '').splitlines())
+            receipt['startup_only'] = (_quota_startup_only(result.stdout) and startup_stderr
+                                       and not (output_file.exists() and output_file.stat().st_size))
+            if prefix == 'agy' and result.returncode == 0:
+                # 仅解释 stderr 中明确的终止诊断；普通警告不参与失败分类。
+                diagnostics = [line.strip() for line in (result.stderr or '').splitlines()
+                               if _parse_agy_error_line(line) is not None or re.match(
+                                   r'^(?:\[agy\]\s+print timeout after\b|error:\s+print timeout after\b)', line.strip(), re.I)]
+                if diagnostics:
+                    detail = '\n'.join(diagnostics)
+                    redacted_detail = _redact_runtime_secret(detail)
+                    if _is_agy_print_timeout_text(detail):
+                        raise HarnessError('agy 执行触发 --print-timeout 超时', 'timeout',
+                                           returncode=0, finished_reason='print_timeout', stderr=redacted_detail[-2000:])
+                    if _is_quota_exhausted(detail):
+                        cooldown = _record_quota_exhausted(prefix, info, detail, batch=batch)
+                        raise HarnessError('agy 额度不足或已达用量上限，已停止并记录冷却状态',
+                                           'quota_exhausted', preflight_blocked=False, returncode=0,
+                                           stderr=redacted_detail[-2000:], **_quota_user_choices(prefix, cooldown))
+                    raise HarnessError('agy 返回终止错误诊断', 'failed', returncode=0, stderr=redacted_detail[-2000:])
+            if result.returncode:
+                detail = _backend_diagnostics(result)
+                structured = _backend_diagnostics(result, structured_only=True)
+                redacted_stderr = _redact_runtime_secret(result.stderr or '')[-2000:]
+                if _is_quota_exhausted(structured or detail):
                     cooldown = _record_quota_exhausted(prefix, info, detail, batch=batch)
-                    raise HarnessError('agy 额度不足或已达用量上限，已停止并记录冷却状态',
-                                       'quota_exhausted', preflight_blocked=False, returncode=0,
-                                       stderr=redacted_detail[-2000:], **_quota_user_choices(prefix, cooldown))
-                raise HarnessError('agy 返回终止错误诊断', 'failed', returncode=0, stderr=redacted_detail[-2000:])
-        if result.returncode:
-            detail = _backend_diagnostics(result)
-            structured = _backend_diagnostics(result, structured_only=True)
-            redacted_stderr = _redact_runtime_secret(result.stderr or '')[-2000:]
-            if _is_quota_exhausted(structured or detail):
-                cooldown = _record_quota_exhausted(prefix, info, detail, batch=batch)
-                raise HarnessError(f'{prefix} 额度不足或已达用量上限，已停止并记录冷却状态',
-                                   'quota_exhausted', preflight_blocked=False, returncode=result.returncode,
-                                   stderr=redacted_stderr, **_quota_user_choices(prefix, cooldown))
-            if prefix == 'agy' and _is_agy_print_timeout_text(detail):
-                raise HarnessError('agy 执行触发 --print-timeout 超时', 'timeout',
-                                   returncode=result.returncode, finished_reason='print_timeout',
+                    raise HarnessError(f'{prefix} 额度不足或已达用量上限，已停止并记录冷却状态',
+                                       'quota_exhausted', preflight_blocked=False, returncode=result.returncode,
+                                       stderr=redacted_stderr, **_quota_user_choices(prefix, cooldown))
+                if prefix == 'agy' and _is_agy_print_timeout_text(detail):
+                    raise HarnessError('agy 执行触发 --print-timeout 超时', 'timeout',
+                                       returncode=result.returncode, finished_reason='print_timeout',
+                                       stderr=redacted_stderr)
+                # A worker may already have written files. Authentication fallback
+                # is allowed only in model listing before planning and execution.
+                raise HarnessError(f'{prefix} 执行失败，退出码 {result.returncode}', returncode=result.returncode,
                                    stderr=redacted_stderr)
-            # A worker may already have written files. Authentication fallback
-            # is allowed only in model listing before planning and execution.
-            raise HarnessError(f'{prefix} 执行失败，退出码 {result.returncode}', returncode=result.returncode,
-                               stderr=redacted_stderr)
-        raw = output_file.read_text(encoding='utf-8-sig') if prefix == 'codex' and output_file.exists() else result.stdout
-        try:
-            parsed = _extract_json_object(raw, schema)
-        except HarnessError as exc:
-            if exc.status == 'quota_exhausted':
-                detail = str(exc.details.get('error') or raw)[-1000:]
-                cooldown = _record_quota_exhausted(prefix, info, detail, batch=batch)
-                raise HarnessError(f'{prefix} 额度不足或已达用量上限，已停止并记录冷却状态',
-                                   'quota_exhausted', preflight_blocked=False,
-                                   **_quota_user_choices(prefix, cooldown)) from exc
-            raise
-        _mark_quota_success(prefix, info, batch)
-        if prefix == 'claude':
-            envelope = _decode_output_json(raw)
-            model_usage = envelope.get('modelUsage') if isinstance(envelope, dict) else None
-            if isinstance(model_usage, dict) and model_usage:
-                receipt['actual_model'] = next(iter(model_usage))
-                receipt['actual_model_source'] = 'claude_result_model_usage'
-        if prefix == 'agy':
-            for line in (result.stdout or '').splitlines():
-                try:
-                    event = json.loads(line)
-                except ValueError:
-                    continue
-                init = event.get('init') if isinstance(event, dict) and event.get('event') == 'init' else None
-                if isinstance(init, dict) and isinstance(init.get('model'), str):
-                    receipt['actual_model'] = init['model']
-                    receipt['actual_model_source'] = 'agy_init_event'
-                    break
-        return _rewrite_staged_paths(parsed, stage_dir) if stage_dir is not None else parsed
+            raw = output_file.read_text(encoding='utf-8-sig') if prefix == 'codex' and output_file.exists() else result.stdout
+            try:
+                parsed = _extract_json_object(raw, schema)
+            except HarnessError as exc:
+                if exc.status == 'quota_exhausted':
+                    detail = str(exc.details.get('error') or raw)[-1000:]
+                    cooldown = _record_quota_exhausted(prefix, info, detail, batch=batch)
+                    raise HarnessError(f'{prefix} 额度不足或已达用量上限，已停止并记录冷却状态',
+                                       'quota_exhausted', preflight_blocked=False,
+                                       **_quota_user_choices(prefix, cooldown)) from exc
+                raise
+            _mark_quota_success(prefix, info, batch)
+            if prefix == 'claude':
+                envelope = _decode_output_json(raw)
+                model_usage = envelope.get('modelUsage') if isinstance(envelope, dict) else None
+                if isinstance(model_usage, dict) and model_usage:
+                    receipt['actual_model'] = next(iter(model_usage))
+                    receipt['actual_model_source'] = 'claude_result_model_usage'
+            if prefix == 'agy':
+                for line in (result.stdout or '').splitlines():
+                    try:
+                        event = json.loads(line)
+                    except ValueError:
+                        continue
+                    init = event.get('init') if isinstance(event, dict) and event.get('event') == 'init' else None
+                    if isinstance(init, dict) and isinstance(init.get('model'), str):
+                        receipt['actual_model'] = init['model']
+                        receipt['actual_model_source'] = 'agy_init_event'
+                        break
+            return _rewrite_staged_paths(parsed, stage_dir) if stage_dir is not None else parsed
+        finally:
+            if stage_dir is not None and stage_before is not None:
+                receipt['staged_scope'] = _safe_changes_report(stage_before, stage_dir, [], readonly)
 
 
 def invoke_readonly_engine(spec, target_dir, prompt, backends, timeout_sec=600, stage_files=None, effort=None, retry_quota=False,
@@ -5081,7 +5144,9 @@ def cmd_task(args):
         status = getattr(exc, 'status', 'failed')
         error = {'error': str(exc), **getattr(exc, 'details', {})}
     finally:
-        scope = _safe_changes_report(before, root, scopes, readonly)
+        staged_scope = invocation.get('staged_scope') if (readonly and invocation.get('staged_readonly_workspace')) else None
+        scope = dict(staged_scope) if isinstance(staged_scope, dict) else _safe_changes_report(before, root, scopes, readonly)
+        invocation.pop('staged_scope', None)
     payload['quota_status'] = backends.get(prefix, {}).get('quota_status', payload['quota_status'])
     if not scope.get('scope_verified', True) and status == 'ok':
         status = 'failed'

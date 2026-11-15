@@ -26,8 +26,8 @@
 
 ## 三、“全面更新”与“全量优化”双循环维护（`fleet-evolve`）
 
-在本上游配置仓库中，当用户提出**“全面更新”**（核查外部工具升级并重算动态角色与定量参数配置，对应 `full` 模式）、**“全量优化”**（基于当前配置全仓加固代码、整篇重写图文文档并做事实锚定与脱敏回归，对应 `hygiene` 模式）或只读巡检（`audit` 模式）时，**先完整读取并遵循 [SKILL.md](template/user-guard/skills/fleet-evolve/SKILL.md)**：
+在本上游配置仓库中，当用户提出“**全面更新**”（核查外部工具升级并重算动态角色与定量参数配置，对应 `full` 模式）、“**全量优化**”（基于当前配置全仓加固代码、整篇重写图文文档并做事实锚定与脱敏回归，对应 `hygiene` 模式）或只读巡检（`audit` 模式）时，**先完整读取并遵循 [SKILL.md](template/user-guard/skills/fleet-evolve/SKILL.md)**：
 
 1. 先运行 `fleet_state.py status` 核对本机状态锁与 `workspace_mode == "upstream_config_repo"`，在只读前提下采集客户端状态、模型缓存与运行期参数基线；重要文档重写前按 `R2` 先做 `--clean-room` 空上下文盲读挑刺。
-2. 在仓库工作区内完成代码加固、`runtime_tunables` 参数收口、图文文档整篇重写、`cae_harness.py check-grounding --target . --strict` 零黑名单事实锚定核验、`readonly-auditor` 逐行核对及全套离线与沙箱回归测试；触及 [AGENTS.md](template/user-guard/rules/AGENTS.md) `R3.1.4` 四类拍板节点时，执行 `fleet_state.py propose` 并附 `install.py --dry-run` 预览清单呈交用户确认后暂停。
+2. 在仓库工作区内完成代码加固、`runtime_tunables` 参数收口、图文文档整篇重写、`cae_harness.py check-grounding --target . --strict` 零黑名单事实锚定核验、对等客户端无头交叉审查（多端凭据就绪时调用 `cae_harness.py` 的 `role:review` 或 `audit`，配合 `readonly-auditor` 逐行核对）及全套离线与沙箱回归测试；触及 [AGENTS.md](template/user-guard/rules/AGENTS.md) `R3.1.4` 四类拍板节点时，执行 `fleet_state.py propose` 并附 `install.py --dry-run` 预览清单呈交用户确认后暂停。
 3. 获批后执行 `fleet_state.py approve`、同步宿主机全局目录并运行无头实测验收；若主会话客户端自身升级或切换，按 `record-pass1` 提示用户手动重启后再完成复核，最终通过 `clear --verified --readback-done`（内置事实锚定硬门禁）归位，未获明确指令不执行 `git push`。

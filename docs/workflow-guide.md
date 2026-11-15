@@ -1,6 +1,6 @@
 # 科学计算与工程求解器研发实战指南
 
-本文面向已完成本机全局配置安装（步骤见 [仓库总说明](../README.md) 第二章）的研发人员，结合偏微分方程（PDE）数值求解器算例说明：在日常通用课题项目（`workspace_mode: "general_project"`）中，如何编写跨进程任务单、如何通过与时期性模型名解耦的**动态角色槽位（`role:*`）**发起数学推导与代码定量验证闭环、如何做文档零黑名单事实锚定核验（`check-grounding`），以及如何按 L1–L4 四个证据等级进行验收。命令行参数详见 [`cae-harness` 技能说明](../template/user-guard/skills/cae-harness/SKILL.md)，底层动态参数与预算公式详见 [架构与钩子说明](architecture-and-hooks.md)。
+本文面向已完成本机全局配置安装（步骤见 [仓库总说明](../README.md) 第二章）的研发人员，结合偏微分方程（PDE）数值求解器算例说明：在日常通用课题项目（`workspace_mode: "general_project"`）中，如何编写跨进程任务单、如何通过与时期性模型名解耦的**动态角色槽位**（`role:*`）发起数学推导与代码定量验证闭环、如何做文档零黑名单事实锚定核验（`check-grounding`），以及如何按 L1–L4 四个证据等级进行验收。命令行参数详见 [`cae-harness` 技能说明](../template/user-guard/skills/cae-harness/SKILL.md)，底层动态参数与预算公式详见 [架构与钩子说明](architecture-and-hooks.md)。
 
 ---
 

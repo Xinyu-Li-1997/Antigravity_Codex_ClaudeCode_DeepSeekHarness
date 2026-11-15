@@ -1300,8 +1300,12 @@ def codex_hook_session(
         return sid, None, "hook input 缺少有效 session_id", False
     raw_path = strip_win_extended_prefix(str(payload.get("transcript_path") or ""))
     if not raw_path:
+        if os.environ.get("CAE_HARNESS_DEPTH") == "1":
+            return sid, None, None, True
         return sid, None, "未提供 transcript_path，无法核实主会话身份", False
     transcript = Path(raw_path).expanduser()
+    if not transcript.is_file() and os.environ.get("CAE_HARNESS_DEPTH") == "1":
+        return sid, None, None, True
     meta, error = read_codex_rollout_meta(transcript)
     if meta and meta["source_kind"] == "subagent":
         return sid, None, None, True
@@ -2124,6 +2128,8 @@ def claude_hook_session(payload: Dict[str, Any]) -> Tuple[str, Optional[Path], s
         candidates = [path for path in candidates if path.is_file()]
         if candidates:
             return sid, max(candidates, key=lambda path: path.stat().st_mtime_ns), "", False
+    if os.environ.get("CAE_HARNESS_DEPTH") == "1":
+        return sid, None, "", True
     return sid, None, "未找到 Claude 会话轨迹文件", False
 
 

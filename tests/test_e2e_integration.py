@@ -2571,6 +2571,125 @@ class TestEndToEndIntegration(unittest.TestCase):
             self.assertEqual(bad_json["reason"], "grounding_check_failed")
             self.assertGreaterEqual(bad_json["finding_count"], 1)
 
+    def test_49_markdown_commonmark_flanking_bold_and_winapps_codex_freshness(self) -> None:
+        import unicodedata
+
+        ascii_punct = set(r"""!"#$%&'()*+,-./:;<=>?@[\]^_`{|}~""")
+
+        def is_punct(ch: str) -> bool:
+            return bool(ch) and (ch in ascii_punct or unicodedata.category(ch).startswith("P"))
+
+        def is_space(ch: str) -> bool:
+            return not ch or ch in " \t\n\r\f\v" or unicodedata.category(ch).startswith("Z")
+
+        def mask_inline_code(line: str) -> str:
+            chars = list(line)
+            idx, n = 0, len(chars)
+            while idx < n:
+                if chars[idx] == "`":
+                    run = 1
+                    while idx + run < n and chars[idx + run] == "`":
+                        run += 1
+                    end = line.find("`" * run, idx + run)
+                    if end != -1:
+                        for pos in range(idx + run, end):
+                            chars[pos] = "x"
+                        idx = end + run
+                        continue
+                    idx += run
+                else:
+                    idx += 1
+            return "".join(chars)
+
+        def broken_bold_spans(md_text: str) -> list[tuple[int, str]]:
+            issues: list[tuple[int, str]] = []
+            in_fence = False
+            fence_marker = ""
+            for lineno, raw_line in enumerate(md_text.splitlines(), 1):
+                stripped = raw_line.lstrip()
+                m_fence = re.match(r"^(`{3,}|~{3,})(.*)$", stripped)
+                if m_fence:
+                    ticks, rest = m_fence.group(1), m_fence.group(2)
+                    if not in_fence:
+                        if ticks[0] not in rest:
+                            in_fence = True
+                            fence_marker = ticks
+                        continue
+                    if ticks[0] == fence_marker[0] and len(ticks) >= len(fence_marker) and not rest.strip():
+                        in_fence = False
+                        fence_marker = ""
+                    continue
+                if in_fence:
+                    continue
+                masked = mask_inline_code(raw_line)
+                runs = [m.span() for m in re.finditer(r"\*{2,}", masked)]
+                if len(runs) >= 2 and len(runs) % 2 == 0:
+                    for idx in range(0, len(runs), 2):
+                        s1, e1 = runs[idx]
+                        s2, e2 = runs[idx + 1]
+                        b1 = masked[s1 - 1] if s1 > 0 else ""
+                        a1 = masked[e1] if e1 < len(masked) else ""
+                        b2 = masked[s2 - 1] if s2 > 0 else ""
+                        a2 = masked[e2] if e2 < len(masked) else ""
+                        lf = (not is_space(a1)) and ((not is_punct(a1)) or is_space(b1) or is_punct(b1))
+                        rf = (not is_space(b2)) and ((not is_punct(b2)) or is_space(a2) or is_punct(a2))
+                        if not (lf and rf):
+                            issues.append((lineno, raw_line[s1:e2]))
+            return issues
+
+        # 验证检测器对 GitHub 失败样例敏感，且全仓所有 Markdown 文件零违规
+        self.assertTrue(broken_bold_spans("本项目获**中国国家留学基金委（CSC）**资助"))
+        self.assertTrue(broken_bold_spans("专享**“全面更新”**闭环"))
+        self.assertEqual(broken_bold_spans("本项目获**中国国家留学基金委**（**CSC**）资助，专享“**全面更新**”闭环"), [])
+
+        md_files = sorted(
+            p for p in REPO_ROOT.rglob("*.md")
+            if not any(part in p.relative_to(REPO_ROOT).parts for part in (".git", "__pycache__", ".pytest_cache"))
+        )
+        self.assertGreaterEqual(len(md_files), 10)
+        for md_path in md_files:
+            rel = md_path.relative_to(REPO_ROOT).as_posix()
+            self.assertEqual(broken_bold_spans(md_path.read_text(encoding="utf-8")), [], f"{rel} 存在 GitHub CommonMark 失效粗体定界符")
+
+        # 验证 install.py 在 Windows 下遇到新版 MSIX Codex 包时自动覆盖旧版 AppData\Local\OpenAI\Codex\bin 缓存
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_home = Path(tmp) / "home"
+            old_cli = fake_home / "AppData" / "Local" / "OpenAI" / "Codex" / "bin" / "old" / "codex.exe"
+            msix_cli = Path(tmp) / "winapps" / "codex.exe"
+            old_cli.parent.mkdir(parents=True)
+            msix_cli.parent.mkdir(parents=True)
+            old_cli.write_bytes(b"MZ-old")
+            msix_cli.write_bytes(b"MZ-new")
+            os.utime(old_cli, ns=(1_700_000_000_000_000_000, 1_700_000_000_000_000_000))
+            os.utime(msix_cli, ns=(1_800_000_000_000_000_000, 1_800_000_000_000_000_000))
+            with mock.patch.dict(os.environ, {"LOCALAPPDATA": str(fake_home / "AppData" / "Local")}, clear=False):
+                windows_os = mock.Mock(wraps=os)
+                windows_os.name = "nt"
+                windows_os.environ = os.environ
+                with mock.patch.object(INSTALLER, "os", windows_os), \
+                     mock.patch.object(INSTALLER, "_is_wsl", return_value=False), \
+                     mock.patch.object(INSTALLER, "_probe_windows_wsl", return_value={"status": "checked", "apps": {}}), \
+                     mock.patch.object(INSTALLER.Path, "home", return_value=fake_home), \
+                     mock.patch.object(INSTALLER.shutil, "which", return_value=None), \
+                     mock.patch.object(INSTALLER, "_find_windows_codex_package", return_value=(str(msix_cli), None)):
+                    detected = INSTALLER.detect_installed_apps()
+                    self.assertEqual(detected["codex"]["native_binary"], str(msix_cli))
+                    standalone_cli = fake_home / ".local" / "bin" / "codex.exe"
+                    standalone_cli.parent.mkdir(parents=True)
+                    standalone_cli.write_bytes(b"MZ-standalone")
+                    detected_user = INSTALLER.detect_installed_apps()
+                    self.assertEqual(detected_user["codex"]["native_binary"], str(standalone_cli))
+
+            uw_spec = importlib.util.spec_from_file_location("uw_headless_test", TEMPLATE_DIR / "hooks" / "user_words.py")
+            uw_mod = importlib.util.module_from_spec(uw_spec)
+            uw_spec.loader.exec_module(uw_mod)
+            with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(fake_home / ".claude")}, clear=True):
+                self.assertFalse(uw_mod.claude_hook_session({"session_id": "sess-headless-01"})[3])
+                self.assertFalse(uw_mod.codex_hook_session({"session_id": "sess-headless-01"})[3])
+            with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(fake_home / ".claude"), "CAE_HARNESS_DEPTH": "1"}, clear=True):
+                self.assertTrue(uw_mod.claude_hook_session({"session_id": "sess-headless-01"})[3])
+                self.assertTrue(uw_mod.codex_hook_session({"session_id": "sess-headless-01"})[3])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

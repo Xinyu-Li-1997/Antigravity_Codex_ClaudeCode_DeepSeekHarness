@@ -4,6 +4,21 @@
 
 ---
 
+## [1.14.1] - 2026-11-15
+
+修复跨客户端无头协作选路与隔离快照校验缺陷、Windows MSIX 应用包新版 Codex CLI 探测覆盖、GitHub CommonMark 强调定界符渲染异常及脱敏单测占位符越界问题：
+
+- **跨客户端无头编排与客户端探测修复（`cae_harness.py`、`install.py`、`rules/AGENTS.md`、`fleet-evolve/SKILL.md`）**：
+  - 修复显式指定专长角色槽位（如 `codex:code`、`codex:math`、`codex:review`、`dsh:code`、`agy:@math`）并传入 `--tier low` 时被静默降级替换为 `fast` 轻量模型（如 `gpt-6-luna` 在 `--output-schema` 下跳过工具读取）的缺陷，仅在 `role:fast`／`<client>:@fast` 或未指定专长槽位时允许 `low` 挡切入轻量模型；
+  - 修复 `cmd_task` 在 `--clean-room` 或跨子系统副本目录（`staged_readonly_workspace`）模式下比对原工作区 `root` 而非隔离副本目录 `stage_dir`，导致主会话并发准备文件时误报 `scope_violation` 的缺陷，改为自 `stage_dir` 快照建立起全阶段保护并在临时目录清理前执行哈希核验；同时在 `user_words.py` 中对 `CAE_HARNESS_DEPTH=1` 无头瞬态调用（`--ephemeral`／`--no-session-persistence` 无落盘轨迹）静默跳过长会话门禁告警；
+  - 统一 `install.py` 与 `cae_harness.py` 在 Windows 下对 Microsoft Store／MSIX 应用包（`WindowsApps\OpenAI.Codex_*`）与 `%LOCALAPPDATA%\OpenAI\Codex\bin` 缓存目录的按时间戳择新逻辑（保留用户显式安装的 `~/.local/bin` 与 `~/.cargo/bin` 优先级），避免旧版桌面缓存二进制遮蔽新版 MSIX CLI；
+  - 明确 `R3.1` 与 `fleet-evolve` 中跨客户端 `cae-harness`（`role:math`、`role:code`、`role:review`、`audit`）与同端 `readonly-*` 子代理的分工边界，防止在多端就绪环境下仅用同模型子代理替代跨模型独立审查。
+- **GitHub CommonMark 粗体定界符与公开脱敏单测修复（`README.md`、`AGENTS.md`、`CHANGELOG.md`、`docs/workflow-guide.md`、`cae-harness/SKILL.md`、`tests/`）**：
+  - 修复全仓 5 份 Markdown 文档中紧邻全角括号与引号的 `**...**` 违背 CommonMark 0.31.2 侧翼定界符规则（在 GitHub 裸露原样星号）的排版问题，并在 `test_e2e_integration.py` 中新增全仓 Markdown 强调定界符静态回归检查；
+  - 将 `test_harness_offline.py` 中触发 `test_02` 路径扫描拦截的非白名单模拟主目录占位词统一改为受控占位符 `<user>`，在 `test_claude_and_router_offline.py` 的 `OfflineSandbox` 中补齐外部 `DSH_HOME` 与 `CAE_FLEET_PROFILE` 环境变量隔离，并新增专长槽位保模、隔离副本快照校验与 Windows MSIX 择新的离线单元测试。
+
+---
+
 ## [1.14.0] - 2026-11-15
 
 完成全仓运行期定量参数（`runtime_tunables`）深度收口、会话生命周期钩子静态拆壳与截断全文恢复加固、无头编排器 JSON 解析与子进程树清理增强、本地分流代理与升级审计边界修复，以及全仓文档、子代理契约与矢量图的整篇重写润色：
@@ -41,7 +56,7 @@
   - 在 `cae_harness.py`（`probe`、`assess`、`check-grounding`）中新增 `detect_workspace_mode`（区分 `general_project` 与 `upstream_config_repo`），在 `fleet_state.py` 中对非上游仓库无 `--repo` 调用返回结构化退出码 `2`（`reason: "not_upstream_config_repo"`），并收窄 `fleet-evolve` 触发条件，确保日常课题研发说出“全量优化代码和文档”时仅在项目内闭环，绝不误触全局元更新；
   - 将 `README.md` 第四章表二重构为“通用课题与工程项目日常研发（部分功能）”与“维护本上游配置仓库（全功能：全面更新 `full` 与全量优化 `hygiene` 双闭环）”两张分类对照表。
 - **图文文档全量校准、致谢补充与回归单测扩展（`README.md`、`docs/`、`docs/assets/*.svg`、`tests/`）**：
-  - 整篇重写校准 `README.md`、`AGENTS.md`、`template/user-guard/rules/AGENTS.md`、两份 `SKILL.md`、`docs/*.md` 及两张 SVG 架构管线图，在 `README.md` 第六章中英文部分补充**中国国家留学基金委（China Scholarship Council, CSC）**唯一资助致谢（学号：`202506280162`，批准文号：`留金选[2025]37号`），并新增动态参数覆盖、实质子代理筛选、对称角色路由、双工作区硬拦截与 `check-grounding` 防幻觉回归单测。
+  - 整篇重写校准 `README.md`、`AGENTS.md`、`template/user-guard/rules/AGENTS.md`、两份 `SKILL.md`、`docs/*.md` 及两张 SVG 架构管线图，在 `README.md` 第六章中英文部分补充**中国国家留学基金委**（**China Scholarship Council, CSC**）目前唯一资助致谢（学号：`202506280162`，批准文号：`留金选[2025]37号`），并新增动态参数覆盖、实质子代理筛选、对称角色路由、双工作区硬拦截与 `check-grounding` 防幻觉回归单测。
 
 ---
 

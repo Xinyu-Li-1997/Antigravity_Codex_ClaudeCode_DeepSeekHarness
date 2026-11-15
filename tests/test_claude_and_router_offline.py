@@ -99,6 +99,8 @@ class OfflineSandbox(unittest.TestCase):
         })
         patch.start()
         self.addCleanup(patch.stop)
+        os.environ.pop("DSH_HOME", None)
+        os.environ.pop("CAE_FLEET_PROFILE", None)
         patch = mock.patch.object(tempfile, "tempdir", str(self.root))
         patch.start()
         self.addCleanup(patch.stop)

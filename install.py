@@ -688,6 +688,15 @@ def _is_windows() -> bool:
     return os.name == "nt"
 
 
+def _newer_executable(candidate: str, current: str) -> bool:
+    try:
+        cand_st = Path(candidate).stat()
+        curr_st = Path(current).stat()
+    except OSError:
+        return False
+    return (cand_st.st_mtime_ns, candidate) > (curr_st.st_mtime_ns, current)
+
+
 def _find_windows_codex_package() -> Tuple[Optional[str], Optional[str]]:
     """通过注册表只读读取当前用户的 Codex 应用包位置，不启动外部进程且零磁盘写入。"""
     if not _is_windows():
@@ -858,8 +867,24 @@ def detect_installed_apps() -> Dict[str, Any]:
         if os.name == "nt":
             local_app = Path(os.environ.get("LOCALAPPDATA") or str(home / "AppData" / "Local"))
             _, desktop = _windows_app_binaries(home, local_app, name)
-            if name == "codex" and not (cli or desktop):
-                cli, desktop = _find_windows_codex_package()
+            if name == "codex":
+                pkg_cli, pkg_desktop = _find_windows_codex_package()
+                standalone_bins = set()
+                for user_bin in (home / ".local" / "bin" / "codex.exe", home / ".cargo" / "bin" / "codex.exe"):
+                    try:
+                        standalone_bins.add(str(user_bin.resolve()).lower())
+                    except OSError:
+                        standalone_bins.add(str(user_bin).lower())
+                cli_norm = ""
+                if cli:
+                    try:
+                        cli_norm = str(Path(cli).resolve()).lower()
+                    except OSError:
+                        cli_norm = cli.lower()
+                if pkg_cli and (not cli or (cli_norm not in standalone_bins and _newer_executable(pkg_cli, cli))):
+                    cli = pkg_cli
+                if pkg_desktop and (not desktop or _newer_executable(pkg_desktop, desktop)):
+                    desktop = pkg_desktop
         elif name == "agy":
             desktop = _first_executable([Path("/usr/bin/antigravity"), Path("/opt/Antigravity/antigravity")])
 

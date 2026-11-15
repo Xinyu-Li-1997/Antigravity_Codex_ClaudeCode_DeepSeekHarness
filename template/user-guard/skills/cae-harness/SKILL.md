@@ -9,7 +9,7 @@ description: >
 
 # 四客户端动态角色路由、事实锚定与后台验证工具（`cae-harness`）
 
-`cae-harness` 通过纯 Python 3.11+ 标准库脚本 `scripts/cae_harness.py` 按需启动本机已就绪的 **Codex**、**Antigravity（`agy`）**、**Claude Code（`claude` 或 `cc`）** 与 **DeepSeek Harness（`dsh`）** 无头命令行（Headless CLI）子进程，并提供零外部依赖的文档事实锚定核验子命令 `check-grounding`。本技能在**通用课题项目（`general_project`）**与**上游配置仓库（`upstream_config_repo`）**中均可直接使用；每次后台调用均在独立进程与全新上下文中运行，不占用交互式主会话窗口。
+`cae-harness` 通过纯 Python 3.11+ 标准库脚本 `scripts/cae_harness.py` 按需启动本机已就绪的 **Codex**、**Antigravity（`agy`）**、**Claude Code（`claude` 或 `cc`）** 与 **DeepSeek Harness（`dsh`）** 无头命令行（Headless CLI）子进程，并提供零外部依赖的文档事实锚定核验子命令 `check-grounding`。本技能在**通用课题项目**（`general_project`）与**上游配置仓库**（`upstream_config_repo`）中均可直接使用；每次后台调用均在独立进程与全新上下文中运行，不占用交互式主会话窗口。
 
 ## 一、动态选路、工作区识别与安全门禁
 
