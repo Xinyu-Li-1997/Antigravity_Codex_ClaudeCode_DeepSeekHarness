@@ -671,7 +671,10 @@ def _native_cli(name: str, home: Path) -> Optional[str]:
     if os.name == "nt":
         local_app = Path(os.environ.get("LOCALAPPDATA") or str(home / "AppData" / "Local"))
         local_cli, _ = _windows_app_binaries(home, local_app, name)
-        return local_cli or shutil.which(f"{name}.exe") or shutil.which(name)
+        found = local_cli or shutil.which(f"{name}.exe") or shutil.which(name)
+        if name == "codex" and found and "/microsoft/windowsapps/" in Path(found).as_posix().lower():
+            return None
+        return found
     candidates = [home / ".local" / "bin" / name]
     if name in {"agy", "codex"}:
         candidates.insert(0, home / (".gemini" if name == "agy" else ".cargo") / "bin" / name)
@@ -731,6 +734,85 @@ def _find_windows_codex_package() -> Tuple[Optional[str], Optional[str]]:
             if cli or desktop:
                 return cli, desktop
     except (ImportError, OSError, ValueError):
+        pass
+    return None, None
+
+
+def _decode_wsl_reg_output(raw: bytes, reg_exe: str, reg_cwd: Optional[str]) -> Optional[str]:
+    if raw.isascii():
+        return raw.decode("ascii")
+    try:
+        cp_proc = subprocess.run(
+            [reg_exe, "query", r"HKLM\SYSTEM\CurrentControlSet\Control\Nls\CodePage", "/v", "ACP"],
+            cwd=reg_cwd,
+            capture_output=True,
+            timeout=5,
+        )
+        if cp_proc.returncode == 0:
+            cp_match = re.search(rb"ACP\s+REG_SZ\s+([0-9]+)", cp_proc.stdout)
+            if cp_match:
+                acp = cp_match.group(1).decode("ascii")
+                return raw.decode("utf-8" if acp == "65001" else f"cp{acp}")
+    except (LookupError, OSError, subprocess.SubprocessError, UnicodeDecodeError):
+        return None
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def _find_wsl_windows_codex_package() -> Tuple[Optional[str], Optional[str]]:
+    """在 WSL2 中通过原生 reg.exe 只读读取 Windows Codex MSIX 应用包位置，零 PowerShell 缓存写入。"""
+    if not _is_wsl():
+        return None, None
+    reg_exe = shutil.which("reg.exe")
+    wslpath = shutil.which("wslpath")
+    if not (reg_exe and wslpath):
+        return None, None
+    key_path = r"HKCU\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages"
+    try:
+        reg_parent = Path(reg_exe).parent
+        reg_cwd = str(reg_parent) if reg_parent.is_dir() else None
+        proc = subprocess.run(
+            [reg_exe, "query", key_path, "/s", "/v", "PackageRootFolder"],
+            cwd=reg_cwd,
+            capture_output=True,
+            timeout=5,
+        )
+        if proc.returncode != 0:
+            return None, None
+        text = _decode_wsl_reg_output(proc.stdout, reg_exe, reg_cwd)
+        if not text:
+            return None, None
+        locations: List[Tuple[Tuple[int, ...], str]] = []
+        current_sub = ""
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if line.upper().startswith("HKEY_CURRENT_USER\\"):
+                current_sub = line.rsplit("\\", 1)[-1].strip()
+            elif current_sub.lower().startswith("openai.codex_") and "REG_SZ" in line and "PackageRootFolder" in line:
+                loc = line.split("REG_SZ", 1)[1].strip()
+                if loc:
+                    parts = current_sub.split("_")
+                    ver = tuple(int(part) for part in parts[1].split(".") if part.isdigit()) if len(parts) > 1 else ()
+                    locations.append((ver, loc))
+        for _, win_loc in sorted(locations, reverse=True):
+            converted = subprocess.run(
+                [wslpath, "-u", win_loc],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=5,
+            )
+            wsl_loc = converted.stdout.strip()
+            if converted.returncode != 0 or not wsl_loc:
+                continue
+            app = Path(wsl_loc) / "app"
+            cli = _first_executable([app / "resources" / "codex.exe"], windows=True)
+            desktop = _first_executable([app / "Codex.exe"], windows=True)
+            if cli or desktop:
+                return cli, desktop
+    except (OSError, ValueError, subprocess.SubprocessError):
         pass
     return None, None
 
@@ -893,6 +975,8 @@ def detect_installed_apps() -> Dict[str, Any]:
         if wsl:
             found = shutil.which(name)
             win_cli = shutil.which(f"{name}.exe") or (found if _is_mnt_windows_path(found) else None)
+            if name == "codex" and win_cli and "/microsoft/windowsapps/" in Path(win_cli).as_posix().lower():
+                win_cli = None
             win_desktop = None
             trace = False
             if windows_home is not None:
@@ -901,6 +985,25 @@ def detect_installed_apps() -> Dict[str, Any]:
                 win_cli = win_cli or known_cli
                 config_name = {"agy": ".gemini", "codex": ".codex", "claude": ".claude", "dsh": ".dsh", "cc-switch": ".cc-switch"}[name]
                 trace = (windows_home / config_name).is_dir()
+            if name == "codex":
+                pkg_cli, pkg_desktop = _find_wsl_windows_codex_package()
+                standalone_bins = set()
+                if windows_home is not None:
+                    for user_bin in (windows_home / ".local" / "bin" / "codex.exe", windows_home / ".cargo" / "bin" / "codex.exe"):
+                        try:
+                            standalone_bins.add(str(user_bin.resolve()).lower())
+                        except OSError:
+                            standalone_bins.add(str(user_bin).lower())
+                win_cli_norm = ""
+                if win_cli:
+                    try:
+                        win_cli_norm = str(Path(win_cli).resolve()).lower()
+                    except OSError:
+                        win_cli_norm = win_cli.lower()
+                if pkg_cli and (not win_cli or (win_cli_norm not in standalone_bins and _newer_executable(pkg_cli, win_cli))):
+                    win_cli = pkg_cli
+                if pkg_desktop and (not win_desktop or _newer_executable(pkg_desktop, win_desktop)):
+                    win_desktop = pkg_desktop
             evidence.append({"binary": win_cli, "desktop_binary": win_desktop, "config_dir_exists": trace})
         elif wsl_probe is not None:
             evidence = wsl_probe["apps"].get(name, [])

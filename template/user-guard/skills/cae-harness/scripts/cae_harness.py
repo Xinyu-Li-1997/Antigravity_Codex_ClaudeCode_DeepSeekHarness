@@ -44,8 +44,10 @@ from urllib.request import urlopen
 
 SOURCE_EXTENSIONS = {'.f90', '.f95', '.f03', '.f08', '.f', '.for', '.c', '.cpp', '.cc', '.cxx', '.cu', '.cuh',
                      '.h', '.hpp', '.hh', '.py', '.jl', '.m', '.rs', '.go', '.ts', '.js', '.cmake', '.toml',
-                     '.yaml', '.yml', '.json', '.md', '.tex', '.bib', '.rst', '.txt', '.lean', '.inc',
+                     '.yaml', '.yml', '.json', '.md', '.svg', '.tex', '.bib', '.rst', '.txt', '.lean', '.inc',
                      '.sh', '.bash', '.ps1', '.cfg', '.ini'}
+
+NAMED_TEXT_FILES = {'CMakeLists.txt', 'Makefile', 'makefile', 'GNUmakefile', 'Dockerfile', 'NOTICE', 'LICENSE', 'COPYING'}
 
 
 IGNORED_DIRS = {'.git', '.hg', '.svn', '__pycache__', '.pytest_cache', 'node_modules', '.venv', 'venv',
@@ -459,12 +461,74 @@ def _sorted_codex_binaries(root):
     return _rank_codex_candidates(entries)
 
 
+def _parse_codex_package_version(sub_name):
+    parts = str(sub_name).split('_')
+    return tuple(int(part) for part in parts[1].split('.') if part.isdigit()) if len(parts) > 1 else ()
+
+
+def _decode_reg_output(raw, reg_exe, reg_cwd):
+    if raw.isascii():
+        return raw.decode('ascii')
+    try:
+        cp_proc = subprocess.run(
+            [reg_exe, 'query', r'HKLM\SYSTEM\CurrentControlSet\Control\Nls\CodePage', '/v', 'ACP'],
+            cwd=reg_cwd, capture_output=True, timeout=5,
+        )
+        if cp_proc.returncode == 0:
+            cp_match = re.search(rb'ACP\s+REG_SZ\s+([0-9]+)', cp_proc.stdout)
+            if cp_match:
+                acp = cp_match.group(1).decode('ascii')
+                return raw.decode('utf-8' if acp == '65001' else f'cp{acp}')
+    except (LookupError, OSError, subprocess.SubprocessError, UnicodeDecodeError):
+        return None
+    try:
+        return raw.decode('utf-8')
+    except UnicodeDecodeError:
+        return None
+
+
 def _find_windows_codex_package_cli():
+    key_path = r'Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages'
     if _is_posix():
+        reg_exe = shutil.which('reg.exe')
+        if not (reg_exe and shutil.which('wslpath')):
+            return None
+        try:
+            reg_parent = Path(reg_exe).parent
+            reg_cwd = str(reg_parent) if reg_parent.is_dir() else None
+            proc = subprocess.run(
+                [reg_exe, 'query', r'HKCU' + '\\' + key_path, '/s', '/v', 'PackageRootFolder'],
+                cwd=reg_cwd,
+                capture_output=True, timeout=5,
+            )
+            if proc.returncode != 0:
+                return None
+            text = _decode_reg_output(proc.stdout, reg_exe, reg_cwd)
+            if not text:
+                return None
+            locations = []
+            current_sub = ''
+            for raw_line in text.splitlines():
+                line = raw_line.strip()
+                if line.upper().startswith('HKEY_CURRENT_USER\\'):
+                    current_sub = line.rsplit('\\', 1)[-1].strip()
+                elif current_sub.lower().startswith('openai.codex_') and 'REG_SZ' in line and 'PackageRootFolder' in line:
+                    loc = line.split('REG_SZ', 1)[1].strip()
+                    if loc:
+                        locations.append((_parse_codex_package_version(current_sub), loc))
+            for _, win_loc in sorted(locations, reverse=True):
+                try:
+                    wsl_loc = Path(_wsl_path(win_loc, windows=False))
+                except HarnessError:
+                    continue
+                cli = wsl_loc / 'app' / 'resources' / 'codex.exe'
+                if cli.is_file():
+                    return cli
+        except (OSError, subprocess.SubprocessError, ValueError):
+            pass
         return None
     try:
         import winreg
-        key_path = r'Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages'
         locations = []
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path) as root_key:
             count = winreg.QueryInfoKey(root_key)[0]
@@ -481,9 +545,7 @@ def _find_windows_codex_package_cli():
                 except OSError:
                     continue
                 if isinstance(loc, str) and loc.strip():
-                    parts = sub_name.split('_')
-                    ver = tuple(int(part) for part in parts[1].split('.') if part.isdigit()) if len(parts) > 1 else ()
-                    locations.append((ver, loc.strip()))
+                    locations.append((_parse_codex_package_version(sub_name), loc.strip()))
         for _, location in sorted(locations, reverse=True):
             cli = Path(location) / 'app' / 'resources' / 'codex.exe'
             if cli.is_file():
@@ -513,17 +575,22 @@ def _find_binary(name):
             codex_bin_root = local_app / 'OpenAI' / 'Codex' / 'bin'
             found_path = Path(found)
             found_norm = found_path.as_posix().lower()
+            is_alias_stub = '/microsoft/windowsapps/' in found_norm
             try:
                 in_desktop_bin = found_path.resolve().is_relative_to(codex_bin_root.resolve())
             except OSError:
                 in_desktop_bin = False
-            in_winapps = 'windowsapps' in found_norm and 'openai.codex_' in found_norm
+            in_winapps = '/windowsapps/' in found_norm
             if in_desktop_bin or in_winapps:
                 pkg_cli = _find_windows_codex_package_cli() if not os.environ.get('CAE_CODEX_HOME') else None
-                ranked = _rank_codex_candidates([*_sorted_codex_binaries(codex_bin_root), pkg_cli, found_path])
+                real_found = found_path if not is_alias_stub else None
+                ranked = _rank_codex_candidates([*_sorted_codex_binaries(codex_bin_root), pkg_cli, real_found])
                 if ranked:
                     return str(ranked[0])
-        return found
+                if is_alias_stub:
+                    found = None
+        if found:
+            return found
     candidates = [home / '.gemini' / 'bin' / ('agy' if _is_posix() else 'agy.exe')] if name == 'agy' else []
     if name == 'codex' and not _is_posix():
         for standalone in (home / '.local' / 'bin' / 'codex.exe', home / '.cargo' / 'bin' / 'codex.exe'):
@@ -538,16 +605,25 @@ def _find_binary(name):
             return str(candidate)
     if name == 'codex' and _is_posix() and shutil.which('wslpath'):
         found_exe = shutil.which('codex.exe')
-        if found_exe:
+        found_norm = Path(found_exe).as_posix().lower() if found_exe else ''
+        is_alias_stub = '/microsoft/windowsapps/' in found_norm
+        in_managed = ('/windowsapps/' in found_norm) or ('/openai/codex/bin/' in found_norm)
+        if found_exe and not in_managed:
             return found_exe
+        win_desktop_bins = []
         if shutil.which('cmd.exe'):
             try:
                 local_app = Path(_wsl_path(_windows_env('LOCALAPPDATA'), windows=False))
-                ranked = _sorted_codex_binaries(local_app / 'OpenAI' / 'Codex' / 'bin')
-                if ranked:
-                    return str(ranked[0])
+                win_desktop_bins = _sorted_codex_binaries(local_app / 'OpenAI' / 'Codex' / 'bin')
             except (HarnessError, OSError):
                 pass
+        pkg_cli = _find_windows_codex_package_cli() if not os.environ.get('CAE_CODEX_HOME') else None
+        real_found = found_exe if (found_exe and not is_alias_stub) else None
+        ranked = _rank_codex_candidates([*win_desktop_bins, pkg_cli, real_found])
+        if ranked:
+            return str(ranked[0])
+        if real_found:
+            return real_found
     if name == 'agy':
         win_agy = _find_windows_agy_in_wsl()
         if win_agy:
@@ -915,7 +991,19 @@ def _interop_command(command, work_dir, temp_dir, input_text, codex_home=None, e
         '[void]$p.Start()', '$started = $true',
         *pipes,
         '$exitCode = $p.ExitCode', '} finally {',
-        'if ($started) { & taskkill.exe /T /F /PID $p.Id 2>$null | Out-Null }',
+        'if ($started) {',
+        '  try {',
+        "    $tk = New-Object System.Diagnostics.ProcessStartInfo('taskkill.exe', ('/T /F /PID ' + $p.Id))",
+        '    $tk.UseShellExecute = $false; $tk.CreateNoWindow = $true',
+        '    $tk.RedirectStandardOutput = $true; $tk.RedirectStandardError = $true',
+        '    $kp = [System.Diagnostics.Process]::Start($tk)',
+        '    if ($null -ne $kp) {',
+        '      $tkOut = $kp.StandardOutput.ReadToEndAsync(); $tkErr = $kp.StandardError.ReadToEndAsync()',
+        "      if (-not $kp.WaitForExit(5000)) { try { $kp.Kill() } catch {}; [Console]::Error.WriteLine('[cae-harness] taskkill cleanup timed out for PID ' + $p.Id) }",
+        '      [void]$tkOut.Wait(1000); [void]$tkErr.Wait(1000); $kp.Dispose()',
+        '    }',
+        "  } catch { [Console]::Error.WriteLine('[cae-harness] taskkill cleanup failed: ' + $_.Exception.Message) }",
+        '}',
         '$p.Dispose()', '}', 'exit $exitCode',
     ])
     encoded = base64.b64encode(script.encode('utf-16le')).decode('ascii')
@@ -3857,7 +3945,7 @@ def collect_target_files(target, skipped_files=None):
                     skipped.append({'file': directory.relative_to(target).as_posix(), 'reason': 'directory_link'})
                     dirs.remove(name)
             candidates.extend(Path(root) / name for name in sorted(files)
-                              if Path(name).suffix.lower() in SOURCE_EXTENSIONS or name in ('CMakeLists.txt', 'Makefile', 'makefile'))
+                              if Path(name).suffix.lower() in SOURCE_EXTENSIONS or name in NAMED_TEXT_FILES)
     records = []
     for path in candidates:
         rel = path.name if target.is_file() else path.relative_to(target).as_posix()

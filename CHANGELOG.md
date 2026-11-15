@@ -4,6 +4,17 @@
 
 ---
 
+## [1.14.2] - 2026-11-15
+
+在双环境真机无头连通性实测中定位并修复 WSL2 跨子系统进程树清理异常、只读镜像无后缀工程文本漏拷及 WSL2 互操作 MSIX Codex 择新缺失问题：
+
+- **WSL2 跨子系统互操作退出码保护与 MSIX 包择新对齐（`cae_harness.py`、`install.py`、`tests/`）**：
+  - 修复 `_interop_command` 在 Windows PowerShell 5.1（`$ErrorActionPreference='Stop'`）下执行 `finally` 进程树清理时，因已正常退出的子进程触发 `taskkill.exe` `2>$null` 流重定向 `NativeCommandError` 而误返退出码 `1` 的真机缺陷，改为通过 `System.Diagnostics.ProcessStartInfo` 启动清理、异步排空重定向流并在等待超时后强制终止及输出诊断；
+  - 新增 WSL2 下基于原生 `reg.exe` 的零缓存写入 MSIX 应用包只读解析（支持 UTF-8 与 `ACP` 本地代码页回退严格解码），在 Windows 与 WSL2 的 Codex 探测及最终回退分支中统一排除 `%LOCALAPPDATA%\Microsoft\WindowsApps` 执行别名占位文件，同步对齐 MSIX `app/resources/codex.exe` 与桌面缓存二进制的时间戳择新；
+  - 扩展 `collect_target_files` 收录 `NOTICE`、`LICENSE`、`COPYING`、`Dockerfile`、`GNUmakefile` 及 `.svg` 矢量图文件，消除 `--clean-room` 空上下文盲读与跨子系统只读镜像漏拷顶层无后缀文本文件的盲区，并补齐离线与双端真机无头回归验证。
+
+---
+
 ## [1.14.1] - 2026-11-15
 
 修复跨客户端无头协作选路与隔离快照校验缺陷、Windows MSIX 应用包新版 Codex CLI 探测覆盖、GitHub CommonMark 强调定界符渲染异常及脱敏单测占位符越界问题：

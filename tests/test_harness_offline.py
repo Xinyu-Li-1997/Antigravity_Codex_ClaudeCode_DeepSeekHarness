@@ -3230,6 +3230,95 @@ else:
              patch.dict(os.environ, {'LOCALAPPDATA': str(fake_home / 'AppData' / 'Local')}, clear=True):
             self.assertEqual(harness._find_binary('codex'), str(msix_bin))
 
+        # 4) WSL 跨子系统互操作：_interop_command 不使用 2>$null 避免 PowerShell 5.1 NativeCommandError，异步排空输出并处理超时；
+        #    collect_target_files 收录无扩展名 NOTICE/LICENSE/Dockerfile 与 .svg；
+        #    Windows 与 WSL 下排除 Microsoft/WindowsApps 执行别名（含仅剩别名回退分支与 windows_home=None 探测分支）并支持非 UTF-8 ACP 解码
+        with patch.object(harness, '_wsl_path', side_effect=lambda p, windows=True: 'Z:\\tmp\\' + Path(p).name):
+            interop_cmd, _ = harness._interop_command(['codex.exe', 'exec'], self.root, self.root, '输入')
+        interop_ps = base64.b64decode(interop_cmd[-1]).decode('utf-16le')
+        self.assertIn("ProcessStartInfo('taskkill.exe'", interop_ps)
+        self.assertIn('ReadToEndAsync()', interop_ps)
+        self.assertIn('$kp.Kill()', interop_ps)
+        self.assertNotIn('2>$null', interop_ps)
+
+        doc_proj = self.root / 'doc-stage-proj'
+        doc_proj.mkdir()
+        for fname in ('NOTICE', 'LICENSE', 'Dockerfile', 'arch.svg'):
+            (doc_proj / fname).write_text('sample content\n', encoding='utf-8')
+        collected_rels = {item['rel_path'] for item in harness.collect_target_files(doc_proj)}
+        self.assertEqual(collected_rels, {'NOTICE', 'LICENSE', 'Dockerfile', 'arch.svg'})
+
+        alias_stub = fake_home / 'AppData' / 'Local' / 'Microsoft' / 'WindowsApps' / 'codex.exe'
+        alias_stub.parent.mkdir(parents=True)
+        alias_stub.write_bytes(b'')
+        # 仅剩别名占位且无真实包/缓存二进制时，Windows 与 WSL 均不得将别名当作有效 CLI 返回
+        empty_home = self.root / 'empty-win-home'
+        with patch.object(harness, '_is_posix', return_value=False), \
+             patch.object(harness.Path, 'home', return_value=empty_home), \
+             patch.object(harness.shutil, 'which', return_value=str(alias_stub)), \
+             patch.object(harness, '_find_windows_codex_package_cli', return_value=None), \
+             patch.dict(os.environ, {'LOCALAPPDATA': str(empty_home / 'AppData' / 'Local')}, clear=True):
+            self.assertIsNone(harness._find_binary('codex'))
+
+        def wsl_which(cmd):
+            return {
+                'wslpath': '/usr/bin/wslpath',
+                'cmd.exe': '/mnt/c/Windows/System32/cmd.exe',
+                'reg.exe': '/mnt/c/Windows/System32/reg.exe',
+                'codex.exe': str(alias_stub),
+            }.get(cmd)
+        with patch.object(harness, '_is_posix', return_value=True), \
+             patch.object(harness.Path, 'home', return_value=self.root / 'wsl-linux-home'), \
+             patch.object(harness.shutil, 'which', side_effect=wsl_which), \
+             patch.object(harness, '_windows_env', side_effect=harness.HarnessError('no env')), \
+             patch.object(harness, '_find_windows_codex_package_cli', return_value=None), \
+             patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(harness._find_binary('codex'))
+
+        # CP936 非 UTF-8 注册表中文路径（含在 UTF-8 中碰巧合法双字节的“目录” \xc4\xbf\xc2\xbc）通过 ACP 代码页无损解码并命中 MSIX CLI
+        reg_stdout_gbk = (
+            'HKEY_CURRENT_USER\\Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\CurrentVersion\\AppModel\\Repository\\Packages\\OpenAI.CodexPrimaryRuntime_99.0_x64__abc\r\n'
+            '    PackageRootFolder    REG_SZ    D:\\运行库\\OldRuntime\r\n'
+            'HKEY_CURRENT_USER\\Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\CurrentVersion\\AppModel\\Repository\\Packages\\OpenAI.Codex_26.1111.2228.0_x64__abc\r\n'
+            '    PackageRootFolder    REG_SZ    D:\\目录\\OpenAI.Codex_26.1111\r\n'
+        ).encode('cp936')
+        acp_stdout = b'\r\nHKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\Nls\\CodePage\r\n    ACP    REG_SZ    936\r\n\r\n'
+        def reg_run_mock(cmd, **_kwargs):
+            if 'CodePage' in ' '.join(str(x) for x in cmd):
+                return subprocess.CompletedProcess(cmd, 0, acp_stdout, b'')
+            return subprocess.CompletedProcess(cmd, 0, reg_stdout_gbk, b'')
+        def wsl_path_mock(raw, windows=True):
+            if not windows and '目录\\OpenAI.Codex_26.1111' in str(raw):
+                return str(msix_bin.parent.parent.parent)
+            return str(fake_home / 'AppData' / 'Local')
+        with patch.object(harness, '_is_posix', return_value=True), \
+             patch.object(harness.Path, 'home', return_value=self.root / 'wsl-linux-home'), \
+             patch.object(harness.shutil, 'which', side_effect=wsl_which), \
+             patch.object(harness, '_windows_env', return_value='C:\\Users\\<user>\\AppData\\Local'), \
+             patch.object(harness, '_wsl_path', side_effect=wsl_path_mock), \
+             patch.object(harness.subprocess, 'run', side_effect=reg_run_mock), \
+             patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(harness._find_binary('codex'), str(msix_bin))
+
+        # install.detect_installed_apps 在 WSL windows_home=None 且仅剩执行别名时不得将互操作标为可用
+        inst_spec = importlib.util.spec_from_file_location('install_alias_guard_test', ROOT / 'install.py')
+        inst_mod = importlib.util.module_from_spec(inst_spec)
+        inst_spec.loader.exec_module(inst_mod)
+        wsl_only_alias = self.root / 'mnt' / 'c' / 'win-home' / 'AppData' / 'Local' / 'Microsoft' / 'WindowsApps' / 'codex.exe'
+        wsl_only_alias.parent.mkdir(parents=True)
+        wsl_only_alias.write_bytes(b'')
+        with patch.object(inst_mod, '_is_wsl', return_value=True), \
+             patch.object(inst_mod, '_probe_wsl_windows_profile_dir', return_value=None), \
+             patch.object(inst_mod, '_find_wsl_windows_codex_package', return_value=(None, None)), \
+             patch.object(inst_mod, '_native_cli', return_value=None), \
+             patch.object(inst_mod, '_first_executable', return_value=None), \
+             patch.object(inst_mod.Path, 'home', return_value=self.root / 'wsl-linux-home'), \
+             patch.object(inst_mod.shutil, 'which', side_effect=lambda c: str(wsl_only_alias) if c == 'codex.exe' else None), \
+             patch.dict(os.environ, {}, clear=True):
+            detected = inst_mod.detect_installed_apps()
+            self.assertFalse(detected['codex']['interop_available'])
+            self.assertIsNone(detected['codex']['interop_evidence'][0]['binary'])
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
