@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""ccswitch_admin.py - Pure stdlib CC Switch provider card, live projection, and prompt guard CLI.
+"""ccswitch_admin.py - CC Switch 供应商卡片配置、settings.json 同步与旧提示词清理工具（仅依赖 Python 标准库）。
 
-Subcommands:
-  * status          Read-only inspection of cc-switch.db, Claude settings.json, and prompt/skill conflicts
-  * prepare-cards   Atomically create or update Kimi, DeepSeek, and hybrid router cards (preserving keys)
-  * switch-card     Safely project a target Claude card into settings.json using CC Switch floor/residue rules
-  * disable-prompts Disable enabled prompts in cc-switch.db so stale rules never overwrite AGENTS.md/CLAUDE.md
-  * retire-legacy   Disable or purge retired CC Switch prompts/skills (with backup) so host global roots remain sole source
-  * verify          Validate card alignment, effort settings, prompt/skill safety, and optional router health
+子命令：
+  * status          只读检查 cc-switch.db、Claude settings.json 及已启用的旧提示词或技能冲突
+  * prepare-cards   原子创建或更新 Kimi、DeepSeek 与本地分流卡片（保留用户已填写的真实密钥）
+  * switch-card     按 CC Switch 字段合并规则将目标 Claude 卡片同步到 settings.json
+  * disable-prompts 停用 cc-switch.db 中已启用的提示词，避免旧内容覆盖全局 AGENTS.md 或 CLAUDE.md
+  * retire-legacy   备份后停用或清空 CC Switch 内旧提示词与旧技能目录
+  * verify          校验激活卡片与 settings.json 是否一致、推理强度是否被环境变量锁死及本地路由健康状态
 """
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ import sys
 import tempfile
 import time
 import urllib.error
+from urllib.parse import urlsplit
 import urllib.request
 import uuid
 from pathlib import Path
@@ -116,6 +117,27 @@ def mask_token_state(raw_token: Any) -> str:
     if stripped.upper().startswith("PASTE_"):
         return "placeholder"
     return "present"
+
+
+def _sanitize_url(raw_url: Any) -> Optional[str]:
+    if not isinstance(raw_url, str):
+        return None
+    stripped = raw_url.strip()
+    if not stripped:
+        return ""
+    if not stripped.lower().startswith(("http://", "https://")):
+        return "<redacted-url>" if ("@" in stripped or "?" in stripped) else stripped
+    try:
+        parsed = urlsplit(stripped)
+        host = parsed.hostname or ""
+        if not host:
+            return "<redacted-url>"
+        if ":" in host:
+            host = "[" + host + "]"
+        port_part = f":{parsed.port}" if parsed.port else ""
+        return f"{parsed.scheme}://{host}{port_part}{parsed.path}"
+    except ValueError:
+        return "<redacted-url>"
 
 
 def atomic_write_bytes(path: Path, data: bytes) -> None:
@@ -373,7 +395,7 @@ def inspect_status(
                         "app_type": app_type,
                         "name": name,
                         "current": bool(is_current),
-                        "base_url": env.get("ANTHROPIC_BASE_URL"),
+                        "base_url": _sanitize_url(env.get("ANTHROPIC_BASE_URL")),
                         "model": env.get("ANTHROPIC_MODEL"),
                         "subagent_model": env.get("CLAUDE_CODE_SUBAGENT_MODEL"),
                         "max_context": env.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS"),
@@ -418,7 +440,14 @@ def inspect_status(
             report["skills_dir_entries"] = sorted(p.name for p in skills_dir.iterdir() if p.name != ".DS_Store")
 
     if settings_path and settings_path.is_file():
-        settings_obj = json.loads(settings_path.read_text(encoding="utf-8-sig"))
+        try:
+            settings_obj = json.loads(settings_path.read_text(encoding="utf-8-sig"))
+            if not isinstance(settings_obj, dict):
+                raise ValueError("settings.json root must be an object")
+        except (OSError, UnicodeError, ValueError):
+            report["settings_aligned"] = False
+            report["warnings"].append("Claude settings.json is unreadable or contains invalid JSON.")
+            return report
         env_obj = settings_obj.get("env") if isinstance(settings_obj, dict) and isinstance(settings_obj.get("env"), dict) else {}
         report["effort_level"] = settings_obj.get("effortLevel") if isinstance(settings_obj, dict) else None
         report["locked_effort_env"] = "CLAUDE_CODE_EFFORT_LEVEL" in env_obj
@@ -574,7 +603,7 @@ def prepare_cards(
                     "name": name,
                     "action": "update" if current else "insert",
                     "current": bool(record["is_current"]),
-                    "base_url": env.get("ANTHROPIC_BASE_URL"),
+                    "base_url": _sanitize_url(env.get("ANTHROPIC_BASE_URL")),
                     "model": env.get("ANTHROPIC_MODEL"),
                     "subagent": env.get("CLAUDE_CODE_SUBAGENT_MODEL"),
                     "context": env.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS"),
@@ -610,7 +639,12 @@ def switch_card(
         raise FileNotFoundError(f"Settings file not found: {settings_path}")
     state_path = db_path.with_name("live-state.json")
     if state_path.exists():
-        state = json.loads(state_path.read_text(encoding="utf-8-sig")).get("apps", {}).get("claude", {})
+        try:
+            raw_state = json.loads(state_path.read_text(encoding="utf-8-sig"))
+        except (OSError, UnicodeError, ValueError) as exc:
+            raise RuntimeError("Claude must be in direct mode (live-state.json is unreadable)") from exc
+        apps = raw_state.get("apps") if isinstance(raw_state, dict) and isinstance(raw_state.get("apps"), dict) else {}
+        state = apps.get("claude") if isinstance(apps.get("claude"), dict) else {}
         if state.get("mode") == "proxy" or state.get("attached") or state.get("pending") is not None:
             raise RuntimeError("Claude must be in direct mode with no pending CC Switch operation")
 

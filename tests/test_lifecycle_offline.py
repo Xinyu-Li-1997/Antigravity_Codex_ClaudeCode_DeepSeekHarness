@@ -1880,6 +1880,179 @@ class TestCodexHandoffAdapter(unittest.TestCase):
                     self.assertEqual(reply_repeat_guard.extract_current_turn_latest_reply(str(transcript)),
                                      (expected_turn, 7, reply))
 
+    def test_agy_compaction_recovers_truncated_recent_subagent_returns_and_skips_task_noise(self):
+        cid = "agy-subagent-digest"
+        log_dir = self.root / "brain" / cid / ".system_generated" / "logs"
+        tp = log_dir / "transcript.jsonl"
+        tp_full = log_dir / "transcript_full.jsonl"
+
+        _append_jsonl(tp, {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT",
+                           "created_at": "2026-11-15T01:00:00Z", "content": "<USER_REQUEST>\n核查通量守恒与边界条件\n</USER_REQUEST>"})
+        _append_jsonl(tp_full, {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT",
+                                "created_at": "2026-11-15T01:00:00Z", "content": "<USER_REQUEST>\n核查通量守恒与边界条件\n</USER_REQUEST>"})
+
+        # 噪声 1：后台命令完成通知 (/task-99) 与 BROWSER_HOST_FACTS 必须排除
+        _append_jsonl(tp, {
+            "step_index": 1, "source": "SYSTEM", "type": "SYSTEM_MESSAGE",
+            "content": f"<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-15T01:01:00Z sender={cid}/task-99 content=Task id \"{cid}/task-99\" finished\n</SYSTEM_MESSAGE>",
+        })
+        _append_jsonl(tp, {
+            "step_index": 2, "source": "SYSTEM", "type": "SYSTEM_MESSAGE",
+            "content": "<SYSTEM_MESSAGE>\nBROWSER_HOST_FACTS sender=sub-browser content=origin ok\n</SYSTEM_MESSAGE>",
+        })
+
+        # 连续 5 个子代理完成返回：仅保留最近 4 个，且第 5 个在紧凑轨迹中被截断、需从 transcript_full.jsonl 补全首尾
+        for idx in range(1, 6):
+            sub_id = f"sub-auditor-000{idx}"
+            call_step = idx * 10
+            res_step = call_step + 1
+            msg_step = call_step + 2
+            _append_jsonl(tp, {
+                "step_index": call_step, "source": "MODEL", "type": "PLANNER_RESPONSE",
+                "tool_calls": [{
+                    "id": f"call-{idx}", "name": "invoke_subagent",
+                    "args": {"TypeName": '"readonly-auditor"', "Role": f'"Auditor #{idx}"'},
+                }],
+            })
+            _append_jsonl(tp, {
+                "step_index": res_step, "source": "MODEL", "type": "GENERIC", "tool_call_id": f"call-{idx}",
+                "content": "Created the following subagent: " + json.dumps({
+                    "conversationId": sub_id,
+                    "logAbsoluteUri": f"file:///tmp/{sub_id}/transcript.jsonl",
+                }),
+            })
+            full_report = (
+                f"【核查范围 #{idx}】src/flux/hllc.py 第 10-88 行。\n"
+                + ("中间推导细节_" * (180 if idx == 5 else 5))
+                + f"\n【最终结论 #{idx}】第 {40 + idx} 行法向投影无误。"
+            )
+            full_wrapped = f"<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-15T01:0{idx}:00Z sender={sub_id} priority=HIGH content={full_report}\n</SYSTEM_MESSAGE>"
+            if idx == 5:
+                trunc_wrapped = f"<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-15T01:05:00Z sender={sub_id} priority=HIGH content=【核查范围 #5】截断预览..."
+                _append_jsonl(tp, {
+                    "step_index": msg_step, "source": "SYSTEM", "type": "SYSTEM_MESSAGE",
+                    "created_at": "2026-11-15T01:05:00Z", "content": trunc_wrapped, "truncated_fields": ["content"],
+                })
+                _append_jsonl(tp_full, {
+                    "step_index": msg_step, "source": "SYSTEM", "type": "SYSTEM_MESSAGE",
+                    "created_at": "2026-11-15T01:05:00Z", "content": full_wrapped,
+                })
+            else:
+                _append_jsonl(tp, {
+                    "step_index": msg_step, "source": "SYSTEM", "type": "SYSTEM_MESSAGE",
+                    "created_at": f"2026-11-15T01:0{idx}:00Z", "content": full_wrapped,
+                })
+
+        _append_jsonl(tp, {"step_index": 60, "source": "SYSTEM", "type": "CHECKPOINT", "content": "compacted"})
+        payload = {"conversationId": cid, "transcriptPath": str(tp)}
+        first_res = session_context_loader.handle_pre_invocation(payload)
+        self.assertEqual(len(first_res["injectSteps"]), 1)
+        injected = first_res["injectSteps"][0]["systemMessage"]["systemMessage"]
+        self.assertLessEqual(len(injected), session_context_loader.MAX_INLINE_TOTAL_CHARS)
+        self.assertIn("最近子代理返回摘要（采纳前须按 R6 核对原文件或子代理日志）", injected)
+        self.assertNotIn("Auditor #1", injected)
+        self.assertIn("readonly-auditor (Auditor #5)", injected)
+        self.assertIn("【最终结论 #5】第 45 行法向投影无误。", injected)
+        self.assertNotIn("task-99", injected)
+        self.assertNotIn("BROWSER_HOST_FACTS", injected)
+
+        # 未新增 CHECKPOINT 的后续回合必须严格零字节注入，保护前缀缓存命中率
+        _append_jsonl(tp, {"step_index": 61, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "继续下一步"})
+        second_res = session_context_loader.handle_pre_invocation(payload)
+        self.assertEqual(second_res, {"injectSteps": []})
+
+        md_file = self.state_dir / f"{cid}_user_words.md"
+        md_text = md_file.read_text(encoding="utf-8")
+        self.assertIn("- **累计指令轮数**: 1", md_text)
+        self.assertIn("- **最近子代理返回摘要数**: 4", md_text)
+        self.assertIn("file:///tmp/sub-auditor-0005/transcript.jsonl", md_text)
+        self.assertIn("【最终结论 #5】第 45 行法向投影无误。", md_text)
+
+        # 多轮超长原话叠加子代理摘要时，总内联长度仍严格不超过 MAX_INLINE_TOTAL_CHARS，且首轮指令保留
+        many_words = [
+            {"turn": i, "step_index": i, "created_at": "2026-11-15T00:00:00Z", "kind": "user_input",
+             "content": f"第{i}轮首锚点_" + ("超长约束条件_" * 180) + f"_第{i}轮尾锚点"}
+            for i in range(1, 18)
+        ]
+        archive_data = user_words.extract_agy_archive(str(tp), include_subagent_msgs=False)
+        capped = session_context_loader.build_compaction_system_message(
+            many_words, md_file, "CHECKPOINT step #60", subagent_returns=archive_data["subagent_returns"],
+        )
+        self.assertLessEqual(len(capped), session_context_loader.MAX_INLINE_TOTAL_CHARS)
+        self.assertIn("第1轮首锚点_", capped)
+        self.assertIn("Auditor #5", capped)
+
+    def test_codex_session_start_recovers_wait_agent_returns_and_deduplicates_segments(self):
+        sid = "019codex-subagent-main"
+        codex_root = self.root / ".codex"
+        older = codex_root / "archived_sessions" / f"rollout-2026-11-15T01-00-00-{sid}.jsonl"
+        active = codex_root / "sessions" / "2026" / "11" / "15" / f"rollout-2026-11-15T02-00-00-{sid}.jsonl"
+        sub_rollout = codex_root / "sessions" / "2026" / "11" / "15" / "rollout-2026-11-15T01-05-00-019subagent001.jsonl"
+        _append_jsonl(sub_rollout, {"type": "session_meta", "payload": {"id": "019subagent001", "source": "subagent"}})
+
+        for seg in (older, active):
+            _append_jsonl(seg, {"type": "session_meta", "payload": {"id": sid, "source": "cli", "cwd": str(self.root)}})
+            _append_jsonl(seg, {
+                "type": "response_item", "ordinal": 1, "timestamp": "2026-11-15T01:01:00Z",
+                "payload": {
+                    "type": "message", "role": "user", "id": "u-1", "content": "推导旋转网格度量恒等式",
+                    "internal_chat_message_metadata_passthrough": {
+                        "content_item_metadata": [{"provenance": {"type": "user"}}],
+                    },
+                },
+            })
+            # spawn_agent 仅返回句柄，不得误归档为子代理完成报告
+            _append_jsonl(seg, {
+                "type": "response_item", "ordinal": 2, "timestamp": "2026-11-15T01:02:00Z",
+                "payload": {
+                    "type": "function_call", "name": "functions.spawn_agent", "call_id": "call-spawn-1",
+                    "arguments": json.dumps({"agent_type": "readonly-collaborator", "description": "GCL derivation"}),
+                },
+            })
+            _append_jsonl(seg, {
+                "type": "response_item", "ordinal": 3, "timestamp": "2026-11-15T01:02:01Z",
+                "payload": {
+                    "type": "function_call_output", "call_id": "call-spawn-1",
+                    "output": json.dumps({"agent_id": "019subagent001", "nickname": "Gauss"}),
+                },
+            })
+            _append_jsonl(seg, {
+                "type": "response_item", "ordinal": 4, "timestamp": "2026-11-15T01:05:00Z",
+                "payload": {
+                    "type": "function_call", "name": "functions.wait_agent", "call_id": "call-wait-1",
+                    "arguments": json.dumps({"ids": ["019subagent001"]}),
+                },
+            })
+            _append_jsonl(seg, {
+                "type": "response_item", "ordinal": 5, "timestamp": "2026-11-15T01:05:30Z",
+                "payload": {
+                    "type": "function_call_output", "call_id": "call-wait-1",
+                    "output": json.dumps({
+                        "status": {"019subagent001": {"completed": "离散几何守恒律（GCL）在三阶曲网格下残差为机器零。"}},
+                        "timed_out": False,
+                    }, ensure_ascii=False),
+                },
+            })
+
+        ctx_state = codex_root / "hooks" / "state" / "session-context"
+        res = session_context_loader.handle_codex_session_start(
+            {"session_id": sid, "transcript_path": str(active), "source": "compact", "cwd": str(self.root)},
+            state_dir_str=str(ctx_state),
+            log_path_str=str(codex_root / "hooks" / "logs" / "session-context.jsonl"),
+        )
+        add_ctx = res["hookSpecificOutput"]["additionalContext"]
+        self.assertLessEqual(len(add_ctx), session_context_loader.MAX_INLINE_TOTAL_CHARS)
+        self.assertIn("最近子代理返回摘要：1 条", add_ctx)
+        self.assertIn("readonly-collaborator (Gauss)", add_ctx)
+        self.assertIn("离散几何守恒律（GCL）", add_ctx)
+        self.assertIn(str(sub_rollout), add_ctx)
+
+        md_path = codex_root / "hooks" / "state" / "user-words" / f"{sid}.md"
+        meta_path = codex_root / "hooks" / "state" / "user-words" / f"{sid}.json"
+        manifest = json.loads(meta_path.read_text(encoding="utf-8"))
+        self.assertEqual(manifest["sha256"], hashlib.sha256(md_path.read_bytes()).hexdigest())
+        self.assertEqual(manifest["count"], 1)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

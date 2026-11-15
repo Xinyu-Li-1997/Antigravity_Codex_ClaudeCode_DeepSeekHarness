@@ -1,0 +1,118 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 584" width="1080" height="584" role="img" aria-labelledby="arch-title arch-desc">
+  <title id="arch-title">两层解耦配置与四客户端对等协作总览</title>
+  <desc id="arch-desc">展示常驻机制层与动态模型评估配置层的解耦关系、四个必停用户拍板门禁，以及 Antigravity、Codex、Claude Code 与 DeepSeek Harness 四个对等客户端的全局目录挂载方式。</desc>
+  <defs>
+    <style>
+      .bg { fill: #f8fafc; stroke: #cbd5e1; stroke-width: 1.5; }
+      .title { font: 700 18px "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; fill: #0f172a; }
+      .subtitle { font: 400 12px "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; fill: #475569; }
+      .box-perm { fill: #eff6ff; stroke: #2563eb; stroke-width: 1.6; }
+      .box-dyn { fill: #fffbeb; stroke: #d97706; stroke-width: 1.6; }
+      .box-gate { fill: #fef2f2; stroke: #dc2626; stroke-width: 1.5; stroke-dasharray: 5 3; }
+      .box-peer { fill: #ffffff; stroke: #64748b; stroke-width: 1.4; }
+      .hdr-perm { font: 700 13.8px "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; fill: #1d4ed8; }
+      .hdr-dyn { font: 700 13.8px "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; fill: #b45309; }
+      .hdr-gate { font: 700 13px "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; fill: #b91c1c; }
+      .hdr-peer { font: 700 13.5px "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; fill: #0f172a; }
+      .body { font: 400 11.4px "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; fill: #1e293b; }
+      .mono { font: 600 11px Consolas, "SFMono-Regular", Menlo, monospace; fill: #0f172a; }
+      .mono-sm { font: 600 10px Consolas, "SFMono-Regular", Menlo, monospace; fill: #0f172a; }
+      .tag { fill: #e2e8f0; stroke: #94a3b8; stroke-width: 1; }
+      .arrow { stroke: #475569; stroke-width: 1.6; fill: none; marker-end: url(#arrow-head); }
+      .arrow-dyn { stroke: #d97706; stroke-width: 1.6; fill: none; stroke-dasharray: 4 3; marker-end: url(#arrow-amber); }
+    </style>
+    <marker id="arrow-head" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#475569"/>
+    </marker>
+    <marker id="arrow-amber" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#d97706"/>
+    </marker>
+  </defs>
+
+  <rect x="8" y="8" width="1064" height="568" rx="12" class="bg"/>
+  <text x="540" y="35" text-anchor="middle" class="title">两层解耦全局配置与四客户端对等协作架构</text>
+  <text x="540" y="55" text-anchor="middle" class="subtitle">课题业务仓库零侵入 · Python 3.11+ 纯标准库实现 · 常驻工程契约与动态模型快照严格分离</text>
+
+  <!-- Layer 1 Left: Permanent Layer -->
+  <rect x="28" y="72" width="500" height="184" rx="9" class="box-perm"/>
+  <text x="44" y="96" class="hdr-perm">1. 常驻机制层（跨模型换代稳定，零时期性模型名硬编码）</text>
+  <text x="44" y="118" class="body">• 全局规则模板：template/user-guard/rules/AGENTS.md（R0–R11）</text>
+  <text x="44" y="138" class="body">• 生命周期钩子：user_words · session_context_loader · status_guard</text>
+  <text x="58" y="156" class="body">reply_repeat_guard · handoff_gate（短进程 JSON 协议，平时零驻留）</text>
+  <text x="44" y="176" class="body">• 幂等分发与审计：install.py（保留自定义尾段 · --audit-upgrade 耦合检查）</text>
+  <text x="44" y="196" class="body">• 角色路由与门禁：cae_harness.py（快照保护 / --write-scope / --verify-cmd）</text>
+  <text x="58" y="214" class="body">fleet_state.py（推荐表审批锁 propose/approve · 重启重入锁 pass1/pass2）</text>
+  <text x="44" y="236" class="body">• 只读子代理：readonly-reader · readonly-collaborator · readonly-auditor</text>
+
+  <!-- Layer 1 Right: Dynamic Fleet Profile Layer -->
+  <rect x="552" y="72" width="500" height="184" rx="9" class="box-dyn"/>
+  <text x="568" y="96" class="hdr-dyn">2. 模型评估快照层（随客户端与模型迭代动态校准）</text>
+  <text x="568" y="118" class="body">• 唯一机器可读配置：skills/cae-harness/fleet_profile.json</text>
+  <text x="568" y="138" class="body">• 五类抽象角色槽位（主控端同样支持重算切换，非永久绑定）：</text>
+  <rect x="568" y="148" width="466" height="24" rx="5" class="tag"/>
+  <text x="801" y="164" text-anchor="middle" class="mono">role:orchestrator | role:math | role:code | role:review | role:fast</text>
+  <text x="568" y="192" class="body">• 双向实证记录：各客户端/模型优势依据 + 严重短板隔离参数（过滤 ultra、</text>
+  <text x="582" y="211" class="body">跳过共享窗口复合路由、显式最大窗口预算、暂缓区域受限或退役模型）</text>
+  <text x="568" y="236" class="body">• 动态校准入口：fleet-evolve（结合本机探测缓存、报错日志与官方文档重算）</text>
+
+  <!-- Cross link between layers -->
+  <path d="M 552 164 L 530 164" class="arrow-dyn"/>
+
+  <!-- Middle Approval Gate -->
+  <rect x="28" y="274" width="1024" height="74" rx="8" class="box-gate"/>
+  <text x="44" y="296" class="hdr-gate">必停用户拍板门禁（R3.1.4 / R4，未获明确批准严禁跨步执行）</text>
+  <text x="44" y="317" class="body">① 生成或调整推荐搭配表（fleet_state.py propose）   ·   ② 向宿主机全局配置目录写入变更（install.py 正式执行）或切换主控客户端</text>
+  <text x="44" y="337" class="body">③ 系统级 Python 跨次版本、CUDA 跨大版本或 WSL 跨 LTS 发行版等 ABI 强耦合升级   ·   ④ git push 推送远端仓库前</text>
+
+  <!-- Arrows down to 4 Peer Clients -->
+  <path d="M 278 256 L 278 274" class="arrow"/>
+  <path d="M 802 256 L 802 274" class="arrow"/>
+  <path d="M 150 348 L 150 374" class="arrow"/>
+  <path d="M 410 348 L 410 374" class="arrow"/>
+  <path d="M 670 348 L 670 374" class="arrow"/>
+  <path d="M 930 348 L 930 374" class="arrow"/>
+
+  <!-- Peer 1: Antigravity -->
+  <rect x="28" y="376" width="244" height="182" rx="8" class="box-peer"/>
+  <text x="40" y="398" class="hdr-peer">Antigravity (agy)</text>
+  <text x="40" y="416" class="mono-sm">~/.gemini/config/plugins/user-guard</text>
+  <text x="40" y="437" class="body">• 挂载 4 类钩子（存 PLUGIN_DATA）</text>
+  <text x="40" y="456" class="body">• 3 个 inherit 原生只读子代理</text>
+  <text x="40" y="475" class="body">• 订阅按模型组计 5h / 7d 滚动配额</text>
+  <text x="40" y="494" class="body">• CLI 不输出窗口整数，分片按 120k</text>
+  <text x="52" y="513" class="body">保守预算规划，过滤复合与异池模型</text>
+  <text x="40" y="534" class="body">• 严格校验：agy plugin validate</text>
+
+  <!-- Peer 2: Codex -->
+  <rect x="288" y="376" width="244" height="182" rx="8" class="box-peer"/>
+  <text x="300" y="398" class="hdr-peer">OpenAI Codex (codex)</text>
+  <text x="300" y="416" class="mono-sm">~/.codex</text>
+  <text x="300" y="437" class="body">• 挂载 5 类钩子（保留 trusted_hash）</text>
+  <text x="300" y="456" class="body">• 3 个只读子代理 + workspace-write</text>
+  <text x="300" y="475" class="body">• 订阅共享 5h / 周度窗口或按量 API</text>
+  <text x="300" y="494" class="body">• 默认挡位偏低（low/medium），脚本</text>
+  <text x="312" y="513" class="body">显式声明最大窗口与非委派最高挡</text>
+  <text x="300" y="534" class="body">• 支持 --clean-room 空上下文盲读</text>
+
+  <!-- Peer 3: Claude Code -->
+  <rect x="548" y="376" width="244" height="182" rx="8" class="box-peer"/>
+  <text x="560" y="398" class="hdr-peer">Claude Code (claude / cc)</text>
+  <text x="560" y="416" class="mono-sm">~/.claude (+ router/ &amp; CC Switch)</text>
+  <text x="560" y="437" class="body">• settings.json 合并 5 类钩子与挡位</text>
+  <text x="560" y="456" class="body">• 原生 --json-schema 输出结构强校验</text>
+  <text x="560" y="475" class="body">• router.py 绑定 127.0.0.1 前缀直通</text>
+  <text x="572" y="494" class="body">原生兼容 /v1/messages 官方接口</text>
+  <text x="560" y="513" class="body">• 只读传 --permission-mode dontAsk</text>
+  <text x="560" y="534" class="body">• ccswitch_admin 在线备份安全切卡</text>
+
+  <!-- Peer 4: DeepSeek Harness -->
+  <rect x="808" y="376" width="244" height="182" rx="8" class="box-peer"/>
+  <text x="820" y="398" class="hdr-peer">DeepSeek Harness (dsh)</text>
+  <text x="820" y="416" class="mono-sm">~/.dsh</text>
+  <text x="820" y="437" class="body">• 同步 AGENTS.md（留尾段）与 skills/</text>
+  <text x="820" y="456" class="body">• 安装器不改 .credentials.yaml</text>
+  <text x="820" y="475" class="body">• 复用官方 OAuth 或 DEEPSEEK_API_KEY</text>
+  <text x="820" y="494" class="body">• 无头调用生成临时 --patch 激活凭据</text>
+  <text x="820" y="513" class="body">• 单 JSON 约束并清洗尾随 DSML 标记</text>
+  <text x="820" y="534" class="body">• 支持单端直连起步与配额冷却接替</text>
+</svg>

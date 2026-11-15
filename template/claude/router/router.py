@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
-"""Local transparent model router for Claude Code (primary + subagent split via CC Switch cards).
+"""Claude Code 本地模型分流代理（配合 CC Switch 供应商卡片使用，仅依赖 Python 标准库）。
 
-Claude Code sends every request to one ANTHROPIC_BASE_URL. Point it here; this router
-forwards each request by its "model" field:
-  * models matching a route prefix (default "deepseek") -> that route's upstream, with the
-    route's own API key (read from the cc-switch provider card of the same name);
-  * everything else -> the default upstream (Kimi); if "default_key_from_card" is set, its key
-    from that cc-switch card replaces the incoming one (so the card pointing here needs no real key).
-Responses (including SSE streams) are relayed byte for byte. No request or response bodies
-and no keys are logged; one line per request goes to the log file.
+Claude Code 每次请求固定发往单一 ANTHROPIC_BASE_URL。将激活卡片指向本服务后，代理按请求体中的
+"model" 字段透明转发：
+  * 模型名匹配某条路由前缀（默认 "deepseek"）时，转发至该路由对应的上游接口，并自动从同名
+    CC Switch 卡片读取 API Key 替换请求头，同时剥离 Claude Code 附加的 "[1m]"/"[1M]" 后缀；
+  * 其余请求转发至默认上游（如 Kimi），并从 default_key_from_card 指定的卡片读取真实密钥，
+    因此指向本地端口的分流卡片本身无需保存真实密钥。
+上游响应（含 SSE 流式块）按字节原样回传。日志仅记录单行耗时、状态码与字节数，绝不写入请求正文、
+响应正文或任何密钥。
 
-Usage: python3 router.py [--config router.json]
-Health check: GET http://127.0.0.1:<port>/__router/health
+用法：python3 router.py [--config router.json]
+健康检查：GET http://127.0.0.1:<port>/__router/health
 """
 import argparse
 import base64
@@ -356,7 +356,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         rec["model"] = model
         for r in cfg["routes"]:
-            if model.lower().startswith(r["prefix"]):
+            prefix = str(r.get("prefix") or "")
+            if prefix and model.lower().startswith(prefix.lower()):
                 upstream, route = r["upstream"], r
                 break
         rec["route"] = route["prefix"] if route else "default"
@@ -368,10 +369,14 @@ class Handler(BaseHTTPRequestHandler):
             if route:
                 data["model"] = model.replace("[1m]", "").replace("[1M]", "")
                 if route.get("force_effort"):
-                    oc = dict(oc); oc["effort"] = route["force_effort"]; data["output_config"] = oc
+                    oc = dict(oc)
+                    oc["effort"] = route["force_effort"]
+                    data["output_config"] = oc
             elif (cfg.get("kimi_effort_map") and isinstance(oc.get("effort"), str)
                   and oc["effort"] in cfg["kimi_effort_map"]):
-                oc = dict(oc); oc["effort"] = cfg["kimi_effort_map"][oc["effort"]]; data["output_config"] = oc
+                oc = dict(oc)
+                oc["effort"] = cfg["kimi_effort_map"][oc["effort"]]
+                data["output_config"] = oc
             rec["effort_out"] = oc.get("effort")
             body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         key_card = route.get("key_from_card") if route else cfg.get("default_key_from_card")
@@ -379,7 +384,8 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 key = card_key(cfg, key_card)
             except Exception as e:
-                rec.update(status=502, err=str(e)); log_line(cfg, rec)
+                rec.update(status=502, err=str(e))
+                log_line(cfg, rec)
                 self.send_error(502, "router: %s" % e)
                 return
             for k in list(headers):
@@ -432,7 +438,7 @@ class Handler(BaseHTTPRequestHandler):
                 total += len(chunk)
         except Exception as e:
             rec.update(status=rec.get("status") or 502, err="%s: %s" % (type(e).__name__, e), err_side=side)
-            if not sent:      # after the response has started, an error page would corrupt the stream: just close
+            if not sent:  # 响应头已发出时不能再补写错误页，直接关闭连接避免破坏 SSE 流
                 try:
                     self.send_error(502, "router upstream error")
                 except Exception:
@@ -446,8 +452,8 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--config", default=default_config_path())
+    ap = argparse.ArgumentParser(description="Claude Code 本地模型分流代理服务")
+    ap.add_argument("--config", default=default_config_path(), help="路由配置文件路径（默认优先读取同目录 router.json）")
     a = ap.parse_args()
     cfg = load_config(a.config)
     srv = ThreadingHTTPServer((cfg["listen"], cfg["port"]), Handler)

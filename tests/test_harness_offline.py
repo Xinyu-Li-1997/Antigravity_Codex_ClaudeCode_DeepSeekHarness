@@ -2876,6 +2876,7 @@ else:
         self.assertEqual(ctx.exception.status, 'quota_exhausted')
         parsed_reset = harness._parse_quota_reset("You've hit your weekly limit · resets 5pm (UTC)")
         self.assertIsNotNone(parsed_reset)
+        self.assertEqual(parsed_reset['reset_hint'], '5pm (UTC)')
 
         # 验证 DSH 无头调用注入单 JSON 对象强约束且不破坏结果解析
         dsh_home = self.root / 'dsh-json-check'
@@ -2890,6 +2891,77 @@ else:
 
         with patch.object(harness, 'run_process', side_effect=check_dsh_prompt):
             self.assertEqual(harness.invoke_engine('dsh:default', self.root, '检查提示词', engines, harness.TASK_JSON_SCHEMA), TASK)
+
+    def test_runtime_secret_redaction_dsh_clean_room_dotenv_and_audit_fast_tier(self):
+        # 1) 运行期错误详情与端点 URL 脱敏，防止配额冷却 JSON 落盘密钥
+        fake_sk = 'sk-' + 'r' * 28
+        fake_bearer = 'Bearer ' + 'b' * 28
+        raw_err = (
+            f"quota hit for DEEPSEEK_API_KEY={fake_sk} auth={fake_bearer} "
+            "url=https://u:p@example.com/v1?api_key=secret_q_12345678"
+        )
+        scrubbed = harness._redact_runtime_secret(raw_err)
+        self.assertNotIn(fake_sk, scrubbed)
+        self.assertNotIn('b' * 28, scrubbed)
+        self.assertNotIn('secret_q_12345678', scrubbed)
+        self.assertNotIn('u:p@', scrubbed)
+        self.assertEqual(
+            harness._sanitize_endpoint_url('https://u:p@example.com/anthropic?token=xyz#f'),
+            'https://example.com/anthropic',
+        )
+
+        # 2) DSH --clean-room 模式支持从 .env 提取官方 DEEPSEEK_API_KEY
+        dsh_dotenv_home = self.root / 'dsh-clean-dotenv'
+        dsh_dotenv_home.mkdir()
+        dotenv_val = 'ds_env_tok_' + 'k' * 16
+        (dsh_dotenv_home / '.env').write_text(f'export DEEPSEEK_API_KEY="{dotenv_val}"\n', encoding='utf-8')
+        engines = self.four_backends()
+        engines['dsh']['config_home'] = str(dsh_dotenv_home)
+        target_dir = self.root / 'clean_doc_target'
+        target_dir.mkdir()
+        (target_dir / 'README.md').write_text('# Doc\n', encoding='utf-8')
+
+        def fake_clean_dsh(command, cwd, input_text, timeout_sec, **kwargs):
+            run_env = kwargs.get('env') or {}
+            self.assertEqual(run_env.get('DEEPSEEK_API_KEY'), dotenv_val)
+            stream = json.dumps({'type': 'final', 'reason': {'kind': 'completed'}, 'text': json.dumps(TASK)})
+            return subprocess.CompletedProcess(command, 0, stream, '')
+
+        with patch.object(harness, 'run_process', side_effect=fake_clean_dsh):
+            out = harness.invoke_engine(
+                'dsh:default', target_dir, '盲读检查', engines, harness.TASK_JSON_SCHEMA, clean_room=True,
+            )
+        self.assertEqual(out, TASK)
+
+        # 3) audit --single --left role:fast 透传 engine 提示，默认选用 low 挡位而非 max
+        captured_efforts: list[str | None] = []
+
+        def fake_readonly(spec, root, prompt, backends, timeout, files, cli_effort, *rest, **kwargs):
+            captured_efforts.append(cli_effort)
+            return {**AUDIT, 'read_files': list(files), 'unread_files': [], 'findings': []}
+
+        with patch.object(harness, '_args_backends', return_value=engines), \
+                patch.object(harness, 'invoke_readonly_engine', side_effect=fake_readonly):
+            rc, rep = self.capture(
+                harness.cmd_audit,
+                self.args('audit', '--caller', 'antigravity', '--target', str(target_dir), '--single', '--left', 'role:fast'),
+            )
+        self.assertEqual(rc, 0)
+        self.assertEqual(rep['selected_tier'], 'low')
+        self.assertEqual(captured_efforts, ['low'])
+
+        # 4) agy 自动选模遵守 blocked_auto_tokens，codex 编码选模遵守 workhorse_families 顺序
+        engines['agy']['models'] = [
+            {'slug': 'auto-router-high', 'supported_efforts': ['high']},
+            {'slug': 'gemini-4-argon-high', 'supported_efforts': ['high']},
+        ]
+        engines['agy']['model'] = ''
+        self.assertEqual(harness.resolve_execution_profile(engines, 'agy:default', 'max', kind='code')['model'], 'gemini-4-argon-high')
+        engines['codex']['models'] = [
+            {'slug': 'gpt-6.9-unknown', 'priority': 99, 'supported_efforts': ['max']},
+            {'slug': 'gpt-6.1-sol', 'priority': 10, 'supported_efforts': ['max']},
+        ]
+        self.assertEqual(harness.resolve_execution_profile(engines, 'codex:code', 'max', kind='code')['model'], 'gpt-6.1-sol')
 
 
 if __name__ == '__main__':

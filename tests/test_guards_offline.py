@@ -1786,6 +1786,47 @@ class TestGuardsOffline(unittest.TestCase):
         ):
             self.assertEqual(decide(allowed_cmd), "allow", allowed_cmd)
 
+    def test_33_handoff_env_sudo_command_unwrap_and_nested_headless_depth(self) -> None:
+        import handoff_gate
+        import session_context_loader
+
+        project = self.tmp_root / "proj33"
+        outside = self.tmp_root / "outside33"
+        project.mkdir()
+        outside.mkdir()
+
+        # 1) CAE_HARNESS_DEPTH=2 多层后台无头嵌套时，Antigravity 项目外写操作必须直接 deny 而非弹框
+        with unittest.mock.patch.dict(os.environ, {"CAE_HARNESS_DEPTH": "2"}):
+            nested_res = status_guard.handle_pre_tool_use({
+                "conversationId": "depth-2-conv",
+                "cwd": str(project),
+                "workspacePaths": [str(project)],
+                "toolCall": {"name": "write_file", "args": {"Path": str(outside / "leak.txt"), "Content": "x"}},
+            })
+            self.assertEqual(nested_res["decision"], "deny")
+
+        # 2) drain/freeze 阶段阻断 env -u / sudo -u 包裹的 git push，放行 command -v 只读查询
+        cid = "handoff-unwrap-33"
+        tp = self.tmp_root / "tp33.jsonl"
+        _append_jsonl(tp, {"type": "USER_INPUT", "step_index": 0, "content": "请整理交接"})
+        session_context_loader.handle_pre_invocation({"conversationId": cid, "transcriptPath": str(tp)})
+        state_dir = self.plugin_data / "state"
+        gs = handoff_gate.load_gate_state(state_dir, cid)
+        gs["phase"] = "freeze"
+        handoff_gate.save_gate_state(state_dir, cid, gs)
+
+        def freeze_cmd(cmd: str) -> str:
+            return status_guard.handle_pre_tool_use({
+                "conversationId": cid,
+                "cwd": str(project),
+                "workspacePaths": [str(project)],
+                "toolCall": {"name": "run_command", "args": {"CommandLine": cmd}},
+            })["decision"]
+
+        self.assertEqual(freeze_cmd("env -u GIT_SSH git push origin main"), "deny")
+        self.assertEqual(freeze_cmd("sudo -u root git push origin main"), "deny")
+        self.assertEqual(freeze_cmd("command -v git"), "allow")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

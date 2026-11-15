@@ -1,19 +1,16 @@
 #!/usr/bin/env python3
 """
-================================================================================
-  Antigravity、Codex、Claude Code 与 DeepSeek Harness 工程／科研工作流安装器
-================================================================================
-功能特性：
-1. 自动探测客户端并按需部署（--app auto|all|both|antigravity|codex|claude|dsh）：
-   - 单反重力独立模式：部署 ~/.gemini/config/plugins/user-guard 全套插件（含双模压缩恢复与两阶段长会话交接停机门禁）、CLI 默认模型补缺与可选 Zotero MCP；
-   - 单 Codex 独立模式：部署 ~/.codex/AGENTS.md（保留自定义本机硬件段）、agents/readonly-*.toml 只读子代理、
-     hooks/ 原话压缩恢复和长会话交接钩子、config.toml 安全沙箱和默认模型补缺及可选 Zotero MCP；
-   - both 保持反重力加 Codex；all 部署四端（按已安装状态接入 DSH）。Claude 可选集成本地路由器与 CC Switch 提示词清理。
-   - 单 DSH 独立模式：同步 ~/.dsh/AGENTS.md 与 skills/ 托管技能（cae-harness、fleet-evolve），不改登录凭据或 cordis.patch.yml。
-2. 当本机仅检测到单客户端时，清晰提示是否先安装另一方；选择不安装（或非交互 --yes）即单独配置当前客户端，零报错闭环。
-3. --probe-apps 探测客户端；--audit-upgrade 零写入检查资产、卡片与本地模型目录对齐状态。
-4. 以 -B 无字节码模式运行 tests/ 下全套离线与端到端回归测试。
-================================================================================
+Antigravity、Codex、Claude Code 与 DeepSeek Harness 全局配置安装脚本（仅依赖 Python 3.11+ 标准库）。
+
+主要功能：
+1. 自动探测已安装客户端并按需同步配置（--app auto|all|both|antigravity|codex|claude|dsh）：
+   - Antigravity：同步 ~/.gemini/config/plugins/user-guard 插件（含压缩后原话恢复、项目外写操作拦截、重复等待拦截与长会话交接钩子）、CLI 默认模型补缺与可选 Zotero MCP；
+   - Codex：同步 ~/.codex/AGENTS.md（保留自定义尾段）、只读子代理、会话钩子、config.toml 工作区写沙箱与默认模型补缺及可选 Zotero MCP；
+   - Claude Code：同步 ~/.claude/CLAUDE.md（保留自定义尾段）、只读子代理、生命周期钩子与托管技能，可选同步本地分流代理并停用 CC Switch 旧提示词；
+   - DeepSeek Harness（DSH）：同步 ~/.dsh/AGENTS.md（保留自定义尾段）与托管技能，不改动登录凭据或 cordis.patch.yml。
+2. 仅检测到单个客户端时提示是否先安装其他客户端；选择继续或传入 --yes 时直接完成当前客户端配置。
+3. --probe-apps 只读探测客户端安装情况；--audit-upgrade 只读核查配置差异、CC Switch 卡片状态与本地模型列表。
+4. 安装后默认以 -B 无字节码模式运行 tests/ 下回归测试（可通过 --skip-test 跳过）。
 """
 
 import argparse
@@ -69,7 +66,7 @@ CLAUDE_RETIRED_SCRIPTS = ("background_status.py", "read_delegation_guard.py", "r
 
 
 def _load_fleet_profile(repo_root: Optional[Path] = None) -> Dict[str, Any]:
-    """读取受控的舰队能力评估快照清单（支持环境变量覆盖以供无模型耦合单测）。"""
+    """读取模型评估配置文件 fleet_profile.json（支持环境变量覆盖以供离线单测）。"""
     env_override = os.environ.get("CAE_FLEET_PROFILE", "").strip()
     candidates: List[Path] = []
     if env_override:
@@ -217,19 +214,19 @@ def validate_install_target(target: Path, repo_root: Path) -> Path:
     return resolved
 
 
-def validate_codex_home_target(codex_home: Path, repo_root: Path) -> Path:
-    """校验 Codex 主配置目录（支持真实 ~/.codex 或独立沙箱 --codex-home，拒绝源仓库重叠、用户主目录及链接重定向）"""
+def validate_codex_home_target(codex_home: Path, repo_root: Path, label: str = "Codex") -> Path:
+    """校验客户端配置主目录（支持默认目录或独立沙箱目录，拒绝源仓库重叠、用户主目录及链接重定向）"""
     resolved = _validate_path(codex_home, directory=True).resolve()
     repo_resolved = repo_root.resolve()
     user_root = Path.home().resolve()
 
     if resolved == user_root or resolved in user_root.parents:
-        raise ValueError(f"Codex 目标目录不能是用户主目录或上级系统目录: {resolved}")
+        raise ValueError(f"{label} 目标目录不能是用户主目录或上级系统目录: {resolved}")
     gemini_root = user_root / ".gemini"
     if resolved == gemini_root or gemini_root in resolved.parents:
-        raise ValueError(f"Codex 目标目录不能与反重力配置目录混用: {resolved}")
+        raise ValueError(f"{label} 目标目录不能与反重力配置目录混用: {resolved}")
     if resolved == repo_resolved or resolved in repo_resolved.parents or repo_resolved in resolved.parents:
-        raise ValueError(f"Codex 目标目录与源码仓库重叠: {resolved}")
+        raise ValueError(f"{label} 目标目录与源码仓库重叠: {resolved}")
     return resolved
 
 
@@ -2291,8 +2288,16 @@ def _audit_redact(value: Any, roots: List[Tuple[Path, str]], secrets: Set[str]) 
         except ValueError:
             return "<redacted-url>"
     value = re.sub(r"https?://[^\s\"<>]+", endpoint, value)
-    value = re.sub(r"(?i)(?:[A-Z]:[/\\]Users[/\\]|/(?:home|Users)/)[^/\\\s]+", "<home>", value)
-    value = re.sub(r"(?i)\b(?:sk-[A-Za-z0-9_-]{12,}|Bearer\s+[^\s]+)", "<redacted>", value)
+    value = re.sub(
+        r"(?i)(?:[A-Z]:[/\\]Users[/\\]|/mnt/[a-z]/Users/|(?:\\\\|//)wsl(?:\.localhost|\$)[/\\][^/\\\s]+[/\\]home[/\\]|/(?:home|Users)/)[^/\\\s\"']+",
+        "<home>",
+        value,
+    )
+    value = re.sub(
+        r"(?i)\b(?:sk-[A-Za-z0-9_-]{12,}|AIza[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|hf_[A-Za-z0-9]{20,}|glpat-[A-Za-z0-9_-]{16,}|Bearer\s+[^\s\"']+)",
+        "<redacted>",
+        value,
+    )
     return value
 
 
@@ -2327,8 +2332,13 @@ def audit_upgrade_status(
     def collect_secrets(doc: Any) -> None:
         if isinstance(doc, dict):
             for key, value in doc.items():
-                if re.search(r"(?i)(?:auth|api.?key|secret|password|(?:^|_)token(?:$|_))", key):
-                    if isinstance(value, str) and value not in {"via-router", "present", "missing"}:
+                if re.search(r"(?i)(?:auth|api.?key|secret|password|credential|bearer|(?:^|[_-])token(?:$|[_-])|[a-z0-9]Token$|^token[A-Z])", key):
+                    if (
+                        isinstance(value, str)
+                        and len(value.strip()) >= 6
+                        and not value.strip().isdigit()
+                        and value.strip().lower() not in {"via-router", "present", "missing", "placeholder", "n/a", "true", "false"}
+                    ):
                         secrets.add(value)
                 collect_secrets(value)
         elif isinstance(doc, list):
@@ -2595,15 +2605,22 @@ def audit_upgrade_status(
 
     cc = _audit_cli(detection.get("cc_switch", {}))
     port = 8240 if os.name == "nt" else 8241
+    router_cfg_path = claude_root / "router/router.json"
+    if router_cfg_path.is_file():
+        custom_router_cfg = read_json(router_cfg_path)
+        custom_port = custom_router_cfg.get("port") if isinstance(custom_router_cfg, dict) else None
+        if isinstance(custom_port, int) and not isinstance(custom_port, bool) and 1 <= custom_port <= 65535:
+            port = custom_port
     card_uses_router = False
     inspect_cc_db = not is_sandbox_run or explicit_cc
     if inspect_cc_db:
         try:
             admin = _load_ccswitch_admin(repo_root)
-            cc.update(admin.inspect_status(ccswitch_db, settings_path))
+            probe_port = port if (cl_active and not is_sandbox_run and (expect_cc_router or cl["router"]["installed"])) else None
+            cc.update(admin.inspect_status(ccswitch_db, settings_path, router_port=probe_port))
             current_card = cc.get("current_claude_card") or {}
             card_uses_router = current_card.get("base_url") == f"http://127.0.0.1:{port}"
-            if cl_active and (card_uses_router or (not is_sandbox_run and (expect_cc_router or cl["router"]["installed"]))):
+            if cl_active and card_uses_router and probe_port is None:
                 cc.update(admin.inspect_status(ccswitch_db, settings_path, router_port=port))
         except (OSError, ValueError, TypeError, sqlite3.Error) as exc:
             cc.update(db_exists=ccswitch_db.is_file(), schema_version=None, enabled_prompts=[], enabled_skills=[], inspection_error=type(exc).__name__)
@@ -2629,6 +2646,16 @@ def audit_upgrade_status(
             ref_re.sub(lambda m: m.group(0).split(":", 1)[0] + ":<custom-card>", str(warn))
             for warn in cc["warnings"]
         ]
+    for prompt_row in cc.get("enabled_prompts") or []:
+        if isinstance(prompt_row, dict):
+            prompt_row["id"] = "<custom-prompt-id>"
+            prompt_row["name"] = "<custom-prompt>"
+    for skill_row in cc.get("enabled_skills") or []:
+        if isinstance(skill_row, dict):
+            skill_row["id"] = "<custom-skill-id>"
+            skill_row["name"] = "<custom-skill>"
+    if isinstance(cc.get("skills_dir_entries"), list):
+        cc["skills_dir_entries"] = ["<custom-skill-dir>" for _ in cc["skills_dir_entries"]]
     cc["default_router_port"] = port
     cc["legacy_residue_present"] = bool(
         cc.get("stored_prompt_count") or cc.get("stored_skill_count") or cc.get("skills_dir_entries")
@@ -2676,7 +2703,7 @@ def audit_upgrade_status(
               "antigravity": ag, "codex": cx, "claude": cl, "dsh": dsh, "cc_switch": cc,
               "summary": {"all_aligned": not actions, "recommended_actions": actions}, "read_errors": errors}
     roots = [(home, "~"), (target_plugin_dir, "<antigravity>"), (codex_root, "<codex>"), (claude_root, "<claude>"),
-             (dsh_root, "<dsh>"), (repo_root, "<repo>")]
+             (dsh_root, "<dsh>"), (ccswitch_db.parent, "<ccswitch>"), (repo_root, "<repo>")]
     return _audit_redact(report, roots, secrets)
 
 
@@ -2794,15 +2821,17 @@ def resolve_multi_app_plan(
     if any(detection.get(name, {}).get("interop_available") or detection.get(name, {}).get("interop_status") == "unknown" for name in missing):
         print("[*] 对侧客户端可用或状态未确认，本次只配置已检测到的本侧客户端。")
         return installed
-    label = names[installed.index(True)]
-    if not _confirm_single_app_install(label, " / ".join(missing), interactive, auto_yes, dry_run):
+    app_labels = {"antigravity": "反重力 (Antigravity)", "codex": "Codex", "claude": "Claude Code"}
+    label = app_labels.get(names[installed.index(True)], names[installed.index(True)])
+    missing_labels = [app_labels.get(item, item) for item in missing]
+    if not _confirm_single_app_install(label, " / ".join(missing_labels), interactive, auto_yes, dry_run):
         sys.exit(0)
     return installed
 
 
 def main() -> None:
     """先解析参数、完成各端预检，再按预演或正式安装路径执行。"""
-    parser = argparse.ArgumentParser(description="Antigravity、Codex、Claude Code 与 DeepSeek Harness 统一工作流安装器")
+    parser = argparse.ArgumentParser(description="Antigravity、Codex、Claude Code 与 DeepSeek Harness 统一配置安装脚本")
     if sys.version_info < (3, 11):
         parser.error("需要 Python 3.11 或更高版本")
     parser.add_argument(
@@ -2812,7 +2841,7 @@ def main() -> None:
         help="auto 按已安装集合配置；both 仅反重力加 Codex；all 配置四端（按需接入 DSH）；也可单独指定客户端",
     )
     parser.add_argument("--probe-apps", action="store_true", help="只读探测四端客户端、CC Switch 与 Zotero，输出 JSON")
-    parser.add_argument("--audit-upgrade", action="store_true", help="零写入全栈升级与本地模型目录对齐体检，输出 JSON")
+    parser.add_argument("--audit-upgrade", action="store_true", help="只读检查各端配置、CC Switch 卡片与本地模型列表同步状态，输出 JSON")
     parser.add_argument("-y", "--yes", action="store_true", help="非交互自动确认（仅检测到单客户端时直接单独配置已安装的一端）")
     parser.add_argument("--target-dir", type=str, default="",
                         help="自定义反重力插件目录。配置 Zotero 时须采用 <配置目录>/plugins/user-guard 布局")
@@ -3006,9 +3035,9 @@ def main() -> None:
         agy_config_root = None
         if target_plugin_dir is not None:
             target_plugin_dir = validate_install_target(target_plugin_dir, repo_root)
-            for forbidden_codex in {default_codex_root.resolve(), (Path.home().resolve() / ".codex"), default_claude_root.resolve(), default_dsh_root.resolve()}:
-                if target_plugin_dir == forbidden_codex or forbidden_codex in target_plugin_dir.parents:
-                    raise ValueError(f"反重力插件目标目录不能位于 Codex 配置目录内: {target_plugin_dir}")
+            for forbidden_peer in {default_codex_root.resolve(), (Path.home().resolve() / ".codex"), default_claude_root.resolve(), default_dsh_root.resolve()}:
+                if target_plugin_dir == forbidden_peer or forbidden_peer in target_plugin_dir.parents:
+                    raise ValueError(f"反重力插件目标目录不能位于其他客户端配置目录内: {target_plugin_dir}")
             _validate_mirror(template_dir, target_plugin_dir)
             standard_layout = target_plugin_dir == target_plugin_dir.parent.parent / "plugins" / "user-guard"
             if zotero_exe and not standard_layout:
@@ -3048,13 +3077,13 @@ def main() -> None:
         if codex_skill_dirs:
             codex_skill_dirs = _validate_skill_targets(codex_skill_dirs)
         if claude_root is not None:
-            claude_root = validate_codex_home_target(claude_root, repo_root)
+            claude_root = validate_codex_home_target(claude_root, repo_root, label="Claude")
             if any(_paths_overlap(claude_root, other) for other in (default_plugin_root, default_codex_root, default_dsh_root)):
                 raise ValueError("Claude 目录不能与其他客户端配置目录相互包含")
             if not args.no_claude_skill:
                 _validate_skill_targets([claude_root / "skills" / name for name in skill_names])
         if dsh_root is not None:
-            dsh_root = validate_codex_home_target(dsh_root, repo_root)
+            dsh_root = validate_codex_home_target(dsh_root, repo_root, label="DSH")
             if any(_paths_overlap(dsh_root, other) for other in (default_plugin_root, default_codex_root, default_claude_root)):
                 raise ValueError("DSH 目录不能与其他客户端配置目录相互包含")
             if not args.no_dsh_rules:

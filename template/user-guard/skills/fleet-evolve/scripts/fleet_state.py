@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Host-local two-pass bootstrap state lock for fleet-evolve (stdlib only)."""
+"""fleet_state.py - fleet-evolve 维护流程的本机审批与重启验证状态锁（仅依赖 Python 标准库）。"""
 
 from __future__ import annotations
 

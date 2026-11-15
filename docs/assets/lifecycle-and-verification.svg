@@ -1,0 +1,119 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 500" width="1080" height="500" role="img" aria-labelledby="flow-title flow-desc">
+  <title id="flow-title">会话生命周期防护管线与后台定量验证闭环</title>
+  <desc id="flow-desc">上半部分展示交互式主会话在恢复/调用前、工具调用前与回合结束时的钩子防护管线（含用户原话与最近子代理返回摘要恢复）；下半部分展示 cae-harness 独立子进程的预检、快照隔离、定量验证门禁与 R6/L1-L4 验收闭环。</desc>
+  <defs>
+    <style>
+      .bg { fill: #f8fafc; stroke: #cbd5e1; stroke-width: 1.5; }
+      .title { font: 700 18px "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; fill: #0f172a; }
+      .subtitle { font: 400 12px "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; fill: #475569; }
+      .lane-hook { fill: #f0fdf4; stroke: #16a34a; stroke-width: 1.5; }
+      .lane-ver { fill: #eff6ff; stroke: #2563eb; stroke-width: 1.5; }
+      .card { fill: #ffffff; stroke: #94a3b8; stroke-width: 1.3; }
+      .lane-hdr-g { font: 700 13.5px "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; fill: #15803d; }
+      .lane-hdr-b { font: 700 13.5px "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; fill: #1d4ed8; }
+      .card-hdr { font: 700 12.5px "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; fill: #0f172a; }
+      .body { font: 400 11.2px "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; fill: #1e293b; }
+      .mono { font: 600 10.8px Consolas, "SFMono-Regular", Menlo, monospace; fill: #0f172a; }
+      .arrow-g { stroke: #16a34a; stroke-width: 1.7; fill: none; marker-end: url(#head-g); }
+      .arrow-b { stroke: #2563eb; stroke-width: 1.7; fill: none; marker-end: url(#head-b); }
+    </style>
+    <marker id="head-g" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#16a34a"/>
+    </marker>
+    <marker id="head-b" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#2563eb"/>
+    </marker>
+  </defs>
+
+  <rect x="8" y="8" width="1064" height="484" rx="12" class="bg"/>
+  <text x="540" y="35" text-anchor="middle" class="title">会话生命周期防护管线与后台定量验证闭环</text>
+  <text x="540" y="55" text-anchor="middle" class="subtitle">日常未压缩回合零字节注入（保护前缀缓存命中） · 压缩后双路恢复（历轮原话 + 最近子代理摘要） · 跨进程改码强制验证闭环</text>
+
+  <!-- Upper Lane: Interactive Lifecycle Hooks -->
+  <rect x="24" y="70" width="1032" height="192" rx="10" class="lane-hook"/>
+  <text x="40" y="93" class="lane-hdr-g">A. 交互式主会话钩子管线（Antigravity / Codex / Claude Code 事件驱动）</text>
+
+  <!-- Hook Step 1 -->
+  <rect x="40" y="106" width="320" height="142" rx="7" class="card"/>
+  <text x="52" y="126" class="card-hdr">① 恢复与调用前：压缩对齐恢复</text>
+  <text x="52" y="143" class="mono">session_context_loader.py + user_words.py</text>
+  <text x="52" y="162" class="body">• 无新压缩检查点：返回空对象（0 B 注入）</text>
+  <text x="52" y="180" class="body">• 压缩或恢复时原子归档并有界注入（&lt;=8000 字）：</text>
+  <text x="64" y="198" class="body">- 全部人类原话与选项回答（首轮总纲+近期定论）</text>
+  <text x="64" y="216" class="body">- 最近 4 条已完成子代理首尾摘要与日志路径指针</text>
+  <text x="64" y="234" class="body">- 与人类指令严格分区，防压缩遗忘且不越权覆盖</text>
+
+  <path d="M 360 177 L 380 177" class="arrow-g"/>
+
+  <!-- Hook Step 2 -->
+  <rect x="382" y="106" width="320" height="142" rx="7" class="card"/>
+  <text x="394" y="126" class="card-hdr">② 工具执行前：写边界与防轮询门禁</text>
+  <text x="394" y="143" class="mono">status_guard.py + handoff_gate.py</text>
+  <text x="394" y="162" class="body">• 拦截未获批项目外写删、重定向、worktree 与</text>
+  <text x="406" y="180" class="body">内联 Python AST 越界写入（无头子进程直接 deny）</text>
+  <text x="394" y="198" class="body">• 阻止对大小与修改时间未变的日志同区间重复读取</text>
+  <text x="394" y="216" class="body">• 长会话进入 drain / freeze 时阻断新开子代理、</text>
+  <text x="406" y="234" class="body">跨端派工与 git push，预留预算完成原子收尾</text>
+
+  <path d="M 702 177 L 722 177" class="arrow-g"/>
+
+  <!-- Hook Step 3 -->
+  <rect x="724" y="106" width="316" height="142" rx="7" class="card"/>
+  <text x="736" y="126" class="card-hdr">③ 回合结束时：防空等与交接校验</text>
+  <text x="736" y="143" class="mono">reply_repeat_guard.py + handoff_gate.py</text>
+  <text x="736" y="162" class="body">• 同回合连续 3 次输出无新数值进展的短句等待时</text>
+  <text x="748" y="180" class="body">触发单次拦截提醒（保留迭代步数与残差正常汇报）</text>
+  <text x="736" y="198" class="body">• 冻结交接期核验已验证进展、Git 状态、未完成项</text>
+  <text x="748" y="216" class="body">及可复制的【新对话提示词】（含 GOAL_CANCELLED）</text>
+  <text x="736" y="234" class="body">• 状态锁与日志超过 2 MiB 自动滚动裁剪</text>
+
+  <!-- Lower Lane: CAE Harness Closed-Loop Verification -->
+  <rect x="24" y="278" width="1032" height="198" rx="10" class="lane-ver"/>
+  <text x="40" y="301" class="lane-hdr-b">B. 后台独立子进程编排与定量验证闭环（cae_harness.py：task / audit / gate）</text>
+
+  <!-- Ver Step 1 -->
+  <rect x="40" y="314" width="234" height="146" rx="7" class="card"/>
+  <text x="52" y="334" class="card-hdr">1. 角色选路与预检</text>
+  <text x="52" y="351" class="mono">probe / assess / role:*</text>
+  <text x="52" y="370" class="body">• 读取 fleet_profile.json 候选</text>
+  <text x="52" y="388" class="body">• 核实可执行文件、密钥、路由健康</text>
+  <text x="64" y="406" class="body">及运行侧配额冷却记录（退出码 5）</text>
+  <text x="52" y="424" class="body">• 按窗口有效比例×90% 计算分片</text>
+  <text x="64" y="442" class="body">预算，过滤 ultra 自动委派挡</text>
+
+  <path d="M 274 387 L 292 387" class="arrow-b"/>
+
+  <!-- Ver Step 2 -->
+  <rect x="294" y="314" width="234" height="146" rx="7" class="card"/>
+  <text x="306" y="334" class="card-hdr">2. 独立上下文与读写边界</text>
+  <text x="306" y="351" class="mono">CAE_HARNESS_DEPTH=1</text>
+  <text x="306" y="370" class="body">• 全新进程运行，不挤占主会话窗口</text>
+  <text x="306" y="388" class="body">• 只读任务：前后全树文件哈希快照</text>
+  <text x="306" y="406" class="body">• 盲读模式：--clean-room 剥离规则</text>
+  <text x="306" y="424" class="body">• 改码任务：--write-scope 锁定白</text>
+  <text x="318" y="442" class="body">名单，越界立即报 scope_violation</text>
+
+  <path d="M 528 387 L 546 387" class="arrow-b"/>
+
+  <!-- Ver Step 3 -->
+  <rect x="548" y="314" width="234" height="146" rx="7" class="card"/>
+  <text x="560" y="334" class="card-hdr">3. 定量门禁闭环修正</text>
+  <text x="560" y="351" class="mono">gate --verify-cmd</text>
+  <text x="560" y="370" class="body">• 强制绑定非空定量验证脚本</text>
+  <text x="560" y="388" class="body">• 严禁放宽 rtol / atol 或删断言</text>
+  <text x="560" y="406" class="body">• 未通过时自动将真实报错回传子进</text>
+  <text x="572" y="424" class="body">程在 --max-rounds 内迭代修复</text>
+  <text x="560" y="442" class="body">• 回执实报 verification_executed</text>
+
+  <path d="M 782 387 L 800 387" class="arrow-b"/>
+
+  <!-- Ver Step 4 -->
+  <rect x="802" y="314" width="238" height="146" rx="7" class="card"/>
+  <text x="814" y="334" class="card-hdr">4. R6 复核与 L1–L4 披露</text>
+  <text x="814" y="351" class="mono">handoff_to_caller: true</text>
+  <text x="814" y="370" class="body">• 主会话亲自打开原文件核对行号</text>
+  <text x="814" y="388" class="body">• L1 源码就位  ·  L2 编译单测通过</text>
+  <text x="814" y="406" class="body">• L3 守恒与几何不变量达机器零</text>
+  <text x="814" y="424" class="body">• L4 网格加密收敛阶 EOC 达标</text>
+  <text x="814" y="442" class="body">• 未执行项如实标注“未验证”</text>
+</svg>

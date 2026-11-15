@@ -4,13 +4,13 @@
   "evaluated_at": "2026-11-15",
   "evaluation_policy": {
     "bidirectional_strength_and_defect_audit": true,
-    "defect_veto_priority": "双向评估各客户端与模型的长板与短板；长板决定角色能力上限，致命短板（风控封号、硬限流断流、协议转换丢包、自动派生死等、压缩丢指令）作为一票否决或隔离边界。",
+    "defect_veto_priority": "同步评估各客户端与模型的优势与短板；优势决定角色选型，严重短板（平台访问受限、高频会话配额上限、协议转换丢包、自动派生子代理阻塞、长对话压缩丢失早期约束）作为排除或参数隔离依据。",
     "user_approval_required_before_apply": true,
     "approval_checkpoints": [
-      "生成或变更推荐的客户端 × 模型 × 推理挡位搭配表（fleet_profile.json 与 README 表一）时必须停下请用户拍板",
-      "向宿主机全局目录写入配置（install.py 正式执行）或切换当前主控客户端时必须停下请用户批准（R4）",
-      "涉及系统级 Python 跨次版本、CUDA 跨大版本或 WSL 跨 LTS 发行版等高耦合升级时必须发出警告并交由用户裁决",
-      "执行 git push 推送远端仓库前必须停下等待用户明确指令"
+      "生成或调整推荐的客户端 × 模型 × 推理挡位搭配表时须停下请用户拍板",
+      "向宿主机全局目录写入配置（install.py 正式执行）或切换主控客户端时须先获用户批准（R4）",
+      "涉及系统级 Python 跨次版本、CUDA 跨大版本或 WSL 跨 LTS 发行版等 ABI 强耦合升级时须发出警告并交由用户决定",
+      "执行 git push 推送远端仓库前须停下等待用户明确指令"
     ]
   },
   "roles": {
@@ -19,41 +19,41 @@
       "recommended_client": "antigravity",
       "recommended_model_family": "carbon",
       "recommended_tier": "high",
-      "dynamic_role_note": "总控客户端并非永久绑定反重力；当后续评估发现其他客户端与旗舰模型在自然语言表达、长程稳定性与订阅成本上综合更优时，通过 fleet-evolve 经用户拍板后动态切换。",
-      "strengths": "Google 旗舰模型中文自然语言理解与直白沟通能力最强（最说人话），适合承担面向研发人员的需求对齐、方案权衡与汇报总控；且旗舰额度原生绑定反重力订阅，单独按量购买官方旗舰 API 成本过高。",
-      "defects_and_mitigations": "单会话在二十余万 token 附近即触发自动检查点压缩，长对话历史易丢失早期约束；需配合 R9 用户原话落盘恢复，并将重度公式推导与多文件编码分流至后台独立进程。"
+      "dynamic_role_note": "主控客户端并非永久绑定 Antigravity；当后续评估表明其他客户端与主力模型在中文表达清晰度、长对话稳定性与订阅成本上综合更合适时，通过 fleet-evolve 经用户批准后切换。",
+      "strengths": "中文自然语言理解与日常工程沟通平实清晰，适合承担需求澄清、方案权衡与主会话协调；Gemini 4 Carbon 在客户端目录中的最高单模型挡位即为 High，且直接使用客户端订阅内含的模型组滚动配额（5 小时窗口与 7 天周期额度），无需单独按量采购 API。",
+      "defects_and_mitigations": "交互式单会话在约 20 万至 26 万 token 附近会触发自动检查点压缩，且 agy models 命令行不返回整数窗口字段；通过 R9 钩子自动归档恢复历轮用户原话与最近 4 次子代理返回摘要，在 cae_harness.py 中按 120,000 token 保守单分片预算规划审查，并通过 blocked_auto_tokens 跳过共享窗口 Orchestrator 及独立配额池的第三方模型。"
     },
     "math": {
       "candidates": ["codex:math", "codex:code", "agy:default", "dsh:default", "claude:default"],
       "recommended_client": "codex",
       "recommended_model_family": "astra",
       "recommended_tier": "max",
-      "strengths": "长链条偏微分方程离散推导、几何不变量证明、雅可比求导与形式化边界分析严谨度最高，原生 CLI 前缀缓存复用率高且复用订阅配额。",
-      "defects_and_mitigations": "多文件工程改写速度慢于编码主力模型，且开启 ultra 挡位会触发大量子代理派生与空等超时；必须锁定单模型非委派最高挡 max 并限定明确文件范围。"
+      "strengths": "擅长长链条偏微分方程离散推导、几何不变量证明、雅可比矩阵求导与边界条件相容性分析；客户端缓存声明最大窗口 872,000 token（有效窗口比例 95%，脚本单次规划预算 745,560 token），连续工具调用可自动复用服务端前缀缓存，支持 ChatGPT 订阅额度（5 小时滚动窗口与周度上限）或按量 API。",
+      "defects_and_mitigations": "客户端缓存默认推理挡位为 medium、默认窗口为 272,000 token，不显式传参无法用满窗口与推理预算；开启 ultra 委派挡位则会自动派生多层子代理引发轮询超时。由 install.py 与 cae_harness.py 显式声明 872,000 窗口与单模型非委派最高挡 max，并在只读任务前后比对工作区文件哈希快照。"
     },
     "code": {
       "candidates": ["codex:code", "codex:math", "claude:default", "agy:default", "dsh:default"],
       "recommended_client": "codex",
       "recommended_model_family": "sol",
       "recommended_tier": "max",
-      "strengths": "核心算法实现、跨模块补丁收敛与带验证命令（gate --verify-cmd）的闭环修复效率最高，支持显式声明 872k 上下文窗口。",
-      "defects_and_mitigations": "Windows 下无范围遍历大型仓库易触发进程调用超时；派工时须附带明确读写范围（--write-scope）与必读行号指引。"
+      "strengths": "适合核心算法实现、跨模块重构与配合验证命令（gate --verify-cmd）自动迭代闭环修复；客户端缓存声明最大窗口 872,000 token（单次规划预算 745,560 token），多文件补丁生成稳定。",
+      "defects_and_mitigations": "客户端缓存默认推理挡位为 low、默认窗口为 500,000 token，且在 Windows 下不限定目标目录遍历大型仓库时易因进程调用开销触发超时；脚本显式传入 max 挡位与 872,000 窗口，派发任务须配合 --write-scope 与必读行号限定范围。"
     },
     "review": {
       "candidates": ["claude:default", "codex:code", "agy:default", "dsh:default"],
       "recommended_client": "claude",
       "recommended_model_family": "k3.1-pro[1m]+deepseek-flash",
       "recommended_tier": "max",
-      "strengths": "Claude Code 客户端具备成熟的五类确定性生命周期钩子与原生 --json-schema 结构化输出强约束，挂载原生兼容 Anthropic Messages 协议的 Kimi 与 DeepSeek 接口可兼顾多步工具稳定性与低成本长窗口审查。",
-      "defects_and_mitigations": "严禁走第三方 Responses API 协议转换反代（易引发 HTTP 422 工具调用 ID 断裂与流截断）；无头只读调用固定传入 --permission-mode dontAsk，避免触发 auto 模式额外安全分类器限流报错。"
+      "strengths": "Claude Code 客户端提供完整的五类生命周期钩子与原生 --json-schema 结构化输出校验；经本地 router.py（或 CC Switch 直连卡片）接入原生实现 Anthropic Messages API（/v1/messages）的 Kimi 与 DeepSeek 官方接口（均支持 1M 上下文窗口，单次规划预算 900,000 token），按 API 余额与速率等级计费并自动享受前缀缓存折扣。",
+      "defects_and_mitigations": "严禁接入第三方 Responses API 协议转换反代（易因工具调用 ID 映射不一致触发 HTTP 422 或流式响应中断）；无头只读调用固定附加 --permission-mode dontAsk，避免触发 auto 权限模式的额外安全分类器限流报错。"
     },
     "fast": {
       "candidates": ["dsh:fast", "claude:@fast", "agy:fast", "codex:@fast"],
       "recommended_client": "dsh",
       "recommended_model_family": "deepseek-flash",
       "recommended_tier": "low",
-      "strengths": "无需额外本地路由即可通过官方账号或 API Key 零配置直连，既可作为单客户端入门方案，也可在用户明确要求省额度或其他客户端配额耗尽时提供快速接替。",
-      "defects_and_mitigations": "DSH 命令行暂未提供原生钩子与 --json-schema 参数，需由编排器在提示词与解析层强化单 JSON 结构校验；轻量挡位绝不作为高严谨度推导与核心审查的静默降级去向。"
+      "strengths": "通过官方账号登录（deepseek-account）或 DEEPSEEK_API_KEY（~/.dsh/.credentials.yaml 或 .env）即可直连，内置 DeepSeek-V4-Pro 与 DeepSeek-V4.1-Flash 均声明 1,048,576 token 窗口（单次规划预算 943,718 token，支持 off/low/high/max 四挡）；既可单客户端独立使用，也可在显式省额度或其他客户端进入配额冷却时接替。",
+      "defects_and_mitigations": "DSH 命令行暂未内置生命周期钩子与原生 --json-schema 参数，偶发附带底层工具停止标记；由 cae_harness.py 自动注入单 JSON 输出约束并清洗尾随 DSML 标记，且轻量挡仅用于显式省额度或快速表面检查，不静默替代高严谨度推导与核心审查。"
     }
   },
   "excluded_or_retiring": {
@@ -61,7 +61,7 @@
       {
         "vendor": "anthropic_native_claude",
         "status": "excluded_until_policy_relaxed",
-        "reason": "在 Anthropic 解除过严的风控封号操作及 5 小时会话／7 天周度硬限流之前，暂不考虑接入 Claude 原生模型；当前仅复用本地 Claude Code 客户端外壳与钩子机制连接兼容协议的国产官方模型。"
+        "reason": "受平台区域访问限制与订阅会话/周度配额上限影响，当前暂不默认接入 Claude 原生系列模型；仅复用本地 Claude Code 客户端的钩子与结构化输出能力连接兼容协议的官方接口。"
       }
     ],
     "agy_retiring_patterns": [

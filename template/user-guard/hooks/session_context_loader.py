@@ -1,15 +1,12 @@
 """
-session_context_loader.py - 反重力与 Codex 双端上下文压缩原话回溯引擎 (user-guard)
+session_context_loader.py - Antigravity、Codex 与 Claude Code 压缩后原话及最近子代理返回恢复钩子 (user-guard)
 
 挂载事件：
-- Antigravity 侧 (--client antigravity，默认)：
-  * SessionStart: 会话初次启动或进程冷重载时同步检查点游标（若存在未注入的压缩检查点则补注入 1 次）
-  * PreInvocation: 会话运行中每轮调用模型前，通过 O(Δbytes) 二进制增量游标检测新增 CHECKPOINT：
-    日常未压缩对话零全盘读取、零上下文注入；发生压缩后首轮精确触发 1 次全量原话提取落盘并注入索引与摘要；
-    同时增量维护压缩频次/间隔与多模态读图遥测，联动 handoff_gate.py 注入长会话预警 (advisory) 与强收口停机提醒 (drain/freeze)。
-- Codex 侧 (--client codex)：
-  * SessionStart (matcher: ^(compact|resume)$): 在 Codex 发生上下文压缩或恢复会话时，合并同 ID 主会话全部 rollout 分段，
-    原子刷新 hooks/state/user-words/<session_id>.md 并通过 hookSpecificOutput.additionalContext 注入原话档案路径与核心指令摘要。
+- Antigravity（--client antigravity，默认）：
+  * SessionStart：会话启动或重载时同步检查点游标，若存在尚未注入的压缩检查点则补发一次恢复提醒；
+  * PreInvocation：每轮调用模型前按文件字节偏移增量检查新增 CHECKPOINT；未发生压缩时不额外读全盘、不注入上下文；发生压缩后提取全部用户原话与最近子代理返回摘要写入归档文件，并向本轮有界注入归档路径、原话摘要及最近子代理返回摘要，同时配合 handoff_gate.py 发送长会话提醒。
+- Codex 与 Claude Code（--client codex / claude）：
+  * SessionStart（触发源 compact 或 resume）：在上下文压缩或会话恢复时刷新 hooks/state/user-words/<session_id>.md，并通过 hookSpecificOutput.additionalContext 注入原话归档路径、历史指令摘要与最近子代理返回摘要。
 """
 
 # ① 常量、阈值与宿主依赖
@@ -32,6 +29,8 @@ user_words.ensure_utf8_stdio()
 
 MAX_INLINE_TOTAL_CHARS = 8000
 MAX_INLINE_ITEM_CHARS = 1200
+MAX_INLINE_SUBAGENT_TOTAL_CHARS = 1400
+MAX_INLINE_SUBAGENT_ITEM_CHARS = 280
 MAX_TRANSCRIPT_TRACKED_IMAGES = 2000
 ARCHIVE_RETRY_INTERVAL_SEC = 30
 
@@ -233,7 +232,7 @@ def _scan_transcript_incrementally(
 ) -> bool:
     """
     从上次 scannedByteOffset 起以二进制模式仅扫描新增尾部字节，
-    极速捕获新增的 CHECKPOINT 步骤与 USER_INPUT 标记。
+    识别新增的 CHECKPOINT 步骤与 USER_INPUT 标记。
     返回 state 是否发生变更。
     """
     try:
@@ -458,6 +457,29 @@ def _truncate_single_item(content: str, turn: int, max_chars: int = MAX_INLINE_I
     )
 
 
+def _format_inline_subagent_section(subagent_returns: List[Dict[str, Any]]) -> str:
+    if not subagent_returns:
+        return ""
+    title = "【最近子代理返回摘要（采纳前须按 R6 核对原文件或子代理日志）】"
+    chosen_blocks: List[str] = []
+    used = len(title) + 2
+    for item in reversed(subagent_returns):
+        label = str(item.get("label") or item.get("agent_id") or "subagent").strip()
+        trunc_tag = " | 轨迹截断" if item.get("truncated") else ""
+        log_hint = f"\n原始日志：{item['log_path']}" if item.get("log_path") else ""
+        body = user_words.summarize_subagent_return(item.get("content", ""), MAX_INLINE_SUBAGENT_ITEM_CHARS)
+        blk = f"· [{label} | Step {item['step_index']}{trunc_tag}]{log_hint}\n{body}"
+        cost = len(blk) + (2 if chosen_blocks else 1)
+        if used + cost > MAX_INLINE_SUBAGENT_TOTAL_CHARS:
+            break
+        chosen_blocks.append(blk)
+        used += cost
+    if not chosen_blocks:
+        return ""
+    chosen_blocks.reverse()
+    return "\n\n" + title + "\n" + "\n\n".join(chosen_blocks)
+
+
 def build_compaction_system_message(
     words: List[Dict[str, Any]],
     saved_md_path: Optional[Path],
@@ -467,16 +489,24 @@ def build_compaction_system_message(
     issues: Optional[List[str]] = None,
     source_paths: Optional[List[str]] = None,
     header: str = "",
+    subagent_returns: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
-    """构造带预算上限保护与归档文件指针的原话回溯系统消息"""
+    """构造带预算上限保护与归档文件指针的原话及最近子代理摘要回溯消息"""
     archive_str = str(saved_md_path) if saved_md_path else "未落盘"
     total_turns = len(words)
+    recent_returns = list(subagent_returns or [])
 
-    header_lines = [header] if header else [
-        f"【系统原话回溯】会话经过压缩或恢复（触发源：{trigger_reason}）。",
-        f"归档位置：{archive_str}",
-        f"归档状态：{archive_status}。本次提取 {total_turns} 条记录。",
-    ]
+    if header:
+        header_lines = [header]
+        if recent_returns:
+            header_lines.append(f"最近子代理返回摘要：{len(recent_returns)} 条（已附于归档末尾）")
+    else:
+        sub_note = f"，附最近 {len(recent_returns)} 条子代理返回摘要" if recent_returns else ""
+        header_lines = [
+            f"【系统原话回溯】会话经过压缩或恢复（触发源：{trigger_reason}）。",
+            f"归档位置：{archive_str}",
+            f"归档状态：{archive_status}。本次提取 {total_turns} 条记录{sub_note}。",
+        ]
     if source_paths:
         header_lines.append("原始轨迹：" + "、".join(source_paths[:2]))
         if len(source_paths) > 2:
@@ -486,6 +516,9 @@ def build_compaction_system_message(
         header_lines.append(f"缺口信息：{detail[:1100]}" + ("…（其余缺口见日志或归档）" if len(detail) > 1100 else ""))
     header_lines.append("请按全局规则 R9 核对原始轨迹、归档状态及用户最新裁定，汇报现状后继续。")
     header_text = "\n".join(header_lines) + "\n\n"
+
+    subagent_section = _format_inline_subagent_section(recent_returns)
+    words_total_budget = MAX_INLINE_TOTAL_CHARS - len(subagent_section)
 
     formatted_blocks: List[str] = []
     for w in words:
@@ -502,12 +535,13 @@ def build_compaction_system_message(
         formatted_blocks.append(block)
 
     joined_all = "\n\n".join(formatted_blocks)
-    if len(header_text) + len(joined_all) <= MAX_INLINE_TOTAL_CHARS or not formatted_blocks:
-        return header_text + joined_all
+    if len(header_text) + len(joined_all) <= words_total_budget or not formatted_blocks:
+        combined = header_text + joined_all + subagent_section
+        return combined if len(combined) <= MAX_INLINE_TOTAL_CHARS else (header_text + joined_all)[:MAX_INLINE_TOTAL_CHARS]
 
     # 超出总预算时：必保第 1 轮立项总纲 + 逆序尽可能多地保留最近定论轮次
     first_block = formatted_blocks[0]
-    budget_left = MAX_INLINE_TOTAL_CHARS - len(header_text) - len(first_block) - 180
+    budget_left = words_total_budget - len(header_text) - len(first_block) - 180
     tail_blocks: List[str] = []
     used = 0
     for blk in reversed(formatted_blocks[1:]):
@@ -524,9 +558,13 @@ def build_compaction_system_message(
             f"...（中间第 2～{end_omitted_turn} 轮共 {omitted_count} 条历史指令因上下文预算省略内联；"
             "请按 R9 查阅轨迹和已保存的归档）..."
         )
-        return header_text + "\n\n".join([first_block, omit_notice] + tail_blocks)
+        words_rendered = header_text + "\n\n".join([first_block, omit_notice] + tail_blocks)
+        if len(words_rendered) + len(subagent_section) <= MAX_INLINE_TOTAL_CHARS:
+            return words_rendered + subagent_section
+        return words_rendered[:MAX_INLINE_TOTAL_CHARS]
 
-    return header_text + joined_all
+    combined_fallback = header_text + joined_all + subagent_section
+    return combined_fallback[:MAX_INLINE_TOTAL_CHARS]
 
 
 # ⑤ Antigravity 恢复流程与兼容入口
@@ -584,9 +622,10 @@ def _handle_context_locked(conversation_id: str, event_name: str, explicit_sourc
     injected_blocks: List[str] = []
 
     if trigger_reason:
-        # 确证发生新的上下文压缩或首次显式恢复：提取纯净用户原话（主会话不含子代理系统消息）
+        # 确证发生新的上下文压缩或首次显式恢复：提取纯净用户原话与最近子代理返回摘要（严格与人类原话分区）
         archive = user_words.extract_agy_archive(str(transcript_path), include_subagent_msgs=False)
         words = archive["words"]
+        subagent_returns = archive.get("subagent_returns") or []
         unresolved_steps = archive["unresolved_steps"]
         unverified_answers = archive["unverified_answers"]
         issues = list(archive["issues"])
@@ -607,8 +646,13 @@ def _handle_context_locked(conversation_id: str, event_name: str, explicit_sourc
             saved_md_path = existing
             archive_status = "保留已有文件，本次提取存在缺口"
         else:
-            saved_md_path = (user_words.save_user_words_markdown(state_dir, conversation_id, words, issues)
-                             if update_notice or not existing.is_file() else existing)
+            saved_md_path = (
+                user_words.save_user_words_markdown(
+                    state_dir, conversation_id, words, issues, subagent_returns=subagent_returns
+                )
+                if update_notice or not existing.is_file()
+                else existing
+            )
             archive_status = "已保存部分记录" if issues else "本次可见轨迹中的原话已归档"
             state["archiveComplete"] = bool(saved_md_path) and not issues
         if issues:
@@ -626,12 +670,14 @@ def _handle_context_locked(conversation_id: str, event_name: str, explicit_sourc
             injected_blocks.append(build_compaction_system_message(
                 words, saved_md_path, trigger_reason, archive_status=archive_status, issues=issues,
                 source_paths=[str(transcript_path), str(transcript_path.parent / "transcript_full.jsonl")],
+                subagent_returns=subagent_returns,
             ))
             state["lastInjectedAt"] = get_current_iso_time()
             state["lastInjectedWordCount"] = len(words)
         log_event(
             event_name, conversation_id, f"原话归档检查：{trigger_reason}（{archive_status}）",
-            {"wordCount": len(words), "latestCheckpointStep": latest_cp, "unresolvedSteps": unresolved_steps,
+            {"wordCount": len(words), "subagentReturnCount": len(subagent_returns),
+             "latestCheckpointStep": latest_cp, "unresolvedSteps": unresolved_steps,
              "unverifiedAnswers": unverified_answers, "issues": issues},
         )
 
@@ -660,7 +706,7 @@ def _handle_context_locked(conversation_id: str, event_name: str, explicit_sourc
 def handle_context_check(payload: Dict[str, Any], event_name: str = "PreInvocation") -> Dict[str, Any]:
     """
     统一处理 SessionStart 与 PreInvocation 事件：
-    1. 日常无新增 CHECKPOINT：增量游标毫秒级返回 {"injectSteps": []}，零全盘扫描、零重复注入；
+    1. 日常无新增 CHECKPOINT：按增量字节游标直接返回 {"injectSteps": []}，避免全文件重复扫描与重复注入；
     2. 捕获新增 CHECKPOINT（或显式 compact/resume 信号）：提取全量用户原话落盘并精确注入 1 次。
     """
     conversation_id = str(payload.get("conversationId") or "unknown_session").strip()
@@ -760,7 +806,11 @@ def handle_codex_session_start(
     full_context = build_compaction_system_message(
         words, Path(saved["file"]) if saved.get("available") else None, f"Codex {source}",
         header="\n".join(lines), issues=result.get("issues"), source_paths=source_paths,
+        subagent_returns=result.get("subagent_returns"),
     )
+    if len(full_context) > MAX_INLINE_TOTAL_CHARS:
+        suffix = "\n（内联内容已截断，请查阅原话档案。）"
+        full_context = full_context[:MAX_INLINE_TOTAL_CHARS - len(suffix)] + suffix
 
     _append_codex_log(
         log_path,
@@ -814,6 +864,7 @@ def handle_claude_session_start(
     full_context = build_compaction_system_message(
         result["words"], Path(saved["file"]) if saved.get("available") else None, f"Claude {source}",
         header="\n".join(lines), issues=result["issues"], source_paths=result["segments"],
+        subagent_returns=result.get("subagent_returns"),
     )
     # 路径、来源和时间戳也可能很长，最终输出仍须遵守 SessionStart 字符预算。
     if len(full_context) > MAX_INLINE_TOTAL_CHARS:

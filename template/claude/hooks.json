@@ -51,7 +51,7 @@
             "type": "command",
             "command": "python3 -X utf8 -I -B \"~/.claude/hooks/status_guard.py\" --client claude --state-dir \"~/.claude/hooks/state\" --log-dir \"~/.claude/hooks/logs\"",
             "timeout": 15,
-            "statusMessage": "核验工作区边界与防空转门禁"
+            "statusMessage": "检查工作区写边界与日志重复读取"
           },
           {
             "type": "command",

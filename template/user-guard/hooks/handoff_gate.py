@@ -456,14 +456,44 @@ def _strip_token_quotes(tok: str) -> str:
 
 
 def _unwrap_clause_or_shell(tokens: List[str]) -> Tuple[List[str], Optional[str]]:
-    """剥离前导 env/timeout/wsl/& 等包装；若遇到 bash -lc / powershell -Command 等壳包装则返回内层脚本供递归分类。"""
+    """剥离前导 env/sudo/command/timeout/wsl/& 等包装；若遇到 bash -lc / powershell -Command 等壳包装则返回内层脚本供递归分类。"""
     idx = 0
     n = len(tokens)
     while idx < n:
         head_raw = _strip_token_quotes(tokens[idx])
         head_name = Path(head_raw.replace("\\", "/")).name.lower()
-        if head_raw == "&" or head_name in ("sudo", "command", "env"):
+        if head_raw == "&":
             idx += 1
+            continue
+        if head_name == "command":
+            idx += 1
+            while idx < n and _strip_token_quotes(tokens[idx]).startswith("-"):
+                fl = _strip_token_quotes(tokens[idx])
+                idx += 1
+                if fl == "--":
+                    break
+                if fl in ("-v", "-V") or (not fl.startswith("--") and any(c in fl[1:] for c in ("v", "V"))):
+                    return [], None
+            continue
+        if head_name == "env":
+            idx += 1
+            while idx < n and _strip_token_quotes(tokens[idx]).startswith("-"):
+                fl = _strip_token_quotes(tokens[idx])
+                idx += 1
+                if fl == "--":
+                    break
+                if fl in ("-u", "--unset", "-C", "--chdir", "-S", "--split-string") and idx < n:
+                    idx += 1
+            continue
+        if head_name == "sudo":
+            idx += 1
+            while idx < n and _strip_token_quotes(tokens[idx]).startswith("-"):
+                fl = _strip_token_quotes(tokens[idx])
+                idx += 1
+                if fl == "--":
+                    break
+                if fl in ("-u", "--user", "-g", "--group", "-h", "--host", "-p", "--prompt", "-r", "--role", "-t", "--type", "-C", "-D", "--chdir") and idx < n:
+                    idx += 1
             continue
         if "=" in head_raw and not head_raw.startswith("-") and "/" not in head_raw and "\\" not in head_raw:
             idx += 1
@@ -1474,8 +1504,8 @@ def check_pre_tool_use_locked(payload: Dict[str, Any], state_dir: Path,
             return {
                 "decision": "deny",
                 "reason": (
-                    "【user-guard 长会话交接门禁 (drain -> freeze)】排空动作预算（8 次）已用完，已转入冻结期！"
-                    "禁止继续修改业务文件，请整理交接提示词并停机。"
+                    f"【user-guard 长会话交接门禁 (drain -> freeze)】收尾动作预算（{DEFAULT_DRAIN_ACTIONS} 次）已用完，已转入冻结阶段。"
+                    "禁止继续修改业务文件，请整理交接提示词后结束本轮。"
                 ),
             }
         if consume_drain_action(gate_state):
@@ -1599,7 +1629,7 @@ def check_stop_handoff_locked(
     has_prompt_inline = _handoff_structure_present(latest_reply)
     if not has_file and not has_prompt_inline:
         missing_parts.append(
-            "尚未落盘非空交接文档且最终回复中缺少可直接复制粘贴到新对话的完整【接续提示词】（含已验证进度、Git 状态与未尽事项）"
+            "尚未落盘非空交接文档且最终回复中缺少可直接复制粘贴到新对话的完整【新对话提示词】（含已验证进度、Git 状态与未完成事项）"
         )
 
     requires_cancel = bool(gate_state.get("isGoalActive")) if goal_active is None else goal_active
@@ -1637,8 +1667,8 @@ def check_stop_handoff_locked(
 
 # ⑥ Codex 压缩事件对账与独立协议适配
 
-def _codex_notice(phase: str, count: int, mode: str) -> str:
-    prefix = f"【Codex 长会话交接：{phase}】已登记的压缩次数下界为 {count}。模式 {mode}。"
+def _codex_notice(phase: str, count: int, mode: str, client_label: str = "Codex") -> str:
+    prefix = f"【{client_label} 长会话交接：{phase}】已登记的压缩次数下界为 {count}。模式 {mode}。"
     if phase == "overridden":
         return prefix + "已按用户明确指令继续；宽限到其后第 3 个新压缩事件，再按已配置策略评估。"
     if phase in ("drain", "freeze"):
@@ -2062,9 +2092,8 @@ def _handle_native_handoff(payload: Dict[str, Any], state_dir: Path, mode: str,
                          stopCorrectionRequested=False, handoffRecorded=False, toolDecisions={},
                          handoffFileBaselines={})
         phase = state["phase"]
-        notice = _codex_notice(phase, count, mode)
-        if client == "claude":
-            notice = notice.replace("Codex", "Claude", 1)
+        client_label = "Claude" if client == "claude" else "Codex"
+        notice = _codex_notice(phase, count, mode, client_label=client_label)
         if state["compactionIssues"]:
             notice += " 压缩轨迹对账存在缺口，次数按当前可见证据保守计算。"
         response: Dict[str, Any] = {}
@@ -2085,9 +2114,7 @@ def _handle_native_handoff(payload: Dict[str, Any], state_dir: Path, mode: str,
                             "permissionDecisionReason": notice}}
             elif kind == "mutating_other":
                 if consume_drain_action(state):
-                    notice = _codex_notice(state["phase"], count, mode)
-                    if client == "claude":
-                        notice = notice.replace("Codex", "Claude", 1)
+                    notice = _codex_notice(state["phase"], count, mode, client_label=client_label)
                     if state["compactionIssues"]:
                         notice += " 压缩轨迹对账存在缺口，次数按当前可见证据保守计算。"
                 response = _codex_context(event, notice)

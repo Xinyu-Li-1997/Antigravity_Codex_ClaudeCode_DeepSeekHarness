@@ -1,15 +1,13 @@
 """
-reply_repeat_guard.py - 反重力 Stop 交接终审与防连续同质等待刷屏门禁 (user-guard)
+reply_repeat_guard.py - Stop 阶段长会话交接核查与重复等待回复拦截钩子 (user-guard)
 
-正常模型停机时检查交接与重复等待。后台是否空闲和 Stop 钩子续跑状态独立判定。
-1. 长会话 Stage-2 (drain/freeze) 交接终审（联动 handoff_gate.py）：
-   - 核验是否已落盘非空交接文档或回复中已给出可粘贴【新对话提示词】；开启 /goal 时同时强制校验末尾是否附带 `<!-- GOAL_CANCELLED -->` 终止标记（每回合至多阻断 1 次）。
-2. 日常防连续同质等待刷屏：
-   - 优先定位紧凑版 transcript.jsonl，尾部高效读取末尾窗口（>256KB 时仅扫描末尾窗口，并在单回合超长时分块逆序溯源），按最近一条 USER_INPUT 或父代理消息定位当前回合；
-   - 检测模型最新回复是否为短状态等待回复（<=300 字符、含后台运行等待词、不含向用户提问或等待用户拍板词）；
-   - 严格执行相邻归一化文本同质比对（保留数字以区分真实迭代步数/残差进展！）：
-     仅当同一回合连续 3 次输出同质无增量的短状态等待回复时，触发 1 次 decision="continue" 阻断提醒；
-   - 同一用户回合至多触发一次续跑。
+在模型准备结束当前回合时执行两项检查（互不干扰后台正常任务）：
+1. 长会话收尾阶段（drain / freeze）交接核查（配合 handoff_gate.py）：
+   - 检查是否已写入非空交接文档，或在回复中给出可直接复制的【新对话提示词】；开启 /goal 时同步检查末尾是否包含 `<!-- GOAL_CANCELLED -->` 标记（每个用户回合最多提醒补齐一次）。
+2. 连续重复空等回复拦截：
+   - 读取会话轨迹末尾窗口（文件超过 256 KB 时仅扫描尾部窗口，单回合超长时向前分块定位回合起点）；
+   - 判断最新回复是否属于无实质进展的短等待提示（不超过 300 字符、含后台运行等待词、不含向用户提问或请用户决定的词）；
+   - 相邻回复按保留数字的归一化文本比对（保留迭代步数与残差数值），仅当同一回合连续三次输出内容相近的无增量短等待回复时触发一次拦截提醒。
 """
 
 # ① 常量、阈值与宿主依赖
@@ -113,8 +111,8 @@ USER_DECISION_OR_QUESTION_MARKERS = (
 )
 
 BLOCK_REASON_TEXT = (
-    "【user-guard 防刷屏门禁阻断】当前已连续三次输出内容同质、无实质进展的短状态等待回复。"
-    "请停止重复刷屏；后台任务未完成时请直接简明收尾并静默挂起等待系统 Reactive Wakeup 通知。"
+    "【user-guard 重复空等拦截】当前已连续三次输出内容相近、无实质进展的短状态等待回复。"
+    "请停止重复汇报；后台任务尚未完成时，请直接结束本轮并等待系统 Reactive Wakeup 通知。"
 )
 
 
@@ -226,12 +224,6 @@ def _read_tail_steps_with_offset(transcript_path: Path) -> Tuple[List[Dict[str, 
         except (ValueError, RecursionError):
             continue
     return steps, start_offset
-
-
-def _read_tail_steps(transcript_path: Path) -> List[Dict[str, Any]]:
-    """读取 transcript.jsonl 末尾窗口并解析步骤列表，避免大会话全量读盘"""
-    steps, _ = _read_tail_steps_with_offset(transcript_path)
-    return steps
 
 
 def _is_turn_boundary_step(step: Dict[str, Any]) -> bool:

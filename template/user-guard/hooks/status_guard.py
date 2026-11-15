@@ -1,18 +1,16 @@
 """
-status_guard.py - 反重力 PreToolUse 项目目录硬边界、长会话交接门禁与防空转轮询门禁 (user-guard)
+status_guard.py - PreToolUse 项目目录写边界、长会话收尾限制与重复读取日志拦截钩子 (user-guard)
 
-核心职责：
-1. 项目目录外文件改动硬约束（R4 硬门禁，防在业务盘乱建目录与越权篡改配置）：
-   - 拦截 write_file / edit_file 及已登记的跨表面工具别名对项目目录外的文件写改；
-   - 通过内联 Python AST 语法树分析与 Shell 子句命令头精确配对，拦截 run_command 向项目目录外创建 git worktree（如 ../.codex-worktrees）、写删改外部路径或执行全局生产安装（忽略只读打开、数组 .copy()、.md 文件名与外部解释器调用，杜绝误报）；
-   - 自动放行系统标准临时目录、宿主与项目关联的对话记忆/子代理轨迹/制品草稿（brain / plugin_data / memories / sessions 等）、标准工具缓存（~/.cache）及 Windows<->WSL 同项目挂载路径；
-   - 交互主会话触发真实越界时返回 force_ask，在弹窗清晰列出“当前任务意图 + 具体写删动作 + 项目外目标路径 + 触发语句”请求用户明确批准；无头跨端子任务（CAE_HARNESS_DEPTH=1）直接硬 deny。
-2. 反重力专有长会话两阶段交接停机门禁（联动 handoff_gate.py）：
-   - 在 drain/freeze 收口期内严禁新开子代理/run_workflow/swarm/schedule/browser/cae_harness 派工、禁止读图及 git push，按排空预算管控写/运行动作并无阻断放行只读核对、交接档写入与本地 git add/commit。
-3. 防空转轮询门禁（适配 Antigravity Reactive Wakeup 响应式唤醒机制）：
-   - read_file / view_file 读取算例/任务证据文件（将 StartLine/EndLine/ByteOffset 编入查询键，放行正常长文件翻页阅读）；
-   - run_command 使用只读命令查看证据文件（将归一化命令参数编入查询键，放行变参检索）；
-   - manage_task (Action == "status") 轮询后台任务状态（自动联动 .system_generated/tasks/<TaskId>.log 真实物理指纹，有新输出自动放行，杜绝永久锁死）。
+主要职责：
+1. 项目目录外文件改动拦截（对应全局规则 R4）：
+   - 检查 write_file / edit_file 及跨端文件编辑工具对当前项目根目录以外路径的写入；
+   - 解析内联 Python AST 语法树与 Shell 命令子句，拦截向项目目录外创建 git worktree（如 ../.codex-worktrees）、增删改外部文件或运行全局配置同步（区分只读打开、容器 .copy()、文档字符串与外部工具调用，避免误报）；
+   - 自动放行操作系统标准临时目录、当前客户端会话记录与制品目录（brain / plugin_data / memories / sessions 等）、标准缓存目录（~/.cache）以及 Windows 与 WSL 指向同一项目的挂载路径；
+   - 交互式主会话遇到项目外写操作时返回 force_ask / ask，列出任务意图、写删动作、外部目标路径与触发语句请用户确认；后台无头子进程（CAE_HARNESS_DEPTH >= 1）直接返回 deny。
+2. 长会话收尾阶段限制（配合 handoff_gate.py）：
+   - 在 drain / freeze 阶段拦截新开子代理、后台任务编排、图片读取与 git push，按剩余动作次数限制修改与执行，同时放行只读核对、交接文档编写和本地 git add / git commit。
+3. 重复读取未变化日志拦截（配合客户端 Reactive Wakeup 唤醒机制）：
+   - 对日志文件或任务输出的读取按文件大小、修改时间及行号范围记录指纹，阻止在同一文件未发生变化时原地重复读取相同区间；文件追加新内容或翻页读取其他区间时正常放行。
 """
 
 # ① 常量、阈值与宿主依赖
@@ -2198,7 +2196,7 @@ def _detect_command_external_mutation(
             ) for value in sandbox_targets):
                 continue
         return (
-            "执行全局配置同步安装 (将更新本机 ~/.gemini/config、~/.codex、~/.claude 与/或 ~/.dsh)",
+            "执行全局配置同步安装 (将更新本机 ~/.gemini/config、~/.codex、~/.claude 或 ~/.dsh)",
             "~/.gemini/config/plugins/user-guard, ~/.codex, ~/.claude, ~/.dsh",
             _compact_snippet(m_inst.group(0)),
         )
@@ -2372,6 +2370,10 @@ def _detect_command_external_mutation(
     return None
 
 
+def _is_headless_subtask() -> bool:
+    return os.environ.get("CAE_HARNESS_DEPTH", "").strip() not in ("", "0")
+
+
 def _build_boundary_violation_response(
     tool_name: str,
     action_desc: str,
@@ -2381,7 +2383,7 @@ def _build_boundary_violation_response(
     tool_summary: str = "",
     snippet: str = "",
 ) -> Dict[str, Any]:
-    headless_subtask = os.environ.get("CAE_HARNESS_DEPTH", "").strip() == "1"
+    headless_subtask = _is_headless_subtask()
     decision = "deny" if headless_subtask else "force_ask"
     intent_line = f" | 任务说明：{tool_summary}" if tool_summary else ""
     snippet_line = f"\n• 触发语句：{snippet}" if snippet else ""
@@ -2700,7 +2702,7 @@ def handle_claude_pre_tool_use(payload: Dict[str, Any], state_dir: Optional[Path
             hit = _detect_command_external_mutation(str(args.get("command") or ""), base_cwd, allowed, resolved, allow_temp)
     if hit:
         action, target, snippet = hit
-        decision = "deny" if os.environ.get("CAE_HARNESS_DEPTH", "").strip() not in ("", "0") else "ask"
+        decision = "deny" if _is_headless_subtask() else "ask"
         reason = (f"【user-guard 项目目录硬边界】当前项目根目录：{display}。"
                   f"具体写删动作：{action}；项目外目标路径：{target}。")
         description = str(args.get("description") or "").strip()

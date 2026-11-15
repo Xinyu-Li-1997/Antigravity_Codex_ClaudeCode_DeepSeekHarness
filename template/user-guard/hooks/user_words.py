@@ -1,11 +1,11 @@
 """
-user_words.py - 反重力与 Codex 双端会话用户原话纯标准库解析与基础设施模块 (user-guard)
+user_words.py - Antigravity、Codex 与 Claude Code 会话原话及最近子代理返回归档模块 (user-guard)
 
 职责：
-1. 提供全平台 UTF-8 标准流自愈、原子写盘与 PLUGIN_DATA 数据目录解析基础设施；
-2. 解析 Antigravity 会话 transcript.jsonl，并在存在 truncated_fields 时以 O(N+M) 单次索引回退补全 transcript_full.jsonl；
-3. 解析 Codex 会话 rollout-*.jsonl（含跨 sessions / archived_sessions 多分段接续合并、provenance 来源鉴别与 SHA-256 完整性校验）；
-4. 安全提取用户原始输入与交互式选项回答，按序格式化并原子写入会话原话归档 Markdown 文档。
+1. 提供跨平台 UTF-8 标准流初始化、原子文件写入、会话文件锁与数据目录定位函数；
+2. 解析 Antigravity 会话 transcript.jsonl，遇到 truncated_fields 截断标记时按步骤号单次索引补齐 transcript_full.jsonl；
+3. 解析 Codex 会话 rollout-*.jsonl（合并 sessions 与 archived_sessions 下的同会话分段并校验 SHA-256 摘要）及 Claude Code 会话 jsonl；
+4. 过滤系统自动注入噪声，提取用户原始指令、交互式选项回答以及最近 N 次子代理返回摘要（附原始日志路径指针），按时间顺序原子写入归档 Markdown 文件。
 """
 
 # ① 常量、阈值与宿主依赖
@@ -56,6 +56,19 @@ SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
 MAX_LOG_BYTES = 2 * 1024 * 1024
 TRIM_LOG_BYTES = 1 * 1024 * 1024
+
+MAX_RECENT_SUBAGENT_RETURNS = 4
+MAX_ARCHIVE_SUBAGENT_ITEM_CHARS = 1200
+
+AGY_SUBAGENT_CREATED_RE = re.compile(
+    r"Created the following subagent:\s*(\{[\s\S]*?\})",
+)
+AGY_SYSTEM_MSG_RE = re.compile(
+    r"\[Message\][^\n]*?\bsender=([^\s]+)[^\n]*?\bcontent=",
+)
+CODEX_SUBAGENT_SPAWN_TOOLS = {"spawn_agent", "agent"}
+CODEX_SUBAGENT_WAIT_TOOLS = {"wait_agent", "wait"}
+CLAUDE_SUBAGENT_TOOLS = {"Agent", "Task", "Subagent", "dispatch_agent"}
 
 
 # ② 标准流协议、数据目录与原子状态事务
@@ -377,15 +390,46 @@ def has_goal_cancel_marker(text: str) -> bool:
     return bool(lines and lines[-1] == marker and list(markdown_unquoted_lines(text.rstrip()))[-1] == marker)
 
 
-def format_user_words_markdown(conversation_id: str, words: List[Dict[str, Any]],
-                               issues: Optional[List[str]] = None) -> str:
-    """将提取出的用户原话格式化为持久留痕 Markdown 文档"""
+def summarize_subagent_return(content: str, max_chars: int = MAX_ARCHIVE_SUBAGENT_ITEM_CHARS) -> str:
+    """对子代理返回正文做首尾双端摘要裁剪，兼顾开篇核查范围与末尾缺陷表／结论。"""
+    cleaned = str(content or "").strip()
+    if len(cleaned) <= max_chars:
+        return cleaned
+    marker = "\n...[中间部分已省略，详见子代理日志或源码]...\n"
+    usable = max(max_chars - len(marker), 120)
+    head_len = max(int(usable * 0.58), 70)
+    tail_len = max(usable - head_len, 50)
+    return f"{cleaned[:head_len].rstrip()}{marker}{cleaned[-tail_len:].lstrip()}"
+
+
+def _unquote_proto_scalar(raw: Any) -> str:
+    text = str(raw or "").strip()
+    if len(text) >= 2 and text[0] == '"' and text[-1] == '"':
+        try:
+            decoded = json.loads(text)
+            if isinstance(decoded, str):
+                text = decoded
+        except (ValueError, RecursionError):
+            text = text[1:-1]
+    return text.strip()
+
+
+def format_user_words_markdown(
+    conversation_id: str,
+    words: List[Dict[str, Any]],
+    issues: Optional[List[str]] = None,
+    subagent_returns: Optional[List[Dict[str, Any]]] = None,
+) -> str:
+    """将提取出的用户原话及最近子代理返回摘要格式化为持久留痕 Markdown 文档"""
+    recent_returns = list(subagent_returns or [])
     lines = [
         "# 会话用户原话归档",
         "",
         f"- **Conversation ID**: `{conversation_id}`",
         f"- **累计指令轮数**: {len(words)}",
     ]
+    if recent_returns:
+        lines.append(f"- **最近子代理返回摘要数**: {len(recent_returns)}")
     if issues:
         lines.extend(["- 归档状态：存在缺口，未核实完整性", *[f"  - {issue}" for issue in issues]])
     lines.extend(["", "---", ""])
@@ -410,18 +454,43 @@ def format_user_words_markdown(conversation_id: str, words: List[Dict[str, Any]]
         lines.append("---")
         lines.append("")
 
+    if recent_returns:
+        lines.append(
+            f"## 附：最近子代理返回摘要（最近 {len(recent_returns)} 条，采纳前须按 R6 核对原文件或子代理日志）"
+        )
+        lines.append("")
+        for idx, item in enumerate(recent_returns, start=1):
+            time_str = f" ({item['created_at']})" if item.get("created_at") else ""
+            trunc_tag = " [轨迹截断摘要]" if item.get("truncated") else ""
+            label = str(item.get("label") or item.get("agent_id") or f"subagent-{idx}").strip()
+            lines.append(f"### 子代理返回 #{idx} · {label} [Step {item['step_index']}]{trunc_tag}{time_str}")
+            if item.get("agent_id"):
+                lines.append(f"- **子代理标识**: `{item['agent_id']}`")
+            if item.get("log_path"):
+                lines.append(f"- **原始日志**: `{item['log_path']}`")
+            lines.append("")
+            lines.append(summarize_subagent_return(item.get("content", ""), MAX_ARCHIVE_SUBAGENT_ITEM_CHARS))
+            lines.append("")
+            lines.append("---")
+            lines.append("")
+
     return "\n".join(lines)
 
 
-def save_user_words_markdown(state_dir: Path, conversation_id: str, words: List[Dict[str, Any]],
-                             issues: Optional[List[str]] = None) -> Optional[Path]:
-    """将用户原话列表原子保存至 state/<conversationId>_user_words.md"""
+def save_user_words_markdown(
+    state_dir: Path,
+    conversation_id: str,
+    words: List[Dict[str, Any]],
+    issues: Optional[List[str]] = None,
+    subagent_returns: Optional[List[Dict[str, Any]]] = None,
+) -> Optional[Path]:
+    """将用户原话列表与最近子代理返回摘要原子保存至 state/<conversationId>_user_words.md"""
     if not words:
         return None
     if not valid_session_id(conversation_id):
         raise ValueError("会话标识缺失或不合法")
     out_file = state_dir / f"{conversation_id}_user_words.md"
-    md_text = format_user_words_markdown(conversation_id, words, issues)
+    md_text = format_user_words_markdown(conversation_id, words, issues, subagent_returns=subagent_returns)
     atomic_write_text(out_file, md_text)
     return out_file
 
@@ -509,12 +578,54 @@ def _clean_generic_tool_answer(raw_output: str) -> str:
     return cleaned
 
 
+def _parse_agy_subagent_call(call: Dict[str, Any]) -> Tuple[str, str]:
+    args = call.get("args") or call.get("arguments")
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except (ValueError, RecursionError):
+            args = {}
+    if not isinstance(args, dict):
+        return "", ""
+    type_name = _unquote_proto_scalar(args.get("TypeName") or args.get("typeName") or "")
+    role = _unquote_proto_scalar(args.get("Role") or args.get("role") or "")
+    return type_name, role
+
+
+def _extract_agy_subagent_return_body(raw_content: str) -> Tuple[str, str]:
+    """解析主会话 SYSTEM_MESSAGE 中的子代理返回标识与正文；后台命令任务与系统通知返回空。"""
+    if not isinstance(raw_content, str) or not raw_content:
+        return "", ""
+    text = raw_content.strip()
+    if "BROWSER_HOST_FACTS" in text or any(noise in text for noise in SYSTEM_NOISE_PATTERNS):
+        return "", ""
+    msg_match = AGY_SYSTEM_MSG_RE.search(text)
+    if not msg_match:
+        return "", ""
+    sender = msg_match.group(1).strip()
+    sender_lower = sender.lower()
+    if not sender or sender_lower == "system" or "/task-" in sender_lower or sender_lower.startswith("task-"):
+        return "", ""
+    content_start = msg_match.end()
+    close_idx = text.rfind("</SYSTEM_MESSAGE>", content_start)
+    body = (text[content_start:close_idx] if close_idx != -1 else text[content_start:]).strip()
+    if not body or body.startswith("Task id "):
+        return "", ""
+    return sender, body
+
+
 def extract_agy_archive(
     transcript_path_str: Optional[str],
     include_subagent_msgs: bool = True,
 ) -> Dict[str, Any]:
-    """提取原话和来源缺口，仅归档可关联的选项回答。"""
-    result: Dict[str, Any] = {"words": [], "unresolved_steps": [], "unverified_answers": [], "issues": []}
+    """提取原话、最近子代理返回摘要和来源缺口，仅归档可关联的选项回答。"""
+    result: Dict[str, Any] = {
+        "words": [],
+        "subagent_returns": [],
+        "unresolved_steps": [],
+        "unverified_answers": [],
+        "issues": [],
+    }
     if not transcript_path_str:
         result["issues"].append("未提供 transcriptPath")
         return result
@@ -523,6 +634,9 @@ def extract_agy_archive(
     full_transcript_path = transcript_path.parent / "transcript_full.jsonl"
 
     raw_candidates: List[Dict[str, Any]] = []
+    raw_subagent_returns: List[Dict[str, Any]] = []
+    pending_subagent_calls: List[Tuple[str, str, str]] = []
+    subagent_registry: Dict[str, Dict[str, str]] = {}
     truncated_needed: Set[int] = set()
     pending_questions: Dict[str, Tuple[int, str]] = {}
     unidentified_questions: Set[int] = set()
@@ -557,7 +671,16 @@ def extract_agy_archive(
                     calls = step.get("tool_calls")
                     if isinstance(calls, list):
                         for call in calls:
-                            if not isinstance(call, dict) or call.get("name") != "ask_question":
+                            if not isinstance(call, dict):
+                                continue
+                            call_name = call.get("name")
+                            if call_name == "invoke_subagent":
+                                t_name, role_name = _parse_agy_subagent_call(call)
+                                pending_subagent_calls.append(
+                                    (_tool_call_id(call, is_call=True), t_name, role_name)
+                                )
+                                continue
+                            if call_name != "ask_question":
                                 continue
                             call_id = _tool_call_id(call, is_call=True)
                             if call_id and call_id not in pending_questions:
@@ -570,6 +693,28 @@ def extract_agy_archive(
                     tool_result = step.get("tool_result")
                     tool_result = tool_result if isinstance(tool_result, dict) else step
                     call_id = _tool_call_id(tool_result) or _tool_call_id(step)
+                    raw_tool_out = step.get("content") or tool_result.get("output") or ""
+                    if isinstance(raw_tool_out, str) and "Created the following subagent:" in raw_tool_out:
+                        created_match = AGY_SUBAGENT_CREATED_RE.search(raw_tool_out)
+                        if created_match:
+                            try:
+                                created_meta = json.loads(created_match.group(1))
+                            except (ValueError, RecursionError):
+                                created_meta = {}
+                            sub_cid = str(created_meta.get("conversationId") or "").strip()
+                            if sub_cid:
+                                matched_idx = next(
+                                    (idx for idx, item in enumerate(pending_subagent_calls) if call_id and item[0] == call_id),
+                                    0 if pending_subagent_calls else None,
+                                )
+                                t_name, role_name = ("", "")
+                                if matched_idx is not None:
+                                    _, t_name, role_name = pending_subagent_calls.pop(matched_idx)
+                                subagent_registry[sub_cid] = {
+                                    "type_name": t_name,
+                                    "role": role_name,
+                                    "log_path": str(created_meta.get("logAbsoluteUri") or "").strip(),
+                                }
                     named_ask = (tool_result.get("tool_name") or tool_result.get("name")) == "ask_question"
                     question = pending_questions.pop(call_id, None)
                     waiting = {pos for pos in unidentified_questions if pos < step_index} | {
@@ -606,6 +751,23 @@ def extract_agy_archive(
                     )
                     continue
 
+                if step_type == "SYSTEM_MESSAGE" and not include_subagent_msgs:
+                    raw_sys = step.get("content")
+                    if isinstance(raw_sys, str):
+                        sender_id, sub_body = _extract_agy_subagent_return_body(raw_sys)
+                        if sender_id and sub_body and (sender_id in subagent_registry or valid_session_id(sender_id)):
+                            raw_subagent_returns.append(
+                                {
+                                    "step_index": step_index,
+                                    "created_at": created_at,
+                                    "sender": sender_id,
+                                    "raw_content": raw_sys,
+                                    "fallback_body": sub_body,
+                                    "needs_full": is_content_truncated,
+                                }
+                            )
+                    continue
+
                 is_explicit_user = step_type == "USER_INPUT" or source == "USER_EXPLICIT"
                 is_subagent_msg = include_subagent_msgs and step_type == "SYSTEM_MESSAGE"
 
@@ -632,8 +794,13 @@ def extract_agy_archive(
     except OSError as exc:
         result["issues"].append(f"读取 {transcript_path.name} 失败（{exc}）")
 
-    # 单次按需补全所有被截断的记录
-    full_map = _load_truncated_contents_map(full_transcript_path, truncated_needed)
+    recent_sub_candidates = raw_subagent_returns[-MAX_RECENT_SUBAGENT_RETURNS:]
+    subagent_truncated_needed = {
+        item["step_index"] for item in recent_sub_candidates if item["needs_full"]
+    }
+
+    # 单次按需补全所有被截断的用户记录与最近子代理返回（仅用户记录计入 unresolved_steps 完整性门禁）
+    full_map = _load_truncated_contents_map(full_transcript_path, truncated_needed | subagent_truncated_needed)
     unresolved_steps = sorted(truncated_needed.difference(full_map))
 
     results: List[Dict[str, Any]] = []
@@ -669,8 +836,39 @@ def extract_agy_archive(
             }
         )
 
+    subagent_returns: List[Dict[str, Any]] = []
+    for sub_item in recent_sub_candidates:
+        s_idx = sub_item["step_index"]
+        sender_id = sub_item["sender"]
+        if sub_item["needs_full"] and s_idx in full_map:
+            _, full_body = _extract_agy_subagent_return_body(full_map[s_idx])
+            body_text = full_body or sub_item["fallback_body"]
+            still_truncated = False
+        else:
+            body_text = sub_item["fallback_body"]
+            still_truncated = bool(sub_item["needs_full"])
+        meta = subagent_registry.get(sender_id, {})
+        type_name = meta.get("type_name") or ""
+        role_name = meta.get("role") or ""
+        if type_name and role_name:
+            label = f"{type_name} ({role_name})"
+        else:
+            label = role_name or type_name or sender_id
+        subagent_returns.append(
+            {
+                "step_index": s_idx,
+                "created_at": sub_item["created_at"],
+                "agent_id": sender_id,
+                "label": label,
+                "log_path": meta.get("log_path") or "",
+                "content": summarize_subagent_return(body_text, MAX_ARCHIVE_SUBAGENT_ITEM_CHARS),
+                "truncated": still_truncated,
+            }
+        )
+
     result.update(
         words=results,
+        subagent_returns=subagent_returns,
         unresolved_steps=unresolved_steps,
         unverified_answers=sorted(index for index, questions in ambiguous_outputs.items() if questions),
     )
@@ -991,16 +1189,179 @@ def _merge_codex_record_origins(existing: Dict[str, Any], incoming: Dict[str, An
     return corrected, conflict
 
 
+def _parse_codex_json_maybe(raw: Any) -> Any:
+    if isinstance(raw, (dict, list)):
+        return raw
+    if isinstance(raw, str):
+        stripped = raw.strip()
+        if stripped.startswith(("{", "[")):
+            try:
+                return json.loads(stripped)
+            except (ValueError, RecursionError):
+                return None
+    return None
+
+
+def _codex_output_to_text(raw: Any) -> str:
+    if isinstance(raw, str):
+        return raw.strip()
+    if isinstance(raw, list):
+        parts: List[str] = []
+        for item in raw:
+            if isinstance(item, str) and item.strip():
+                parts.append(item.strip())
+            elif isinstance(item, dict):
+                for key in ("text", "output_text", "content"):
+                    val = item.get(key)
+                    if isinstance(val, str) and val.strip():
+                        parts.append(val.strip())
+                        break
+        return "\n".join(parts).strip()
+    return ""
+
+
+def _resolve_codex_subagent_log(agent_id: str, rollouts: List[Path], main_keys: Set[str]) -> str:
+    aid = agent_id.strip()
+    if len(aid) < 6:
+        return ""
+    for cand in rollouts:
+        if aid in cand.name and _canonical_path_key(cand) not in main_keys:
+            return str(cand)
+    return ""
+
+
+def _format_codex_subagent_label(meta: Dict[str, str], fallback_id: str) -> str:
+    agent_type = meta.get("agent_type") or ""
+    nickname = meta.get("nickname") or ""
+    task_hint = meta.get("task_hint") or ""
+    if agent_type and nickname and nickname != agent_type:
+        return f"{agent_type} ({nickname})"
+    if agent_type and task_hint:
+        return f"{agent_type} ({task_hint})"
+    return agent_type or nickname or task_hint or fallback_id or "codex-subagent"
+
+
+def _extract_codex_completed_subagent_items(
+    call_meta: Dict[str, Any],
+    raw_output: Any,
+    agent_registry: Dict[str, Dict[str, str]],
+    rollouts: List[Path],
+    main_keys: Set[str],
+) -> List[Tuple[str, str, str, str]]:
+    """解析 Codex spawn_agent / wait_agent 工具输出，跳过纯启动句柄回执，仅返回已完成的子代理正文。"""
+    out_text = _codex_output_to_text(raw_output)
+    parsed = raw_output if isinstance(raw_output, dict) else _parse_codex_json_maybe(out_text)
+    pending_states = {"pending_init", "pending", "running", "in_progress", "shutdown", "not_found", "timed_out"}
+    emitted: List[Tuple[str, str, str, str]] = []
+
+    def _register_agent(aid: str, nickname: str = "", agent_type: str = "") -> Dict[str, str]:
+        clean_id = aid.strip()
+        if not clean_id:
+            return {
+                "agent_type": str(call_meta.get("agent_type") or ""),
+                "nickname": nickname.strip(),
+                "task_hint": str(call_meta.get("task_hint") or ""),
+                "log_path": "",
+            }
+        entry = agent_registry.setdefault(clean_id, {})
+        if agent_type.strip() and not entry.get("agent_type"):
+            entry["agent_type"] = agent_type.strip()
+        if call_meta.get("agent_type") and not entry.get("agent_type"):
+            entry["agent_type"] = str(call_meta["agent_type"])
+        if nickname.strip() and not entry.get("nickname"):
+            entry["nickname"] = nickname.strip()
+        if call_meta.get("task_hint") and not entry.get("task_hint"):
+            entry["task_hint"] = str(call_meta["task_hint"])
+        if not entry.get("log_path"):
+            entry["log_path"] = _resolve_codex_subagent_log(clean_id, rollouts, main_keys)
+        return entry
+
+    if isinstance(parsed, dict):
+        top_aid = str(parsed.get("agent_id") or parsed.get("id") or "").strip()
+        top_nick = str(parsed.get("nickname") or parsed.get("role") or "").strip()
+        top_type = str(parsed.get("agent_type") or parsed.get("subagent_type") or "").strip()
+        if top_aid:
+            _register_agent(top_aid, nickname=top_nick, agent_type=top_type)
+
+        status_val = parsed.get("status")
+        if isinstance(status_val, dict):
+            for sub_aid_raw, state_item in status_val.items():
+                sub_aid = str(sub_aid_raw or "").strip()
+                body = ""
+                if isinstance(state_item, dict):
+                    for key in ("completed", "final_output", "output", "result", "message", "content"):
+                        cand = _codex_output_to_text(state_item.get(key))
+                        if cand:
+                            body = cand
+                            break
+                elif isinstance(state_item, str):
+                    cand = state_item.strip()
+                    if cand and cand.lower() not in pending_states:
+                        body = cand
+                if body:
+                    meta = _register_agent(sub_aid)
+                    emitted.append((sub_aid, _format_codex_subagent_label(meta, sub_aid), meta.get("log_path") or "", body))
+            return emitted
+
+        for list_key in ("results", "outputs"):
+            items_list = parsed.get(list_key)
+            if isinstance(items_list, list):
+                for elem in items_list:
+                    if not isinstance(elem, dict):
+                        continue
+                    elem_status = str(elem.get("status") or "").strip().lower()
+                    if elem_status in pending_states or elem.get("error"):
+                        continue
+                    sub_aid = str(elem.get("agent_id") or elem.get("id") or top_aid).strip()
+                    for key in ("completed", "final_output", "output", "result", "content", "message"):
+                        cand = _codex_output_to_text(elem.get(key))
+                        if cand:
+                            meta = _register_agent(
+                                sub_aid,
+                                nickname=str(elem.get("nickname") or ""),
+                                agent_type=str(elem.get("agent_type") or ""),
+                            )
+                            emitted.append((sub_aid, _format_codex_subagent_label(meta, sub_aid), meta.get("log_path") or "", cand))
+                            break
+                return emitted
+
+        status_str = str(status_val or "").strip().lower()
+        if status_str in pending_states or status_str in ("errored", "failed") or parsed.get("error"):
+            return []
+
+        for key in ("completed", "final_output", "output", "result", "response", "content", "message"):
+            cand = _codex_output_to_text(parsed.get(key))
+            if cand:
+                target_ids = call_meta.get("target_ids") or []
+                aid = top_aid or (target_ids[0] if len(target_ids) == 1 else "")
+                meta = _register_agent(aid, nickname=top_nick, agent_type=top_type)
+                emitted.append((aid, _format_codex_subagent_label(meta, aid), meta.get("log_path") or "", cand))
+                return emitted
+        return []
+
+    if out_text:
+        lowered = out_text.lower()
+        if lowered.startswith(("error:", "timed out", "agent spawned", "spawned agent")):
+            return []
+        if call_meta.get("tool") in CODEX_SUBAGENT_WAIT_TOOLS or call_meta.get("tool") == "agent":
+            target_ids = call_meta.get("target_ids") or []
+            aid = target_ids[0] if len(target_ids) == 1 else ""
+            meta = _register_agent(aid)
+            emitted.append((aid, _format_codex_subagent_label(meta, aid), meta.get("log_path") or "", out_text))
+    return emitted
+
+
 def extract_codex_session_words(
     transcript_path_str: str,
     session_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """合并解析同一 Codex 主会话所有 rollout 分段的用户原话并生成完整性摘要"""
+    """合并解析同一 Codex 主会话所有 rollout 分段的用户原话与最近子代理返回摘要"""
     segments, resolved_sid, issues = discover_codex_session_segments(transcript_path_str, session_id=session_id)
     if not segments:
         return {
             "session_id": resolved_sid or session_id or "unknown",
             "words": [],
+            "subagent_returns": [],
             "segments": [],
             "sources": [],
             "issues": issues or ["未找到可读的 Codex 会话分段"],
@@ -1008,10 +1369,24 @@ def extract_codex_session_words(
             "provenance_corrected": False,
         }
 
+    codex_root: Optional[Path] = None
+    cur_dir = segments[0].parent
+    while cur_dir != cur_dir.parent:
+        if cur_dir.name in ("sessions", "archived_sessions"):
+            codex_root = cur_dir.parent
+            break
+        cur_dir = cur_dir.parent
+    all_rollouts = _scan_codex_home_rollouts(codex_root) if codex_root is not None else []
+    main_segment_keys = {_canonical_path_key(p) for p in segments}
+
     records: List[Dict[str, Any]] = []
     sources: List[Dict[str, Any]] = []
     records_by_id: Dict[str, List[int]] = {}
     provenance_corrected = False
+    pending_subagent_calls: Dict[str, Dict[str, Any]] = {}
+    codex_agent_registry: Dict[str, Dict[str, str]] = {}
+    seen_subagent_keys: Set[Tuple[str, str, str]] = set()
+    raw_subagent_returns: List[Dict[str, Any]] = []
 
     for seg_path in segments:
         digest = hashlib.sha256()
@@ -1044,6 +1419,77 @@ def extract_codex_session_words(
                     if not isinstance(entry, dict) or not isinstance(entry.get("type"), str):
                         bad_lines += 1
                         continue
+                    item_obj = (
+                        entry.get("payload")
+                        if entry.get("type") == "response_item"
+                        else (entry.get("event") if entry.get("type") == "event" else None)
+                    )
+                    if isinstance(item_obj, dict):
+                        item_type = item_obj.get("type")
+                        step_no = entry.get("ordinal") if isinstance(entry.get("ordinal"), int) else line_counter
+                        ts_str = str(entry.get("timestamp") or "")
+                        if item_type in ("function_call", "custom_tool_call"):
+                            raw_tool = str(item_obj.get("name") or item_obj.get("tool_name") or "").strip()
+                            base_tool = raw_tool.rsplit(".", 1)[-1]
+                            call_id = str(item_obj.get("call_id") or item_obj.get("id") or "").strip()
+                            if call_id and base_tool in (CODEX_SUBAGENT_SPAWN_TOOLS | CODEX_SUBAGENT_WAIT_TOOLS):
+                                raw_args = item_obj.get("arguments") if "arguments" in item_obj else item_obj.get("input")
+                                parsed_args = _parse_codex_json_maybe(raw_args)
+                                args_dict = parsed_args if isinstance(parsed_args, dict) else {}
+                                agent_type = str(
+                                    args_dict.get("agent_type")
+                                    or args_dict.get("subagent_type")
+                                    or args_dict.get("role")
+                                    or args_dict.get("name")
+                                    or ""
+                                ).strip()
+                                task_hint = str(args_dict.get("description") or args_dict.get("title") or "").strip()
+                                if len(task_hint) > 48:
+                                    task_hint = task_hint[:45].rstrip() + "..."
+                                target_ids: List[str] = []
+                                for id_key in ("ids", "agent_ids"):
+                                    id_list = args_dict.get(id_key)
+                                    if isinstance(id_list, list):
+                                        target_ids.extend(str(x).strip() for x in id_list if str(x).strip())
+                                single_id = args_dict.get("agent_id")
+                                if isinstance(single_id, str) and single_id.strip():
+                                    target_ids.append(single_id.strip())
+                                pending_subagent_calls[call_id] = {
+                                    "tool": base_tool,
+                                    "agent_type": agent_type,
+                                    "task_hint": task_hint,
+                                    "target_ids": target_ids,
+                                }
+                        elif item_type in ("function_call_output", "custom_tool_call_output"):
+                            call_id = str(item_obj.get("call_id") or item_obj.get("id") or "").strip()
+                            call_meta = pending_subagent_calls.get(call_id)
+                            if call_meta is not None:
+                                completed_items = _extract_codex_completed_subagent_items(
+                                    call_meta,
+                                    item_obj.get("output"),
+                                    codex_agent_registry,
+                                    all_rollouts,
+                                    main_segment_keys,
+                                )
+                                for sub_aid, sub_label, sub_log, sub_body in completed_items:
+                                    body_hash = hashlib.sha256(sub_body.encode("utf-8")).hexdigest()[:24]
+                                    dedup_key = (call_id, sub_aid, body_hash)
+                                    if dedup_key in seen_subagent_keys:
+                                        continue
+                                    seen_subagent_keys.add(dedup_key)
+                                    raw_subagent_returns.append(
+                                        {
+                                            "step_index": step_no,
+                                            "created_at": ts_str,
+                                            "agent_id": sub_aid,
+                                            "label": sub_label,
+                                            "log_path": sub_log,
+                                            "content": summarize_subagent_return(
+                                                sub_body, MAX_ARCHIVE_SUBAGENT_ITEM_CHARS
+                                            ),
+                                            "truncated": False,
+                                        }
+                                    )
                     rec_id, record = _extract_codex_record(entry, fallback_step=line_counter)
                     if record is None:
                         continue
@@ -1098,6 +1544,7 @@ def extract_codex_session_words(
     return {
         "session_id": resolved_sid or session_id or "unknown",
         "words": words,
+        "subagent_returns": raw_subagent_returns[-MAX_RECENT_SUBAGENT_RETURNS:],
         "segments": [str(p) for p in segments],
         "sources": sources,
         "issues": issues,
@@ -1224,21 +1671,22 @@ def refresh_codex_session_archive(
     """串行发布原话与校验清单。发布中断时，按磁盘上实际可核验的一对文件判定。"""
     sid = session_id.strip()
     if not valid_session_id(sid):
-        return {"complete": False, "words": [], "issues": [identity_error or "无效的 session_id"],
+        return {"complete": False, "words": [], "subagent_returns": [], "issues": [identity_error or "无效的 session_id"],
                 "saved": {}, "meta_path": "", "segments": []}
     md_path = user_words_dir / f"{sid}.md"
     meta_path = user_words_dir / f"{sid}.json"
     if identity_error and not md_path.exists() and not meta_path.exists():
-        return {"complete": False, "words": [], "issues": [identity_error], "saved": {},
+        return {"complete": False, "words": [], "subagent_returns": [], "issues": [identity_error], "saved": {},
                 "meta_path": str(meta_path), "segments": []}
     with session_state_lock(user_words_dir, sid):
         previous = _read_codex_publication(md_path, meta_path, sid)
         parsed = (
-            {"complete": False, "issues": [identity_error], "words": [], "sources": [], "segments": [],
-             "provenance_corrected": False}
+            {"complete": False, "issues": [identity_error], "words": [], "subagent_returns": [],
+             "sources": [], "segments": [], "provenance_corrected": False}
             if identity_error else extract_codex_session_words(transcript_path_str, session_id=sid)
         )
         words = parsed["words"]
+        subagent_returns = parsed.get("subagent_returns") or []
         issues = list(parsed["issues"])
         complete = bool(parsed["complete"])
         saved = previous
@@ -1250,7 +1698,7 @@ def refresh_codex_session_archive(
         can_update_partial = parsed["provenance_corrected"] or (bool(words) and (not previous["available"] or (
             previous["manifest_verified"] and not previous["verified"] and len(words) >= previous["count"]
         )))
-        md_text = format_user_words_markdown(sid, words, issues)
+        md_text = format_user_words_markdown(sid, words, issues, subagent_returns=subagent_returns)
         md_sha = hashlib.sha256(md_text.encode("utf-8")).hexdigest()
         body_sha = previous.get("body_sha256")
         can_restore_manifest = bool(body_sha and body_sha == md_sha and parsed["sources"])
@@ -1291,6 +1739,7 @@ def refresh_codex_session_archive(
     return {
         "complete": complete,
         "words": words,
+        "subagent_returns": subagent_returns,
         "issues": issues,
         "saved": saved,
         "meta_path": str(meta_path),
@@ -1430,15 +1879,140 @@ def claude_user_content(entry: Dict[str, Any], question_ids: Optional[Set[str]] 
     return (_claude_clean_text(content), "user_input") if isinstance(content, str) else ("", "")
 
 
+def _claude_subagent_calls_from_assistant(entry: Dict[str, Any]) -> Dict[str, Dict[str, str]]:
+    msg = entry.get("message")
+    content = msg.get("content") if isinstance(msg, dict) else None
+    if not isinstance(content, list):
+        return {}
+    calls: Dict[str, Dict[str, str]] = {}
+    for block in content:
+        if not (
+            isinstance(block, dict)
+            and block.get("type") == "tool_use"
+            and block.get("name") in CLAUDE_SUBAGENT_TOOLS
+            and block.get("id")
+        ):
+            continue
+        inp = block.get("input") if isinstance(block.get("input"), dict) else {}
+        sub_type = str(
+            inp.get("subagent_type") or inp.get("agent_type") or inp.get("name") or block.get("name") or ""
+        ).strip()
+        desc = str(inp.get("description") or "").strip()
+        if len(desc) > 48:
+            desc = desc[:45].rstrip() + "..."
+        calls[str(block["id"])] = {"sub_type": sub_type, "description": desc}
+    return calls
+
+
+def _extract_claude_text_blocks(raw: Any) -> str:
+    if isinstance(raw, str):
+        return raw.strip()
+    if isinstance(raw, list):
+        parts = [
+            item["text"].strip()
+            for item in raw
+            if isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str) and item["text"].strip()
+        ]
+        return "\n".join(parts).strip()
+    return ""
+
+
+def _resolve_claude_subagent_log(transcript_path: Path, agent_id: str, explicit_path: str = "") -> str:
+    if explicit_path:
+        cand_exp = Path(strip_win_extended_prefix(explicit_path)).expanduser()
+        if cand_exp.is_file():
+            return str(cand_exp)
+    aid = agent_id.strip()
+    if not aid:
+        return ""
+    for cand in (
+        transcript_path.with_suffix("") / "subagents" / f"agent-{aid}.jsonl",
+        transcript_path.parent / "subagents" / f"agent-{aid}.jsonl",
+    ):
+        if cand.is_file():
+            return str(cand)
+    return ""
+
+
+def _extract_claude_subagent_returns_from_user(
+    entry: Dict[str, Any],
+    line_index: int,
+    pending_subagents: Dict[str, Dict[str, str]],
+    transcript_path: Path,
+) -> List[Dict[str, Any]]:
+    if entry.get("isSidechain") is True or entry.get("isMeta") is True or entry.get("type") != "user":
+        return []
+    msg = entry.get("message")
+    content = msg.get("content") if isinstance(msg, dict) else None
+    if not isinstance(content, list):
+        return []
+    matched = [
+        (block, pending_subagents[str(block.get("tool_use_id") or "")])
+        for block in content
+        if isinstance(block, dict)
+        and block.get("type") == "tool_result"
+        and not block.get("is_error")
+        and str(block.get("tool_use_id") or "") in pending_subagents
+    ]
+    if not matched:
+        return []
+    tool_res = entry.get("toolUseResult")
+    if isinstance(tool_res, dict) and str(tool_res.get("status") or "").strip().lower() in (
+        "async_launched", "running", "pending", "in_progress",
+    ):
+        return []
+
+    returns: List[Dict[str, Any]] = []
+    ts_str = str(entry.get("timestamp") or "")
+    for block, call_meta in matched:
+        body_text = _extract_claude_text_blocks(block.get("content"))
+        if not body_text and isinstance(tool_res, dict) and len(matched) == 1:
+            for key in ("content", "result", "output", "text"):
+                body_text = _extract_claude_text_blocks(tool_res.get(key))
+                if body_text:
+                    break
+        if not body_text:
+            continue
+        agent_id = ""
+        explicit_log = ""
+        if isinstance(tool_res, dict) and len(matched) == 1:
+            agent_id = str(tool_res.get("agentId") or tool_res.get("agent_id") or "").strip()
+            explicit_log = str(tool_res.get("agent_transcript_path") or tool_res.get("transcript_path") or "").strip()
+        if not agent_id:
+            id_match = re.search(r"\bagentId:\s*([A-Za-z0-9_-]{4,120})", body_text)
+            if id_match:
+                agent_id = id_match.group(1).strip()
+        sub_type = call_meta.get("sub_type") or ""
+        desc = call_meta.get("description") or ""
+        if sub_type and desc:
+            label = f"{sub_type} ({desc})"
+        else:
+            label = sub_type or desc or agent_id or "Agent"
+        returns.append(
+            {
+                "step_index": line_index,
+                "created_at": ts_str,
+                "agent_id": agent_id,
+                "label": label,
+                "log_path": _resolve_claude_subagent_log(transcript_path, agent_id, explicit_log),
+                "content": summarize_subagent_return(body_text, MAX_ARCHIVE_SUBAGENT_ITEM_CHARS),
+                "truncated": False,
+            }
+        )
+    return returns
+
+
 def extract_claude_user_words(transcript_path: Path) -> Dict[str, Any]:
-    """逐行严格解码并记录读取缺口；仅合并排队输入及紧邻的消费记录。"""
+    """逐行严格解码并记录读取缺口；合并排队输入并提取最近子代理返回摘要。"""
     words: List[Dict[str, Any]] = []
+    subagent_returns: List[Dict[str, Any]] = []
     issues: List[str] = []
     sources: List[Dict[str, Any]] = []
     digest = hashlib.sha256()
     offset = 0
     queued_index: Optional[int] = None
     question_ids: Set[str] = set()
+    pending_subagents: Dict[str, Dict[str, str]] = {}
     try:
         with transcript_path.open("rb") as stream:
             before = os.fstat(stream.fileno())
@@ -1457,6 +2031,13 @@ def extract_claude_user_words(transcript_path: Path) -> Dict[str, Any]:
                     continue
                 if entry.get("type") == "assistant" and not entry.get("isSidechain"):
                     question_ids.update(_claude_question_ids_from_assistant(entry))
+                    pending_subagents.update(_claude_subagent_calls_from_assistant(entry))
+                if pending_subagents:
+                    subagent_returns.extend(
+                        _extract_claude_subagent_returns_from_user(
+                            entry, line_index, pending_subagents, transcript_path
+                        )
+                    )
                 text, kind = claude_user_content(entry, question_ids=question_ids)
                 if not text:
                     if entry.get("type") == "assistant" and not entry.get("isSidechain"):
@@ -1483,13 +2064,20 @@ def extract_claude_user_words(transcript_path: Path) -> Dict[str, Any]:
                         "observed_size": before.st_size, "sha256": digest.hexdigest()})
     except OSError as exc:
         issues.append(f"读取 Claude 轨迹失败（{exc}）")
-    return {"words": words, "issues": issues, "sources": sources, "complete": not issues}
+    return {
+        "words": words,
+        "subagent_returns": subagent_returns[-MAX_RECENT_SUBAGENT_RETURNS:],
+        "issues": issues,
+        "sources": sources,
+        "complete": not issues,
+    }
 
 
 def archive_claude_session_words(payload: Dict[str, Any], state_dir: Path) -> Dict[str, Any]:
-    """按 Codex SessionStart 的目录与恢复安全规则发布 Claude 原话及 SHA-256 清单。"""
+    """按 Codex SessionStart 的目录与恢复安全规则发布 Claude 原话、最近子代理摘要及 SHA-256 清单。"""
     sid, transcript, error, skip = claude_hook_session(payload)
-    result: Dict[str, Any] = {"complete": False, "words": [], "issues": [error] if error else [],
+    result: Dict[str, Any] = {"complete": False, "words": [], "subagent_returns": [],
+                              "issues": [error] if error else [],
                               "saved": {}, "meta_path": "", "segments": [], "skipped": skip}
     if skip or not sid:
         return result
@@ -1501,6 +2089,7 @@ def archive_claude_session_words(payload: Dict[str, Any], state_dir: Path) -> Di
         previous = _read_codex_publication(md_path, meta_path, sid, CLAUDE_ARCHIVE_FORMAT)
         parsed = extract_claude_user_words(transcript) if transcript else result
         words = parsed["words"]
+        subagent_returns = parsed.get("subagent_returns") or []
         issues = list(parsed["issues"])
         sources = parsed.get("sources", [])
         complete = bool(transcript is not None and not issues)
@@ -1512,7 +2101,7 @@ def archive_claude_session_words(payload: Dict[str, Any], state_dir: Path) -> Di
         can_update_partial = bool(words) and (not previous["available"] or (
             previous["manifest_verified"] and not previous["verified"] and len(words) >= previous["count"]
         ))
-        md_text = format_user_words_markdown(sid, words, issues)
+        md_text = format_user_words_markdown(sid, words, issues, subagent_returns=subagent_returns)
         md_sha = hashlib.sha256(md_text.encode("utf-8")).hexdigest()
         body_sha = previous.get("body_sha256")
         can_restore_manifest = bool(body_sha and body_sha == md_sha and sources and not previous.get("legacy_hash_mismatch"))
@@ -1544,6 +2133,7 @@ def archive_claude_session_words(payload: Dict[str, Any], state_dir: Path) -> Di
         saved.pop("body_sha256", None)
         saved.pop("previous_manifest_sources", None)
         saved.pop("legacy_hash_mismatch", None)
-        result.update(complete=complete and saved.get("verified", False), words=words, issues=issues,
+        result.update(complete=complete and saved.get("verified", False), words=words,
+                      subagent_returns=subagent_returns, issues=issues,
                       saved=saved, segments=[str(transcript)] if transcript else [])
     return result

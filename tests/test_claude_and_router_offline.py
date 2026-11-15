@@ -1994,6 +1994,151 @@ class TestClaudeInstallerAndUpgradeAudit(OfflineSandbox):
         broken_status = admin.inspect_status(db, self.claude_home / "settings.json")
         self.assertFalse(broken_status["settings_aligned"])
 
+    def test_runtime_redaction_hardening_router_case_fold_and_corrupt_settings(self):
+        # 1) router.py 前缀匹配不区分大小写
+        case_body = json.dumps({"model": "DeepSeek-Flash", "messages": [{"role": "user", "content": "hi"}]}).encode("utf-8")
+        h_case = object.__new__(router.Handler)
+        cfg_case = copy.deepcopy(router.DEFAULTS)
+        cfg_case["routes"][0]["prefix"] = "DeepSeek"
+        h_case.server = SimpleNamespace(cfg=cfg_case)
+        h_case.path, h_case.command, h_case.headers = "/v1/messages", "POST", Message()
+        h_case.headers["Content-Type"] = "application/json"
+        h_case.send_error = mock.Mock()
+        seen_cards: list[str] = []
+
+        def fake_card_key(_cfg, card_name):
+            seen_cards.append(card_name)
+            raise RuntimeError("stop after route match")
+
+        with mock.patch.object(router, "card_key", side_effect=fake_card_key), \
+                mock.patch.object(router, "log_line"):
+            h_case._forward_locked(case_body)
+        self.assertEqual(seen_cards, ["DeepSeek"])
+
+        # 2) ccswitch_admin.py URL 凭据/查询参数脱敏及损坏 settings.json 容错
+        db = self.database()
+        admin.prepare_cards(db, 8240)
+        secret_url = "https://user:" + "sec_tok@example.com/v1?api_key=" + "z" * 24 + "#frag"
+        self.replace_card(db, "Kimi", {"env": {"ANTHROPIC_BASE_URL": secret_url, "ANTHROPIC_AUTH_TOKEN": "tok_k"}})
+        settings_path = self.claude_home / "settings.json"
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        settings_path.write_text("{corrupt settings json", encoding="utf-8")
+        st = admin.inspect_status(db, settings_path)
+        self.assertFalse(st["settings_aligned"])
+        st_serialized = json.dumps(st, ensure_ascii=False)
+        self.assertNotIn("sec_tok", st_serialized)
+        self.assertNotIn("api_key=", st_serialized)
+        self.assertIn("https://example.com/v1", st_serialized)
+
+        # 3) install.py _audit_redact 与 audit_upgrade_status 驼峰令牌、短布尔防误伤、WSL 路径及自定义提示词/技能名脱敏
+        fake_ghp = "ghp_" + "z" * 32
+        fake_aiza = "AIza" + "z" * 34
+        fake_wsl_path = "/mnt/c/" + "Users/private" + "person/project"
+        camel_secret = "camel_secret_" + "z" * 16
+        redacted_sample = installer._audit_redact(
+            {"msg": f"{fake_wsl_path} {fake_ghp} {fake_aiza} {camel_secret}", "count": 1},
+            [],
+            {camel_secret},
+        )
+        self.assertEqual(redacted_sample["count"], 1)
+        for leaked in ("private" + "person", fake_ghp, fake_aiza, camel_secret):
+            self.assertNotIn(leaked, json.dumps(redacted_sample))
+
+        user_words.atomic_write_json(
+            settings_path,
+            {
+                "effortLevel": "xhigh",
+                "accessToken": camel_secret,
+                "env": {"CLAUDE_CODE_SKIP_BEDROCK_AUTH": "1"},
+            },
+        )
+        user_words.atomic_write_json(self.claude_home / "router/router.json", {"port": 8255})
+        priv_dir = db.parent / "skills/private_topic_skill_dir"
+        priv_dir.mkdir(parents=True, exist_ok=True)
+        with closing(sqlite3.connect(db)) as con:
+            con.execute("INSERT INTO prompts VALUES (?,?,?,?,?)", ("p_priv", "claude", "private_prompt_title", 1, "secret rule"))
+            con.execute("CREATE TABLE IF NOT EXISTS skills (id TEXT, name TEXT, enabled_claude INT)")
+            con.execute("INSERT INTO skills VALUES (?,?,?)", ("s_priv", "private_skill_title", 1))
+            con.commit()
+        audit_rep = installer.audit_upgrade_status(
+            REPO_ROOT, self.plugin, self.codex, self.claude_home, db,
+            detection={}, is_sandbox_run=True, app_scope="claude",
+        )
+        rep_text = json.dumps(audit_rep, ensure_ascii=False)
+        for private_token in ("private_prompt_title", "private_skill_title", "private_topic_skill_dir", camel_secret, str(db.parent)):
+            self.assertNotIn(private_token, rep_text)
+        self.assertEqual(audit_rep["cc_switch"]["enabled_prompt_count"] if "enabled_prompt_count" in audit_rep["cc_switch"] else len(audit_rep["cc_switch"]["enabled_prompts"]), 1)
+        self.assertIn("<custom-prompt>", rep_text)
+        self.assertIn("<custom-skill>", rep_text)
+        self.assertIn("<custom-skill-dir>", rep_text)
+
+    def test_claude_session_start_recovers_recent_agent_returns_and_sidechain_log_paths(self):
+        sid = "claude-subagent-session-01"
+        proj_dir = self.claude_home / "projects" / "cfd-solver"
+        transcript = proj_dir / f"{sid}.jsonl"
+        sidechain_log = proj_dir / sid / "subagents" / "agent-a1b2c3d4.jsonl"
+        _append_jsonl(sidechain_log, {"type": "assistant", "isSidechain": True, "message": {"content": []}})
+
+        _append_jsonl(transcript, _user("请核对 HLLC 通量与边界反射实现", timestamp="2026-11-15T02:00:00Z"))
+        _append_jsonl(transcript, {
+            "type": "assistant", "isSidechain": False, "timestamp": "2026-11-15T02:01:00Z",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": "tu-ok", "name": "Agent",
+                     "input": {"subagent_type": "readonly-auditor", "description": "Audit HLLC"}},
+                    {"type": "tool_use", "id": "tu-async", "name": "Task",
+                     "input": {"subagent_type": "readonly-reader", "description": "Async launch"}},
+                    {"type": "tool_use", "id": "tu-err", "name": "Agent",
+                     "input": {"subagent_type": "readonly-auditor", "description": "Failed run"}},
+                ],
+            },
+        })
+        # 1) 异步启动回执不应作为完成结果归档
+        _append_jsonl(transcript, {
+            "type": "user", "isSidechain": False, "timestamp": "2026-11-15T02:01:05Z",
+            "toolUseResult": {"status": "async_launched", "agentId": "bg9999"},
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "tu-async", "content": "Async agent launched"},
+            ]},
+        })
+        # 2) 报错回执不应归档
+        _append_jsonl(transcript, {
+            "type": "user", "isSidechain": False, "timestamp": "2026-11-15T02:01:10Z",
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "tu-err", "is_error": True, "content": "Subagent timed out"},
+            ]},
+        })
+        # 3) 正常完成回执应提取首尾摘要并关联 subagents/agent-<id>.jsonl
+        _append_jsonl(transcript, {
+            "type": "user", "isSidechain": False, "timestamp": "2026-11-15T02:02:00Z",
+            "toolUseResult": {"status": "completed", "agentId": "a1b2c3d4"},
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "tu-ok",
+                 "content": [{"type": "text", "text": "核对完毕：src/flux/hllc.py 第 52 行接触波速与 Toro 公式一致。"}]},
+            ]},
+        })
+
+        state_dir = self.claude_home / "hooks" / "state" / "session-context"
+        res = session_context_loader.handle_claude_session_start(
+            {"session_id": sid, "transcript_path": str(transcript), "source": "compact", "cwd": str(self.root)},
+            state_dir_str=str(state_dir),
+        )
+        ctx = res["hookSpecificOutput"]["additionalContext"]
+        self.assertLessEqual(len(ctx), session_context_loader.MAX_INLINE_TOTAL_CHARS)
+        self.assertIn("最近子代理返回摘要：1 条", ctx)
+        self.assertIn("readonly-auditor (Audit HLLC)", ctx)
+        self.assertIn("Toro 公式一致", ctx)
+        self.assertIn(str(sidechain_log), ctx)
+        self.assertNotIn("Async agent launched", ctx)
+        self.assertNotIn("Subagent timed out", ctx)
+
+        md_file = self.claude_home / "hooks" / "state" / "user-words" / f"{sid}.md"
+        meta_file = self.claude_home / "hooks" / "state" / "user-words" / f"{sid}.meta.json"
+        meta = json.loads(meta_file.read_text(encoding="utf-8"))
+        self.assertEqual(meta["sha256"], hashlib.sha256(md_file.read_bytes()).hexdigest())
+        self.assertEqual(meta["count"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

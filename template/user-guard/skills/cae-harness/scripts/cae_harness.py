@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 
-"""Antigravity、Codex、Claude Code 与 DeepSeek Harness 对等任务与验收。"""
+"""Antigravity、Codex、Claude Code 与 DeepSeek Harness 跨端任务派发与验收工具。"""
 
 
 import argparse
@@ -1122,7 +1122,7 @@ def _is_fast_engine_spec(engine):
 
 
 def select_task_tier(requested_tier='auto', kind='review', text='', file_count=1, estimated_tokens=0, *, engine=''):
-    """默认满血；显式挡位、role:fast、省流意图与非 ultra 环境默认值可覆盖自动策略。"""
+    """默认选用单模型最高挡位；显式挡位、role:fast、节省额度意图与非 ultra 环境默认值可覆盖自动策略。"""
     if requested_tier and requested_tier != 'auto':
         return requested_tier, 'explicit_tier_flag'
     sample = (text or '').strip()
@@ -1319,9 +1319,12 @@ def _select_codex_specialty_record(info, kind, tier, prompt_text, estimated_toke
         deep = [item for item in eligible if _model_specialty(item) == 'deep' and estimated_tokens <= budget(item)]
         if deep:
             return deep[0], 'specialty_deep_reasoning'
-    # 满血模式不能因主力目录缺失而静默切到轻量模型。
+    # 默认选最高挡时不能因主力工程模型缺失而静默切到轻量模型。
     non_lightweight = [item for item in eligible if _model_specialty(item) != 'fast']
-    workhorse = [item for item in non_lightweight if _model_specialty(item) == 'engineering'] or non_lightweight
+    engineering = [item for item in non_lightweight if _model_specialty(item) == 'engineering']
+    workhorse_tags = {str(t).lower() for t in (_catalog_rules('codex').get('workhorse_families') or ())}
+    preferred_workhorse = [item for item in engineering if workhorse_tags and (_tokens_lower(item['slug']) & workhorse_tags)]
+    workhorse = preferred_workhorse or engineering or non_lightweight
     if not workhorse:
         return {}, 'no_native_catalog_candidate'
     fitting = [item for item in workhorse if estimated_tokens <= budget(item)]
@@ -1437,7 +1440,9 @@ def resolve_execution_profile(backends, spec, tier='max', prompt_text='', kind='
             if record or explicit_model:
                 return _agy_profile(info, spec, record, record.get('slug') or explicit_model, tier,
                                     'prompt_fuzzy_model' if hint else source if record else 'explicit_engine_model')
-        native = [item for item in models if _model_category('agy', item) == 'native']
+        agy_blocked = {str(t).lower() for t in (_catalog_rules('agy').get('blocked_auto_tokens') or ())}
+        native = [item for item in models if _model_category('agy', item) == 'native'
+                  and not (_tokens_lower(f"{item['slug']} {item.get('display_name', '')}") & agy_blocked)]
         families = _agy_families(native)
         eligible = sorted((name for name in families if _match_agy_family(families[name], tier)), key=_agy_family_order)
         if eligible:
@@ -1654,7 +1659,8 @@ def _refresh_agy_listing(info, batch, *, refresh_model_cache, record_quota=True)
             if alternate:
                 info = alternate
                 continue
-        raise HarnessError('agy models 查询失败，停止派工', returncode=result.returncode, stderr=detail[-1000:],
+        raise HarnessError('agy models 查询失败，停止派工', returncode=result.returncode,
+                           stderr=_redact_runtime_secret(detail)[-1000:],
                            execution_environment=_execution_environment(info))
     fetched_at = datetime.datetime.now(datetime.timezone.utc)
     snapshot = {'source': 'agy_models_cli', 'fetched_at': fetched_at.isoformat(), 'models': models}
@@ -1670,6 +1676,45 @@ def _refresh_agy_listing(info, batch, *, refresh_model_cache, record_quota=True)
                 capability_source='agy_models_cli',
                 model_catalog=_catalog_metadata(None, snapshot, models, 'agy_models_cli', fetched_at))
     return info
+
+
+def _sanitize_endpoint_url(raw_url):
+    text = str(raw_url or '').strip()
+    if not text:
+        return ''
+    if not text.lower().startswith(('http://', 'https://')):
+        return '<redacted-url>' if ('@' in text or '?' in text) else text
+    try:
+        parsed = urlsplit(text)
+        host = parsed.hostname or ''
+        if not host:
+            return '<redacted-url>'
+        if ':' in host:
+            host = '[' + host + ']'
+        port_part = f':{parsed.port}' if parsed.port else ''
+        return f'{parsed.scheme}://{host}{port_part}{parsed.path}'
+    except ValueError:
+        return '<redacted-url>'
+
+
+def _redact_runtime_secret(text):
+    raw = str(text or '')
+    if not raw:
+        return ''
+    raw = re.sub(r'https?://[^\s"<>]+', lambda m: _sanitize_endpoint_url(m.group(0)), raw)
+    raw = re.sub(
+        r'(?i)\b(DEEPSEEK_API_KEY|ANTHROPIC_AUTH_TOKEN|ANTHROPIC_API_KEY|OPENAI_API_KEY)\s*([=:])\s*(["\']?)[^\s"\']+\3',
+        r'\1\2<redacted>',
+        raw,
+    )
+    raw = re.sub(r'(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{8,}', 'Bearer <redacted>', raw)
+    raw = re.sub(
+        r'\b(?:sk-[A-Za-z0-9_-]{12,}|AIza[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|'
+        r'github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|hf_[A-Za-z0-9]{20,}|glpat-[A-Za-z0-9_-]{16,})',
+        '<redacted>',
+        raw,
+    )
+    return raw
 
 
 def _usable_credential(value):
@@ -1730,7 +1775,7 @@ def _claude_info(binary, requested=None):
                   for i, alias in enumerate(('opus', 'sonnet', 'haiku'))]
     return {'available': bool(binary), 'detected': bool(binary), 'binary': binary, 'family': 'claude',
             'config_home': str(root), 'windows_interop': interop, 'model': configured, 'models': models,
-            'base_url': base_url, 'router_configured': bool(router_cfg),
+            'base_url': _sanitize_endpoint_url(base_url), 'router_configured': bool(router_cfg),
             'llm_source': source, 'llm_configured': source in ('local_router', 'settings_env', 'credentials_file'),
             'configured_window_tokens': configured_window, 'effective_compaction_tokens': compact_window,
             'verified_status': 'unverified', 'authentication_status': 'not_checked',
@@ -1746,7 +1791,8 @@ def _dsh_info(binary, requested=None):
         if line.strip().startswith('#'):
             continue
         key, equal, value = line.partition('=')
-        if equal and key.strip() == 'DEEPSEEK_API_KEY':
+        clean_key = re.sub(r'^export\s+', '', key.strip())
+        if equal and clean_key == 'DEEPSEEK_API_KEY':
             api_key = api_key or _usable_credential(_credential_scalar(value))
     account = False
     # 仅识别凭据文件中两种官方提供方及其密钥字段，不实现通用 YAML 解析器。
@@ -2200,7 +2246,7 @@ def _active_quota_record(prefix, info, files=None):
 
 def _record_quota_exhausted(prefix, info, detail, now=None, *, batch=None):
     now_ts = time.time() if now is None else float(now)
-    clean_detail = re.sub(r'<Objs\b[\s\S]*', '', detail or '').strip()
+    clean_detail = _redact_runtime_secret(re.sub(r'<Objs\b[\s\S]*', '', detail or '').strip())
     key = _quota_scope(prefix, info)
     record = {'backend': prefix, 'execution_side': key[1], 'exhausted': True,
               'event_id': uuid.uuid4().hex, 'detected_at_epoch': round(now_ts, 3),
@@ -2327,7 +2373,7 @@ def _quota_can_replay(details, invocation):
 
 
 class _WindowsJob:
-    """为本次子进程单独持有 Job；挂起创建、先纳管后恢复，封住派生竞态。"""
+    """为本次子进程单独创建 Windows Job 对象；以挂起状态创建子进程，先绑定至 Job 再恢复执行，防止派生子进程逃逸。"""
 
     def __init__(self):
         import ctypes
@@ -3085,6 +3131,16 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
                 clean_dsh.mkdir(parents=True, exist_ok=True)
                 if src_home and (src_home / '.credentials.yaml').is_file() and not _is_link(src_home / '.credentials.yaml'):
                     shutil.copy2(src_home / '.credentials.yaml', clean_dsh / '.credentials.yaml')
+                if src_home and not env.get('DEEPSEEK_API_KEY') and (src_home / '.env').is_file() and not _is_link(src_home / '.env'):
+                    for line in _optional_text(src_home / '.env').splitlines():
+                        if line.strip().startswith('#'):
+                            continue
+                        k_env, eq_env, v_env = line.partition('=')
+                        if eq_env and re.sub(r'^export\s+', '', k_env.strip()) == 'DEEPSEEK_API_KEY':
+                            extracted_key = _credential_scalar(v_env)
+                            if _usable_credential(extracted_key):
+                                env['DEEPSEEK_API_KEY'] = extracted_key
+                            break
                 effective_dsh_home = str(clean_dsh)
         if prefix == 'codex' and effective_codex_home and not interop:
             env['CODEX_HOME'] = effective_codex_home
@@ -3220,31 +3276,33 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
                                r'^(?:\[agy\]\s+print timeout after\b|error:\s+print timeout after\b)', line.strip(), re.I)]
             if diagnostics:
                 detail = '\n'.join(diagnostics)
+                redacted_detail = _redact_runtime_secret(detail)
                 if _is_agy_print_timeout_text(detail):
                     raise HarnessError('agy 执行触发 --print-timeout 超时', 'timeout',
-                                       returncode=0, finished_reason='print_timeout', stderr=detail[-2000:])
+                                       returncode=0, finished_reason='print_timeout', stderr=redacted_detail[-2000:])
                 if _is_quota_exhausted(detail):
                     cooldown = _record_quota_exhausted(prefix, info, detail, batch=batch)
                     raise HarnessError('agy 额度不足或已达用量上限，已停止并记录冷却状态',
                                        'quota_exhausted', preflight_blocked=False, returncode=0,
-                                       stderr=detail[-2000:], **_quota_user_choices(prefix, cooldown))
-                raise HarnessError('agy 返回终止错误诊断', 'failed', returncode=0, stderr=detail[-2000:])
+                                       stderr=redacted_detail[-2000:], **_quota_user_choices(prefix, cooldown))
+                raise HarnessError('agy 返回终止错误诊断', 'failed', returncode=0, stderr=redacted_detail[-2000:])
         if result.returncode:
             detail = _backend_diagnostics(result)
             structured = _backend_diagnostics(result, structured_only=True)
+            redacted_stderr = _redact_runtime_secret(result.stderr or '')[-2000:]
             if _is_quota_exhausted(structured or detail):
                 cooldown = _record_quota_exhausted(prefix, info, detail, batch=batch)
                 raise HarnessError(f'{prefix} 额度不足或已达用量上限，已停止并记录冷却状态',
                                    'quota_exhausted', preflight_blocked=False, returncode=result.returncode,
-                                   stderr=(result.stderr or '')[-2000:], **_quota_user_choices(prefix, cooldown))
+                                   stderr=redacted_stderr, **_quota_user_choices(prefix, cooldown))
             if prefix == 'agy' and _is_agy_print_timeout_text(detail):
                 raise HarnessError('agy 执行触发 --print-timeout 超时', 'timeout',
                                    returncode=result.returncode, finished_reason='print_timeout',
-                                   stderr=(result.stderr or '')[-2000:])
+                                   stderr=redacted_stderr)
             # A worker may already have written files. Authentication fallback
             # is allowed only in model listing before planning and execution.
             raise HarnessError(f'{prefix} 执行失败，退出码 {result.returncode}', returncode=result.returncode,
-                               stderr=(result.stderr or '')[-2000:])
+                               stderr=redacted_stderr)
         raw = output_file.read_text(encoding='utf-8-sig') if prefix == 'codex' and output_file.exists() else result.stdout
         try:
             parsed = _extract_json_object(raw, schema)
@@ -4029,7 +4087,8 @@ def cmd_audit(args):
         raise HarnessError('目标范围没有可审查文件', skipped_files=skipped)
     total_tokens = sum(item['tokens'] for item in records)
     engines = _audit_engines(backends, not args.single, args.left, args.right, args.dry_run, caller, args.focus)
-    tier, tier_reason = select_task_tier(args.tier, 'audit', args.focus, len(records), total_tokens)
+    audit_engine_hint = (args.left or (engines[0] or '')) if args.single else ''
+    tier, tier_reason = select_task_tier(args.tier, 'audit', args.focus, len(records), total_tokens, engine=audit_engine_hint)
     meta = {'caller': caller, 'handoff_to_caller': True, 'requested_tier': args.tier,
             'selected_tier': tier, 'tier_reason': tier_reason, 'target': str(root)}
     batch = _QuotaBatch(args.retry_quota)
