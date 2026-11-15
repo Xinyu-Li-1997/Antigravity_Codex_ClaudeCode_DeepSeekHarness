@@ -2,8 +2,8 @@
   "$schema": "https://antigravity.google/schemas/v1/plugin.json",
   "name": "user-guard",
   "displayName": "User Guard & Scientific Standards",
-  "version": "1.11.1",
-  "description": "Unified engineering and scientific harness for Antigravity, Codex, Claude Code, and DeepSeek Harness with compaction recovery, boundary guards, read-only subagents, local routing, cross-agent verification, and self-hosting fleet evolution.",
+  "version": "1.12.0",
+  "description": "Meta-driven engineering and scientific computing harness for Antigravity, Codex, Claude Code, and DeepSeek Harness with compaction recovery, boundary guards, read-only subagents, evaluated role routing, cross-agent verification, and defect-first fleet evolution.",
   "license": "Apache-2.0",
   "logo": "assets/logo.svg",
   "repository": "https://github.com/Xinyu-Li-1997/Antigravity_Codex_ClaudeCode_DeepSeekHarness"

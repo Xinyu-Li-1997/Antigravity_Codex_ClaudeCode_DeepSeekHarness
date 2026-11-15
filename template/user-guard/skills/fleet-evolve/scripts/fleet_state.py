@@ -78,13 +78,16 @@ def _resolve_repo_root(raw_repo: str | None) -> Path:
 def _repo_meta(repo_root: Path) -> Dict[str, str]:
     plugin_json = repo_root / "template" / "user-guard" / "plugin.json"
     skill_md = repo_root / "template" / "user-guard" / "skills" / "fleet-evolve" / "SKILL.md"
+    profile_json = repo_root / "template" / "user-guard" / "skills" / "cae-harness" / "fleet_profile.json"
     plugin_version = json.loads(plugin_json.read_text(encoding="utf-8")).get("version", "") if plugin_json.is_file() else ""
     skill_sha256 = hashlib.sha256(skill_md.read_bytes()).hexdigest() if skill_md.is_file() else ""
+    profile_sha256 = hashlib.sha256(profile_json.read_bytes()).hexdigest() if profile_json.is_file() else ""
     core_digest = hashlib.sha256()
     for rel in (
         "install.py",
         "template/user-guard/plugin.json",
         "template/user-guard/skills/fleet-evolve/SKILL.md",
+        "template/user-guard/skills/cae-harness/fleet_profile.json",
         "template/user-guard/skills/cae-harness/scripts/cae_harness.py",
     ):
         target = repo_root / rel
@@ -105,6 +108,7 @@ def _repo_meta(repo_root: Path) -> Dict[str, str]:
         "repo_commit": commit,
         "plugin_version": str(plugin_version),
         "skill_sha256": skill_sha256,
+        "profile_sha256": profile_sha256,
         "core_sha256": core_digest.hexdigest(),
     }
 
@@ -115,6 +119,7 @@ def _is_aligned_with_repo(saved: Dict[str, Any], meta: Dict[str, str]) -> bool:
         and saved.get("execution_side") == _side()
         and saved.get("plugin_version") == meta["plugin_version"]
         and saved.get("skill_sha256") == meta["skill_sha256"]
+        and (not saved.get("profile_sha256") or saved.get("profile_sha256") == meta["profile_sha256"])
         and (not saved.get("repo_root") or saved.get("repo_root") == meta["repo_root"])
         and (not saved.get("core_sha256") or saved.get("core_sha256") == meta["core_sha256"])
         and (not meta["repo_commit"] or saved.get("repo_commit") == meta["repo_commit"])
@@ -203,7 +208,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repo", default=None, help="Upstream repository root (auto-detected from cwd/script if omitted)")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("status", help="Read current bootstrap phase without modifying disk")
+    sub.add_parser("status", help="Read current bootstrap or approval phase without modifying disk")
+
+    p_prop = sub.add_parser("propose", help="Record candidate client-model table and pause for user sign-off")
+    p_prop.add_argument("--session-id", required=True)
+    p_prop.add_argument("--summary", required=True, help="Brief summary of proposed role/model changes requiring user approval")
+    p_prop.add_argument("--ttl", type=int, default=86400)
+
+    p_app = sub.add_parser("approve", help="Record explicit user sign-off on the proposed client-model table")
+    p_app.add_argument("--session-id", required=True)
 
     p_rec = sub.add_parser("record-pass1", help="Record Pass 1 completion awaiting Master reload")
     p_rec.add_argument("--session-id", required=True)
@@ -235,7 +248,8 @@ def main(argv: list[str] | None = None) -> int:
         ttl = _int_field(saved, "ttl_seconds", 86400, positive=True)
         updated = _int_field(saved, "updated_at_epoch", 0)
         side_mismatch = bool(saved and saved.get("execution_side") != _side())
-        expired = bool(raw_phase == "AWAITING_MASTER_RELOAD" and (now - updated > ttl))
+        active_phases = ("AWAITING_MASTER_RELOAD", "AWAITING_USER_APPROVAL")
+        expired = bool(raw_phase in active_phases and (now - updated > ttl))
         aligned = _is_aligned_with_repo(saved, meta)
         stale_reason = "corrupt_state" if corrupt else None
         if raw_phase == "AWAITING_MASTER_RELOAD":
@@ -245,7 +259,12 @@ def main(argv: list[str] | None = None) -> int:
                 stale_reason = "expired_ttl"
             elif not aligned:
                 stale_reason = "repo_drift"
-        effective_phase = "AWAITING_MASTER_RELOAD" if (raw_phase == "AWAITING_MASTER_RELOAD" and stale_reason is None) else "IDLE"
+        elif raw_phase == "AWAITING_USER_APPROVAL":
+            if side_mismatch:
+                stale_reason = "side_mismatch"
+            elif expired:
+                stale_reason = "expired_ttl"
+        effective_phase = raw_phase if (raw_phase in active_phases and stale_reason is None) else "IDLE"
         print(json.dumps({
             "phase": effective_phase,
             "raw_phase": raw_phase,
@@ -257,6 +276,64 @@ def main(argv: list[str] | None = None) -> int:
             "current_repo": meta,
             "saved": saved or None,
         }, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.cmd == "propose":
+        sid = args.session_id.strip()
+        summary = args.summary.strip()
+        if not sid or not summary or args.ttl <= 0:
+            raise ValueError("session-id and summary must be non-empty and ttl must be positive")
+        payload = {
+            "schema_version": 1,
+            "phase": "AWAITING_USER_APPROVAL",
+            "execution_side": _side(),
+            "proposing_session_id": sid,
+            "proposal_summary": summary,
+            "updated_at_epoch": now,
+            "ttl_seconds": args.ttl,
+            **meta,
+        }
+        with _state_lock(state_file):
+            _atomic_write_json(state_file, payload)
+        print(json.dumps({"ok": True, "user_approval_required": True, "state_file": str(state_file), "state": payload}, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.cmd == "approve":
+        sid = args.session_id.strip()
+        if not sid:
+            raise ValueError("session-id must be non-empty")
+        with _state_lock(state_file):
+            try:
+                saved = _load_state(state_file)
+            except ValueError:
+                print(json.dumps({"ok": False, "reason": "corrupt_state"}, ensure_ascii=False, indent=2))
+                return 2
+            if saved.get("phase") != "AWAITING_USER_APPROVAL":
+                print(json.dumps({"ok": False, "reason": "no_pending_proposal", "saved": saved or None}, ensure_ascii=False, indent=2))
+                return 2
+            if saved.get("execution_side") != _side():
+                print(json.dumps({"ok": False, "reason": "side_mismatch", "saved": saved}, ensure_ascii=False, indent=2))
+                return 2
+            if not _is_aligned_with_repo(saved, meta):
+                print(json.dumps({"ok": False, "reason": "repo_or_profile_changed_since_propose", "saved": saved, "current": meta}, ensure_ascii=False, indent=2))
+                return 2
+            if now - _int_field(saved, "updated_at_epoch", 0) > _int_field(saved, "ttl_seconds", 86400, positive=True):
+                print(json.dumps({"ok": False, "reason": "expired_ttl", "saved": saved}, ensure_ascii=False, indent=2))
+                return 2
+            payload = {
+                "schema_version": 1,
+                "phase": "IDLE",
+                "user_approved": True,
+                "approved_by_session_id": sid,
+                "approved_at_epoch": now,
+                "approved_proposal_summary": saved.get("proposal_summary"),
+                "updated_at_epoch": now,
+                "ttl_seconds": _int_field(saved, "ttl_seconds", 86400, positive=True),
+                "execution_side": _side(),
+                **meta,
+            }
+            _atomic_write_json(state_file, payload)
+        print(json.dumps({"ok": True, "phase": "IDLE", "user_approved": True, "state": payload}, ensure_ascii=False, indent=2))
         return 0
 
     if args.cmd == "record-pass1":

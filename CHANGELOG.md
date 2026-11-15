@@ -4,6 +4,24 @@
 
 ---
 
+## [1.12.0] - 2026-11-15
+
+基于跨主机十余万次代理请求与近万份客户端原始会话轨迹的量化复盘，完成“常驻机制层 + 动态评估快照层”两层元驱动重构、优缺点双向评估与用户拍板状态门禁，以及四项真实无头故障根治：
+
+- **两层元驱动架构与受控评估清单单点真源（`fleet_profile.json`、`cae_harness.py`、`install.py`、`ccswitch_admin.py`、`rules/AGENTS.md`、`AGENTS.md`、`SKILL.md`）**：
+  - 新增机器可读清单 `template/user-guard/skills/cae-harness/fleet_profile.json`（支持 `CAE_FLEET_PROFILE` 环境变量覆盖测试），集中定义角色槽位（`orchestrator`、`math`、`code`、`review`、`fast`）候选链、双向长短板与硬隔离措施、风控排除平台（明确在 Anthropic 解除过严封号风控与 5 小时／7 天硬限流前暂不纳入 Claude 原生模型）、客户端模型目录匹配规则及卡片默认参数；
+  - 从 `cae_harness.py`、`install.py`、`ccswitch_admin.py`、两份 `AGENTS.md` 与两个 `SKILL.md` 中彻底剥离硬编码的季节性模型名称，支持 `role:math`、`role:code`、`role:review`、`role:fast`、`role:orchestrator` 及 `<client>:@<role>`／`codex:math`／`codex:code`／`dsh:fast`／`agy:fast` 动态角色选路，并明确总控（`orchestrator`）角色本身亦可随模型沟通能力、稳定性与成本变化动态重算切换。
+- **优缺点双向调研准则与推荐表用户拍板硬门禁（`fleet_state.py`、`fleet-evolve/SKILL.md`、`README.md`）**：
+  - 确立“长板定能力上限、致命短板做一票否决或隔离边界”的双向评估准则，在 `fleet_state.py` 中新增 `propose`／`approve` 状态门禁（`AWAITING_USER_APPROVAL`）并将 `fleet_profile.json` 纳入 `core_sha256` 完整性校验，硬性规定生成／变更推荐 `客户端 × 模型 × 挡位` 表、写入宿主机全局目录（`R4`）、跨大版本 ABI 耦合升级与远端 `git push` 四个必停拍板节点；
+  - 整篇重写 `README.md`、`docs/workflow-guide.md` 与 `docs/architecture-and-hooks.md`，客观阐述官方底层执行／缓存闭环与用户侧薄治理外层的权责边界，校准反重力搭载 Google 旗舰模型担任当前总控的真实依据（中文表达最直白说人话 + 旗舰订阅内含配额对比昂贵按量 API），补充跨主机遥测审计摘要，并将适用范围自然覆盖科学计算、CAE／CFD／FEA、计算几何／CAM 与高可靠系统工程。
+- **跨主机真实遥测暴露的四项无头故障修复（`cae_harness.py`、`tests/`）**：
+  - 扩展 `QUOTA_ERROR_RE` 与 `_parse_quota_reset` 识别 `hit your session/weekly limit`、`5-hour ... limit` 及无介词 `resets 5pm` 限流报文；
+  - 修复 Claude Code JSON 错误信封（`is_error: true` 且字符串提示位于 `result` 字段）在输出状态判定与预检中的提取遗漏；
+  - 为 Claude Code 无头只读任务固定附加 `--permission-mode dontAsk`，消除 `auto` 模式安全分类器高频限流报错；
+  - 强化 `dsh` 无头提示词的单 JSON 输出约束，降低非 `--json-schema` 客户端偶发夹带解释文本导致的 `invalid_output`。
+
+---
+
 ## [1.11.1] - 2026-11-15
 
 新增 `cae-harness` 无头纯净盲读模式（`--clean-room`），建立“多端新手视角盲读 -> 主控重写自然工程中文 -> 独立核对技术准确度与脱敏”三步文档演进机制，完成全仓文档去黑话重写与 CC Switch 退役残留清理：

@@ -297,7 +297,7 @@ class HarnessTests(unittest.TestCase):
                 if readonly:
                     self.assertEqual(command[command.index('--tools') + 1], 'Read,Grep,Glob')
                     self.assertEqual(command[command.index('--permission-prompts') + 1], 'none')
-                    self.assertNotIn('--permission-mode', command)
+                    self.assertEqual(command[command.index('--permission-mode') + 1], 'dontAsk')
                 else:
                     self.assertEqual(command[command.index('--tools') + 1], 'Read,Grep,Glob,Edit,Write,Bash')
                     self.assertEqual(command[command.index('--permission-mode') + 1], 'bypassPermissions')
@@ -2759,6 +2759,137 @@ else:
             res_dsh = harness.invoke_engine('dsh:default', self.root, '新手盲读', engines, harness.TASK_JSON_SCHEMA,
                                             readonly=True, clean_room=True)
         self.assertEqual(res_dsh, TASK)
+
+    def test_meta_driven_synthetic_fleet_profile_and_telemetry_quota_fixes(self):
+        synth_profile = {
+            'schema_version': 1,
+            'profile_id': 'synthetic-future-v9',
+            'evaluated_at': '2029-01-01',
+            'roles': {
+                'orchestrator': {'candidates': ['agy:default', 'codex:default']},
+                'math': {'candidates': ['codex:math', 'dsh:default']},
+                'code': {'candidates': ['codex:code', 'claude:default']},
+                'review': {'candidates': ['claude:default', 'codex:code']},
+                'fast': {'candidates': ['dsh:fast', 'codex:@fast']},
+            },
+            'client_catalog_rules': {
+                'agy': {
+                    'family_priority': ['xenon'],
+                    'fast_tags': ['neon', 'lite'],
+                    'blocked_auto_tokens': ['orchestrator', 'router', 'claude'],
+                },
+                'codex': {
+                    'workhorse_families': ['gauss', 'euler'],
+                    'deep_tags': ['euler'],
+                    'fast_tags': ['spark', 'lite'],
+                },
+                'claude': {
+                    'default_fallback_alias': 'kimi-k9-max[2m]',
+                    'router_primary_model': 'kimi-k9-max[2m]',
+                    'router_subagent_model': 'deepseek-v9-nano',
+                    'alias_map': {'kimi': 'kimi-k9-max[2m]', 'ds': 'deepseek-v9-nano'},
+                },
+                'dsh': {
+                    'default_model': 'deepseek-v9-omega',
+                    'fast_model': 'deepseek-v9-nano',
+                    'builtin_models': [
+                        {'slug': 'deepseek-v9-omega', 'display_name': 'DS-V9-Omega',
+                         'context_window': 2097152, 'max_context_window': 2097152,
+                         'supported_efforts': ['off', 'low', 'high', 'max']},
+                        {'slug': 'deepseek-v9-nano', 'display_name': 'DS-V9-Nano',
+                         'context_window': 2097152, 'max_context_window': 2097152,
+                         'supported_efforts': ['off', 'low', 'high', 'max']},
+                    ],
+                    'alias_map': {'flash': 'deepseek-v9-nano'},
+                },
+            },
+            'peer_fallback_order': {
+                'antigravity': ['codex', 'claude', 'dsh'],
+                'codex': ['agy', 'claude', 'dsh'],
+            },
+            'legacy_aliases': {},
+        }
+        profile_path = self.root / 'synthetic_fleet_profile.json'
+        profile_path.write_text(json.dumps(synth_profile), encoding='utf-8')
+
+        engines = self.four_backends()
+        engines['codex']['models'] = [
+            {'slug': 'gpt-9.2-gauss', 'context_window': 1200000, 'max_context_window': 1200000,
+             'supported_efforts': ['low', 'medium', 'high', 'max']},
+            {'slug': 'gpt-9.1-euler', 'context_window': 1200000, 'max_context_window': 1200000,
+             'supported_efforts': ['low', 'medium', 'high', 'max']},
+            {'slug': 'gpt-9.0-spark', 'context_window': 400000, 'max_context_window': 400000,
+             'supported_efforts': ['low', 'medium', 'high']},
+        ]
+        engines['codex']['model'] = 'gpt-9.2-gauss'
+        engines['agy']['models'] = [
+            {'slug': 'gemini-9-xenon-high', 'supported_efforts': ['high']},
+            {'slug': 'gemini-9-neon-low', 'supported_efforts': ['low']},
+        ]
+        engines['agy']['model'] = 'gemini-9-xenon-high'
+        engines['claude']['model'] = 'kimi-k9-max[2m]'
+
+        with patch.dict(os.environ, {'CAE_FLEET_PROFILE': str(profile_path)}):
+            engines['dsh']['models'] = [dict(item, provider='deepseek_official')
+                                        for item in synth_profile['client_catalog_rules']['dsh']['builtin_models']]
+            engines['dsh']['model'] = synth_profile['client_catalog_rules']['dsh']['default_model']
+
+            math_engine = harness.choose_engine(engines, 'antigravity', 'role:math')
+            code_engine = harness.choose_engine(engines, 'antigravity', 'role:code')
+            review_engine = harness.choose_engine(engines, 'antigravity', 'role:review')
+            fast_engine = harness.choose_engine(engines, 'antigravity', 'role:fast')
+            self.assertEqual(math_engine, 'codex:math')
+            self.assertEqual(code_engine, 'codex:code')
+            self.assertEqual(review_engine, 'claude:default')
+            self.assertEqual(fast_engine, 'dsh:fast')
+
+            p_math = harness.resolve_execution_profile(engines, math_engine, kind='math')
+            p_code = harness.resolve_execution_profile(engines, code_engine, kind='code')
+            p_fast = harness.resolve_execution_profile(engines, fast_engine, tier='low', kind='review')
+            p_cx_fast = harness.resolve_execution_profile(engines, 'codex:@fast', tier='low', kind='review')
+            engines['claude']['llm_source'] = 'local_router'
+            p_cc_fast = harness.resolve_execution_profile(engines, 'claude:@fast', tier='low', kind='review')
+            self.assertEqual(p_math['model'], 'gpt-9.1-euler')
+            self.assertEqual(p_math['capacity']['selected_window_tokens'], 1200000)
+            self.assertEqual(p_code['model'], 'gpt-9.2-gauss')
+            self.assertEqual(p_fast['model'], 'deepseek-v9-nano')
+            self.assertEqual(p_cx_fast['model'], 'gpt-9.0-spark')
+            self.assertEqual(p_cc_fast['model'], 'deepseek-v9-nano')
+            self.assertEqual(harness.select_task_tier('auto', 'review', '快速扫一眼', engine='role:fast'), ('low', 'role_fast_low'))
+
+            with patch.object(harness, '_args_backends', return_value=engines):
+                code_rc, assess_out = self.capture(harness.cmd_assess, self.args('assess', '--caller', 'antigravity'))
+            self.assertEqual(code_rc, 0)
+            self.assertEqual(assess_out['resolved_roles']['math']['model'], 'gpt-9.1-euler')
+            self.assertEqual(assess_out['resolved_roles']['review']['selected_engine'], 'claude:default')
+            self.assertEqual(assess_out['resolved_roles']['fast']['model'], 'deepseek-v9-nano')
+
+        # 验证 Claude JSON 错误信封（is_error=true 且 result 为字符串）识别 session/weekly limit 与无介词 resets 时间
+        claude_limit_envelope = json.dumps({
+            'type': 'result',
+            'subtype': 'success',
+            'is_error': True,
+            'result': "You've hit your session limit · resets 11pm (Asia/Shanghai)",
+        })
+        with self.assertRaises(harness.HarnessError) as ctx:
+            harness._extract_json_object(claude_limit_envelope, harness.TASK_JSON_SCHEMA)
+        self.assertEqual(ctx.exception.status, 'quota_exhausted')
+        parsed_reset = harness._parse_quota_reset("You've hit your weekly limit · resets 5pm (UTC)")
+        self.assertIsNotNone(parsed_reset)
+
+        # 验证 DSH 无头调用注入单 JSON 对象强约束且不破坏结果解析
+        dsh_home = self.root / 'dsh-json-check'
+        dsh_home.mkdir()
+        (dsh_home / '.credentials.yaml').write_text("'deepseek-official/DEEPSEEK_API_KEY': 'tok'\n", encoding='utf-8')
+        engines['dsh']['config_home'] = str(dsh_home)
+
+        def check_dsh_prompt(command, cwd, input_text, timeout_sec, **kwargs):
+            self.assertIn('请仅输出一个以 { 开头、以 } 结尾且严格符合以下 JSON Schema', input_text)
+            stream = json.dumps({'type': 'final', 'reason': {'kind': 'completed'}, 'text': json.dumps(TASK)})
+            return subprocess.CompletedProcess(command, 0, stream, '')
+
+        with patch.object(harness, 'run_process', side_effect=check_dsh_prompt):
+            self.assertEqual(harness.invoke_engine('dsh:default', self.root, '检查提示词', engines, harness.TASK_JSON_SCHEMA), TASK)
 
 
 if __name__ == '__main__':

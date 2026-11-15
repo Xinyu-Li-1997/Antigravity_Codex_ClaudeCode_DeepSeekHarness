@@ -57,7 +57,8 @@ EXIT_CODES = {'ok': 0, 'failed': 1, 'scope_violation': 1, 'verification_failed':
 
 
 QUOTA_ERROR_RE = re.compile(
-    r"(?:hit your usage limit|usage limit|insufficient_quota|exceeded your current quota|"
+    r"(?:hit your (?:usage|session|weekly) limit|usage limit|(?:session|weekly)[ _-]limit(?:[ _-](?:reached|exceeded))?|"
+    r"5-hour (?:usage |session )?limit|insufficient_quota|exceeded your current quota|"
     r"purchase more credits|billing_hard_limit_reached|quota[ _-]?exceeded|quota[ _-]?exhausted|"
     r"out of quota|out of credits|resource_exhausted|daily limit exceeded|"
     r"credit balance is too low|insufficient[ _-]balance|余额不足|账户余额不足)",
@@ -151,8 +152,57 @@ _NEGATION = re.compile(
 
 ROUTER_MODEL_TAGS = {'orchestrator', 'router', 'auto'}
 
+_FLEET_PROFILE_CACHE = {'key': None, 'data': None}
 
-FAST_MODEL_TAGS = {'lite', 'mini', 'fast', 'flash', 'hydrogen', 'luna'}
+
+def _fleet_profile_path():
+    override = os.environ.get('CAE_FLEET_PROFILE', '').strip()
+    if override:
+        return Path(override).expanduser().resolve()
+    return Path(__file__).resolve().parent.parent / 'fleet_profile.json'
+
+
+def _fleet_profile():
+    path = _fleet_profile_path()
+    try:
+        st = path.stat()
+        key = (str(path), st.st_mtime_ns, st.st_size)
+        if _FLEET_PROFILE_CACHE['key'] == key and _FLEET_PROFILE_CACHE['data'] is not None:
+            return _FLEET_PROFILE_CACHE['data']
+        raw = json.loads(path.read_text(encoding='utf-8'))
+        if not isinstance(raw, dict) or raw.get('schema_version') != 1:
+            raise ValueError('invalid fleet_profile schema_version')
+        _FLEET_PROFILE_CACHE['key'] = key
+        _FLEET_PROFILE_CACHE['data'] = raw
+        return raw
+    except (OSError, ValueError) as exc:
+        if os.environ.get('CAE_FLEET_PROFILE', '').strip():
+            raise HarnessError(f'无法读取指定的模型评估快照 {path}: {exc}') from exc
+        return {}
+
+
+def _catalog_rules(prefix):
+    rules = _fleet_profile().get('client_catalog_rules')
+    entry = rules.get(prefix) if isinstance(rules, dict) else None
+    return entry if isinstance(entry, dict) else {}
+
+
+def _fast_model_tags(prefix=None):
+    if prefix:
+        tags = _catalog_rules(prefix).get('fast_tags')
+        if isinstance(tags, list) and tags:
+            return {str(item).lower() for item in tags if item}
+    merged = set()
+    for client in ('agy', 'codex'):
+        for item in _catalog_rules(client).get('fast_tags') or ():
+            if item:
+                merged.add(str(item).lower())
+    return merged or {'lite', 'mini', 'fast', 'flash'}
+
+
+def _deep_model_tags(prefix='codex'):
+    tags = _catalog_rules(prefix).get('deep_tags')
+    return {str(item).lower() for item in tags if item} if isinstance(tags, list) else set()
 
 
 NON_AI_MODEL_STOPWORDS = {
@@ -492,17 +542,58 @@ def _peer_auto_ready(backends, name):
     return bool(info.get('available') and (name not in ('claude', 'dsh') or info.get('llm_configured')))
 
 
+def _resolve_role_engine(backends, caller, role_spec, prompt_text=''):
+    role_name = role_spec.split(':', 1)[1].strip().lower()
+    roles = _fleet_profile().get('roles')
+    role_cfg = roles.get(role_name) if isinstance(roles, dict) else None
+    candidates = role_cfg.get('candidates') if isinstance(role_cfg, dict) else None
+    if not isinstance(candidates, list) or not candidates:
+        raise HarnessError(f'未知或未配置的角色槽位: {role_name!r}（支持 role:math、role:code、role:review、role:fast、role:orchestrator）')
+    negated = _extract_negated_backends(prompt_text)
+    caller_backend = {'antigravity': 'agy', 'codex': 'codex', 'claude': 'claude', 'dsh': 'dsh'}.get(resolve_caller(caller))
+    parsed = []
+    for raw_cand in candidates:
+        if not isinstance(raw_cand, str) or ':' not in raw_cand:
+            continue
+        cand_prefix, _ = _engine_parts(raw_cand)
+        if cand_prefix not in negated:
+            parsed.append((cand_prefix, raw_cand))
+    if not parsed:
+        raise HarnessError(f'提示词已排除角色 {role_name} 的全部候选后端，请显式指定 --engine/--worker')
+    ready_peers = [spec for prefix, spec in parsed if prefix != caller_backend and _peer_auto_ready(backends, prefix)
+                   and not _active_quota_record(prefix, backends[prefix])]
+    if ready_peers:
+        return ready_peers[0]
+    ready_any = [spec for prefix, spec in parsed if _peer_auto_ready(backends, prefix)
+                 and not _active_quota_record(prefix, backends[prefix])]
+    if ready_any:
+        return ready_any[0]
+    avail_any = [spec for prefix, spec in parsed if backends.get(prefix, {}).get('available')]
+    if avail_any:
+        return avail_any[0]
+    raise HarnessError(f'未发现角色 {role_name} 可用的已安装后端，请先配置对应客户端')
+
+
 def choose_engine(backends, caller, explicit='', prompt_text=''):
-    if explicit:
+    if explicit and explicit.strip().lower().startswith('role:'):
+        explicit = _resolve_role_engine(backends, caller, explicit.strip(), prompt_text)
+        name, _ = _engine_parts(explicit)
+    elif explicit:
         name, _ = _engine_parts(explicit)
         explicit = name + ':' + (explicit.partition(':')[2] or 'default')
     elif hinted := _extract_prompt_backend_hint(prompt_text):
         name, explicit = hinted, hinted + ':default'
     else:
-        order = {'antigravity': ('codex', 'claude', 'dsh'), 'codex': ('agy', 'claude', 'dsh'),
-                 'claude': ('codex', 'agy', 'dsh'), 'dsh': ('codex', 'agy', 'claude', 'dsh')}.get(resolve_caller(caller))
-        if order is None:
-            raise HarnessError('请指定 --caller，或指定 --engine/--worker/--left')
+        fallback_map = _fleet_profile().get('peer_fallback_order')
+        default_orders = fallback_map if isinstance(fallback_map, dict) else {
+            'antigravity': ['codex', 'claude', 'dsh'],
+            'codex': ['agy', 'claude', 'dsh'],
+            'claude': ['codex', 'agy', 'dsh'],
+            'dsh': ['codex', 'agy', 'claude', 'dsh'],
+        }
+        order = default_orders.get(resolve_caller(caller))
+        if not order:
+            raise HarnessError('请指定 --caller，或指定 --engine/--worker/--left（或 role:<math|code|review|fast>）')
         negated = _extract_negated_backends(prompt_text)
         allowed = [peer for peer in order if peer not in negated]
         if not allowed:
@@ -782,10 +873,11 @@ def _model_category(prefix, record):
 def _model_specialty(record):
     specialty = str(record.get('model_specialty') or record.get('modelSpecialty') or '').lower()
     description = str(record.get('description') or '').lower()
-    if specialty in ('fast', 'lightweight', 'speed') or _tokens_lower(record.get('slug')) & FAST_MODEL_TAGS or re.search(
+    slug_tokens = _tokens_lower(record.get('slug'))
+    if specialty in ('fast', 'lightweight', 'speed') or slug_tokens & _fast_model_tags() or re.search(
             r'\b(?:fast and affordable|easier tasks|lightweight)\b', description):
         return 'fast'
-    if specialty in ('deep', 'reasoning', 'deep_reasoning') or 'astra' in _tokens_lower(record.get('slug')) or re.search(
+    if specialty in ('deep', 'reasoning', 'deep_reasoning') or slug_tokens & _deep_model_tags('codex') or re.search(
             r'\b(?:most demanding|frontier intelligence|deepest reasoning|hardest problems)\b', description):
         return 'deep'
     return 'engineering'
@@ -848,8 +940,8 @@ def _agy_family_order(name):
     generation = re.search(r'^gemini-(\d+(?:\.\d+)*)-', name)
     version = tuple(int(v) for v in generation.group(1).split('.')) if generation else ()
     tags = _tokens_lower(name)
-    # Carbon is the published high-difficulty engineering / science model.
-    priority = next((n for n, tag in enumerate(('carbon', 'argon', 'pro')) if tag in tags), 9)
+    configured_priority = _catalog_rules('agy').get('family_priority') or ['pro']
+    priority = next((n for n, tag in enumerate(configured_priority) if str(tag).lower() in tags), 9)
     return tuple(-v for v in (version + (0, 0, 0))[:3]), priority, name
 
 
@@ -1018,8 +1110,19 @@ def _extract_prompt_model_hint(prompt_text):
     return ''
 
 
-def select_task_tier(requested_tier='auto', kind='review', text='', file_count=1, estimated_tokens=0):
-    """默认满血；显式挡位、省流意图与非 ultra 环境默认值可覆盖自动策略。"""
+def _is_fast_engine_spec(engine):
+    raw = str(engine or '').strip().lower()
+    if raw == 'role:fast':
+        return True
+    if ':' in raw:
+        _, _, suffix = raw.partition(':')
+        if suffix in ('fast', '@fast'):
+            return True
+    return False
+
+
+def select_task_tier(requested_tier='auto', kind='review', text='', file_count=1, estimated_tokens=0, *, engine=''):
+    """默认满血；显式挡位、role:fast、省流意图与非 ultra 环境默认值可覆盖自动策略。"""
     if requested_tier and requested_tier != 'auto':
         return requested_tier, 'explicit_tier_flag'
     sample = (text or '').strip()
@@ -1034,6 +1137,8 @@ def select_task_tier(requested_tier='auto', kind='review', text='', file_count=1
     for level, cues in prose_requests.items():
         if _has_positive_cue(sample, cues):
             return level, 'user_description_' + level
+    if _is_fast_engine_spec(engine):
+        return 'low', 'role_fast_low'
     env_tier = os.environ.get('CAE_DEFAULT_TIER', '').strip().lower()
     if env_tier in TIER_CHOICES and env_tier not in ('auto', 'ultra'):
         return env_tier, 'env_default_tier'
@@ -1205,7 +1310,7 @@ def _select_codex_specialty_record(info, kind, tier, prompt_text, estimated_toke
     def budget(record):
         return _execution_budget('codex', info, record)['input_budget_tokens']
 
-    if tier == 'low' and not _has_negated_cue(prompt_text, ('轻量', '极速', 'lite', 'mini', 'fast', 'flash', 'luna')):
+    if tier == 'low' and not _has_negated_cue(prompt_text, tuple({'轻量', '极速'} | _fast_model_tags('codex'))):
         fast = [item for item in eligible if _model_specialty(item) == 'fast' and estimated_tokens <= budget(item)]
         if fast:
             return fast[0], 'specialty_fast_lightweight'
@@ -1225,41 +1330,79 @@ def _select_codex_specialty_record(info, kind, tier, prompt_text, estimated_toke
     return (fitting or workhorse)[0], 'frontier_catalog'
 
 
+def _per_backend_role_target(prefix, raw_model):
+    token = str(raw_model or '').strip().lower()
+    if token.startswith('@'):
+        role = token[1:]
+        return role if role in ('math', 'code', 'review', 'fast') else ''
+    if prefix == 'codex' and token in ('math', 'code', 'review'):
+        return token
+    if prefix in ('dsh', 'agy', 'claude') and token in ('math', 'code', 'review', 'fast'):
+        return token
+    return ''
+
+
 def resolve_execution_profile(backends, spec, tier='max', prompt_text='', kind='review', estimated_tokens=0):
     prefix, explicit_model = _engine_parts(spec)
     info = backends.get(prefix, {})
     models = info.get('models', [])
-    hint = _extract_prompt_model_hint(prompt_text) if not explicit_model and models else ''
+    role_target = _per_backend_role_target(prefix, explicit_model)
+    if role_target:
+        explicit_model = ''
+        if role_target == 'fast':
+            tier = 'low'
+            kind = 'review'
+            prompt_text = ''
+        else:
+            kind = role_target
+    hint = _extract_prompt_model_hint(prompt_text) if not explicit_model and not role_target and models else ''
     if prefix in ('claude', 'dsh'):
+        claude_rules = _catalog_rules('claude')
+        dsh_rules = _catalog_rules('dsh')
+        claude_aliases = {str(k).lower(): str(v) for k, v in (claude_rules.get('alias_map') or {}).items()}
+        dsh_aliases = {str(k).lower(): str(v) for k, v in (dsh_rules.get('alias_map') or {}).items()}
+        dsh_default = str(dsh_rules.get('default_model') or (models[0]['slug'] if models else 'default'))
+        dsh_fast = str(dsh_rules.get('fast_model') or (models[-1]['slug'] if models else dsh_default))
         query = explicit_model or hint
+        q_low = query.lower()
         record = _exact_model_record(models, query) if query else {}
-        if prefix == 'dsh' and query.lower() == 'deepseek':
-            record = _exact_model_record(models, 'deepseek-v4-pro')
-        elif prefix == 'claude' and query.lower() in ('kimi', 'k3'):
-            record = next((m for m in models if m['slug'].lower().startswith(('k3', 'kimi'))), {})
-        elif prefix == 'claude' and query.lower() in ('deepseek', 'ds'):
-            record = next((m for m in models if m['slug'].lower().startswith('deepseek')), {})
+        if prefix == 'dsh' and q_low in dsh_aliases:
+            record = _exact_model_record(models, dsh_aliases[q_low])
+        elif prefix == 'claude' and q_low in claude_aliases:
+            target_prefix = claude_aliases[q_low].split('[', 1)[0].split('-', 1)[0].lower()
+            record = _exact_model_record(models, claude_aliases[q_low]) or next(
+                (m for m in models if m['slug'].lower().startswith((target_prefix, q_low))), {}
+            )
         if query and not record:
             terms = _alias_tokens(query) - NON_AI_MODEL_STOPWORDS
             matches = [item for item in models if terms and terms <= _alias_tokens(
                 f"{item['slug']} {item.get('display_name', '')}")]
             record = _unique_model_matches(query, matches)
-        source = 'prompt_fuzzy_model' if hint and record else 'explicit_engine_model' if explicit_model else 'configured_model'
+        source = ('role_specialty_' + role_target if role_target else
+                  'prompt_fuzzy_model' if hint and record else
+                  'explicit_engine_model' if explicit_model else 'configured_model')
         slug = record.get('slug') or explicit_model
-        if prefix == 'claude' and not record and info.get('llm_source') == 'local_router':
-            if query.lower() in ('kimi', 'k3'):
-                slug = 'k3.1-pro[1m]'
-            elif query.lower() in ('deepseek', 'ds'):
-                slug = 'deepseek-flash'
+        if prefix == 'claude' and not record and info.get('llm_source') == 'local_router' and q_low in claude_aliases:
+            slug = claude_aliases[q_low]
         if not slug:
-            forbid_lightweight = _has_negated_cue(prompt_text, ('轻量', '极速', 'lite', 'mini', 'fast', 'flash', 'hydrogen', '氢'))
-            use_dsh_flash = tier in ('low', 'minimal') and not forbid_lightweight
-            slug = ('deepseek-flash' if use_dsh_flash else 'deepseek-v4-pro') if prefix == 'dsh' else info.get('model') or 'opus'
-            record = _exact_model_record(models, slug)
+            light_cues = tuple({'轻量', '极速'} | _fast_model_tags())
+            forbid_lightweight = _has_negated_cue(prompt_text, light_cues)
+            use_fast_slot = (role_target == 'fast') or (tier in ('low', 'minimal') and not forbid_lightweight)
+            fallback_claude = str(claude_rules.get('default_fallback_alias') or 'default')
             if prefix == 'dsh':
-                source = 'specialty_fast_lightweight' if use_dsh_flash else 'builtin_flagship'
-        if prefix == 'dsh' and slug.lower() == 'flash':
-            slug = 'deepseek-flash'
+                slug = dsh_fast if use_fast_slot else dsh_default
+            elif role_target == 'fast':
+                router_sub = str(claude_rules.get('router_subagent_model') or '')
+                fast_configured = next((m['slug'] for m in models if _tokens_lower(m['slug']) & _fast_model_tags()), '')
+                slug = (router_sub if info.get('llm_source') == 'local_router' and router_sub
+                        else fast_configured or info.get('model') or fallback_claude)
+            else:
+                slug = info.get('model') or fallback_claude
+            record = _exact_model_record(models, slug)
+            if prefix == 'dsh' and not role_target:
+                source = 'specialty_fast_lightweight' if use_fast_slot else 'builtin_flagship'
+        if prefix == 'dsh' and slug.lower() in dsh_aliases:
+            slug = dsh_aliases[slug.lower()]
             record = _exact_model_record(models, slug)
         effort = ({'ultra': 'max', 'max': 'max', 'xhigh': 'max', 'high': 'high',
                    'medium': 'low', 'low': 'low', 'minimal': 'low', 'off': 'off', 'none': 'off'}[tier]
@@ -1281,7 +1424,8 @@ def resolve_execution_profile(backends, spec, tier='max', prompt_text='', kind='
                 return _codex_profile(info, spec, record, slug, tier, source)
         record, source = _select_codex_specialty_record(info, kind, tier, prompt_text, estimated_tokens)
         if record:
-            return _codex_profile(info, spec, record, record['slug'], tier, source)
+            return _codex_profile(info, spec, record, record['slug'], tier,
+                                  'role_specialty_' + role_target if role_target else source)
     else:
         if explicit_model or hint:
             try:
@@ -1297,9 +1441,11 @@ def resolve_execution_profile(backends, spec, tier='max', prompt_text='', kind='
         families = _agy_families(native)
         eligible = sorted((name for name in families if _match_agy_family(families[name], tier)), key=_agy_family_order)
         if eligible:
-            is_fast = lambda name: bool(_tokens_lower(name) & FAST_MODEL_TAGS)
+            agy_fast_tags = _fast_model_tags('agy')
+            is_fast = lambda name: bool(_tokens_lower(name) & agy_fast_tags)
             normal = [name for name in eligible if not is_fast(name)]
-            forbid_lightweight = _has_negated_cue(prompt_text, ('轻量', '极速', 'lite', 'mini', 'fast', 'flash', 'hydrogen', '氢'))
+            light_cues = tuple({'轻量', '极速'} | _fast_model_tags())
+            forbid_lightweight = _has_negated_cue(prompt_text, light_cues)
             if not normal and (tier != 'low' or forbid_lightweight):
                 return _profile(prefix, info, spec, None, {}, tier, 'no_native_catalog_candidate',
                                 error='未找到原生旗舰模型，请刷新目录或显式指定模型。')
@@ -1317,7 +1463,8 @@ def resolve_execution_profile(backends, spec, tier='max', prompt_text='', kind='
                     _agy_slug_tier(_match_agy_family(families[name], tier)['slug'])[1]))
                 source = 'specialty_deep_reasoning'
             record = _match_agy_family(families[chosen], tier)
-            return _agy_profile(info, spec, record, record['slug'], tier, source)
+            return _agy_profile(info, spec, record, record['slug'], tier,
+                                'role_specialty_' + role_target if role_target else source)
         source = 'no_non_delegating_effort' if families else 'no_native_catalog_candidate'
     return _profile(prefix, info, spec, None, {}, tier, source, effort_source=source,
                     error='未找到符合自动选路规则的原生目录模型，请刷新目录或显式指定后端模型。')
@@ -1623,11 +1770,17 @@ def _dsh_info(binary, requested=None):
         if not value:
             scopes.append((len(indent), key))
     source = 'api_key' if api_key else 'deepseek_account' if account else 'unconfigured'
-    models = [{'slug': slug, 'display_name': label, 'provider': 'deepseek', 'category': 'native', 'priority': i,
-               'context_window': 1_048_576, 'max_context_window': 1_048_576, 'supported_efforts': ['off', 'low', 'high', 'max']}
-              for i, (slug, label) in enumerate((('deepseek-v4-pro', 'DeepSeek-V4-Pro'), ('deepseek-flash', 'DeepSeek-V4.1-Flash')))]
+    dsh_rules = _catalog_rules('dsh')
+    raw_builtin = dsh_rules.get('builtin_models') or []
+    models = [{'slug': item['slug'], 'display_name': item.get('display_name', item['slug']),
+               'provider': 'deepseek', 'category': 'native', 'priority': i,
+               'context_window': item.get('context_window', 1_048_576),
+               'max_context_window': item.get('max_context_window', 1_048_576),
+               'supported_efforts': list(item.get('supported_efforts') or ['off', 'low', 'high', 'max'])}
+              for i, item in enumerate(raw_builtin) if isinstance(item, dict) and item.get('slug')]
+    default_dsh_model = str(dsh_rules.get('default_model') or (models[0]['slug'] if models else 'default'))
     return {'available': bool(binary), 'detected': bool(binary), 'binary': binary, 'family': 'dsh',
-            'config_home': str(root), 'windows_interop': interop, 'model': 'deepseek-v4-pro', 'models': models,
+            'config_home': str(root), 'windows_interop': interop, 'model': default_dsh_model, 'models': models,
             'llm_source': source, 'dsh_provider': 'deepseek-official' if api_key else 'deepseek-account' if account else None,
             'llm_configured': source != 'unconfigured', 'verified_status': 'unverified', 'authentication_status': 'not_checked',
             'requested_input_budget_tokens': requested, 'capability_source': 'dsh_builtin_models',
@@ -1673,10 +1826,9 @@ def _verify_claude_router_card_key(info, model_name):
     if not isinstance(cfg, dict) or not isinstance(cfg.get('routes', []), list):
         raise HarnessError('Claude Code 路由配置格式无效，请检查 router/router.json')
     model = (model_name or info.get('model') or '').strip()
-    if model.lower() in ('kimi', 'k3'):
-        model = 'k3.1-pro[1m]'
-    elif model.lower() in ('deepseek', 'ds'):
-        model = 'deepseek-flash'
+    claude_aliases = {str(k).lower(): str(v) for k, v in (_catalog_rules('claude').get('alias_map') or {}).items()}
+    if model.lower() in claude_aliases:
+        model = claude_aliases[model.lower()]
     card = cfg.get('default_key_from_card')
     for route in cfg.get('routes', []):
         if isinstance(route, dict) and route.get('prefix') and model.lower().startswith(str(route['prefix']).lower()):
@@ -1741,9 +1893,10 @@ def _verify_claude_llm_ready(info, requested_model='', batch=None):
         _verify_claude_router_card_key(info, requested_model)
     elif source == 'settings_env':
         if not info.get('windows_interop') and _wsl_upstream_hits_unproxied_fake_ip(info.get('base_url', '')):
+            router_card = str(_catalog_rules('claude').get('router_card_name') or '本地混合路由卡片')
             raise HarnessError(
                 'WSL 检测到 Claude Code 直连上游域名解析为宿主 Fake-IP 且未配置代理环境变量；'
-                '请切换至本地路由卡片（K3.1主+DS子代理 / 127.0.0.1:8241）或配置 HTTPS_PROXY',
+                f'请切换至本地路由卡片（{router_card} / 127.0.0.1:8241）或配置 HTTPS_PROXY',
                 execution_environment=_execution_environment(info),
             )
     else:
@@ -1900,7 +2053,7 @@ def _is_quota_exhausted(text):
 def _parse_quota_reset(text, now=None):
     now_ts = time.time() if now is None else float(now)
     match = re.search(
-        r'(?:try again (?:at|after|in)|resets? (?:at|in))\s+([^\r\n]+?)(?:\.(?:\s|$)|$)',
+        r'(?:try again (?:at|after|in)\s+|resets?(?:\s+(?:at|in))?\s+)([^\r\n]+?)(?:\.(?:\s|$)|$)',
         text or '',
         re.IGNORECASE,
     )
@@ -2141,8 +2294,11 @@ def _enforce_preflight_quota(backends, specs, retry_quota=False, *, batch=None, 
 def _local_fallback_engine(caller, engine, backends, prompt_text=''):
     cur_prefix, _ = _engine_parts(engine)
     negated = _extract_negated_backends(prompt_text)
-    local = {'antigravity': 'agy', 'codex': 'codex', 'claude': 'claude', 'dsh': 'dsh'}.get(resolve_caller(caller))
-    for candidate in dict.fromkeys((local, 'agy', 'codex', 'claude', 'dsh')):
+    caller_id = resolve_caller(caller)
+    local = {'antigravity': 'agy', 'codex': 'codex', 'claude': 'claude', 'dsh': 'dsh'}.get(caller_id)
+    fb_map = _fleet_profile().get('peer_fallback_order')
+    configured_peers = fb_map.get(caller_id, []) if isinstance(fb_map, dict) else []
+    for candidate in dict.fromkeys((local, *configured_peers, 'agy', 'codex', 'claude', 'dsh')):
         if (candidate and candidate != cur_prefix and candidate not in negated
                 and _peer_auto_ready(backends, candidate) and not _active_quota_record(candidate, backends[candidate])):
             return candidate + ':default'
@@ -2483,7 +2639,8 @@ def _check_output_status(parsed):
     event_error = parsed.get('event', parsed.get('type')) == 'error'
     if (event_error or finished_reason == 'error' or parsed.get('is_error') or parsed.get('error')
             or status in ('error', 'failed', 'partial', 'incomplete', 'invalid', 'waiting', 'running')):
-        error = str(parsed.get('error') or parsed.get('message') or '')[-2000:]
+        result_err = parsed.get('result') if isinstance(parsed.get('result'), str) else ''
+        error = str(parsed.get('error') or parsed.get('message') or result_err or '')[-2000:]
         error_status = 'quota_exhausted' if _is_quota_exhausted(error) else 'failed'
         raise HarnessError('后端返回错误回执', error_status, backend_status=status or 'error',
                            finished_reason=finished_reason, error=error)
@@ -2829,6 +2986,8 @@ def _backend_diagnostics(result, *, structured_only=False):
             if nested_details:
                 details['result'] = nested_details
             is_error = is_error or nested_error
+        elif isinstance(nested, str) and is_error and nested.strip():
+            details['result'] = nested[-2000:]
         return details, is_error
 
     for line in (result.stdout or '').splitlines():
@@ -3004,22 +3163,26 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
             if effort in ('low', 'medium', 'high', 'xhigh', 'max'):
                 command.extend(['--effort', effort])
             if readonly:
-                command.extend(['--tools', 'Read,Grep,Glob', '--permission-prompts', 'none'])
+                command.extend(['--permission-mode', 'dontAsk', '--tools', 'Read,Grep,Glob', '--permission-prompts', 'none'])
             else:
                 command.extend(['--permission-mode', 'bypassPermissions', '--tools', 'Read,Grep,Glob,Edit,Write,Bash'])
             input_text = exec_prompt
         else:
             patch_file = temp_path / 'dsh-headless.patch.yml'
             provider = 'deepseek-official' if info.get('dsh_provider') == 'deepseek-official' else 'deepseek-account'
+            dsh_default_slug = str(_catalog_rules('dsh').get('default_model') or info.get('model') or 'default')
             patch_file.write_text(
                 '- id: credentials\n  disabled: false\n- id: authorization\n  disabled: false\n'
                 '- id: deepseek-account\n  disabled: false\n- id: agent-default-model\n'
                 "  name: '@deepseek-ai/dsh-agent-default-model'\n  config:\n"
-                f'    provider: {provider}\n    model: {json.dumps(model or "deepseek-v4-pro")}\n'
+                f'    provider: {provider}\n    model: {json.dumps(model or dsh_default_slug)}\n'
                 f'    reasoningEffort: {effort or "high"}\n', encoding='utf-8')
             command = [binary, '--profile', 'headless', '--patch', translate(patch_file), '--json', '--permission-mode',
                        'read-only' if readonly else 'workspace-write', '--approval-policy', 'never', '-']
-            exec_prompt = f'{exec_prompt}\n\n请仅输出一个严格符合以下 JSON Schema 的 JSON 对象，不要输出任何额外解释：\n{json.dumps(schema, ensure_ascii=False)}'
+            req_keys = ', '.join(schema.get('required', ()))
+            exec_prompt = (f'{exec_prompt}\n\n请仅输出一个以 {{ 开头、以 }} 结尾且严格符合以下 JSON Schema 的单行或多行 JSON 对象'
+                           f'（必含顶层键：{req_keys}），严禁输出 Markdown 代码块围栏或任何额外解释文字：\n'
+                           f'{json.dumps(schema, ensure_ascii=False)}')
             input_text = exec_prompt
         receipt.update(argv=list(command), work_dir=str(exec_dir), staged_readonly_workspace=stage_dir is not None,
                        clean_room=bool(clean_room),
@@ -3782,16 +3945,27 @@ def _print(payload):
     return EXIT_CODES.get(payload.get('status', 'ok'), 1)
 
 
+def _fleet_profile_summary():
+    prof = _fleet_profile()
+    if not prof:
+        return None
+    return {
+        'profile_id': prof.get('profile_id'),
+        'evaluated_at': prof.get('evaluated_at'),
+        'roles': prof.get('roles'),
+        'excluded_or_retiring': prof.get('excluded_or_retiring'),
+    }
+
+
 def cmd_probe(args):
     refresh = bool(getattr(args, 'discover_models', False))
     return _print({'status': 'ok', 'caller': resolve_caller(args.caller),
+                   'fleet_profile': _fleet_profile_summary(),
                    'backends': _args_backends(args, refresh_model_cache=refresh)})
 
 
 def cmd_assess(args):
-    backends = probe_backends(args.codex_input_budget, args.agy_input_budget, args.discover_models,
-                              refresh_model_cache=False, claude_input_budget=args.claude_input_budget,
-                              dsh_input_budget=args.dsh_input_budget)
+    backends = _args_backends(args, refresh_model_cache=False)
     caller = resolve_caller(args.caller)
     local_backend = {'codex': 'codex', 'antigravity': 'agy', 'claude': 'claude', 'dsh': 'dsh'}.get(caller)
     scenarios = {kind: (kind, '') for kind in ('review', 'direction', 'polish', 'math', 'code', 'audit', 'gate')}
@@ -3800,18 +3974,19 @@ def cmd_assess(args):
     scenarios['economy_surface_review'] = ('review', '省额度检查注释拼写')
     recommendations = {}
     for name, info in backends.items():
+        detected = bool(info.get('detected', info.get('available')))
         info['caller_relation'] = ('local' if name == local_backend else 'counterpart') if local_backend else 'unspecified'
-        info['program_origin'] = ('windows_interop' if info['windows_interop'] else 'native') if info['detected'] else None
+        info['program_origin'] = ('windows_interop' if info.get('windows_interop') else 'native') if detected else None
         info['execution_environment'] = _execution_environment(info)
         info['capability_matrix'] = _capability_matrix(name, info)
         info['model_metadata_sources'] = {
             'context': 'codex_client_cache_context_fields' if name == 'codex' and any(
-                model.get('context_window') or model.get('max_context_window') for model in info['models']) else
+                model.get('context_window') or model.get('max_context_window') for model in info.get('models', [])) else
                 'dsh_builtin_model_contract' if name == 'dsh' else None,
             'effort': ('codex_client_cache_reasoning_levels' if name == 'codex' and any(
-                model.get('supported_efforts') for model in info['models']) else
+                model.get('supported_efforts') for model in info.get('models', [])) else
                 'agy_catalog_slug_suffix' if name == 'agy' and any(
-                    _agy_slug_tier(model['slug'])[1] for model in info['models']) else
+                    _agy_slug_tier(model['slug'])[1] for model in info.get('models', [])) else
                 'dsh_builtin_model_contract' if name == 'dsh' else None),
             'runtime_verified': False,
         }
@@ -3820,8 +3995,24 @@ def cmd_assess(args):
             tier, reason = select_task_tier(kind=kind, text=prompt)
             profile = resolve_execution_profile(backends, name + ':default', tier, prompt, kind=kind)
             recommendations[name][scenario] = {**profile, 'requested_tier': 'auto', 'tier_reason': reason,
-                                                'backend_detected': info['detected']}
-    return _print({'status': 'ok', 'caller': caller, 'backends': backends,
+                                                'backend_detected': detected}
+    resolved_roles = {}
+    for role_name in ('orchestrator', 'math', 'code', 'review', 'fast'):
+        try:
+            role_spec = _resolve_role_engine(backends, caller, f'role:{role_name}')
+            role_tier = 'low' if role_name == 'fast' else 'max'
+            role_kind = 'review' if role_name in ('fast', 'orchestrator') else role_name
+            role_prof = resolve_execution_profile(backends, role_spec, role_tier, kind=role_kind)
+            resolved_roles[role_name] = {
+                'selected_engine': role_spec,
+                'model': role_prof['model'],
+                'reasoning_effort': role_prof['reasoning_effort'],
+            }
+        except HarnessError as exc:
+            resolved_roles[role_name] = {'selected_engine': None, 'blocked_reason': str(exc)}
+    return _print({'status': 'ok', 'caller': caller, 'fleet_profile': _fleet_profile_summary(),
+                   'resolved_roles': resolved_roles,
+                   'backends': backends,
                    'recommendations': recommendations,
                    'catalog_discovery_requested': args.discover_models,
                    'runtime_verified': False, 'controls_native_spawn_agent': False,
@@ -3972,7 +4163,7 @@ def cmd_gate(args):
     if requested_target.is_file() and not scopes:
         scopes = [requested_target.relative_to(root).as_posix()]
     file_count, est_tokens = _target_metrics(requested_target, text)
-    tier, tier_reason = select_task_tier(args.tier, 'gate', text, file_count, est_tokens)
+    tier, tier_reason = select_task_tier(args.tier, 'gate', text, file_count, est_tokens, engine=args.worker or engine)
     batch = _QuotaBatch(args.retry_quota)
     meta = {'caller': caller, 'handoff_to_caller': True, 'engine': engine, 'worker_engine': engine,
             'requested_tier': args.tier, 'selected_tier': tier, 'tier_reason': tier_reason,
@@ -4038,7 +4229,7 @@ def cmd_task(args):
         if base != expected:
             raise HarnessError('当前 HEAD 与 --base-commit 不一致')
     file_count, est_tokens = _target_metrics(requested_target, text)
-    tier, tier_reason = select_task_tier(args.tier, args.kind, text, file_count, est_tokens)
+    tier, tier_reason = select_task_tier(args.tier, args.kind, text, file_count, est_tokens, engine=args.engine or engine)
     batch = _QuotaBatch(args.retry_quota)
     payload = {'kind': args.kind, 'caller': caller, 'handoff_to_caller': True, 'engine': engine,
                'requested_tier': args.tier, 'selected_tier': tier, 'tier_reason': tier_reason,

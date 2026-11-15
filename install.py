@@ -68,6 +68,25 @@ CLAUDE_HOOK_SCRIPTS = ("user_words.py", "session_context_loader.py", "status_gua
 CLAUDE_RETIRED_SCRIPTS = ("background_status.py", "read_delegation_guard.py", "receipts_stop.py")
 
 
+def _load_fleet_profile(repo_root: Optional[Path] = None) -> Dict[str, Any]:
+    """读取受控的舰队能力评估快照清单（支持环境变量覆盖以供无模型耦合单测）。"""
+    env_override = os.environ.get("CAE_FLEET_PROFILE", "").strip()
+    candidates: List[Path] = []
+    if env_override:
+        candidates.append(Path(env_override).expanduser())
+    base = repo_root if repo_root is not None else Path(__file__).resolve().parent
+    candidates.append(base / "template/user-guard/skills/cae-harness/fleet_profile.json")
+    for candidate in candidates:
+        try:
+            if candidate.is_file() and not _is_link_or_junction(candidate):
+                parsed = json.loads(candidate.read_text(encoding="utf-8-sig"))
+                if isinstance(parsed, dict):
+                    return parsed
+        except (OSError, UnicodeError, ValueError):
+            continue
+    return {}
+
+
 def _is_mnt_windows_path(path_str: Optional[str]) -> bool:
     """在 POSIX/WSL 下判断可执行文件路径是否位于 /mnt/<盘符>/ 挂载的 Windows 侧"""
     if os.name == "nt" or not path_str:
@@ -1155,11 +1174,19 @@ def _parse_agy_model_lines(output: str) -> List[Dict[str, str]]:
     return parsed
 
 
-def _select_agy_frontier_max_label(models: List[Dict[str, str]]) -> Optional[str]:
+def _select_agy_frontier_max_label(
+    models: List[Dict[str, str]], repo_root: Optional[Path] = None,
+) -> Optional[str]:
+    agy_rules = _load_fleet_profile(repo_root).get("client_catalog_rules", {}).get("agy", {})
     blocked_tokens = {
-        "orchestrator", "router", "claude", "sonnet", "opus", "haiku", "gpt", "oss",
+        str(tok).lower()
+        for tok in (agy_rules.get("blocked_auto_tokens") or ("orchestrator", "router", "claude", "sonnet", "opus", "haiku", "gpt", "oss"))
     }
-    light_tokens = {"lite", "mini", "fast", "flash", "hydrogen"}
+    light_tokens = {
+        str(tok).lower()
+        for tok in (agy_rules.get("fast_tags") or ("lite", "mini", "fast", "flash"))
+    }
+    family_priority = [str(tok).lower() for tok in (agy_rules.get("family_priority") or ())]
 
     def _tokens(slug: str) -> Set[str]:
         return set(re.split(r"[^a-z0-9]+", slug.lower()))
@@ -1176,14 +1203,30 @@ def _select_agy_frontier_max_label(models: List[Dict[str, str]]) -> Optional[str
         if match:
             tiered.append((match.group(1), match.group(2), item["display_name"]))
     if not tiered:
+        for pref in family_priority:
+            matched = next(
+                (item["display_name"] for item in eligible if pref in _tokens(item["slug"]) and not (_tokens(item["slug"]) & light_tokens)),
+                None,
+            )
+            if matched:
+                return matched
         return next(
             (item["display_name"] for item in eligible if not (_tokens(item["slug"]) & light_tokens)),
             eligible[0]["display_name"],
         )
-    primary_family = next(
-        (fam for fam, _, _ in tiered if not (_tokens(fam) & light_tokens)),
-        tiered[0][0],
-    )
+    primary_family = None
+    for pref in family_priority:
+        primary_family = next(
+            (fam for fam, _, _ in tiered if pref in _tokens(fam) and not (_tokens(fam) & light_tokens)),
+            None,
+        )
+        if primary_family:
+            break
+    if not primary_family:
+        primary_family = next(
+            (fam for fam, _, _ in tiered if not (_tokens(fam) & light_tokens)),
+            tiered[0][0],
+        )
     variants = {tier: label for fam, tier, label in tiered if fam == primary_family}
     best_tier = max(variants, key=EFFORT_ORDER.index)
     return variants[best_tier]
@@ -1337,7 +1380,12 @@ def _apply_codex_frontier_max(
         visible = [model for model in models if model.get("visibility") != "hide"] or models
         if cur_effort and not overwrite:
             visible = [model for model in visible if cur_effort in _model_efforts(model)]
-        selected = _latest_codex_model(visible, "sol") or _latest_codex_model(visible, "astra") or min(
+        cx_rules = _load_fleet_profile().get("client_catalog_rules", {}).get("codex", {})
+        workhorse_families = [str(fam).lower() for fam in (cx_rules.get("workhorse_families") or ())]
+        selected = next(
+            (candidate for fam in workhorse_families for candidate in [_latest_codex_model(visible, fam)] if candidate is not None),
+            None,
+        ) or min(
             visible,
             key=lambda model: model["priority"] if type(model.get("priority")) is int else 9999,
             default=None,
@@ -2344,18 +2392,39 @@ def audit_upgrade_status(
     if not isinstance(ag_models, list):
         ag_models = []
     ag_models = [item for item in ag_models if isinstance(item, dict) and isinstance(item.get("slug"), str)]
+    fleet_profile = _load_fleet_profile(repo_root)
+    cat_rules = fleet_profile.get("client_catalog_rules", {}) if isinstance(fleet_profile.get("client_catalog_rules"), dict) else {}
+    agy_rules = cat_rules.get("agy", {}) if isinstance(cat_rules.get("agy"), dict) else {}
+    cx_rules = cat_rules.get("codex", {}) if isinstance(cat_rules.get("codex"), dict) else {}
+    cl_rules = cat_rules.get("claude", {}) if isinstance(cat_rules.get("claude"), dict) else {}
+    retiring_patterns = [
+        str(pat) for pat in ((fleet_profile.get("excluded_or_retiring") or {}).get("agy_retiring_patterns") or ()) if pat
+    ]
+    retiring_re = re.compile("|".join(f"(?:{pat})" for pat in retiring_patterns), re.I) if retiring_patterns else None
+
     ag["model_catalog"] = [{"slug": item["slug"], "generation": list(_model_generation(item["slug"])),
                              "declared_max_context_window": _model_window(item), "supported_efforts": _model_efforts(item)} for item in ag_models]
-    carbon = [item for item in ag_models if "carbon" in item["slug"].lower() and not item["slug"].endswith("-ultra")]
-    latest_carbon = max((_model_generation(item["slug"]) for item in carbon), default=())
-    carbon = [item for item in carbon if _model_generation(item["slug"]) == latest_carbon]
-    ag["recommended_carbon_variants"] = [item["slug"] for item in carbon]
-    ag["carbon_supported_efforts"] = sorted({item["slug"].rsplit("-", 1)[-1] for item in carbon
-                                             if item["slug"].rsplit("-", 1)[-1] in EFFORT_ORDER}, key=EFFORT_ORDER.index)
-    ag["retiring_models"] = [item["slug"] for item in ag_models if re.search(r"claude[- ]?4[.-]6|gpt[- ]oss[- ]120b", item["slug"], re.I)]
+    agy_priorities = [str(tok).lower() for tok in (agy_rules.get("family_priority") or ("pro",))]
+    primary_agy_models: List[Dict[str, Any]] = []
+    for fam_tok in agy_priorities:
+        matched = [item for item in ag_models if fam_tok in item["slug"].lower() and not item["slug"].lower().endswith("-ultra")]
+        if matched:
+            primary_agy_models = matched
+            break
+    latest_primary_gen = max((_model_generation(item["slug"]) for item in primary_agy_models), default=())
+    primary_agy_models = [item for item in primary_agy_models if _model_generation(item["slug"]) == latest_primary_gen]
+    ag["recommended_primary_variants"] = [item["slug"] for item in primary_agy_models]
+    ag["primary_supported_efforts"] = sorted(
+        {item["slug"].rsplit("-", 1)[-1] for item in primary_agy_models if item["slug"].rsplit("-", 1)[-1] in EFFORT_ORDER},
+        key=EFFORT_ORDER.index,
+    )
+    ag["recommended_carbon_variants"] = ag["recommended_primary_variants"]
+    ag["carbon_supported_efforts"] = ag["primary_supported_efforts"]
+    ag["retiring_models"] = [item["slug"] for item in ag_models if retiring_re and retiring_re.search(item["slug"])]
     ag["configured_model_retiring"] = bool(
         isinstance(ag["configured_model"], str)
-        and re.search(r"claude[- ]?4[.-]6|gpt[- ]oss[- ]120b", ag["configured_model"], re.I)
+        and retiring_re is not None
+        and retiring_re.search(ag["configured_model"])
     )
     if ag["configured_model_retiring"] and ag["configured_model"] not in ag["retiring_models"]:
         ag["retiring_models"].append(ag["configured_model"])
@@ -2372,14 +2441,21 @@ def audit_upgrade_status(
     cx.update({key: config.get(key) for key in ("model", "model_reasoning_effort", "model_context_window")})
     cx_models = read_json(codex_root / "models_cache.json").get("models", [])
     cx_models = [item for item in cx_models if isinstance(item, dict) and isinstance(item.get("slug"), str)] if isinstance(cx_models, list) else []
-    sol, astra, terra = (_latest_codex_model(cx_models, name) for name in ("sol", "astra", "terra"))
-    selected = sol or astra or terra
+    workhorse_fams = [str(fam).lower() for fam in (cx_rules.get("workhorse_families") or ())]
+    deep_fams = [str(fam).lower() for fam in (cx_rules.get("deep_tags") or ())]
+    tracked_fams = list(dict.fromkeys([*workhorse_fams, *deep_fams]))
+    by_fam = {fam: _latest_codex_model(cx_models, fam) for fam in tracked_fams}
+    workhorse_latest = next((by_fam[fam] for fam in workhorse_fams if by_fam.get(fam) is not None), None)
+    deep_latest = next((by_fam[fam] for fam in deep_fams if by_fam.get(fam) is not None), None)
+    selected = workhorse_latest or deep_latest
     current = next((item for item in cx_models if item["slug"] == cx["model"]), None)
-    fam_match = re.fullmatch(r"gpt-\d+(?:\.\d+)*-(astra|sol|terra)", str(cx["model"]))
-    family = fam_match.group(1) if fam_match else "sol"
-    family_latest = {"astra": astra, "sol": sol, "terra": terra}[family]
+    fam_pattern = "|".join(re.escape(fam) for fam in tracked_fams) if tracked_fams else ""
+    fam_match = re.fullmatch(rf"gpt-\d+(?:\.\d+)*-({fam_pattern})", str(cx["model"]), re.I) if fam_pattern else None
+    family_latest = by_fam.get(fam_match.group(1).lower()) if fam_match else workhorse_latest
     latest = family_latest if (fam_match and cx_models) else (family_latest or selected)
-    cx["latest_sol_slug"], cx["latest_astra_slug"] = (sol or {}).get("slug"), (astra or {}).get("slug")
+    cx["latest_workhorse_slug"] = (workhorse_latest or {}).get("slug")
+    cx["latest_deep_slug"] = (deep_latest or {}).get("slug")
+    cx["latest_sol_slug"], cx["latest_astra_slug"] = cx["latest_workhorse_slug"], cx["latest_deep_slug"]
     cx["declared_max_context_window"] = _model_window(latest or {})
     cx["supported_efforts"] = _model_efforts(latest or {})
     reasons = []
@@ -2391,7 +2467,7 @@ def audit_upgrade_status(
     )
     if latest is None:
         if not codex_interop_only:
-            reasons.append("本地模型目录缺少 Sol / Astra，需刷新客户端目录后复查")
+            reasons.append("本地模型目录缺少评估清单中的主力模型系列，需刷新客户端目录后复查")
     else:
         if current is None or current["slug"] != latest["slug"]:
             reasons.append("当前默认模型与本地目录的最新同系列模型不一致")
@@ -2537,7 +2613,7 @@ def audit_upgrade_status(
             enabled_prompts=[], stored_prompt_count=0, enabled_skills=[], stored_skill_count=0,
             skills_dir_entries=[], settings_aligned=None,
         )
-    managed_card_names = {"Kimi", "DeepSeek", "K3.1主+DS子代理"}
+    managed_card_names = {str(name) for name in (cl_rules.get("managed_cards") or ("Kimi", "DeepSeek")) if name}
     custom_card_refs: List[Tuple[str, str]] = []
     for card in cc.get("cards") or []:
         if isinstance(card, dict) and (card.get("app_type") != "claude" or card.get("name") not in managed_card_names):
@@ -2594,6 +2670,7 @@ def audit_upgrade_status(
         actions.append("repair_unreadable_configs")
     toolchain = _audit_host_toolchain(is_sandbox_run=is_sandbox_run, detection=detection)
     report = {"plugin_version": repo_version,
+              "fleet_profile": {"profile_id": fleet_profile.get("profile_id"), "evaluated_at": fleet_profile.get("evaluated_at")},
               "host": {"platform": sys.platform, "python_version": sys.version.split()[0], "is_wsl": detection.get("is_wsl"),
                        "wsl_probe": detection.get("wsl_probe"), "toolchain": toolchain},
               "antigravity": ag, "codex": cx, "claude": cl, "dsh": dsh, "cc_switch": cc,

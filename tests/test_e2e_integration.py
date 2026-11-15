@@ -2423,5 +2423,88 @@ class TestEndToEndIntegration(unittest.TestCase):
         drifted_core_with_tail = with_custom_tail.replace(b"R10.", b"R10-OLD.")
         self.assertFalse(INSTALLER._rules_equal(drifted_core_with_tail, tmpl_rules))
 
+    def test_44_meta_driven_profile_decoupling_and_user_approval_gate(self) -> None:
+        profile_path = TEMPLATE_DIR / "skills" / "cae-harness" / "fleet_profile.json"
+        self.assertTrue(profile_path.is_file(), "缺少单点模型评估快照清单 fleet_profile.json")
+        profile = json.loads(profile_path.read_text(encoding="utf-8"))
+        self.assertEqual(profile.get("schema_version"), 1)
+        policy = profile.get("evaluation_policy", {})
+        self.assertTrue(policy.get("bidirectional_strength_and_defect_audit"))
+        self.assertTrue(policy.get("user_approval_required_before_apply"))
+        self.assertGreaterEqual(len(policy.get("approval_checkpoints", [])), 4)
+
+        roles = profile.get("roles", {})
+        for role_name in ("orchestrator", "math", "code", "review", "fast"):
+            self.assertIn(role_name, roles)
+            self.assertTrue(roles[role_name].get("candidates"))
+            self.assertTrue(roles[role_name].get("strengths"))
+            self.assertTrue(roles[role_name].get("defects_and_mitigations"))
+
+        excluded_vendors = {
+            item.get("vendor") for item in profile.get("excluded_or_retiring", {}).get("excluded_vendors", [])
+        }
+        self.assertIn("anthropic_native_claude", excluded_vendors)
+
+        # 常驻规则与技能说明中严禁硬编码季节性模型名
+        seasonal_re = re.compile(
+            r"\b(?:astra|sol|terra|carbon|argon|hydrogen|luna|k3\.1-pro|deepseek-v4|deepseek-flash)\b",
+            re.I,
+        )
+        for permanent_doc in (
+            TEMPLATE_DIR / "rules" / "AGENTS.md",
+            REPO_ROOT / "AGENTS.md",
+            TEMPLATE_DIR / "skills" / "cae-harness" / "SKILL.md",
+            TEMPLATE_DIR / "skills" / "fleet-evolve" / "SKILL.md",
+        ):
+            doc_text = permanent_doc.read_text(encoding="utf-8")
+            self.assertIsNone(
+                seasonal_re.search(doc_text),
+                f"常驻契约文件 {permanent_doc.relative_to(REPO_ROOT).as_posix()} 检出季节性模型名硬编码",
+            )
+
+        # 验证 fleet_state.py 推荐搭配表用户拍板硬门禁 (propose -> AWAITING_USER_APPROVAL -> approve -> IDLE)
+        state_py = TEMPLATE_DIR / "skills" / "fleet-evolve" / "scripts" / "fleet_state.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp) / "approval_state"
+            env = {**os.environ, "CAE_FLEET_STATE_DIR": str(state_dir)}
+
+            def run_state(*args: str) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    [sys.executable, "-B", "-X", "utf8", str(state_py), "--repo", str(REPO_ROOT), *args],
+                    cwd=REPO_ROOT, capture_output=True, text=True, encoding="utf-8", env=env, timeout=15,
+                )
+
+            premature = run_state("approve", "--session-id", "sess_a")
+            self.assertEqual(premature.returncode, 2)
+            self.assertEqual(json.loads(premature.stdout)["reason"], "no_pending_proposal")
+
+            prop = run_state("propose", "--session-id", "sess_a", "--summary", "更新客户端×模型×挡位推荐表")
+            self.assertEqual(prop.returncode, 0, prop.stderr)
+            prop_json = json.loads(prop.stdout)
+            self.assertTrue(prop_json["user_approval_required"])
+            self.assertEqual(prop_json["state"]["phase"], "AWAITING_USER_APPROVAL")
+            self.assertTrue(prop_json["state"]["profile_sha256"])
+
+            cur_st = json.loads(run_state("status").stdout)
+            self.assertEqual(cur_st["phase"], "AWAITING_USER_APPROVAL")
+
+            appr = run_state("approve", "--session-id", "sess_a")
+            self.assertEqual(appr.returncode, 0, appr.stderr)
+            appr_json = json.loads(appr.stdout)
+            self.assertEqual(appr_json["phase"], "IDLE")
+            self.assertTrue(appr_json["user_approved"])
+
+            # 若提请拍板后 fleet_profile.json 的 sha256 发生变更，approve 必须拦截重审
+            prop2 = run_state("propose", "--session-id", "sess_b", "--summary", "测试哈希篡改拦截")
+            self.assertEqual(prop2.returncode, 0, prop2.stderr)
+            saved_file = Path(json.loads(prop2.stdout)["state_file"])
+            tampered = json.loads(saved_file.read_text(encoding="utf-8"))
+            tampered["profile_sha256"] = "0" * 64
+            saved_file.write_text(json.dumps(tampered), encoding="utf-8")
+            stale_appr = run_state("approve", "--session-id", "sess_b")
+            self.assertEqual(stale_appr.returncode, 2)
+            self.assertEqual(json.loads(stale_appr.stdout)["reason"], "repo_or_profile_changed_since_propose")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

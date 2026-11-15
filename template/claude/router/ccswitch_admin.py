@@ -69,6 +69,35 @@ def default_router_port() -> int:
     return 8240 if os.name == "nt" else 8241
 
 
+def _claude_profile_defaults() -> Dict[str, str]:
+    here = Path(__file__).resolve()
+    candidates: List[Path] = []
+    env_override = os.environ.get("CAE_FLEET_PROFILE", "").strip()
+    if env_override:
+        candidates.append(Path(env_override).expanduser())
+    candidates.append(here.parent.parent / "skills" / "cae-harness" / "fleet_profile.json")
+    candidates.append(here.parents[2] / "user-guard" / "skills" / "cae-harness" / "fleet_profile.json")
+    cl_rules: Dict[str, Any] = {}
+    for candidate in candidates:
+        try:
+            if candidate.is_file() and not _is_reparse_or_symlink(candidate):
+                doc = json.loads(candidate.read_text(encoding="utf-8-sig"))
+                if isinstance(doc, dict) and isinstance(doc.get("client_catalog_rules"), dict):
+                    raw_cl = doc["client_catalog_rules"].get("claude")
+                    if isinstance(raw_cl, dict):
+                        cl_rules = raw_cl
+                        break
+        except (OSError, UnicodeError, ValueError):
+            continue
+    return {
+        "kimi_model": str(cl_rules.get("router_primary_model") or "kimi-primary"),
+        "deepseek_model": str(cl_rules.get("router_subagent_model") or "deepseek-subagent"),
+        "max_context": str(cl_rules.get("max_context_tokens") or 1048576),
+        "compact_window": str(cl_rules.get("auto_compact_window") or 1000000),
+        "router_card_name": str(cl_rules.get("router_card_name") or "Router_Hybrid"),
+    }
+
+
 def floor_env(key: str) -> bool:
     return (
         key.startswith(FLOOR_PREFIXES)
@@ -174,11 +203,17 @@ def _query_skills_state(con: sqlite3.Connection) -> Tuple[int, List[str], List[D
 
 def _build_card_templates(
     port: int,
-    kimi_model: str = "k3.1-pro[1m]",
-    deepseek_model: str = "deepseek-flash",
-    max_context: str = "1048576",
-    compact_window: str = "1000000",
+    kimi_model: Optional[str] = None,
+    deepseek_model: Optional[str] = None,
+    max_context: Optional[str] = None,
+    compact_window: Optional[str] = None,
 ) -> Dict[str, Tuple[Any, Optional[str], str]]:
+    defaults = _claude_profile_defaults()
+    kimi_model = kimi_model or defaults["kimi_model"]
+    deepseek_model = deepseek_model or defaults["deepseek_model"]
+    max_context = max_context or defaults["max_context"]
+    compact_window = compact_window or defaults["compact_window"]
+    router_card_name = defaults["router_card_name"]
     ds_base = deepseek_model.replace("[1m]", "").replace("[1M]", "")
     ds_main = f"{ds_base}[1M]"
 
@@ -234,7 +269,7 @@ def _build_card_templates(
 
     return {
         "Kimi": (kimi_env, KIMI_PLACEHOLDER, f"Kimi ({kimi_model}) direct connection."),
-        "K3.1主+DS子代理": (
+        router_card_name: (
             router_env,
             None,
             f"Kimi ({kimi_model}) main + DeepSeek ({ds_base}) subagent via local router 127.0.0.1:{port}.",
@@ -425,10 +460,10 @@ def inspect_status(
 def prepare_cards(
     db_path: Path,
     port: int,
-    kimi_model: str = "k3.1-pro[1m]",
-    deepseek_model: str = "deepseek-flash",
-    max_context: str = "1048576",
-    compact_window: str = "1000000",
+    kimi_model: Optional[str] = None,
+    deepseek_model: Optional[str] = None,
+    max_context: Optional[str] = None,
+    compact_window: Optional[str] = None,
     dry_run: bool = False,
 ) -> Dict[str, Any]:
     if not 1 <= port <= 65535:
@@ -876,10 +911,10 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     p_prep = sub.add_parser("prepare-cards", help="Create or update Kimi, DeepSeek, and hybrid router cards")
     p_prep.add_argument("--port", type=int, default=default_router_port())
-    p_prep.add_argument("--kimi-model", default="k3.1-pro[1m]")
-    p_prep.add_argument("--deepseek-model", default="deepseek-flash")
-    p_prep.add_argument("--max-context", default="1048576")
-    p_prep.add_argument("--compact-window", default="1000000")
+    p_prep.add_argument("--kimi-model", default=None)
+    p_prep.add_argument("--deepseek-model", default=None)
+    p_prep.add_argument("--max-context", default=None)
+    p_prep.add_argument("--compact-window", default=None)
     p_prep.add_argument("--dry-run", action="store_true")
 
     p_switch = sub.add_parser("switch-card", help="Switch active Claude card and project into settings.json")

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local model router for Claude Code: main model on Kimi (K3), subagents on DeepSeek.
+"""Local transparent model router for Claude Code (primary + subagent split via CC Switch cards).
 
 Claude Code sends every request to one ANTHROPIC_BASE_URL. Point it here; this router
 forwards each request by its "model" field:
@@ -294,7 +294,7 @@ def log_line(cfg, rec):
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.0"     # stream until close; no chunk re-encoding needed
-    server_version = "k3ds-router/1"
+    server_version = "cc-local-router/1"
     timeout = 60
 
     def log_message(self, *args):     # silence default stderr access log
