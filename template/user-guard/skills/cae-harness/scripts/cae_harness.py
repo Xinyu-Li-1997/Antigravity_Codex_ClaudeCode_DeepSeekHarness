@@ -310,7 +310,15 @@ _AGY_AUTH_REQUIRED = re.compile(
 _QUOTA_EVENT_NAME = re.compile(r'^[0-9a-f]{32}\.json$')
 
 
-MAX_INTEROP_STAGE_BYTES = 64 * 1024 * 1024
+_DEFAULT_MAX_INTEROP_STAGE_BYTES = 64 * 1024 * 1024
+MAX_INTEROP_STAGE_BYTES = _DEFAULT_MAX_INTEROP_STAGE_BYTES
+
+
+def _max_interop_stage_bytes():
+    if MAX_INTEROP_STAGE_BYTES != _DEFAULT_MAX_INTEROP_STAGE_BYTES:
+        return MAX_INTEROP_STAGE_BYTES
+    mib = _positive_int(_headless_tunables().get('interop_stage_max_mib'))
+    return mib * 1024 * 1024 if mib else MAX_INTEROP_STAGE_BYTES
 
 
 STAGED_PROMPT_SUFFIX = '\n[跨端只读工作区说明] 当前目录已按原相对路径只读镜像目标文件，请直接在当前目录下按相对路径读取。'
@@ -420,6 +428,25 @@ def _find_windows_agy_in_wsl():
     return None
 
 
+def _sorted_codex_binaries(root):
+    if not root.is_dir():
+        return []
+    scored = []
+    try:
+        entries = list(root.rglob('codex.exe'))
+    except OSError:
+        return []
+    for item in entries:
+        try:
+            st = item.stat()
+        except OSError:
+            continue
+        if stat.S_ISREG(st.st_mode):
+            scored.append((st.st_mtime_ns, str(item), item))
+    scored.sort(key=lambda row: (row[0], row[1]), reverse=True)
+    return [row[2] for row in scored]
+
+
 def _find_binary(name):
     if name == 'claude':
         return _find_claude()
@@ -432,15 +459,25 @@ def _find_binary(name):
         if not found:
             raise HarnessError(f'指定的 {name} 程序不存在')
         return found
+    home = Path.home()
     found = shutil.which(name)
     if found and Path(found).suffix.lower() not in ('.cmd', '.bat'):
+        if name == 'codex' and not _is_posix():
+            local_app = Path(os.environ.get('LOCALAPPDATA') or (home / 'AppData' / 'Local'))
+            codex_bin_root = local_app / 'OpenAI' / 'Codex' / 'bin'
+            try:
+                in_desktop_bin = Path(found).resolve().is_relative_to(codex_bin_root.resolve())
+            except OSError:
+                in_desktop_bin = False
+            if in_desktop_bin:
+                ranked = _sorted_codex_binaries(codex_bin_root)
+                if ranked:
+                    return str(ranked[0])
         return found
-    home = Path.home()
     candidates = [home / '.gemini' / 'bin' / ('agy' if _is_posix() else 'agy.exe')] if name == 'agy' else []
     if name == 'codex' and not _is_posix():
-        root = Path(os.environ.get('LOCALAPPDATA', '')) / 'OpenAI' / 'Codex' / 'bin'
-        if root.is_dir():
-            candidates.extend(sorted(root.rglob('codex.exe'), key=lambda p: p.stat().st_mtime, reverse=True))
+        local_app = Path(os.environ.get('LOCALAPPDATA') or (home / 'AppData' / 'Local'))
+        candidates.extend(_sorted_codex_binaries(local_app / 'OpenAI' / 'Codex' / 'bin'))
     candidates.append(home / '.local' / 'bin' / (name if _is_posix() else name + '.exe'))
     for candidate in candidates:
         if candidate.is_file():
@@ -452,11 +489,9 @@ def _find_binary(name):
         if shutil.which('cmd.exe'):
             try:
                 local_app = Path(_wsl_path(_windows_env('LOCALAPPDATA'), windows=False))
-                root = local_app / 'OpenAI' / 'Codex' / 'bin'
-                if root.is_dir():
-                    for candidate in sorted(root.rglob('codex.exe'), key=lambda p: p.stat().st_mtime, reverse=True):
-                        if candidate.is_file():
-                            return str(candidate)
+                ranked = _sorted_codex_binaries(local_app / 'OpenAI' / 'Codex' / 'bin')
+                if ranked:
+                    return str(ranked[0])
             except (HarnessError, OSError):
                 pass
     if name == 'agy':
@@ -578,9 +613,23 @@ def _agy_home(binary):
 
 
 def resolve_caller(value):
-    value = os.environ.get('CAE_HARNESS_CALLER', '') if value == 'auto' else value
-    value = {'cc': 'claude', 'agy': 'antigravity'}.get(value, value)
-    return value if value in ('codex', 'antigravity', 'claude', 'dsh') else 'caller'
+    raw = str(value or '').strip().lower()
+    if raw == 'auto':
+        explicit_env = os.environ.get('CAE_HARNESS_CALLER', '').strip().lower()
+        if explicit_env:
+            raw = explicit_env
+        elif any(os.environ.get(k, '').strip() for k in ('ANTIGRAVITY_AGENT', 'ANTIGRAVITY_CONVERSATION_ID', 'ANTIGRAVITY_APP_DATA_DIR')):
+            raw = 'antigravity'
+        elif any(os.environ.get(k, '').strip() for k in ('CODEX_THREAD_ID', 'CODEX_CI')):
+            raw = 'codex'
+        elif any(os.environ.get(k, '').strip() for k in ('CLAUDECODE', 'CLAUDE_CODE_ENTRYPOINT')):
+            raw = 'claude'
+        elif any(os.environ.get(k, '').strip() for k in ('DSH_SESSION_ID', 'DSH_PROFILE')):
+            raw = 'dsh'
+        else:
+            raw = ''
+    raw = {'cc': 'claude', 'agy': 'antigravity'}.get(raw, raw)
+    return raw if raw in ('codex', 'antigravity', 'claude', 'dsh') else 'caller'
 
 
 def _engine_parts(spec):
@@ -698,8 +747,10 @@ def _stage_wsl_readonly_workspace(target_dir, stage_root, rel_files=None, *, exc
                 records.append({'path': src, 'rel_path': rel, 'bytes': src.stat().st_size})
             except (OSError, ValueError) as exc:
                 raise HarnessError(f'无法在目标目录内镜像文件: {rel}') from exc
-    if sum(item['bytes'] for item in records) > MAX_INTEROP_STAGE_BYTES:
-        raise HarnessError('WSL 纯 Linux 路径只读镜像超出 64MB 上限，请缩小 --target 范围或在 WSL 安装原生 codex')
+    stage_limit = _max_interop_stage_bytes()
+    if sum(item['bytes'] for item in records) > stage_limit:
+        limit_mib = max(1, stage_limit // (1024 * 1024))
+        raise HarnessError(f'WSL 纯 Linux 路径只读镜像超出 {limit_mib}MB 上限，请缩小 --target 范围或在 WSL 安装原生 codex')
     windows_names = {}
     for item in records:
         parts = Path(item['rel_path']).parts
@@ -806,10 +857,10 @@ def _interop_command(command, work_dir, temp_dir, input_text, codex_home=None, e
         '$info.StandardErrorEncoding = New-Object System.Text.UTF8Encoding($false)',
         *env_lines,
         '$p = New-Object System.Diagnostics.Process', '$p.StartInfo = $info',
-        '$started = $false', '$completed = $false', '$exitCode = 1', 'try {',
+        '$started = $false', '$exitCode = 1', 'try {',
         '[void]$p.Start()', '$started = $true',
         *pipes,
-        '$exitCode = $p.ExitCode', '$completed = $true', '} finally {',
+        '$exitCode = $p.ExitCode', '} finally {',
         'if ($started) { & taskkill.exe /T /F /PID $p.Id 2>$null | Out-Null }',
         '$p.Dispose()', '}', 'exit $exitCode',
     ])
@@ -1378,7 +1429,7 @@ def _select_codex_frontier_record(models):
     return min(native, key=_catalog_order) if native else {}
 
 
-def _select_codex_specialty_record(info, kind, tier, prompt_text, estimated_tokens):
+def _select_codex_specialty_record(info, kind, tier, prompt_text, estimated_tokens, *, prefer_fast=False):
     models = [item for item in info.get('models', []) if _model_category('codex', item) == 'native']
     eligible = sorted((item for item in models if not _only_delegating_efforts(item, tier)), key=_catalog_order)
     # 同一产品线只自动采用最新一代；目录优先级仍用于不同产品线之间的选择。
@@ -1399,7 +1450,7 @@ def _select_codex_specialty_record(info, kind, tier, prompt_text, estimated_toke
     def budget(record):
         return _execution_budget('codex', info, record)['input_budget_tokens']
 
-    if tier == 'low' and not _has_negated_cue(prompt_text, tuple({'轻量', '极速'} | _fast_model_tags('codex'))):
+    if prefer_fast or (tier == 'low' and not _has_negated_cue(prompt_text, tuple({'轻量', '极速'} | _fast_model_tags('codex')))):
         fast = [item for item in eligible if _model_specialty(item) == 'fast' and estimated_tokens <= budget(item)]
         if fast:
             return fast[0], 'specialty_fast_lightweight'
@@ -1442,7 +1493,8 @@ def resolve_execution_profile(backends, spec, tier='max', prompt_text='', kind='
     if role_target:
         explicit_model = ''
         if role_target == 'fast':
-            tier = 'low'
+            if tier in ('max', 'auto', ''):
+                tier = 'low'
             kind = 'review'
             prompt_text = ''
         elif role_target == 'orchestrator':
@@ -1516,7 +1568,9 @@ def resolve_execution_profile(backends, spec, tier='max', prompt_text='', kind='
                 source = ('prompt_fuzzy_model' if hint else 'explicit_engine_model' if slug.lower() == explicit_model.lower()
                           else 'explicit_fuzzy_model')
                 return _codex_profile(info, spec, record, slug, tier, source)
-        record, source = _select_codex_specialty_record(info, kind, tier, prompt_text, estimated_tokens)
+        record, source = _select_codex_specialty_record(
+            info, kind, tier, prompt_text, estimated_tokens, prefer_fast=(role_target == 'fast')
+        )
         if record:
             return _codex_profile(info, spec, record, record['slug'], tier,
                                   'role_specialty_' + role_target if role_target else source)
@@ -1532,8 +1586,21 @@ def resolve_execution_profile(backends, spec, tier='max', prompt_text='', kind='
                 return _agy_profile(info, spec, record, record.get('slug') or explicit_model, tier,
                                     'prompt_fuzzy_model' if hint else source if record else 'explicit_engine_model')
         agy_blocked = {str(t).lower() for t in (_catalog_rules('agy').get('blocked_auto_tokens') or ())}
-        native = [item for item in models if _model_category('agy', item) == 'native'
-                  and not (_tokens_lower(f"{item['slug']} {item.get('display_name', '')}") & agy_blocked)]
+        retiring_cfg = (_fleet_profile().get('excluded_or_retiring') or {})
+        retiring_res = []
+        if isinstance(retiring_cfg, dict):
+            for pat in retiring_cfg.get('agy_retiring_patterns') or ():
+                if isinstance(pat, str) and pat.strip():
+                    try:
+                        retiring_res.append(re.compile(pat, re.I))
+                    except re.error:
+                        continue
+        native = [
+            item for item in models
+            if _model_category('agy', item) == 'native'
+            and not (_tokens_lower(f"{item['slug']} {item.get('display_name', '')}") & agy_blocked)
+            and not any(rx.search(f"{item['slug']} {item.get('display_name', '')}") for rx in retiring_res)
+        ]
         families = _agy_families(native)
         eligible = sorted((name for name in families if _match_agy_family(families[name], tier)), key=_agy_family_order)
         if eligible:
@@ -1542,12 +1609,12 @@ def resolve_execution_profile(backends, spec, tier='max', prompt_text='', kind='
             normal = [name for name in eligible if not is_fast(name)]
             light_cues = tuple({'轻量', '极速'} | _fast_model_tags())
             forbid_lightweight = _has_negated_cue(prompt_text, light_cues)
-            if not normal and (tier != 'low' or forbid_lightweight):
+            if not normal and role_target != 'fast' and (tier != 'low' or forbid_lightweight):
                 return _profile(prefix, info, spec, None, {}, tier, 'no_native_catalog_candidate',
                                 error='未找到原生旗舰模型，请刷新目录或显式指定模型。')
             normal = normal or eligible
             chosen, source = normal[0], 'frontier_catalog'
-            if tier == 'low' and not forbid_lightweight:
+            if role_target == 'fast' or (tier == 'low' and not forbid_lightweight):
                 fast = [name for name in eligible if is_fast(name)]
                 if fast:
                     chosen, source = fast[0], 'specialty_fast_lightweight'
@@ -1676,6 +1743,7 @@ def _agy_info(binary, requested, now=None):
     cache_file = root / 'antigravity-cli' / 'cache' / 'cae_models_cache.json'
     data = _read_json(cache_file)
     models = _agy_cached_records(data)
+    fallback_win = _positive_int(_headless_tunables().get('unlisted_window_fallback_tokens')) or 120_000
     return {'available': bool(binary), 'detected': bool(binary), 'binary': binary, 'family': 'antigravity',
             **_agy_config(root), 'models': models, 'windows_interop': interop,
             'verified_status': 'unverified', 'authentication_status': 'not_checked',
@@ -1683,8 +1751,8 @@ def _agy_info(binary, requested, now=None):
                                                now or datetime.datetime.now(datetime.timezone.utc)),
             'execution_config_supported': not os.environ.get('CAE_AGY_HOME'),
             'configured_window_tokens': None, 'effective_compaction_tokens': None,
-            'requested_input_budget_tokens': requested, 'safe_input_budget_tokens': requested or 120_000,
-            'budget_source': 'explicit_planning_budget' if requested else 'policy_estimate_120000',
+            'requested_input_budget_tokens': requested, 'safe_input_budget_tokens': requested or fallback_win,
+            'budget_source': 'explicit_planning_budget' if requested else f'policy_estimate_{fallback_win}',
             'capability_source': 'local_settings_and_cache' if models else 'local_settings',
             'capacity_notice': '宿主压缩阈值未核实，规划预算不表示无压缩容量。'}
 
@@ -1708,15 +1776,16 @@ def _fallback_agy_info(info):
 def _run_agy_listing(info):
     binary = info['binary']
     command = [binary, 'models']
+    query_timeout = _positive_int(_headless_tunables().get('catalog_query_timeout_sec')) or 30
     if not info.get('windows_interop'):
-        return run_process(command, Path.cwd(), timeout_sec=30)
+        return run_process(command, Path.cwd(), timeout_sec=query_timeout)
     if not shutil.which('powershell.exe') or not shutil.which('taskkill.exe'):
         raise HarnessError('WSL 跨端查询需要 powershell.exe 与 taskkill.exe 进行进程监督')
     windows_temp = _wsl_path(Path(_windows_env('TEMP')), windows=False)
     with tempfile.TemporaryDirectory(prefix='cae-harness-', dir=windows_temp) as temp:
         path = Path(temp)
         command, pid_file = _interop_command(command, path, path, '', None)
-        return run_process(command, path, timeout_sec=30, native_pid_file=pid_file)
+        return run_process(command, path, timeout_sec=query_timeout, native_pid_file=pid_file)
 
 
 def _refresh_agy_listing(info, batch, *, refresh_model_cache, record_quota=True):
@@ -1857,8 +1926,9 @@ def _claude_info(binary, requested=None):
               else 'credentials_file' if (root / '.credentials.json').is_file() else 'unconfigured')
     model_names = [configured, *(env.get(key) for key in ('ANTHROPIC_DEFAULT_OPUS_MODEL', 'ANTHROPIC_DEFAULT_SONNET_MODEL',
                     'ANTHROPIC_DEFAULT_HAIKU_MODEL', 'CLAUDE_CODE_SUBAGENT_MODEL'))]
+    tag_1m_window = _positive_int(_catalog_rules('claude').get('auto_compact_window')) or 1_000_000
     models = [{'slug': name, 'display_name': name, 'provider': 'claude_configured', 'priority': i,
-               'max_context_window': 1_000_000 if '[1m]' in name.lower() else configured_window,
+               'max_context_window': tag_1m_window if '[1m]' in name.lower() else configured_window,
                'supported_efforts': ['low', 'medium', 'high', 'xhigh', 'max']}
               for i, name in enumerate(dict.fromkeys(name for name in model_names if isinstance(name, str) and name.strip()))]
     if not models and source not in ('local_router', 'settings_env', 'placeholder_token'):
@@ -2032,9 +2102,10 @@ def _verify_claude_llm_ready(info, requested_model='', batch=None):
     elif source == 'settings_env':
         if not info.get('windows_interop') and _wsl_upstream_hits_unproxied_fake_ip(info.get('base_url', '')):
             router_card = str(_catalog_rules('claude').get('router_card_name') or '本地混合路由卡片')
+            wsl_router_port = _positive_int((_headless_tunables().get('router') or {}).get('wsl_port')) or 8241
             raise HarnessError(
                 'WSL 检测到 Claude Code 直连上游域名解析为宿主 Fake-IP 且未配置代理环境变量；'
-                f'请切换至本地路由卡片（{router_card} / 127.0.0.1:8241）或配置 HTTPS_PROXY',
+                f'请切换至本地路由卡片（{router_card} / 127.0.0.1:{wsl_router_port}）或配置 HTTPS_PROXY',
                 execution_environment=_execution_environment(info),
             )
     else:
@@ -2432,15 +2503,17 @@ def _enforce_preflight_quota(backends, specs, retry_quota=False, *, batch=None, 
                                **_quota_user_choices(prefix, cooldown))
 
 
-def _local_fallback_engine(caller, engine, backends, prompt_text=''):
+def _local_fallback_engine(caller, engine, backends, prompt_text='', *, clean_room=False, exclude_prefixes=()):
     cur_prefix, _ = _engine_parts(engine)
-    negated = _extract_negated_backends(prompt_text)
+    excluded = set(_extract_negated_backends(prompt_text)) | {str(p).strip().lower() for p in exclude_prefixes if p}
+    if clean_room:
+        excluded.add('agy')
     caller_id = resolve_caller(caller)
     local = {'antigravity': 'agy', 'codex': 'codex', 'claude': 'claude', 'dsh': 'dsh'}.get(caller_id)
     fb_map = _fleet_profile().get('peer_fallback_order')
     configured_peers = fb_map.get(caller_id, []) if isinstance(fb_map, dict) else []
     for candidate in dict.fromkeys((local, *configured_peers, 'agy', 'codex', 'claude', 'dsh')):
-        if (candidate and candidate != cur_prefix and candidate not in negated
+        if (candidate and candidate != cur_prefix and candidate not in excluded
                 and _peer_auto_ready(backends, candidate) and not _active_quota_record(candidate, backends[candidate])):
             return candidate + ':default'
     return None
@@ -2479,11 +2552,45 @@ class _WindowsJob:
                         ('th32ThreadID', wintypes.DWORD), ('th32OwnerProcessID', wintypes.DWORD),
                         ('tpBasePri', wintypes.LONG), ('tpDeltaPri', wintypes.LONG), ('dwFlags', wintypes.DWORD)]
 
+        class IoCounters(ctypes.Structure):
+            _fields_ = [
+                ('ReadOperationCount', ctypes.c_ulonglong),
+                ('WriteOperationCount', ctypes.c_ulonglong),
+                ('OtherOperationCount', ctypes.c_ulonglong),
+                ('ReadTransferCount', ctypes.c_ulonglong),
+                ('WriteTransferCount', ctypes.c_ulonglong),
+                ('OtherTransferCount', ctypes.c_ulonglong),
+            ]
+
+        class BasicLimitInfo(ctypes.Structure):
+            _fields_ = [
+                ('PerProcessUserTimeLimit', ctypes.c_longlong),
+                ('PerJobUserTimeLimit', ctypes.c_longlong),
+                ('LimitFlags', wintypes.DWORD),
+                ('MinimumWorkingSetSize', ctypes.c_size_t),
+                ('MaximumWorkingSetSize', ctypes.c_size_t),
+                ('ActiveProcessLimit', wintypes.DWORD),
+                ('Affinity', ctypes.c_size_t),
+                ('PriorityClass', wintypes.DWORD),
+                ('SchedulingClass', wintypes.DWORD),
+            ]
+
+        class ExtendedLimitInfo(ctypes.Structure):
+            _fields_ = [
+                ('BasicLimitInformation', BasicLimitInfo),
+                ('IoInfo', IoCounters),
+                ('ProcessMemoryLimit', ctypes.c_size_t),
+                ('JobMemoryLimit', ctypes.c_size_t),
+                ('PeakProcessMemoryUsed', ctypes.c_size_t),
+                ('PeakJobMemoryUsed', ctypes.c_size_t),
+            ]
+
         self.ctypes = ctypes
         self.entry_type = ThreadEntry
         self.api = ctypes.WinDLL('kernel32', use_last_error=True)
         signatures = (
             ('CreateJobObjectW', wintypes.HANDLE, (ctypes.c_void_p, wintypes.LPCWSTR)),
+            ('SetInformationJobObject', wintypes.BOOL, (wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD)),
             ('AssignProcessToJobObject', wintypes.BOOL, (wintypes.HANDLE, wintypes.HANDLE)),
             ('TerminateJobObject', wintypes.BOOL, (wintypes.HANDLE, wintypes.UINT)),
             ('CloseHandle', wintypes.BOOL, (wintypes.HANDLE,)),
@@ -2499,6 +2606,9 @@ class _WindowsJob:
         self.handle = self.api.CreateJobObjectW(None, None)
         if not self.handle:
             raise ctypes.WinError(ctypes.get_last_error())
+        ext_info = ExtendedLimitInfo()
+        ext_info.BasicLimitInformation.LimitFlags = 0x00002000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        self.api.SetInformationJobObject(self.handle, 9, ctypes.byref(ext_info), ctypes.sizeof(ext_info))
 
     def attach(self, proc):
         # Popen 保留的句柄具有创建时的权限，受限令牌重新 OpenProcess 可能被拒绝。
@@ -2794,6 +2904,65 @@ def _strip_dsml_tail(text):
     return DSML_TAIL_RE.sub('', text).strip()
 
 
+_HEX4_CHARS = frozenset('0123456789abcdefABCDEF')
+_VALID_JSON_ESCAPES = frozenset('"\\/bfnrt')
+
+
+def _repair_json_string_escapes(text):
+    """在标准 json.loads 失败后，仅修复双引号字符串字面量内部的非法单反斜杠转义（如 Windows 路径与 LaTeX 命令）。"""
+    if '\\' not in text:
+        return text
+    out = []
+    in_string = False
+    idx = 0
+    length = len(text)
+    while idx < length:
+        ch = text[idx]
+        if not in_string:
+            if ch == '"':
+                in_string = True
+            out.append(ch)
+            idx += 1
+            continue
+        if ch == '"':
+            in_string = False
+            out.append(ch)
+            idx += 1
+            continue
+        if ch != '\\':
+            out.append(ch)
+            idx += 1
+            continue
+        if idx + 1 >= length:
+            out.append('\\\\')
+            idx += 1
+            continue
+        nxt = text[idx + 1]
+        if nxt in _VALID_JSON_ESCAPES:
+            out.append('\\')
+            out.append(nxt)
+            idx += 2
+            continue
+        if nxt == 'u' and idx + 6 <= length and all(c in _HEX4_CHARS for c in text[idx + 2:idx + 6]):
+            out.append(text[idx:idx + 6])
+            idx += 6
+            continue
+        out.append('\\\\')
+        idx += 1
+    return ''.join(out)
+
+
+def _loads_relaxed_dict(candidate):
+    for attempt in (candidate, _repair_json_string_escapes(candidate)):
+        try:
+            parsed = json.loads(attempt, strict=False)
+            if isinstance(parsed, dict):
+                return parsed
+        except (ValueError, RecursionError):
+            continue
+    return None
+
+
 def _decode_output_json(raw_text):
     raw = _strip_dsml_tail(raw_text.strip().lstrip('\ufeff'))
     if not raw:
@@ -2803,6 +2972,10 @@ def _decode_output_json(raw_text):
     except RecursionError as exc:
         raise OutputParseError('JSON 嵌套过深') from exc
     except ValueError as exc:
+        relaxed_top = _loads_relaxed_dict(raw)
+        if relaxed_top is not None:
+            return relaxed_top
+
         def _raise_if_stream_error_lines(text):
             err_items = []
             saw_timeout = False
@@ -2831,9 +3004,11 @@ def _decode_output_json(raw_text):
 
         _raise_if_stream_error_lines(raw)
         fence = re.fullmatch(r'```(?:json)?\s*(\{[\s\S]*\})\s*```', raw)
+        if fence:
+            fenced_dict = _loads_relaxed_dict(_strip_dsml_tail(fence.group(1)))
+            if fenced_dict is not None:
+                return fenced_dict
         try:
-            if fence:
-                return json.loads(_strip_dsml_tail(fence.group(1)))
             events = []
             for line in raw.splitlines():
                 stripped = _strip_dsml_tail(line.strip())
@@ -2841,12 +3016,54 @@ def _decode_output_json(raw_text):
                     continue
                 events.append(json.loads(stripped))
         except (ValueError, RecursionError) as decode_error:
-            fence = re.search(r'```(?:json)?\s*(\{[\s\S]*?\})\s*```', raw)
-            if fence:
+            # 兼容 CLI wrapper（如 Windows .CMD / 插件提示行）混入少量非 JSON 诊断行的 JSONL 事件流
+            tolerant_events = []
+            for line in raw.splitlines():
+                stripped = _strip_dsml_tail(line.strip())
+                if not stripped or not (stripped.startswith('{') and stripped.endswith('}')):
+                    continue
                 try:
-                    return json.loads(_strip_dsml_tail(fence.group(1)))
+                    ev_obj = json.loads(stripped)
                 except (ValueError, RecursionError):
-                    pass
+                    continue
+                if isinstance(ev_obj, dict):
+                    _check_output_status(ev_obj)
+                    tolerant_events.append(ev_obj)
+            tolerant_results = [
+                ev for ev in tolerant_events
+                if ev.get('event') == 'result' or ev.get('type') == 'final'
+            ]
+            if len(tolerant_results) == 1:
+                return tolerant_results[0]
+
+            for pattern in (r'```(?:json)?\s*(\{[\s\S]*\})\s*```', r'```(?:json)?\s*(\{[\s\S]*?\})\s*```'):
+                fence = re.search(pattern, raw)
+                if fence:
+                    fenced_dict = _loads_relaxed_dict(_strip_dsml_tail(fence.group(1)))
+                    if fenced_dict is not None:
+                        return fenced_dict
+            decoder = json.JSONDecoder(strict=False)
+            for scan_text in (raw, _repair_json_string_escapes(raw)):
+                schema_candidates = []
+                search_pos = 0
+                for _ in range(64):
+                    brace_idx = scan_text.find('{', search_pos)
+                    if brace_idx < 0:
+                        break
+                    search_pos = brace_idx + 1
+                    try:
+                        candidate_obj, end_idx = decoder.raw_decode(scan_text, brace_idx)
+                    except (ValueError, RecursionError):
+                        continue
+                    if isinstance(candidate_obj, dict) and candidate_obj:
+                        tail_rest = _strip_dsml_tail(scan_text[end_idx:]).strip()
+                        if not tail_rest or re.fullmatch(r'```+', tail_rest):
+                            return candidate_obj
+                        if 'summary' in candidate_obj and ('content' in candidate_obj or 'findings' in candidate_obj):
+                            schema_candidates.append(candidate_obj)
+                            search_pos = max(search_pos, end_idx)
+                if len(schema_candidates) == 1:
+                    return schema_candidates[0]
             raise OutputParseError('子任务输出不是合法 JSON') from decode_error
         results = []
         for event in events:
@@ -3333,7 +3550,8 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
                        'read-only' if readonly else 'workspace-write', '--approval-policy', 'never', '-']
             req_keys = ', '.join(schema.get('required', ()))
             exec_prompt = (f'{exec_prompt}\n\n请仅输出一个以 {{ 开头、以 }} 结尾且严格符合以下 JSON Schema 的单行或多行 JSON 对象'
-                           f'（必含顶层键：{req_keys}），严禁输出 Markdown 代码块围栏或任何额外解释文字：\n'
+                           f'（必含顶层键：{req_keys}；JSON 字符串内的反斜杠如 Windows 路径与 LaTeX 公式必须转义为双反斜杠 \\\\），'
+                           f'严禁输出外层 Markdown 代码块围栏或任何额外解释文字：\n'
                            f'{json.dumps(schema, ensure_ascii=False)}')
             input_text = exec_prompt
         receipt.update(argv=list(command), work_dir=str(exec_dir), staged_readonly_workspace=stage_dir is not None,
@@ -3353,7 +3571,8 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
         # cannot clear a failure recorded by another unit in this same batch.
         _enforce_preflight_quota(backends, (spec,), batch=batch)
         receipt['launch_attempted'] = True
-        proc_timeout = timeout_sec + 15 if prefix == 'agy' else timeout_sec
+        agy_grace = _positive_int(_headless_tunables().get('agy_timeout_grace_sec')) or 15
+        proc_timeout = timeout_sec + agy_grace if prefix == 'agy' else timeout_sec
         try:
             result = run_process(command, exec_dir, input_text, proc_timeout, env=env, native_pid_file=native_pid_file)
         except HarnessError as exc:
@@ -3692,8 +3911,10 @@ def _audit_engines(backends, dual_blind, left_override, right_override, allow_un
 
 
 def select_audit_plan(total_tokens, file_records, backends, strategy='auto', dual_blind=True,
-                      left_override='', right_override='', shard_tokens=120_000, allow_unconfigured=False, caller='caller',
+                      left_override='', right_override='', shard_tokens=None, allow_unconfigured=False, caller='caller',
                       *, focus='', profiles=None, engines=None):
+    if shard_tokens is None:
+        shard_tokens = _positive_int(_headless_tunables().get('default_shard_tokens')) or 120_000
     requested_strategy = strategy
     if strategy == 'whole-1m':
         strategy = 'single-pass'
@@ -3758,8 +3979,10 @@ def select_audit_plan(total_tokens, file_records, backends, strategy='auto', dua
     return plan
 
 
-def merge_blind_findings(left_findings, right_findings, left_engine, right_engine, target_dir, line_tolerance=8):
+def merge_blind_findings(left_findings, right_findings, left_engine, right_engine, target_dir, line_tolerance=None):
     """按相近行号组织候选发现，同一位置的意见仍需当前总控核实。"""
+    if line_tolerance is None:
+        line_tolerance = _positive_int(_headless_tunables().get('consensus_line_tolerance')) or 8
     ranks = {'critical': 4, 'high': 3, 'medium': 2, 'low': 1}
     left = [{**item, 'file': _normalize_rel_file(item['file'], target_dir)} for item in left_findings]
     right = [{**item, 'file': _normalize_rel_file(item['file'], target_dir)} for item in right_findings]
@@ -4159,7 +4382,10 @@ def _extract_anchor_numbers(text):
                 fval = float(cleaned)
                 nums.add(f'{fval:g}')
                 if 0.0 < fval <= 1.0:
-                    nums.add(str(int(round(fval * 100))))
+                    pct = int(round(fval * 100))
+                    nums.add(str(pct))
+                    if 0 < pct < 100:
+                        nums.add(str(100 - pct))
             except ValueError:
                 pass
         else:
@@ -4189,9 +4415,9 @@ def _build_grounding_anchor(root_dir, exclude_rels, allow_files=None, extra_allo
         dpath = Path(dirpath)
         for fname in sorted(files):
             fpath = dpath / fname
-            if _is_link(fpath):
+            if _is_link(fpath) or not fpath.resolve().is_relative_to(root_dir):
                 continue
-            rel = fpath.relative_to(root_dir).as_posix()
+            rel = fpath.resolve().relative_to(root_dir).as_posix()
             repo_names.add(fname.lower())
             repo_names.add(fpath.stem.lower())
             repo_names.add(rel.lower())
@@ -4251,9 +4477,11 @@ def _iter_visible_doc_lines(rel_path, raw_text):
         if m_fence:
             tok = m_fence.group(1)
             if not fence_marker:
-                fence_marker, fence_len = tok[0], len(tok)
-                continue
-            if tok[0] == fence_marker and len(tok) >= fence_len and not stripped[len(tok):].strip():
+                rest = stripped[len(tok):]
+                if tok not in rest:
+                    fence_marker, fence_len = tok[0], len(tok)
+                    continue
+            elif tok[0] == fence_marker and len(tok) >= fence_len and not stripped[len(tok):].strip():
                 fence_marker, fence_len = '', 0
                 continue
         if not fence_marker:
@@ -4280,29 +4508,36 @@ def _audit_single_doc_text(rel_path, doc_text, anchor, baseline_text=''):
             })
 
     for line_no, raw_line in _iter_visible_doc_lines(rel_path, doc_text):
-        # 剔除行内数学公式 $...$ 与反面示例引号 “...” 以免误报被禁止的夸大词示例
-        no_math = re.sub(r'\$\$?[^$\n]+\$\$?', ' ', raw_line)
-        no_anti_quote = re.sub(r'“[^”\n]{1,60}”', ' ', no_math)
+        # 保护行内代码跨度中的 $VAR，避免两个代码跨度之间的文本被误识别为行内公式 $...$，同时保留代码标识符供后续枚举锚定
+        code_spans = re.findall(r'`([^`\n]+)`', raw_line)
+        line_safe_code = re.sub(r'`[^`\n]+`', lambda m: m.group(0).replace('$', '_'), raw_line)
+        no_math_prose = re.sub(r'\$\$?[^$\n]+\$\$?', ' ', line_safe_code)
+        no_anti_quote = re.sub(r'“[^”\n]{1,60}”', ' ', no_math_prose)
 
         # 1. 行内代码标识符（CLI 选项与源码/配置文件名）
-        for span in re.findall(r'`([^`\n]+)`', no_math):
+        for span in code_spans:
             span_clean = span.strip()
-            if not span_clean or '<' in span_clean or '>' in span_clean:
+            if not span_clean:
                 continue
-            head_tok = re.split(r'[\s/\\]+', span_clean, maxsplit=1)[0].strip('"\'').lower()
+            has_placeholder = '<' in span_clean or '>' in span_clean
+            flag_scan_text = re.sub(r'<[^>\n]*>', ' ', span_clean) if has_placeholder else span_clean
+            head_source = flag_scan_text.strip()
+            if not head_source:
+                continue
+            head_tok = re.split(r'[\s/\\]+', head_source, maxsplit=1)[0].strip('"\'').lower()
             head_stem = Path(head_tok).stem.lower()
             is_external_cmd = head_tok in _GROUNDING_EXTERNAL_CLIS or head_stem in _GROUNDING_EXTERNAL_CLIS
             if not is_external_cmd:
-                for flag in re.findall(r'(?<![A-Za-z0-9])(--[a-z0-9][a-z0-9_-]*)', span_clean.lower()):
+                for flag in re.findall(r'(?<![A-Za-z0-9])(--[a-z0-9][a-z0-9_-]*)', flag_scan_text.lower()):
                     if flag not in anchor['flags']:
                         record(line_no, 'ungrounded_identifier', flag, '行内代码引用的 CLI 选项未在仓库脚本或配置中声明')
             else:
                 # 对 python install.py / cae_harness.py / fleet_state.py / ccswitch_admin.py 调用仍严格校验参数
-                if any(s in span_clean.lower() for s in ('install.py', 'cae_harness.py', 'fleet_state.py', 'ccswitch_admin.py', 'handoff_gate.py', 'router.py')):
-                    for flag in re.findall(r'(?<![A-Za-z0-9])(--[a-z0-9][a-z0-9_-]*)', span_clean.lower()):
+                if any(s in flag_scan_text.lower() for s in ('install.py', 'cae_harness.py', 'fleet_state.py', 'ccswitch_admin.py', 'handoff_gate.py', 'router.py')):
+                    for flag in re.findall(r'(?<![A-Za-z0-9])(--[a-z0-9][a-z0-9_-]*)', flag_scan_text.lower()):
                         if flag not in anchor['flags']:
                             record(line_no, 'ungrounded_identifier', flag, '仓库脚本调用参数未在源码 argparse 中声明')
-            if not is_external_cmd:
+            if not is_external_cmd and not has_placeholder:
                 for fn in re.findall(r'\b([A-Za-z0-9_.*-]+(?:/[A-Za-z0-9_.*-]+)*\.(?:py|json|toml|yaml|yml|svg|sh|ps1))\b', span_clean):
                     fn_low = fn.lower().lstrip('./')
                     base_low = Path(fn_low).name
@@ -4314,10 +4549,9 @@ def _audit_single_doc_text(rel_path, doc_text, anchor, baseline_text=''):
                         continue
                     record(line_no, 'ungrounded_identifier', fn, '行内代码引用的脚本或配置文件名在仓库与锚点语料中均不存在')
 
-        # 2. 全大写领域缩写词（零黑名单：必须存在于锚点语料、仓库文件名或基础计算机协议集合中）
-        prose_no_code = re.sub(r'`[^`\n]+`', ' ', no_anti_quote)
-        prose_no_urls = re.sub(r'https?://\S+', ' ', prose_no_code)
-        for acro in re.findall(r'\b([A-Z][A-Z0-9]{2,})\b', prose_no_urls):
+        # 2. 全大写领域缩写词（零领域黑名单：必须存在于锚点语料、仓库文件名或基础计算机协议集合中）
+        prose_no_urls = re.sub(r'https?://\S+', ' ', no_anti_quote)
+        for acro in re.findall(r'(?<![A-Za-z0-9_])([A-Z][A-Z0-9]{2,})(?![A-Za-z0-9_])', prose_no_urls):
             if (acro in _GROUNDING_GENERIC_ACRONYMS
                     or re.fullmatch(r'(?:R\d{1,2}|L\d+|V\d+|\d+M|\d+K|\d+G)', acro)
                     or acro.lower() in anchor['repo_names']
@@ -4408,7 +4642,8 @@ def audit_doc_grounding(target_path, root_dir=None, *, base_ref=None, allow_file
                 fpath = dpath / fname
                 if _is_link(fpath) or fpath.suffix.lower() not in ('.md', '.svg', '.rst'):
                     continue
-                rel = fpath.relative_to(root).as_posix()
+                resolved_f = fpath.resolve()
+                rel = resolved_f.relative_to(root).as_posix() if resolved_f.is_relative_to(root) else resolved_f.relative_to(target).as_posix()
                 if (rel in skip_rels or rel.startswith('tests/')
                         or rel.startswith('template/user-guard/agents/')
                         or rel.startswith('template/claude/agents/')
@@ -4423,12 +4658,15 @@ def audit_doc_grounding(target_path, root_dir=None, *, base_ref=None, allow_file
         checked_files.append(rel)
         baseline_txt = ''
         if base_ref:
-            proc = subprocess.run(
-                ['git', '-C', str(root), 'show', f'{base_ref}:{rel}'],
-                capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=10,
-            )
-            if proc.returncode == 0:
-                baseline_txt = proc.stdout
+            try:
+                proc = subprocess.run(
+                    ['git', '-C', str(root), 'show', f'{base_ref}:{rel}'],
+                    capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=10,
+                )
+                if proc.returncode == 0:
+                    baseline_txt = proc.stdout
+            except (OSError, subprocess.SubprocessError):
+                pass
         all_findings.extend(_audit_single_doc_text(rel, _optional_text(fpath), anchor, baseline_txt))
     by_category = collections.Counter(item['category'] for item in all_findings)
     return {
@@ -4553,9 +4791,21 @@ def cmd_audit(args):
             return _print({'status': exc.status, **meta, 'error': str(exc), 'requested_engines': list(engines), **exc.details})
         tripped_spec = next((e for e in engines if e and _engine_parts(e)[0] == q_backend), f'{q_backend}:default')
         kept = [e for e in engines if e and _engine_parts(e)[0] != q_backend]
-        target_engine = kept[0] if kept else fb_engine
-        meta['quota_fallback'] = _quota_fallback_record(tripped_spec, target_engine, exc.details)
-        engines = (target_engine, None)
+        if kept and not args.single:
+            kept_prefix = _engine_parts(kept[0])[0]
+            alt_fb = _local_fallback_engine(
+                caller, f'{q_backend}:default', backends, args.focus, exclude_prefixes=(q_backend, kept_prefix)
+            )
+            if alt_fb:
+                engines = (alt_fb, engines[1]) if (engines[0] and _engine_parts(engines[0])[0] == q_backend) else (engines[0], alt_fb)
+                meta['quota_fallback'] = _quota_fallback_record(tripped_spec, alt_fb, exc.details)
+            else:
+                engines = (kept[0], None)
+                meta['quota_fallback'] = _quota_fallback_record(tripped_spec, kept[0], exc.details)
+        else:
+            target_engine = kept[0] if kept else fb_engine
+            meta['quota_fallback'] = _quota_fallback_record(tripped_spec, target_engine, exc.details)
+            engines = (target_engine, None)
         try:
             _prepare_execution(backends, engines, batch, dry_run=args.dry_run)
             if not _workspace_unchanged(fallback_before, root):
@@ -4582,7 +4832,8 @@ def cmd_audit(args):
     tasks = [(side, unit) for side in ('left', 'right') for unit in plan[side + '_units']]
     findings = {'left': [], 'right': []}
     errors, completed = [], []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, max(1, len(tasks)))) as pool:
+    max_workers_cfg = _positive_int(_headless_tunables().get('audit_max_workers')) or 4
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(max_workers_cfg, max(1, len(tasks)))) as pool:
         futures = {}
         for side, unit in tasks:
             profile = profiles[side]
@@ -4679,7 +4930,7 @@ def cmd_gate(args):
     try:
         _prepare_execution(backends, (engine,), batch, dry_run=args.dry_run)
     except HarnessError as exc:
-        fb_engine = _local_fallback_engine(caller, engine, backends, text) if (
+        fb_engine = _local_fallback_engine(caller, engine, backends, text, clean_room=False) if (
             exc.status == 'quota_exhausted' and getattr(args, 'fallback_on_quota', False)
             and _workspace_unchanged(fallback_before, root)
         ) else None
@@ -4748,7 +4999,7 @@ def cmd_task(args):
     try:
         _prepare_execution(backends, (engine,), batch, dry_run=args.dry_run)
     except HarnessError as exc:
-        fb_engine = _local_fallback_engine(caller, engine, backends, text) if (
+        fb_engine = _local_fallback_engine(caller, engine, backends, text, clean_room=clean_room) if (
             exc.status == 'quota_exhausted' and getattr(args, 'fallback_on_quota', False)
             and _workspace_unchanged(fallback_before, root)
         ) else None
@@ -4801,7 +5052,7 @@ def cmd_task(args):
                                    readonly, args.timeout, 'readonly-collaborator', stage_files, profile['cli_effort'], args.retry_quota,
                                    profile=profile, batch=batch, receipt=invocation, clean_room=clean_room)
         except HarnessError as exc:
-            fb_engine = _local_fallback_engine(caller, engine, backends, text) if (
+            fb_engine = _local_fallback_engine(caller, engine, backends, text, clean_room=clean_room) if (
                 getattr(exc, 'status', None) == 'quota_exhausted'
                 and getattr(args, 'fallback_on_quota', False)
                 and 'quota_fallback' not in payload
@@ -4945,7 +5196,7 @@ def main():
         code = handler(args)
     except HarnessError as exc:
         code = _print({'status': exc.status, 'error': str(exc), 'caller': resolve_caller(args.caller), **exc.details})
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
         code = _print({'status': 'failed', 'error': str(exc), 'caller': resolve_caller(args.caller)})
     sys.exit(code)
 

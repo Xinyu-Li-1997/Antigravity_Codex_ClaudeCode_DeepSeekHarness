@@ -3043,6 +3043,84 @@ else:
         self.assertTrue(repo_rep['ok'], repo_rep['findings'])
         self.assertEqual(repo_rep['finding_count'], 0)
 
+    def test_fenced_json_decoding_clean_room_fallback_and_grounding_edges(self):
+        # 1) _decode_output_json 解析外层 ```json 围栏且正文内嵌三反引号代码块的回执，以及前缀杂文+平衡 JSON 对象
+        nested_task = {
+            **TASK,
+            'content': '核对通过，示例代码：\n```python\ndef flux(u):\n    return 0.5 * u * u\n```\n以上守恒。',
+        }
+        wrapped_fenced = '```json\n' + json.dumps(nested_task, ensure_ascii=False, indent=2) + '\n```'
+        self.assertEqual(harness._extract_json_object(wrapped_fenced, harness.TASK_JSON_SCHEMA), nested_task)
+        prefixed_raw = '以下是结构化审查回执：\n' + json.dumps(nested_task, ensure_ascii=False) + '\n以上核对完毕。'
+        self.assertEqual(harness._extract_json_object(prefixed_raw, harness.TASK_JSON_SCHEMA), nested_task)
+        noisy_stream = '\n'.join(
+            ['[runtime] loading cordis plugin...']
+            + [json.dumps({'type': 'step', 'index': idx}) for idx in range(20)]
+            + [json.dumps({'type': 'final', 'reason': {'kind': 'completed'}, 'text': prefixed_raw}, ensure_ascii=False)]
+        )
+        self.assertEqual(harness._extract_json_object(noisy_stream, harness.TASK_JSON_SCHEMA), nested_task)
+        unescaped_win_latex = (
+            '{"summary": "核对通过", '
+            '"content": "控制方程 \\partial_t U + \\Omega = 0，路径 C:\\users\\demo\\NOTICE 与已转义 D:\\\\Data\\\\demo 一致。", '
+            '"evidence": ["C:\\users\\demo\\NOTICE#L1-L6"], '
+            '"unverified": ["D:\\Data\\demo\\LICENSE"]}'
+        )
+        repaired_obj = harness._extract_json_object(unescaped_win_latex, harness.TASK_JSON_SCHEMA)
+        self.assertIn('C:\\users\\demo\\NOTICE', repaired_obj['content'])
+        self.assertIn('D:\\Data\\demo', repaired_obj['content'])
+        self.assertEqual(repaired_obj['unverified'], ['D:\\Data\\demo\\LICENSE'])
+
+        # 2) resolve_caller('auto') 环境变量识别与 _local_fallback_engine 的 clean_room / 双盲排除约束
+        for env_map, expected_caller in (
+            ({'ANTIGRAVITY_AGENT': '1'}, 'antigravity'),
+            ({'CODEX_THREAD_ID': 'thread-01'}, 'codex'),
+            ({'CLAUDECODE': '1'}, 'claude'),
+            ({'DSH_SESSION_ID': 'sess-01'}, 'dsh'),
+        ):
+            with patch.dict(os.environ, env_map, clear=True):
+                self.assertEqual(harness.resolve_caller('auto'), expected_caller)
+
+        engines = self.four_backends()
+        fb_clean = harness._local_fallback_engine('antigravity', 'codex:default', engines, clean_room=True)
+        self.assertIsNotNone(fb_clean)
+        self.assertFalse(fb_clean.startswith('agy:'), f'clean_room 模式回退不得选中 agy: {fb_clean}')
+
+        fb_blind = harness._local_fallback_engine(
+            'codex', 'agy:default', engines, exclude_prefixes=('codex', 'claude')
+        )
+        self.assertEqual(fb_blind, 'dsh:default')
+
+        # 3) audit_doc_grounding：单行三反引号、同行双 `$VAR` 代码跨度与 `<placeholder>` 不误报，中文紧邻大写缩写被拦截
+        edge_dir = self.root / 'grounding_edge_case'
+        (edge_dir / 'src').mkdir(parents=True)
+        (edge_dir / 'src' / 'solver.py').write_text(
+            'import argparse\n'
+            'MAX_ITER = 200\n'
+            'def run_cfd_flux():\n'
+            '    """可压缩流体有限体积求解器"""\n'
+            '    p = argparse.ArgumentParser()\n'
+            '    p.add_argument("--mesh-file")\n'
+            '    return MAX_ITER\n',
+            encoding='utf-8',
+        )
+        edge_doc = edge_dir / 'README.md'
+        edge_doc.write_text(
+            '# 有限体积求解器说明\n\n'
+            '支持 `--mesh-file <case_path>`，读取环境变量 `$HOME` 与 `$PATH`（默认上限 200 步）。\n\n'
+            '```python ghost_ungrounded_symbol = 999999 ```\n',
+            encoding='utf-8',
+        )
+        self.assertTrue(harness.audit_doc_grounding(edge_dir, edge_dir)['ok'])
+
+        edge_doc.write_text(
+            '# 有限体积求解器说明\n\n'
+            '本模块处理离散NURBS几何曲面造型。\n',
+            encoding='utf-8',
+        )
+        bad_rep = harness.audit_doc_grounding(edge_dir, edge_dir)
+        self.assertFalse(bad_rep['ok'])
+        self.assertIn('ungrounded_acronym', {f['category'] for f in bad_rep['findings']})
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

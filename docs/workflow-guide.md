@@ -8,13 +8,13 @@
 
 ### 1. 为什么后台无头任务单必须写清五项要素
 
-在交互式主窗口对话时，客户端持有当前会话历史（并在压缩后由钩子按 `runtime_tunables` 动态恢复历轮原话与高价值子代理返回摘要）；而通过 `cae-harness` 启动后台独立无头命令行子进程时，子进程运行在全新空白上下文中，看不到主窗口先前的口头讨论。因此传给 `--task-file` 的 Markdown 任务单须一次写清五项要素：
+在交互式主窗口对话时，客户端持有当前会话历史（并在压缩后由钩子按 `runtime_tunables` 动态恢复历轮原话与实质子代理返回摘要）；而通过 `cae-harness` 启动后台独立无头命令行子进程时，子进程运行在全新空白上下文中，看不到主窗口先前的口头讨论。因此传给 `--task-file` 的 Markdown 任务单须一次写清五项要素：
 
 1. **数学物理定义与符号约定**：如守恒型或原始变量形式、无量纲参考量（$L_{\text{ref}}, U_{\text{ref}}, \rho_{\text{ref}}$）、单元界面单位外法向 $\mathbf{n}$ 的指向约定、边界条件相容性或数据结构状态不变量；
 2. **项目根目录与分支状态**：对应 `--target` 指定的工作区路径；
 3. **必读源码路径与精确行号范围**：直接写明核心头文件、离散算子与测试夹具的起止行号（尤其在 Windows 环境下，可避免后台子进程全盘扫描大型仓库引发调用超时）；
 4. **允许修改的文件范围与红线约束**：代码修改任务配合 `--write-scope` 限定路径白名单，公式推导与代码审查任务明确声明“零文件修改”，严禁放宽数值容差或删改断言；
-5. **可执行的定量验证命令**：配合 `--verify-cmd` 指定离散守恒残差、有限差分／复步导数核对、奇异网格退化保护单测或网格加密收敛阶脚本。
+5. **可执行的定量验证命令**：配合 `--verify-cmd` 指定离散守恒残差、有限差分或复步导数核对、奇异网格退化保护单测或网格加密收敛阶脚本。
 
 ### 2. `<任务单.md>` 示例（二维可压缩 Euler 方程 HLLC 界面通量）
 
@@ -26,7 +26,7 @@
 - 法向与通量方向：单元界面单位外法向 `n = (nx, ny)` 由左单元 `L` 指向右单元 `R`；返回值 `F_hat` 为沿 `n` 流出左单元 `L` 的数值通量（右单元累加 `-F_hat`）。
 
 ## 2. 必读源码与参考接口
-- `src/flux/rusanov.py` 第 1–68 行：对齐现有函数签名 `compute_flux(u_left, u_right, normal, gamma)` 与非物理负密度／负压强保护逻辑。
+- `src/flux/rusanov.py` 第 1–68 行：对齐现有函数签名 `compute_flux(u_left, u_right, normal, gamma)` 与非物理负密度、负压强保护逻辑。
 - `tests/test_flux_conservation.py` 第 1–95 行：现有均匀自由流保持与周期网格离散守恒测试夹具。
 
 ## 3. 允许修改范围与禁止事项
@@ -38,10 +38,10 @@
 - 周期网格随机扰动初值单步推进后，全局质量、动量、总能离散守恒残差均小于 `1e-14`。
 ````
 
-使用动态角色槽位 `role:code` 启动带定量验证闭环的 `gate` 命令（脚本自动读取 [fleet_profile.json](../template/user-guard/skills/cae-harness/fleet_profile.json) 匹配当前已就绪客户端、最大声明窗口与单模型非委派最高挡）：
+使用动态角色槽位 `role:code` 启动带定量验证闭环的 `gate` 命令（脚本自动读取 [fleet_profile.json](../template/user-guard/skills/cae-harness/fleet_profile.json) 匹配当前已就绪客户端、最大声明窗口与单模型非委派最高挡；Windows 用 `python -B -X utf8`，WSL2 或 Linux 用 `python3 -B -X utf8`）：
 
 ```sh
-python -B template/user-guard/skills/cae-harness/scripts/cae_harness.py gate --caller auto \
+python -B -X utf8 template/user-guard/skills/cae-harness/scripts/cae_harness.py gate --caller auto \
   --worker role:code --tier max --fallback-on-quota --target "<项目根目录>" \
   --task-file "task_hllc.md" \
   --write-scope "src/flux/*.py" --write-scope "tests/test_flux_conservation.py" \
@@ -52,11 +52,11 @@ python -B template/user-guard/skills/cae-harness/scripts/cae_harness.py gate --c
 
 | 回执字段 | 含义与验收判据 |
 | :--- | :--- |
-| `status` 与进程退出码 | `"ok"`（退出码 `0`）表示任务完成（`gate` 同时要求 `gate_passed == true`）；`"verification_failed"`（退出码 `2`）表示验证脚本或 `check-grounding --strict` 未通过；`"quota_exhausted"`（退出码 `5`）表示触发会话／周度限流或余额不足并已登记运行侧冷却 |
+| `status` 与进程退出码 | `"ok"`（退出码 `0`）表示任务完成（`gate` 同时要求 `gate_passed == true`）；`"verification_failed"`（退出码 `2`）表示验证脚本或 `check-grounding --strict` 未通过；`"quota_exhausted"`（退出码 `5`）表示触发会话限额、周度限额或余额不足并已登记运行侧冷却 |
 | `verification_executed` | `true` 表示 `--verify-cmd` 已被实际调用执行；未绑定验证命令的普通 `code` 任务如实标记为 `false`，不得在汇报中写成“已通过实测” |
 | `changed_files` / `scope_violations` | 记录实际增删改的文件列表，以及是否存在越出 `--write-scope` 白名单或违反只读零改动哈希快照的违规路径 |
 | `grounding_audit` | `task --kind polish` 润色任务自动附带的零黑名单事实锚定核验结果，标记是否混入原稿与工作区源码均未出现的陌生缩写、失步数字或虚构领域短语 |
-| `history[]` / `result.evidence` | `gate` 在 `history[]` 中记录每轮 `invocation.returncode`、`verify_exit_code` 与修改摘要；`task`／`audit` 在 `result` 中给出精确文件路径与行号证据。**采纳前主会话须按 `R6` 亲自打开原文件逐行复核** |
+| `history[]` / `result.evidence` | `gate` 在 `history[]` 中记录每轮 `invocation.returncode`、`verify_exit_code` 与修改摘要；`task` 与 `audit` 在 `result` 中给出精确文件路径与行号证据。**采纳前主会话须按 `R6` 亲自打开原文件逐行复核** |
 
 ---
 
@@ -87,9 +87,9 @@ flowchart LR
 | 证据等级 | 判定标准 | 典型数值或工程判据 | 对应回执特征 |
 | :--- | :--- | :--- | :--- |
 | **L1 源码或配置已就位** | 源码、接口或配置文件已编写完成，尚未编译或未执行定量验证脚本 | 语法与静态结构完整，待目标环境编译与算例验证 | `verification_executed: false` |
-| **L2 编译与函数级单测通过** | 目标编译器零错误通过，单函数输出与解析公式或数值导数基准一致 | 解析雅可比与有限差分／复步导数相对误差达预定量级；奇异退化输入边界单测通过 | `gate_passed: true`（单测命令） |
-| **L3 离散物理守恒与不变量保持** | 离散算子在封闭／周期计算域或弯曲网格下严格保持守恒律与度量恒等式 | 均匀自由流保持（GCL）、全局质量／动量／总能离散守恒残差或对称性误差处于双精度机器零量级（$10^{-14} \sim 10^{-12}$） | `gate_passed: true`（守恒算例） |
-| **L4 网格加密收敛阶与基准算例达标** | 在光滑精确解或制造解（MMS）加密序列（$h, h/2, h/4, \dots$）上达到理论设计阶数 $p$，或通过标准基准算例 | 经验收敛阶 $\text{EOC} = \frac{\log(E_1 / E_2)}{\log(h_1 / h_2)}$ 稳定接近设计阶数 $p$；Sod／Lax 激波管或顶盖驱动方腔基准吻合经典文献 | `gate_passed: true`（收敛阶／基准套件） |
+| **L2 编译与函数级单测通过** | 目标编译器零错误通过，单函数输出与解析公式或数值导数基准一致 | 解析雅可比与有限差分或复步导数相对误差达预定量级；奇异退化输入边界单测通过 | `gate_passed: true`（单测命令） |
+| **L3 离散物理守恒与不变量保持** | 离散算子在封闭、周期计算域或弯曲网格下严格保持守恒律与度量恒等式 | 均匀自由流保持（GCL）、全局质量、动量与总能离散守恒残差或对称性误差处于双精度机器零量级（$10^{-14} \sim 10^{-12}$） | `gate_passed: true`（守恒算例） |
+| **L4 网格加密收敛阶与基准算例达标** | 在光滑精确解或制造解（MMS）加密序列（$h, h/2, h/4, \dots$）上达到理论设计阶数 $p$，或通过标准基准算例 | 经验收敛阶 $\text{EOC} = \frac{\log(E_1 / E_2)}{\log(h_1 / h_2)}$ 稳定接近设计阶数 $p$；Sod 或 Lax 激波管、顶盖驱动方腔基准吻合经典文献 | `gate_passed: true`（收敛阶与基准套件） |
 
 ---
 
@@ -97,4 +97,4 @@ flowchart LR
 
 1. **通用课题优化与上游配置演进互不干扰**：在日常课题仓库中优化代码或文档时，`cae_harness.py probe` 会自动识别 `workspace_mode: "general_project"`，仅调用 `cae-harness` 与 `readonly-*` 子代理在项目目录内闭环，不会触发上游仓库专属的 `fleet-evolve` 或改动宿主机全局配置。
 2. **上下文压缩后先对齐再动手（`R9`）**：对话发生自动压缩后，先完整阅读钩子恢复的历轮原话及按 `runtime_tunables` 筛选保留的实质子代理结论，对照当前磁盘源码与 Git 状态交代已完成项与剩余项，不盲目重跑已通过的步骤。
-3. **大规模算例隔离运行（`R10`）**：高自由度三维网格生成、大型 C++／Fortran 并行编译与长时数值模拟建议放在 WSL2、容器或独立计算节点内运行，防止宿主机桌面内存溢出（OOM）。
+3. **大规模算例隔离运行（`R10`）**：高自由度三维网格生成、大型 C++ 或 Fortran 并行编译与长时数值模拟建议放在 WSL2、容器或独立计算节点内运行，防止宿主机桌面内存溢出（OOM）。

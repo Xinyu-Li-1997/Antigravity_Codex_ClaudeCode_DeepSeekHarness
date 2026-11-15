@@ -44,17 +44,16 @@ _REPEAT_BUILTINS: Dict[str, Any] = {
     "CONSECUTIVE_WAIT_LIMIT": CONSECUTIVE_WAIT_LIMIT,
 }
 _ACTIVE_REPEAT_BASELINE: Dict[str, Any] = dict(_REPEAT_BUILTINS)
-_LAST_REPEAT_PROFILE_ID: Optional[int] = None
+_LAST_REPEAT_PROFILE_TOKEN: Optional[Tuple[Any, ...]] = None
 
 
 def _sync_repeat_tunables() -> None:
     """从 fleet_profile.json 同步重复等待门禁参数，同时兼容单测属性覆盖。"""
-    global _LAST_REPEAT_PROFILE_ID
-    profile = user_words.load_fleet_profile(HOOKS_DIR)
-    profile_id = id(profile)
-    if _LAST_REPEAT_PROFILE_ID == profile_id:
+    global _LAST_REPEAT_PROFILE_TOKEN
+    cache_token = user_words.get_fleet_profile_cache_token(HOOKS_DIR)
+    if _LAST_REPEAT_PROFILE_TOKEN == cache_token:
         return
-    _LAST_REPEAT_PROFILE_ID = profile_id
+    _LAST_REPEAT_PROFILE_TOKEN = cache_token
     lg = user_words.get_runtime_tunables("loop_guards", HOOKS_DIR)
     cfg = lg.get("reply_repeat") if isinstance(lg.get("reply_repeat"), dict) else {}
     resolved: Dict[str, Any] = {
@@ -66,9 +65,10 @@ def _sync_repeat_tunables() -> None:
     }
     mod_globals = globals()
     for name, new_val in resolved.items():
-        if mod_globals[name] == _ACTIVE_REPEAT_BASELINE[name]:
-            mod_globals[name] = new_val
+        was_unpatched = (mod_globals[name] == _ACTIVE_REPEAT_BASELINE[name])
         _ACTIVE_REPEAT_BASELINE[name] = new_val
+        if was_unpatched:
+            mod_globals[name] = new_val
 
 
 _sync_repeat_tunables()
@@ -152,6 +152,12 @@ BLOCK_REASON_TEXT = (
     "【user-guard 重复空等拦截】当前已连续三次输出内容相近、无实质进展的短状态等待回复。"
     "请停止重复汇报；后台任务尚未完成时，请直接结束本轮并等待系统 Reactive Wakeup 通知。"
 )
+
+
+def _build_block_reason_text() -> str:
+    if CONSECUTIVE_WAIT_LIMIT == 3:
+        return BLOCK_REASON_TEXT
+    return BLOCK_REASON_TEXT.replace("连续三次", f"连续 {CONSECUTIVE_WAIT_LIMIT} 次")
 
 
 # ② 目录、日志与防重复状态读写
@@ -528,7 +534,7 @@ def _handle_stop_locked(payload: Dict[str, Any], state_dir: Path, conversation_i
         )
         return {
             "decision": "continue",
-            "reason": BLOCK_REASON_TEXT,
+            "reason": _build_block_reason_text(),
         }
 
     _save_repeat_state(state_file, state, conversation_id)
@@ -698,7 +704,7 @@ def handle_claude_stop_repeat_guard(payload: Dict[str, Any], state_dir: Optional
                     "event": "Stop:reply_repeat_guard", "client": "claude", "session_id": sid,
                     "turn_key": turn_key, "count": record["consecutiveShortWaitCount"],
                 })
-                return {"decision": "block", "reason": BLOCK_REASON_TEXT}
+                return {"decision": "block", "reason": _build_block_reason_text()}
     except (OSError, ValueError) as exc:
         user_words.append_jsonl_log(logs_dir / "lifecycle.log", {
             "event": "Stop:state_error", "client": "claude", "session_id": sid, "message": str(exc),

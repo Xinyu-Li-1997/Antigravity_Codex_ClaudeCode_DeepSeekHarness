@@ -2140,6 +2140,93 @@ class TestCodexHandoffAdapter(unittest.TestCase):
         self.assertEqual(handoff_gate.ADVISORY_CP_THRESHOLD, 11)
         self.assertEqual(reply_repeat_guard.CONSECUTIVE_WAIT_LIMIT, 3)
 
+    def test_truncated_subagent_full_restore_fence_closure_and_stale_lock_sweep(self) -> None:
+        import time
+
+        # 1) Antigravity 子代理返回带 truncated_fields: ["content"] 时，先回查 transcript_full.jsonl 再做实质筛选，且无双重省略
+        cid = "ag-trunc-subagent-01"
+        log_dir = self.root / "brain" / cid / ".system_generated" / "logs"
+        compact_tp = log_dir / "transcript.jsonl"
+        full_tp = log_dir / "transcript_full.jsonl"
+        sub_cid = "sub-auditor-trunc-01"
+        sub_log_uri = f"file:///{(self.root / 'sub_log.jsonl').as_posix()}"
+
+        _append_jsonl(compact_tp, {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "请全面核对离散守恒"})
+        _append_jsonl(
+            compact_tp,
+            {
+                "step_index": 1,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "tool_calls": [{"id": "call-sub-1", "name": "invoke_subagent", "args": {"TypeName": "readonly-auditor", "Role": "Flux Auditor"}}],
+            },
+        )
+        created_json = json.dumps({"conversationId": sub_cid, "logAbsoluteUri": sub_log_uri})
+        _append_jsonl(
+            compact_tp,
+            {"step_index": 2, "source": "SYSTEM", "type": "TOOL_RESULT", "id": "call-sub-1", "content": f"Created the following subagent:\n{created_json}"},
+        )
+        full_audit_report = (
+            f"<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-15T01:02:00Z sender={sub_cid} content="
+            + ("逐行核对 src/flux/hllc.py 第 10-120 行：质量、动量与总能通量守恒残差均小于 1e-15，边界反射对称无误。\n" * 8)
+            + "</SYSTEM_MESSAGE>"
+        )
+        _append_jsonl(
+            compact_tp,
+            {
+                "step_index": 3,
+                "source": "SYSTEM_SDK",
+                "type": "SYSTEM_MESSAGE",
+                "content": f"<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-15T01:02:00Z sender={sub_cid} content=逐行核对<truncated>",
+                "truncated_fields": ["content"],
+            },
+        )
+        _append_jsonl(full_tp, {"step_index": 3, "source": "SYSTEM_SDK", "type": "SYSTEM_MESSAGE", "content": full_audit_report})
+        # 追加 3 条简短回执，验证 step 3 还原全文后作为高价值审查报告仍被保留
+        for idx in (4, 5, 6):
+            _append_jsonl(
+                compact_tp,
+                {
+                    "step_index": idx,
+                    "source": "SYSTEM_SDK",
+                    "type": "SYSTEM_MESSAGE",
+                    "content": f"<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-15T01:03:0{idx}Z sender={sub_cid} content=状态正常 #{idx}。\n</SYSTEM_MESSAGE>",
+                },
+            )
+        _append_jsonl(compact_tp, {"step_index": 7, "source": "SYSTEM", "type": "CHECKPOINT"})
+
+        ag_state = self.root / "ag_plugin_data"
+        with mock.patch.dict(os.environ, {"PLUGIN_DATA": str(ag_state)}):
+            res = session_context_loader.handle_pre_invocation({"conversationId": cid, "transcriptPath": str(compact_tp)})
+        injected = res["injectSteps"][0]["systemMessage"]["systemMessage"]
+        self.assertIn("质量、动量与总能通量守恒残差均小于 1e-15", injected)
+        self.assertLessEqual(injected.count("...[中间部分已省略"), 1)
+
+        # 2) _close_unbalanced_fence 自动闭合奇数代码围栏且严格遵守 max_len
+        unbalanced = "前缀说明\n```python\ndef solve():\n    return 42"
+        closed = session_context_loader._close_unbalanced_fence(unbalanced, max_len=len(unbalanced) + 2)
+        self.assertLessEqual(len(closed), len(unbalanced) + 2)
+        self.assertEqual(session_context_loader._unclosed_markdown_fence(closed), "")
+
+        # 3) sweep_stale_lock_files 清理过期空闲锁并保留新鲜锁与业务状态文件
+        sweep_dir = self.root / "lock_sweep_sandbox"
+        (sweep_dir / "handoff").mkdir(parents=True)
+        stale_dot = sweep_dir / ".expired-session.lock"
+        stale_legacy = sweep_dir / "handoff" / "session-legacy.json.lock"
+        fresh_dot = sweep_dir / ".fresh-session.lock"
+        keep_json = sweep_dir / "active_state.json"
+        for p in (stale_dot, stale_legacy, fresh_dot, keep_json):
+            p.write_text("x", encoding="utf-8")
+        old_ts = time.time() - 10 * 86400
+        os.utime(stale_dot, (old_ts, old_ts))
+        os.utime(stale_legacy, (old_ts, old_ts))
+        removed = user_words.sweep_stale_lock_files(sweep_dir)
+        self.assertEqual(removed, 2)
+        self.assertFalse(stale_dot.exists())
+        self.assertFalse(stale_legacy.exists())
+        self.assertTrue(fresh_dot.exists())
+        self.assertTrue(keep_json.exists())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

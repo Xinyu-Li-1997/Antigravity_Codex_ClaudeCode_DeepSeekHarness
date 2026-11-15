@@ -17,6 +17,8 @@ status_guard.py - PreToolUse 项目目录写边界、长会话收尾限制与重
 
 import argparse
 import ast
+import base64
+import binascii
 import hashlib
 import itertools
 import json
@@ -88,25 +90,26 @@ LARGE_FILE_THRESHOLD = 4 * 1024 * 1024  # 4 MB
 CHUNK_SAMPLE_BYTES = 1 * 1024 * 1024    # 1 MB
 MAX_WORKFLOW_SCRIPT_BYTES = 1 * 1024 * 1024  # 1 MB
 TASK_NO_LOG_COOLDOWN_SEC = 30.0
+MAX_WRAPPER_DEPTH = 4
 
 _STATUS_BUILTINS: Dict[str, Any] = {
     "LARGE_FILE_THRESHOLD": LARGE_FILE_THRESHOLD,
     "CHUNK_SAMPLE_BYTES": CHUNK_SAMPLE_BYTES,
     "MAX_WORKFLOW_SCRIPT_BYTES": MAX_WORKFLOW_SCRIPT_BYTES,
     "TASK_NO_LOG_COOLDOWN_SEC": TASK_NO_LOG_COOLDOWN_SEC,
+    "MAX_WRAPPER_DEPTH": MAX_WRAPPER_DEPTH,
 }
 _ACTIVE_STATUS_BASELINE: Dict[str, Any] = dict(_STATUS_BUILTINS)
-_LAST_STATUS_PROFILE_ID: Optional[int] = None
+_LAST_STATUS_PROFILE_TOKEN: Optional[Tuple[Any, ...]] = None
 
 
 def _sync_status_tunables() -> None:
     """从 fleet_profile.json 同步文件指纹采样与无日志冷却参数，同时兼容单测属性覆盖。"""
-    global _LAST_STATUS_PROFILE_ID
-    profile = user_words.load_fleet_profile(HOOKS_DIR)
-    profile_id = id(profile)
-    if _LAST_STATUS_PROFILE_ID == profile_id:
+    global _LAST_STATUS_PROFILE_TOKEN
+    cache_token = user_words.get_fleet_profile_cache_token(HOOKS_DIR)
+    if _LAST_STATUS_PROFILE_TOKEN == cache_token:
         return
-    _LAST_STATUS_PROFILE_ID = profile_id
+    _LAST_STATUS_PROFILE_TOKEN = cache_token
     lg = user_words.get_runtime_tunables("loop_guards", HOOKS_DIR)
     cfg = lg.get("status_guard") if isinstance(lg.get("status_guard"), dict) else {}
     raw_cd = cfg.get("task_no_log_cooldown_sec")
@@ -121,12 +124,14 @@ def _sync_status_tunables() -> None:
         "CHUNK_SAMPLE_BYTES": user_words._coerce_pos_int(cfg.get("chunk_sample_mib"), 1, minimum=1) * 1024 * 1024,
         "MAX_WORKFLOW_SCRIPT_BYTES": user_words._coerce_pos_int(cfg.get("max_workflow_script_mib"), 1, minimum=1) * 1024 * 1024,
         "TASK_NO_LOG_COOLDOWN_SEC": cd_val,
+        "MAX_WRAPPER_DEPTH": user_words._coerce_pos_int(cfg.get("max_wrapper_depth"), 4, minimum=1),
     }
     mod_globals = globals()
     for name, new_val in resolved.items():
-        if mod_globals[name] == _ACTIVE_STATUS_BASELINE[name]:
-            mod_globals[name] = new_val
+        was_unpatched = (mod_globals[name] == _ACTIVE_STATUS_BASELINE[name])
         _ACTIVE_STATUS_BASELINE[name] = new_val
+        if was_unpatched:
+            mod_globals[name] = new_val
 
 
 _sync_status_tunables()
@@ -187,7 +192,7 @@ _PY_FALLBACK_PAIRS = (
         r"""\bshutil\.copy\w*\s*\([^,]+,\s*(['"][^'"]+['"])""")),
 )
 
-_SHELL_DELETE_VERBS = {"rm", "rmdir", "del", "erase", "remove-item"}
+_SHELL_DELETE_VERBS = {"rm", "rmdir", "rd", "del", "erase", "remove-item", "ri"}
 _SHELL_CREATE_WRITE_VERBS = {
     "mkdir",
     "md",
@@ -195,13 +200,16 @@ _SHELL_CREATE_WRITE_VERBS = {
     "truncate",
     "tee",
     "new-item",
+    "ni",
     "set-content",
     "add-content",
+    "ac",
     "clear-content",
+    "clc",
     "out-file",
 }
-_SHELL_MOVE_VERBS = {"mv", "move", "ren", "rename", "move-item", "rename-item"}
-_SHELL_COPY_VERBS = {"cp", "copy", "xcopy", "robocopy", "copy-item"}
+_SHELL_MOVE_VERBS = {"mv", "move", "ren", "rename", "move-item", "mi", "rename-item", "rni"}
+_SHELL_COPY_VERBS = {"cp", "copy", "xcopy", "robocopy", "copy-item", "cpi"}
 _PS_NON_PATH_VALUE_FLAGS = {
     "-value",
     "-itemtype",
@@ -1074,7 +1082,11 @@ def _read_quoted_arg(text: str, start_idx: int) -> Optional[Tuple[str, int, str]
             if ch == '"':
                 return "".join(buf), idx + 1, q
         else:
-            # POSIX bash '\'' 转义兼容
+            # POSIX bash '\'' 与 shlex.quote 生成的 '"'"' 转义兼容
+            if ch == "'" and idx + 4 < n and text[idx : idx + 5] == "'\"'\"'":
+                buf.append("'")
+                idx += 5
+                continue
             if ch == "'" and idx + 3 < n and text[idx : idx + 4] == "'\\''":
                 buf.append("'")
                 idx += 4
@@ -1087,17 +1099,16 @@ def _read_quoted_arg(text: str, start_idx: int) -> Optional[Tuple[str, int, str]
 
 
 def _extract_and_mask_inline_python(command_line: str) -> Tuple[List[str], str]:
-    """提取命令中的 python -c / PowerShell here-string / heredoc 代码块，并在原命令中掩码避免误当成 Shell 命令"""
+    """提取命令中的 python -c / PowerShell here-string / heredoc 代码块，并在原命令中按序号掩码以便对应子句工作目录"""
     blocks: List[str] = []
-    masked = command_line
 
-    for m_ps in list(_PS_HERESTRING_PY_RE.finditer(masked)):
-        blocks.append(m_ps.group(2))
-    masked = _PS_HERESTRING_PY_RE.sub("__INLINE_PY__", masked)
+    def _alloc_marker(code: str) -> str:
+        idx = len(blocks)
+        blocks.append(code)
+        return f"__INLINE_PY_{idx}__"
 
-    for m_hd in list(_SH_HEREDOC_PY_RE.finditer(masked)):
-        blocks.append(m_hd.group(2))
-    masked = _SH_HEREDOC_PY_RE.sub("__INLINE_PY__", masked)
+    masked = _PS_HERESTRING_PY_RE.sub(lambda m_ps: _alloc_marker(m_ps.group(2)), command_line)
+    masked = _SH_HEREDOC_PY_RE.sub(lambda m_hd: _alloc_marker(m_hd.group(2)), masked)
 
     out_parts: List[str] = []
     pos = 0
@@ -1112,9 +1123,8 @@ def _extract_and_mask_inline_python(command_line: str) -> Tuple[List[str], str]:
             pos = m.end()
             continue
         code_str, end_pos, _ = q_res
-        blocks.append(code_str)
         out_parts.append(masked[pos : m.start()])
-        out_parts.append("__INLINE_PY__")
+        out_parts.append(_alloc_marker(code_str))
         pos = end_pos
 
     return blocks, "".join(out_parts)
@@ -1144,8 +1154,9 @@ _AST_CWD = object()
 _AST_DEFINITION = object()
 _AST_MAX_CANDIDATES = 64
 _AST_MODULE_CALLS = {
-    "os": {"chdir", "open", "remove", "unlink", "rmdir", "removedirs", "mkdir", "makedirs", "rename",
+    "os": {"chdir", "getcwd", "open", "remove", "unlink", "rmdir", "removedirs", "mkdir", "makedirs", "rename",
            "replace", "renames", "truncate", "symlink", "link", "system"},
+    "sys": {"executable"},
     "shutil": {"rmtree", "move", "copy", "copy2", "copyfile", "copytree", "make_archive", "unpack_archive"},
     "tempfile": {"gettempdir", "mkdtemp", "TemporaryDirectory", "mkstemp", "NamedTemporaryFile"},
     "subprocess": {"run", "Popen", "call", "check_call", "check_output"},
@@ -1275,6 +1286,12 @@ def _eval_ast_path_candidates(node, bindings):
     if isinstance(node, ast.Name):
         return _ast_values(bindings.get(node.id, _AST_DYNAMIC))
     if isinstance(node, ast.Attribute):
+        if node.attr == "executable":
+            if isinstance(node.value, ast.Name) and node.value.id == "sys" and "sys" not in bindings:
+                return frozenset((sys.executable,))
+            owners = _eval_ast_path_candidates(node.value, bindings)
+            if any(isinstance(owner, _AstModule) and owner.name == "sys" for owner in owners):
+                return frozenset((sys.executable,))
         values = frozenset(_AstCallable(owner.name + "." + node.attr)
                            for owner in _eval_ast_path_candidates(node.value, bindings) if isinstance(owner, _AstModule))
         return values or dynamic
@@ -1359,12 +1376,17 @@ def _eval_ast_path_candidates(node, bindings):
                 result.update(value.fields.get(key, dynamic) if isinstance(value, _AstDict) and not value.uncertain else dynamic)
         return frozenset(result) or dynamic
     if isinstance(node, ast.Call):
-        temp_names = _ast_call_qualnames(node.func, bindings) & {"tempfile." + name for name in _AST_MODULE_CALLS["tempfile"]}
+        qualnames = _ast_call_qualnames(node.func, bindings)
+        temp_names = qualnames & {"tempfile." + name for name in _AST_MODULE_CALLS["tempfile"]}
         if temp_names:
             return frozenset().union(*(_ast_temp_path_candidates(node, name.split(".")[1], bindings) for name in temp_names))
+        if "os.getcwd" in qualnames and not node.args and not node.keywords:
+            return frozenset((c or ".") if isinstance(c, str) else _AST_DYNAMIC for c in _ast_values(bindings.get(_AST_CWD, ".")))
         name = node.func.id if isinstance(node.func, ast.Name) else (node.func.attr if isinstance(node.func, ast.Attribute) else "")
-        if name == "home" and isinstance(node.func, ast.Attribute) and not node.args:
+        if name == "home" and isinstance(node.func, ast.Attribute) and not node.args and not node.keywords:
             return frozenset(("~",))
+        if name == "cwd" and isinstance(node.func, ast.Attribute) and not node.args and not node.keywords:
+            return frozenset((c or ".") if isinstance(c, str) else _AST_DYNAMIC for c in _ast_values(bindings.get(_AST_CWD, ".")))
         if name in ("Path", "PurePath", "WindowsPath", "PosixPath", "expanduser", "abspath", "realpath", "resolve", "join", "joinpath", "str"):
             parts = [_eval_ast_path_candidates(arg, bindings) for arg in node.args]
             is_path_ctor = name in ("Path", "PurePath", "WindowsPath", "PosixPath")
@@ -1527,7 +1549,10 @@ def _iter_ast_calls_in_order(node, bindings, active=()):
     if isinstance(node, ast.ImportFrom) and node.module in _AST_MODULE_CALLS:
         for alias in node.names:
             if alias.name in _AST_MODULE_CALLS[node.module]:
-                bindings[alias.asname or alias.name] = frozenset((_AstCallable(node.module + "." + alias.name),))
+                if node.module == "sys" and alias.name == "executable":
+                    bindings[alias.asname or alias.name] = frozenset((sys.executable,))
+                else:
+                    bindings[alias.asname or alias.name] = frozenset((_AstCallable(node.module + "." + alias.name),))
     if isinstance(node, ast.Import):
         for alias in node.names:
             if alias.name in _AST_MODULE_CALLS:
@@ -1677,7 +1702,7 @@ def _scan_inline_python_code(
                     tgt = _ast_call_arg_candidates(node, 0, ("file", "fname"), bindings)
                     if _bad(tgt):
                         return f"NumPy 数组落盘 ({qualname})", _format_ast_candidates(tgt), snippet
-                elif depth <= 3 and (qualname == "os.system" or qualname in {
+                elif depth < MAX_WRAPPER_DEPTH and (qualname == "os.system" or qualname in {
                     "subprocess." + name for name in _AST_MODULE_CALLS["subprocess"]
                 }):
                     cwds = _ast_values(bindings.get(_AST_CWD, base_cwd))
@@ -1692,7 +1717,17 @@ def _scan_inline_python_code(
                         cwds = resolved | (cwds if None in raw_cwds else frozenset())
                     commands = _ast_call_arg_candidates(node, 0, ("args", "command"), bindings)
                     for command in commands:
+                        direct_py_code: Optional[str] = None
                         if isinstance(command, tuple) and all(isinstance(part, str) for part in command):
+                            if command:
+                                exe_stem = Path(command[0].replace("\\", "/")).name.lower()
+                                if exe_stem.endswith(".exe"):
+                                    exe_stem = exe_stem[:-4]
+                                if exe_stem == "py" or exe_stem.startswith("python"):
+                                    for idx_arg, tok in enumerate(command[1:-1], start=1):
+                                        if re.fullmatch(r"-[BIuEsSqvVOP]*c", tok):
+                                            direct_py_code = command[idx_arg + 1]
+                                            break
                             command = " ".join(shlex.quote(part) for part in command)
                         if not isinstance(command, str):
                             if _AST_DEFINITION in bindings:
@@ -1703,6 +1738,13 @@ def _scan_inline_python_code(
                                 if _AST_DEFINITION in bindings:
                                     continue
                                 return "Python 子进程工作目录无法静态确定", "<DYNAMIC_UNRESOLVED>", snippet
+                            if direct_py_code is not None:
+                                py_hit = _scan_inline_python_code(
+                                    direct_py_code, cwd, allowed_norm_keys, allowed_resolved_keys,
+                                    allow_os_temp, depth + 1, wsl_distribution,
+                                )
+                                if py_hit:
+                                    return py_hit
                             sub_hit = _detect_command_external_mutation(
                                 command, cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp,
                                 depth + 1, wsl_distribution,
@@ -1989,8 +2031,45 @@ def _compact_snippet(text: str, max_len: int = 140) -> str:
     return flat if len(flat) <= max_len else flat[: max_len - 3] + "..."
 
 
+_INVALID_ENCODED_SENTINEL = "\x00__INVALID_ENCODED_COMMAND__"
+_INLINE_PY_MARKER_RE = re.compile(r"__INLINE_PY_(\d+)__")
+
+
 def _unwrap_shell_script_layer(cmd: str) -> Optional[str]:
-    """若整条命令是 wsl/bash/powershell -c '<inner>' 包装，提取内层脚本以精确解析子句命令头"""
+    """若整条命令是 wsl/bash/powershell -c '<inner>' 或 -EncodedCommand 包装，提取内层脚本递归审查"""
+    m_enc = re.match(
+        r"^\s*(?:[A-Za-z_]\w*=\S+\s+)*"
+        r"""(?:wsl(?:\.exe)?\b(?:\s+(?:-(?:d|u)|--(?:distribution|user|cd))\s+(?:"(?:\\.|[^"\\])*"|'(?:''|[^'])*'|\S+)|\s+(?:--|-e|--exec|-[A-Za-z]+))*\s+)?"""
+        r"(?:pwsh(?:\.exe)?|powershell(?:\.exe)?)\b"
+        r"(?:\s+(?:-(?:ExecutionPolicy|ep|WindowStyle|w|InputFormat|OutputFormat)\s+\S+|-[A-Za-z]+))*"
+        r"\s+-(?:EncodedCommand|ec)\s+",
+        cmd,
+        re.IGNORECASE,
+    )
+    if m_enc:
+        rest = cmd[m_enc.end() :].strip()
+        if not rest:
+            return _INVALID_ENCODED_SENTINEL
+        if rest[0] in ("'", '"'):
+            q_enc = _read_quoted_arg(rest, 0)
+            if not q_enc or rest[q_enc[1] :].strip():
+                return _INVALID_ENCODED_SENTINEL
+            b64_raw = q_enc[0].strip()
+        else:
+            parts = rest.split()
+            if len(parts) != 1:
+                return _INVALID_ENCODED_SENTINEL
+            b64_raw = parts[0]
+        if not b64_raw or b64_raw.startswith(("$", "%")):
+            return _INVALID_ENCODED_SENTINEL
+        try:
+            raw_bytes = base64.b64decode(b64_raw, validate=True)
+            if not raw_bytes or len(raw_bytes) % 2 != 0:
+                return _INVALID_ENCODED_SENTINEL
+            return raw_bytes.decode("utf-16-le")
+        except (binascii.Error, ValueError, UnicodeDecodeError):
+            return _INVALID_ENCODED_SENTINEL
+
     m = re.match(
         r"^\s*(?:[A-Za-z_]\w*=\S+\s+)*"
         r"""(?:wsl(?:\.exe)?\b(?:\s+(?:-(?:d|u)|--(?:distribution|user|cd))\s+(?:"(?:\\.|[^"\\])*"|'(?:''|[^'])*'|\S+)|\s+(?:--|-e|--exec|-[A-Za-z]+))*\s+)?"""
@@ -2015,10 +2094,16 @@ def _extract_clause_path_targets(tokens: List[str], copy_dest_only: bool = False
     """从单条写/删/复制/移动 Shell 子句参数中提取实际受影响的目标路径列表"""
     if copy_dest_only:
         for idx, tok in enumerate(tokens[1:], start=1):
-            if tok.lower() in ("-destination", "-dest") and idx + 1 < len(tokens):
+            low_tok = tok.lower()
+            if low_tok in ("-destination", "-dest") and idx + 1 < len(tokens):
                 return [tokens[idx + 1]]
-            if tok.lower().startswith("-destination:"):
+            if low_tok.startswith("-destination:"):
                 return [tok.split(":", 1)[1]]
+            if head_low == "cp":
+                if (tok == "-t" or low_tok == "--target-directory") and idx + 1 < len(tokens):
+                    return [tokens[idx + 1]]
+                if low_tok.startswith("--target-directory="):
+                    return [tok.split("=", 1)[1]]
 
     positional: List[str] = []
     explicit_paths: List[str] = []
@@ -2037,10 +2122,19 @@ def _extract_clause_path_targets(tokens: List[str], copy_dest_only: bool = False
                 has_explicit_script = True
                 idx += 1
                 continue
+        if head_low in ("cp", "mv"):
+            if (tok == "-t" or low == "--target-directory") and idx + 1 < n:
+                explicit_paths.append(tokens[idx + 1])
+                idx += 2
+                continue
+            if low.startswith("--target-directory="):
+                explicit_paths.append(tok.split("=", 1)[1])
+                idx += 1
+                continue
         if low in _PS_NON_PATH_VALUE_FLAGS:
             idx += 2
             continue
-        if low in ("-path", "-literalpath", "-filepath", "-destination", "-newname") and idx + 1 < len(tokens):
+        if low in ("-path", "-literalpath", "-filepath", "-destination", "-newname") and idx + 1 < n:
             explicit_paths.append(tokens[idx + 1])
             idx += 2
             continue
@@ -2068,7 +2162,7 @@ def _extract_clause_path_targets(tokens: List[str], copy_dest_only: bool = False
 
 def _looks_like_explicit_or_escaped_path(tok: str) -> bool:
     s = tok.strip().strip("\"'")
-    if not s or s == "__INLINE_PY__":
+    if not s or s == "__INLINE_PY__" or s.startswith("__INLINE_PY_"):
         return False
     if re.match(r"^[A-Za-z]:[\\/]", s) or s.startswith(("\\\\", "//", "~", "..", "$HOME", "${HOME}", "$env:", "%")):
         return True
@@ -2110,7 +2204,7 @@ def _detect_command_external_mutation(
     """
     if not command_line or not command_line.strip():
         return None
-    if depth > 4:
+    if depth > MAX_WRAPPER_DEPTH:
         return "深层嵌套命令超出静态目录边界审查上限", "<NESTED_DEPTH_EXCEEDED>", _compact_snippet(command_line)
 
     wsl_prefix = _wsl_command_prefix(command_line) if os.name == "nt" else None
@@ -2125,6 +2219,8 @@ def _detect_command_external_mutation(
 
     # 先拆壳并隔离内联 Python，再扫描 Shell；Python 字符串中的命令只是数据。
     unwrapped = _unwrap_shell_script_layer(sanitized)
+    if unwrapped == _INVALID_ENCODED_SENTINEL:
+        return "PowerShell 编码命令无法静态解码审查 (-EncodedCommand)", "<ENCODED_COMMAND>", _compact_snippet(command_line)
     if unwrapped:
         return _detect_command_external_mutation(
             unwrapped, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp,
@@ -2148,12 +2244,6 @@ def _detect_command_external_mutation(
                         allowed_norm_keys, allowed_resolved_keys, allow_os_temp, depth + 1, wsl_distribution,
                     )
     py_blocks, shell_masked = _extract_and_mask_inline_python(sanitized)
-    for block in py_blocks:
-        py_hit = _scan_inline_python_code(
-            block, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp, depth, wsl_distribution
-        )
-        if py_hit:
-            return py_hit
 
     for inner in handoff_gate._extract_cmd_substitutions(shell_masked):
         hit = _detect_command_external_mutation(
@@ -2258,18 +2348,10 @@ def _detect_command_external_mutation(
             ):
                 return f".NET 文件写删操作 ([IO.{cls_name}]::{method_name})", cand, _compact_snippet(m_net.group(0))
 
-    # 4. 检查外层 Shell 重定向 (> / >> / >| / <> / &>) 的直接输出目标（忽略位于引号字面量内的符号）
-    for m_red in _SHELL_REDIRECT_RE.finditer(shell_masked):
-        if _pos_inside_quotes(shell_masked, m_red.start()):
-            continue
-        red_tok = m_red.group(1).strip().strip("\"'")
-        if not _is_write_target_allowed(
-            red_tok, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp, wsl_distribution
-        ):
-            return "Shell 输出重定向写入", red_tok, _compact_snippet(m_red.group(0))
-
-    # 5. 按子句严格检查处于“命令头位置”的 Shell/PowerShell 写删移动复制命令，并跟踪多子句目录切换
+    # 4. 按子句跟踪多子句目录切换，逐子句检查输出重定向、内联 Python、嵌套拆壳与写删移动复制命令
     clause_cwd = base_cwd
+    scanned_py_indices: set[int] = set()
+    checked_any_redirect = False
     clauses = handoff_gate._split_shell_clauses(shell_masked)
     for raw_clause in clauses:
         clause = raw_clause.strip()
@@ -2278,14 +2360,10 @@ def _detect_command_external_mutation(
         # 剥离前导控制流关键字（if/elif/while/until 条件子句中的命令同样会真实执行）
         clause = re.sub(r"^(?:(?:else|then|do|if|elif|while|until)\b\s*)+", "", clause, flags=re.IGNORECASE)
         tokens = _safe_split_tokens(clause)
-        if not tokens:
-            continue
-
-        # 跳过前导 env / sudo / wsl / timeout / command / KEY=VAL / PowerShell & 调用符
+        effective_cwd = clause_cwd
         idx = 0
         n_tok = len(tokens)
         lookup_only = False
-        effective_cwd = clause_cwd
         while idx < n_tok:
             t = tokens[idx]
             tl = Path(t.replace("\\", "/")).name.lower()
@@ -2350,6 +2428,40 @@ def _detect_command_external_mutation(
                 idx += 1
                 continue
             break
+
+        for m_py in _INLINE_PY_MARKER_RE.finditer(raw_clause):
+            py_idx = int(m_py.group(1))
+            if 0 <= py_idx < len(py_blocks):
+                scanned_py_indices.add(py_idx)
+                py_hit = _scan_inline_python_code(
+                    py_blocks[py_idx], effective_cwd, allowed_norm_keys, allowed_resolved_keys,
+                    allow_os_temp, depth, wsl_distribution,
+                )
+                if py_hit:
+                    return py_hit
+
+        for m_red in _SHELL_REDIRECT_RE.finditer(raw_clause):
+            if _pos_inside_quotes(raw_clause, m_red.start()):
+                continue
+            checked_any_redirect = True
+            red_tok = m_red.group(1).strip().strip("\"'")
+            if not _is_write_target_allowed(
+                red_tok, effective_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp, wsl_distribution
+            ):
+                return "Shell 输出重定向写入", red_tok, _compact_snippet(m_red.group(0))
+
+        sub_unwrapped = _unwrap_shell_script_layer(clause)
+        if sub_unwrapped == _INVALID_ENCODED_SENTINEL:
+            return "PowerShell 编码命令无法静态解码审查 (-EncodedCommand)", "<ENCODED_COMMAND>", _compact_snippet(clause)
+        if sub_unwrapped:
+            sub_hit = _detect_command_external_mutation(
+                sub_unwrapped, effective_cwd, allowed_norm_keys, allowed_resolved_keys,
+                allow_os_temp, depth + 1, wsl_distribution,
+            )
+            if sub_hit:
+                return sub_hit
+            continue
+
         if lookup_only or idx >= n_tok:
             continue
 
@@ -2408,6 +2520,23 @@ def _detect_command_external_mutation(
                     expanded_cand, effective_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp, command_distribution
                 ):
                     return action_label, cand, _compact_snippet(clause)
+
+    for py_idx, block in enumerate(py_blocks):
+        if py_idx not in scanned_py_indices:
+            py_hit = _scan_inline_python_code(
+                block, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp, depth, wsl_distribution
+            )
+            if py_hit:
+                return py_hit
+    if not checked_any_redirect:
+        for m_red in _SHELL_REDIRECT_RE.finditer(shell_masked):
+            if _pos_inside_quotes(shell_masked, m_red.start()):
+                continue
+            red_tok = m_red.group(1).strip().strip("\"'")
+            if not _is_write_target_allowed(
+                red_tok, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp, wsl_distribution
+            ):
+                return "Shell 输出重定向写入", red_tok, _compact_snippet(m_red.group(0))
 
     return None
 

@@ -214,7 +214,7 @@ _HANDOFF_BUILTINS: Dict[str, Any] = {
     "_CLAUDE_DRAIN_ACTIONS": _CLAUDE_DRAIN_ACTIONS,
 }
 _ACTIVE_HANDOFF_BASELINE: Dict[str, Any] = dict(_HANDOFF_BUILTINS)
-_LAST_HANDOFF_PROFILE_ID: Optional[int] = None
+_LAST_HANDOFF_PROFILE_TOKEN: Optional[Tuple[Any, ...]] = None
 
 
 def _pos_float(raw: Any, fallback: float) -> float:
@@ -229,13 +229,12 @@ def _pos_float(raw: Any, fallback: float) -> float:
 
 def _sync_handoff_tunables() -> Dict[str, Any]:
     """从 fleet_profile.json 同步交接门禁参数；若单测通过 monkeypatch 覆盖了模块属性则保留覆盖值。"""
-    global _LAST_HANDOFF_PROFILE_ID
-    profile = user_words.load_fleet_profile(HOOKS_DIR)
+    global _LAST_HANDOFF_PROFILE_TOKEN
+    cache_token = user_words.get_fleet_profile_cache_token(HOOKS_DIR)
     ht = user_words.get_runtime_tunables("handoff_thresholds", HOOKS_DIR)
-    profile_id = id(profile)
-    if _LAST_HANDOFF_PROFILE_ID == profile_id:
+    if _LAST_HANDOFF_PROFILE_TOKEN == cache_token:
         return ht
-    _LAST_HANDOFF_PROFILE_ID = profile_id
+    _LAST_HANDOFF_PROFILE_TOKEN = cache_token
     agy = ht.get("antigravity") if isinstance(ht.get("antigravity"), dict) else {}
     codex = ht.get("codex") if isinstance(ht.get("codex"), dict) else {}
     claude = ht.get("claude") if isinstance(ht.get("claude"), dict) else {}
@@ -266,9 +265,10 @@ def _sync_handoff_tunables() -> Dict[str, Any]:
     }
     mod_globals = globals()
     for name, new_val in resolved.items():
-        if mod_globals[name] == _ACTIVE_HANDOFF_BASELINE[name]:
-            mod_globals[name] = new_val
+        was_unpatched = (mod_globals[name] == _ACTIVE_HANDOFF_BASELINE[name])
         _ACTIVE_HANDOFF_BASELINE[name] = new_val
+        if was_unpatched:
+            mod_globals[name] = new_val
     return ht
 
 
@@ -411,6 +411,7 @@ def record_image_read(
     increment_calls: bool = True,
 ) -> Tuple[int, int]:
     """登记 PreToolUse 图片请求，文件大小用于估算可能增加的图片负载。"""
+    _sync_handoff_tunables()
     if increment_calls:
         gate_state["imageReadCallCount"] = int(gate_state.get("imageReadCallCount", 0)) + 1
 
@@ -1758,7 +1759,7 @@ def check_stop_handoff_locked(
 def _codex_notice(phase: str, count: int, mode: str, client_label: str = "Codex") -> str:
     prefix = f"【{client_label} 长会话交接：{phase}】已登记的压缩次数下界为 {count}。模式 {mode}。"
     if phase == "overridden":
-        return prefix + "已按用户明确指令继续；宽限到其后第 3 个新压缩事件，再按已配置策略评估。"
+        return prefix + f"已按用户明确指令继续；宽限到其后第 {OVERRIDE_SNOOZE_CPS} 个新压缩事件，再按已配置策略评估。"
     if phase in ("drain", "freeze"):
         return (prefix + "请收尾当前小步，核对用户原话与最新裁定，整理已验证进展、Git/工作区状态、"
                 "未完成事项及可复制的新对话提示词。结束当前回合不等于取消目标循环或终止后台任务；"
@@ -1813,7 +1814,7 @@ def _scan_codex_compactions(transcript: Path, ledger: Dict[str, Any]) -> Optiona
                                                       b'"turn_aborted"')):
                     continue
                 try:
-                    entry = json.loads(raw)
+                    entry = json.loads(user_words.decode_jsonl_line(raw))
                 except (ValueError, RecursionError):
                     cursor["unreadable"] = True
                     continue

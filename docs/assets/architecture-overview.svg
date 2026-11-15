@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 584" width="1080" height="584" role="img" aria-labelledby="arch-title arch-desc">
   <title id="arch-title">两层解耦配置与四客户端全动态协作总览</title>
-  <desc id="arch-desc">展示常驻机制层与全动态角色及运行期参数配置层的解耦关系、双工作区识别、四个必停用户拍板门禁，以及 Antigravity、Codex、Claude Code 与 DeepSeek Harness 四个对等客户端的全局目录挂载方式。</desc>
+  <desc id="arch-desc">展示常驻机制层与全动态角色及运行期参数配置层的解耦关系、双工作区隔离、四个必停用户拍板节点，以及 Antigravity、Codex、Claude Code 与 DeepSeek Harness 四个对等客户端的全局目录挂载方式。</desc>
   <defs>
     <style>
       .bg { fill: #f8fafc; stroke: #cbd5e1; stroke-width: 1.5; }
@@ -35,10 +35,10 @@
 
   <!-- Layer 1 Left: Permanent Layer -->
   <rect x="28" y="72" width="500" height="184" rx="9" class="box-perm"/>
-  <text x="44" y="96" class="hdr-perm">1. 常驻机制层（零时期性模型名 · 零散落业务魔数）</text>
+  <text x="44" y="96" class="hdr-perm">1. 常驻机制层（零时期性模型名 · 零静态死数字）</text>
   <text x="44" y="118" class="body">• 全局规则模板：template/user-guard/rules/AGENTS.md（R0–R11）</text>
-  <text x="44" y="138" class="body">• 生命周期钩子：user_words · session_context_loader · status_guard</text>
-  <text x="58" y="156" class="body">reply_repeat_guard · handoff_gate（短进程 JSON 协议，平时零驻留）</text>
+  <text x="44" y="138" class="body">• 5 个钩子脚本模块：user_words · session_context_loader</text>
+  <text x="58" y="156" class="body">status_guard · reply_repeat_guard · handoff_gate（短进程零驻留）</text>
   <text x="44" y="176" class="body">• 角色编排与事实锚定：cae_harness.py（gate / audit / check-grounding）</text>
   <text x="44" y="196" class="body">• 上游专属工具（workspace_mode 硬隔离）：install.py · fleet_state.py</text>
   <text x="58" y="214" class="body">（推荐表审批锁 propose/approve · 重启重入锁 · 终审锚定门禁）</text>
@@ -48,11 +48,11 @@
   <rect x="552" y="72" width="500" height="184" rx="9" class="box-dyn"/>
   <text x="568" y="96" class="hdr-dyn">2. 全动态评估与参数层（随客户端与模型特性重算）</text>
   <text x="568" y="118" class="body">• 唯一机器可读配置：skills/cae-harness/fleet_profile.json</text>
-  <text x="568" y="138" class="body">• 五类对等角色槽位全部动态选路（均无永久客户端或模型绑定）：</text>
+  <text x="568" y="138" class="body">• 五个对等角色槽位全部动态选路（均无永久客户端或模型绑定）：</text>
   <rect x="568" y="148" width="466" height="24" rx="5" class="tag"/>
   <text x="801" y="164" text-anchor="middle" class="mono">role:orchestrator | role:math | role:code | role:review | role:fast</text>
   <text x="568" y="192" class="body">• 受控定量参数 runtime_tunables：各端压缩恢复预算、实质子代理</text>
-  <text x="582" y="211" class="body">筛选窗口、交接与防轮询阈值、分片安全系数、路由并发与缓存上限</text>
+  <text x="582" y="211" class="body">筛选窗口、交接与防轮询阈值、过期锁清理、路由并发与缓存上限</text>
   <text x="568" y="236" class="body">• 上游双循环入口：fleet-evolve（全面更新 full · 全量优化 hygiene）</text>
 
   <!-- Cross link between layers -->
@@ -76,7 +76,7 @@
   <rect x="28" y="376" width="244" height="182" rx="8" class="box-peer"/>
   <text x="40" y="398" class="hdr-peer">Antigravity (agy)</text>
   <text x="40" y="416" class="mono-sm">~/.gemini/config/plugins/user-guard</text>
-  <text x="40" y="437" class="body">• 挂载 4 类钩子（存 PLUGIN_DATA）</text>
+  <text x="40" y="437" class="body">• 挂载 4 类事件钩子（存 PLUGIN_DATA）</text>
   <text x="40" y="456" class="body">• 3 个 inherit 原生只读子代理</text>
   <text x="40" y="475" class="body">• 订阅按模型组计 5h / 7d 滚动配额</text>
   <text x="40" y="494" class="body">• CLI 不输出窗口整数，读取回退预</text>
@@ -87,7 +87,7 @@
   <rect x="288" y="376" width="244" height="182" rx="8" class="box-peer"/>
   <text x="300" y="398" class="hdr-peer">OpenAI Codex (codex)</text>
   <text x="300" y="416" class="mono-sm">~/.codex</text>
-  <text x="300" y="437" class="body">• 挂载 5 类钩子（保留 trusted_hash）</text>
+  <text x="300" y="437" class="body">• 挂载 5 类事件钩子（保 trusted_hash）</text>
   <text x="300" y="456" class="body">• 3 个只读子代理 + workspace-write</text>
   <text x="300" y="475" class="body">• 订阅共享 5h / 周度窗口或按量 API</text>
   <text x="300" y="494" class="body">• 默认挡位偏低（low/medium），脚本</text>
@@ -98,7 +98,7 @@
   <rect x="548" y="376" width="244" height="182" rx="8" class="box-peer"/>
   <text x="560" y="398" class="hdr-peer">Claude Code (claude / cc)</text>
   <text x="560" y="416" class="mono-sm">~/.claude (+ router/ &amp; CC Switch)</text>
-  <text x="560" y="437" class="body">• settings.json 合并 5 类钩子与挡位</text>
+  <text x="560" y="437" class="body">• settings.json 合入 5 类事件钩子</text>
   <text x="560" y="456" class="body">• 原生 --json-schema 输出结构强校验</text>
   <text x="560" y="475" class="body">• router.py 绑定 127.0.0.1 前缀直通</text>
   <text x="572" y="494" class="body">原生兼容 /v1/messages 官方接口</text>
@@ -113,6 +113,6 @@
   <text x="820" y="456" class="body">• 安装器不改 .credentials.yaml</text>
   <text x="820" y="475" class="body">• 复用官方 OAuth 或 DEEPSEEK_API_KEY</text>
   <text x="820" y="494" class="body">• 无头调用生成临时 --patch 激活凭据</text>
-  <text x="820" y="513" class="body">• 单 JSON 约束并清洗尾随 DSML 标记</text>
+  <text x="820" y="513" class="body">• 剥离外层代码围栏与尾随 DSML 标记</text>
   <text x="820" y="534" class="body">• 支持单端直连起步与配额冷却接替</text>
 </svg>

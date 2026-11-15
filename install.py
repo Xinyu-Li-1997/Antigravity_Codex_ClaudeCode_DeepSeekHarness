@@ -628,7 +628,16 @@ def _windows_app_binaries(home: Path, local_app: Path, name: str) -> Tuple[Optio
         desktop = [codex_dir / "Codex.exe"]
         try:
             if codex_dir.is_dir():
-                cli += sorted(codex_dir.glob("bin/**/codex.exe"), reverse=True)
+                scored_cx: List[Tuple[int, str, Path]] = []
+                for entry in codex_dir.glob("bin/**/codex.exe"):
+                    try:
+                        st = entry.stat()
+                    except OSError:
+                        continue
+                    if stat.S_ISREG(st.st_mode):
+                        scored_cx.append((st.st_mtime_ns, str(entry), entry))
+                scored_cx.sort(key=lambda row: (row[0], row[1]), reverse=True)
+                cli += [row[2] for row in scored_cx]
         except OSError:
             pass
     elif name == "claude":
@@ -644,7 +653,10 @@ def _windows_app_binaries(home: Path, local_app: Path, name: str) -> Tuple[Optio
         program_files = Path("/mnt/c/Program Files") if os.name != "nt" else Path(os.environ.get("ProgramFiles") or "C:/Program Files")
         cli = [local_app / "Programs/DeepSeek Harness/resources/runtime/cli/bin/dsh.cmd",
                program_files / "DeepSeek Harness/resources/runtime/cli/bin/dsh.cmd"]
-        desktop = []
+        desktop = [
+            local_app / "Programs" / "DeepSeek Harness" / "DeepSeek Harness.exe",
+            program_files / "DeepSeek Harness" / "DeepSeek Harness.exe",
+        ]
     else:
         return None, None
     return _first_executable(cli, windows=True), _first_executable(desktop, windows=True)
@@ -783,10 +795,12 @@ def _probe_windows_wsl() -> Dict[str, Any]:
     script = (
         'for name in agy codex claude dsh cc-switch; do '
         '  bin=$(command -v "$name"); '
-        '  for candidate in "$HOME/.gemini/bin/$name" "$HOME/.local/bin/$name" "$HOME/.cargo/bin/$name"; do '
+        '  for candidate in "$HOME/.gemini/bin/$name" "$HOME/.local/bin/$name" "$HOME/.cargo/bin/$name" '
+        '    "$HOME/.npm-global/bin/$name" "/usr/local/bin/$name" "/usr/bin/$name" '
+        '    "/opt/DeepSeek Harness/resources/runtime/cli/bin/$name"; do '
         '    if [ -f "$candidate" ] && [ -x "$candidate" ]; then bin=$candidate; break; fi; '
         '  done; '
-        '  case "$bin" in /*) case "$bin" in /mnt/[a-zA-Z]/*|*.exe) bin=;; esac;; *) bin=;; esac; '
+        '  case "$bin" in /*) case "$bin" in /mnt/[a-zA-Z]/*|*.exe|*.cmd|*.bat) bin=;; esac;; *) bin=;; esac; '
         '  trace=false; '
         '  if [ "$name" = agy ]; then '
         '    [ -d "$HOME/.gemini/config" ] || [ -d "$HOME/.gemini/antigravity-cli" ] || [ -d "$HOME/.gemini/antigravity" ]; '
@@ -814,7 +828,7 @@ def _probe_windows_wsl() -> Dict[str, Any]:
                     result["apps"].setdefault(name, []).append(
                         {"distro": distro, "binary": binary or None, "config_dir_exists": trace == "true"}
                     )
-            if any(not any(item["distro"] == distro for item in result["apps"].get(name, [])) for name in ("agy", "codex")):
+            if any(not any(item["distro"] == distro for item in result["apps"].get(name, [])) for name in ("agy", "codex", "claude")):
                 complete = False
         except (OSError, ValueError, subprocess.SubprocessError):
             complete = False
@@ -857,6 +871,7 @@ def detect_installed_apps() -> Dict[str, Any]:
             win_desktop = None
             trace = False
             if windows_home is not None:
+                interop_complete = True
                 known_cli, win_desktop = _windows_app_binaries(windows_home, windows_home / "AppData" / "Local", name)
                 win_cli = win_cli or known_cli
                 config_name = {"agy": ".gemini", "codex": ".codex", "claude": ".claude", "dsh": ".dsh", "cc-switch": ".cc-switch"}[name]
@@ -1122,7 +1137,11 @@ def mirror_sync_plugin(
             continue
 
         if len(rel.parts) >= 2 and rel.parts[0] == "hooks" and rel.parts[1] in ("state", "logs"):
-            if existing.name == ".gitkeep" or existing.name.endswith("_stop_gate.json"):
+            if (
+                existing.name == ".gitkeep"
+                or existing.name.endswith("_stop_gate.json")
+                or (existing.name.startswith("session-") and existing.name.endswith(".json.lock"))
+            ):
                 stale_files.append(existing)
             continue
 
@@ -1158,6 +1177,22 @@ def mirror_sync_plugin(
             if not any(directory.iterdir()):
                 directory.rmdir()
                 print(f"  [-] 已清理过时空目录: {rel}")
+
+
+def _clean_legacy_session_lock_files(state_root: Path, dry_run: bool = False) -> None:
+    """清理状态目录下早期版本遗留的 session-*.json.lock 废弃锁文件，保留真实归档数据。"""
+    if not state_root.exists():
+        return
+    _validate_tree_links(state_root)
+    for stale_lock in sorted(state_root.rglob("session-*.json.lock")):
+        if not stale_lock.is_file():
+            continue
+        if dry_run:
+            print(f"  [Dry-Run CLEAN] 将清理过时锁文件: {stale_lock}")
+        else:
+            _validate_path(stale_lock, directory=False)
+            stale_lock.unlink(missing_ok=True)
+            print(f"  [-] 已清理过时锁文件: {stale_lock}")
 
 
 def _plan_user_zotero(config_root: Path, zotero_exe: Optional[str]) -> Optional[FileChange]:
@@ -1250,7 +1285,7 @@ def _select_agy_frontier_max_label(
 
 
 def _plan_agy_model(
-    gemini_root: Path, *, dry_run: bool, overwrite: bool,
+    gemini_root: Path, *, dry_run: bool, overwrite: bool, repo_root: Optional[Path] = None,
 ) -> List[FileChange]:
     """保留现有模型。预演仅读取本侧缓存，正式安装才查询原生 CLI。"""
     cli_dir = gemini_root / "antigravity-cli"
@@ -1303,7 +1338,7 @@ def _plan_agy_model(
                           and isinstance(item.get("display_name"), str) and item["slug"] and item["display_name"]]
         except (TypeError, ValueError):
             print(f"[*] 无法读取模型目录 {cache_path}，保留原文件。")
-    label = _select_agy_frontier_max_label(models)
+    label = _select_agy_frontier_max_label(models, repo_root=repo_root)
     if not label:
         suffix = "。预演不会查询 CLI，正式安装可尝试读取本侧模型目录。" if dry_run else "，保留原配置。"
         print("[*] 未取得 Antigravity 的可用模型目录" + suffix)
@@ -1314,10 +1349,10 @@ def _plan_agy_model(
 
 
 def configure_agy_frontier_max_default(
-    gemini_root: Path, dry_run: bool = False, *, overwrite: bool = False,
+    gemini_root: Path, dry_run: bool = False, *, overwrite: bool = False, repo_root: Optional[Path] = None,
 ) -> None:
     """把已校验的模型变更逐文件原子落盘，预演只输出计划。"""
-    for change in _plan_agy_model(gemini_root, dry_run=dry_run, overwrite=overwrite):
+    for change in _plan_agy_model(gemini_root, dry_run=dry_run, overwrite=overwrite, repo_root=repo_root):
         _apply_file_change(change, dry_run)
 
 
@@ -1367,7 +1402,7 @@ def codex_skill_target(
 
 
 def _apply_codex_frontier_max(
-    editor: "CodexConfig", cache_path: Path, *, overwrite: bool,
+    editor: "CodexConfig", cache_path: Path, *, overwrite: bool, repo_root: Optional[Path] = None,
 ) -> None:
     """按本机模型目录补齐缺项，显式覆盖时才更新已有模型及挡位。"""
     keys = ("model", "model_reasoning_effort")
@@ -1397,7 +1432,7 @@ def _apply_codex_frontier_max(
         visible = [model for model in models if model.get("visibility") != "hide"] or models
         if cur_effort and not overwrite:
             visible = [model for model in visible if cur_effort in _model_efforts(model)]
-        cx_rules = _load_fleet_profile().get("client_catalog_rules", {}).get("codex", {})
+        cx_rules = _load_fleet_profile(repo_root).get("client_catalog_rules", {}).get("codex", {})
         workhorse_families = [str(fam).lower() for fam in (cx_rules.get("workhorse_families") or ())]
         selected = next(
             (candidate for fam in workhorse_families for candidate in [_latest_codex_model(visible, fam)] if candidate is not None),
@@ -1492,7 +1527,7 @@ def _apply_codex_zotero(editor: "CodexConfig", zotero_exe: str) -> None:
 
 def _plan_codex_config(
     codex_root: Path, *, include_sandbox: bool, include_model: bool,
-    overwrite_model: bool, zotero_exe: Optional[str],
+    overwrite_model: bool, zotero_exe: Optional[str], repo_root: Optional[Path] = None,
 ) -> Optional["FileChange"]:
     """先在内存中合并 TOML 并校验，双端安装可在写入前统一报错。"""
     editor = CodexConfig(codex_root / "config.toml")
@@ -1500,15 +1535,15 @@ def _plan_codex_config(
     if zotero_exe:
         _apply_codex_zotero(editor, zotero_exe)
     if include_model:
-        _apply_codex_frontier_max(editor, codex_root / "models_cache.json", overwrite=overwrite_model)
+        _apply_codex_frontier_max(editor, codex_root / "models_cache.json", overwrite=overwrite_model, repo_root=repo_root)
     return editor.change()
 
 
 def _sync_codex_frontier_max(
-    codex_root: Path, dry_run: bool = False, *, overwrite: bool = False,
+    codex_root: Path, dry_run: bool = False, *, overwrite: bool = False, repo_root: Optional[Path] = None,
 ) -> None:
     editor = CodexConfig(codex_root / "config.toml")
-    _apply_codex_frontier_max(editor, codex_root / "models_cache.json", overwrite=overwrite)
+    _apply_codex_frontier_max(editor, codex_root / "models_cache.json", overwrite=overwrite, repo_root=repo_root)
     _apply_file_change(editor.change(), dry_run)
 
 
@@ -1676,7 +1711,7 @@ def _codex_managed_hook(
 
 def _codex_handoff_policy(
     doc: Dict[str, Any], policies: Set[Tuple[str, int]], requested_mode: Optional[str],
-    requested_limit: Optional[int],
+    requested_limit: Optional[int], *, repo_root: Optional[Path] = None,
 ) -> Tuple[str, int]:
     description = doc.get("description", "")
     if not isinstance(description, str):
@@ -1693,7 +1728,7 @@ def _codex_handoff_policy(
     limits = {limit for _, limit in policies}
     if (requested_mode is None and len(modes) > 1) or (requested_limit is None and len(limits) > 1):
         raise ValueError("Codex 钩子交接策略不一致，请用 --codex-handoff-mode 和 --codex-handoff-compactions 指定需要保留的值")
-    def_mode, def_limit = _default_handoff_policy("codex")
+    def_mode, def_limit = _default_handoff_policy("codex", repo_root)
     mode = requested_mode if requested_mode is not None else next(iter(modes), def_mode)
     limit = requested_limit if requested_limit is not None else next(iter(limits), def_limit)
     marker = f"[user-guard codex-handoff v1 mode={mode} compact_limit={limit}]"
@@ -1721,7 +1756,7 @@ def _read_codex_hooks(path: Path, raw: Optional[bytes]) -> Dict[str, Any]:
 def _plan_codex_hooks(
     hooks_path: Path, template_path: Path, py_cmd: str,
     mode: Optional[str] = None, compact_limit: Optional[int] = None,
-    *, verify_interpreters: bool = True,
+    *, verify_interpreters: bool = True, repo_root: Optional[Path] = None,
 ) -> CodexHooksPlan:
     """逐条识别本项目钩子并合并，保留用户 handler、信任信息及交接策略。"""
     _validate_path(hooks_path, directory=False)
@@ -1759,7 +1794,7 @@ def _plan_codex_hooks(
                     print(f"[!] {hooks_path} 的 {event} 包含自定义脚本命令，保留原 handler。", file=sys.stderr)
                 if managed and managed.policy is not None:
                     policies.add(managed.policy)
-    mode, compact_limit = _codex_handoff_policy(doc, policies, mode, compact_limit)
+    mode, compact_limit = _codex_handoff_policy(doc, policies, mode, compact_limit, repo_root=repo_root)
 
     for event, groups in defaults.items():
         matcher = groups[0].get("matcher")
@@ -1881,6 +1916,7 @@ def _sync_codex_hooks(
             print(f"  [Dry-Run CLEAN] 将清理 Codex 钩子字节码缓存: {pycache_dir}")
         else:
             shutil.rmtree(pycache_dir)
+    _clean_legacy_session_lock_files(dst_hooks_dir / "state", dry_run=dry_run)
 
     if scripts_updated:
         action = "将同步" if dry_run else "已同步"
@@ -1983,6 +2019,7 @@ def _claude_managed_script(handler: Dict[str, Any], claude_root: Path) -> Option
 
 def _claude_handoff_policy(
     handlers: List[Dict[str, Any]], mode: Optional[str], compact_limit: Optional[int],
+    *, repo_root: Optional[Path] = None,
 ) -> Tuple[str, int]:
     policies = set()
     for handler in handlers:
@@ -1997,7 +2034,7 @@ def _claude_handoff_policy(
     modes, limits = {item[0] for item in policies}, {item[1] for item in policies}
     if (mode is None and len(modes) > 1) or (compact_limit is None and len(limits) > 1):
         raise ValueError("Claude 交接策略不一致，请显式指定 --claude-handoff-mode 和 --claude-handoff-compactions")
-    def_mode, def_limit = _default_handoff_policy("claude")
+    def_mode, def_limit = _default_handoff_policy("claude", repo_root)
     return mode or next(iter(modes), def_mode), compact_limit if compact_limit is not None else next(iter(limits), def_limit)
 
 
@@ -2005,7 +2042,7 @@ def _plan_claude_settings(
     settings_path: Path, template_path: Path, py_cmd: str,
     mode: Optional[str] = None, compact_limit: Optional[int] = None, *,
     include_hooks: bool = True, include_model: bool = True, overwrite_model: bool = False,
-    verify_interpreters: bool = True,
+    verify_interpreters: bool = True, repo_root: Optional[Path] = None,
 ) -> CodexHooksPlan:
     """按目标脚本路径迁移托管钩子，其余设置及第三方 handler 保持原值。"""
     original = _read_optional_bytes(settings_path)
@@ -2017,7 +2054,7 @@ def _plan_claude_settings(
         raise ValueError(f"{settings_path} 的 env 必须是对象")
     if include_model:
         if overwrite_model or "effortLevel" not in doc:
-            doc["effortLevel"] = _default_claude_effort()
+            doc["effortLevel"] = _default_claude_effort(repo_root)
         if overwrite_model:
             env.pop("CLAUDE_CODE_EFFORT_LEVEL", None)
     if include_hooks:
@@ -2062,7 +2099,7 @@ def _plan_claude_settings(
                      if id(handler) in managed for tokens in [_claude_hook_tokens(handler)])
         if mode is None and managed and modern and not gates:
             mode = "off"
-        mode, compact_limit = _claude_handoff_policy(gates, mode, compact_limit)
+        mode, compact_limit = _claude_handoff_policy(gates, mode, compact_limit, repo_root=repo_root)
         for event, groups in list(events.items()):
             retained = []
             canonical_matcher = defaults.get(event, [{}])[0].get("matcher")
@@ -2099,7 +2136,7 @@ def _plan_claude_settings(
                 existing.append(target)
             target["hooks"].extend(desired)
     else:
-        def_mode, def_limit = _default_handoff_policy("claude")
+        def_mode, def_limit = _default_handoff_policy("claude", repo_root)
         mode, compact_limit = mode or def_mode, compact_limit if compact_limit is not None else def_limit
     content = _preserve_text_format(_json_bytes(doc), original)
     return CodexHooksPlan(FileChange(settings_path, original, content) if doc != initial else None, mode, compact_limit)
@@ -2133,6 +2170,7 @@ def _sync_claude_hooks(
             print(f"[Dry-Run CLEAN] 将清理 {cache}")
         else:
             shutil.rmtree(cache)
+    _clean_legacy_session_lock_files(hooks_dir / "state", dry_run=dry_run)
     _apply_file_change(plan.change, dry_run)
 
 
@@ -2311,6 +2349,12 @@ def _audit_redact(value: Any, roots: List[Tuple[Path, str]], secrets: Set[str]) 
         except ValueError:
             return "<redacted-url>"
     value = re.sub(r"https?://[^\s\"<>]+", endpoint, value)
+    octet = r"(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)"
+    value = re.sub(
+        rf"(?<![0-9A-Za-z_.-])(?:10\.{octet}\.{octet}\.{octet}|172\.(?:1[6-9]|2\d|3[01])\.{octet}\.{octet}|192\.168\.{octet}\.{octet}|169\.254\.{octet}\.{octet})(?![0-9A-Za-z_.-])",
+        "<private-ip>",
+        value,
+    )
     value = re.sub(
         r"(?i)(?:[A-Z]:[/\\]Users[/\\]|/mnt/[a-z]/Users/|(?:\\\\|//)wsl(?:\.localhost|\$)[/\\][^/\\\s]+[/\\]home[/\\]|/(?:home|Users)/)[^/\\\s\"']+",
         "<home>",
@@ -2523,7 +2567,8 @@ def audit_upgrade_status(
     codex_hooks_path = codex_root / "hooks.json"
     try:
         cx_plan = _plan_codex_hooks(
-            codex_hooks_path, repo_root / "template/codex/hooks.json", "python3 -X utf8 -I -B", verify_interpreters=False,
+            codex_hooks_path, repo_root / "template/codex/hooks.json", "python3 -X utf8 -I -B",
+            verify_interpreters=False, repo_root=repo_root,
         )
         expected_cx_doc = json.loads(cx_plan.change.content) if cx_plan.change else codex_doc
 
@@ -2559,7 +2604,7 @@ def audit_upgrade_status(
     claude_mode = "advisory"
     try:
         plan = _plan_claude_settings(settings_path, repo_root / "template/claude/hooks.json", "python3 -X utf8 -I -B",
-                                    include_model=False, verify_interpreters=False)
+                                    include_model=False, verify_interpreters=False, repo_root=repo_root)
         claude_mode = plan.mode
         expected_doc = json.loads(plan.change.content) if plan.change else settings
         def hook_layout(doc: Dict[str, Any]) -> List[Any]:
@@ -2627,40 +2672,72 @@ def audit_upgrade_status(
             peer_report["drift_files"] = []
 
     cc = _audit_cli(detection.get("cc_switch", {}))
-    port = 8240 if os.name == "nt" else 8241
+    tunables = fleet_profile.get("runtime_tunables") if isinstance(fleet_profile.get("runtime_tunables"), dict) else {}
+    hd_tunables = tunables.get("headless_dispatch") if isinstance(tunables.get("headless_dispatch"), dict) else {}
+    router_tunables = hd_tunables.get("router") if isinstance(hd_tunables.get("router"), dict) else {}
+    default_port_key = "port" if os.name == "nt" else "wsl_port"
+    fallback_port = 8240 if os.name == "nt" else 8241
+    raw_default_port = router_tunables.get(default_port_key, fallback_port)
+    port = (
+        raw_default_port
+        if isinstance(raw_default_port, int) and not isinstance(raw_default_port, bool) and 1 <= raw_default_port <= 65535
+        else fallback_port
+    )
     router_cfg_path = claude_root / "router/router.json"
     if router_cfg_path.is_file():
         custom_router_cfg = read_json(router_cfg_path)
         custom_port = custom_router_cfg.get("port") if isinstance(custom_router_cfg, dict) else None
         if isinstance(custom_port, int) and not isinstance(custom_port, bool) and 1 <= custom_port <= 65535:
             port = custom_port
+
+    def _url_points_to_local_router(raw_url: Any, expected_port: int) -> bool:
+        if not isinstance(raw_url, str) or not raw_url.strip():
+            return False
+        try:
+            parsed = urlsplit(raw_url.strip())
+        except ValueError:
+            return False
+        return (
+            parsed.scheme.lower() in {"http", "https"}
+            and (parsed.hostname or "").lower() in {"127.0.0.1", "localhost", "::1"}
+            and parsed.port == expected_port
+        )
+
+    settings_uses_router = _url_points_to_local_router(env.get("ANTHROPIC_BASE_URL"), port)
     card_uses_router = False
     inspect_cc_db = not is_sandbox_run or explicit_cc
     if inspect_cc_db:
         try:
             admin = _load_ccswitch_admin(repo_root)
-            probe_port = port if (cl_active and not is_sandbox_run and (expect_cc_router or cl["router"]["installed"])) else None
+            probe_port = port if (cl_active and settings_uses_router) else None
             cc.update(admin.inspect_status(ccswitch_db, settings_path, router_port=probe_port))
-            current_card = cc.get("current_claude_card") or {}
-            card_uses_router = current_card.get("base_url") == f"http://127.0.0.1:{port}"
-            if cl_active and card_uses_router and probe_port is None:
+            current_card = cc.get("current_claude_card")
+            card_uses_router = _url_points_to_local_router((current_card or {}).get("base_url"), port) if isinstance(current_card, dict) else False
+            uses_local_router = card_uses_router if isinstance(current_card, dict) else settings_uses_router
+            if cl_active and uses_local_router and probe_port is None:
                 cc.update(admin.inspect_status(ccswitch_db, settings_path, router_port=port))
+            elif not uses_local_router:
+                cc.pop("router_health", None)
         except (OSError, ValueError, TypeError, sqlite3.Error) as exc:
             cc.update(db_exists=ccswitch_db.is_file(), schema_version=None, enabled_prompts=[], enabled_skills=[], inspection_error=type(exc).__name__)
+            uses_local_router = settings_uses_router
     else:
         cc.update(
             db_exists=False, schema_version=None, cards=[], current_claude_card=None,
             enabled_prompts=[], stored_prompt_count=0, enabled_skills=[], stored_skill_count=0,
             skills_dir_entries=[], settings_aligned=None,
         )
+        uses_local_router = settings_uses_router
     managed_card_names = {str(name) for name in (cl_rules.get("managed_cards") or ("Kimi", "DeepSeek")) if name}
     custom_card_refs: List[Tuple[str, str]] = []
     for card in cc.get("cards") or []:
         if isinstance(card, dict) and (card.get("app_type") != "claude" or card.get("name") not in managed_card_names):
             if isinstance(card.get("app_type"), str) and isinstance(card.get("name"), str) and card["name"]:
                 custom_card_refs.append((card["app_type"], card["name"]))
+            card["id"] = "<custom-card-id>"
             card["name"] = "<custom-card>"
     if isinstance(cc.get("current_claude_card"), dict) and cc["current_claude_card"].get("name") not in managed_card_names:
+        cc["current_claude_card"]["id"] = "<custom-card-id>"
         cc["current_claude_card"]["name"] = "<custom-card>"
     if custom_card_refs and isinstance(cc.get("warnings"), list):
         ordered_refs = sorted(set(custom_card_refs), key=lambda item: len(item[1]), reverse=True)
@@ -2684,7 +2761,7 @@ def audit_upgrade_status(
         cc.get("stored_prompt_count") or cc.get("stored_skill_count") or cc.get("skills_dir_entries")
     )
     router_active = cl_active and bool(
-        expect_cc_router or cl["router"]["installed"] or cl["router"]["config_exists"] or card_uses_router
+        expect_cc_router or cl["router"]["installed"] or cl["router"]["config_exists"] or uses_local_router
     )
     cc_active = cl_active and inspect_cc_db and bool(not is_sandbox_run or ccswitch_db.is_file())
     actions = []
@@ -2712,7 +2789,7 @@ def audit_upgrade_status(
             actions.append("disable_ccswitch_prompts")
         if cc.get("settings_aligned") is False:
             actions.append("align_ccswitch_card")
-        if (card_uses_router or expect_cc_router) and cc.get("router_health") and not cc["router_health"].get("ok"):
+        if uses_local_router and cc.get("router_health") and not cc["router_health"].get("ok"):
             actions.append("start_cc_router")
         if cc.get("inspection_error"):
             actions.append("inspect_ccswitch_schema")
@@ -2853,6 +2930,9 @@ def resolve_multi_app_plan(
     app_labels = {"antigravity": "反重力 (Antigravity)", "codex": "Codex", "claude": "Claude Code"}
     label = app_labels.get(names[installed.index(True)], names[installed.index(True)])
     missing_labels = [app_labels.get(item, item) for item in missing]
+    dsh_info = detection.get("dsh", {}) if isinstance(detection.get("dsh"), dict) else {}
+    if not dsh_info.get("native_installed") and not dsh_info.get("interop_available") and dsh_info.get("interop_status") != "unknown":
+        missing_labels.append("DeepSeek Harness")
     if not _confirm_single_app_install(label, " / ".join(missing_labels), interactive, auto_yes, dry_run):
         sys.exit(0)
     return installed
@@ -3139,18 +3219,19 @@ def main() -> None:
             if not args.no_codex_hooks:
                 codex_hooks_plan = _plan_codex_hooks(
                     codex_root / "hooks.json", codex_template_dir / "hooks.json", py_cmd,
-                    args.codex_handoff_mode, args.codex_handoff_compactions,
+                    args.codex_handoff_mode, args.codex_handoff_compactions, repo_root=repo_root,
                 )
             _validate_codex_assets(codex_root, codex_template_dir, args, codex_hooks_plan)
             codex_config_change = _plan_codex_config(
                 codex_root, include_sandbox=not args.no_sandbox_config, include_model=not args.no_model_config,
-                overwrite_model=args.sync_model_defaults, zotero_exe=zotero_exe,
+                overwrite_model=args.sync_model_defaults, zotero_exe=zotero_exe, repo_root=repo_root,
             )
         if claude_root is not None:
             claude_settings_plan = _plan_claude_settings(
                 claude_root / "settings.json", claude_template_dir / "hooks.json", py_cmd or "", args.claude_handoff_mode,
                 args.claude_handoff_compactions, include_hooks=not args.no_claude_hooks,
                 include_model=not args.no_model_config, overwrite_model=args.sync_model_defaults,
+                repo_root=repo_root,
             )
             _validate_claude_assets(repo_root, claude_root, args, claude_settings_plan.mode)
         if retire_ccswitch:
@@ -3161,6 +3242,7 @@ def main() -> None:
         if target_plugin_dir == (default_config_root / "plugins" / "user-guard").absolute() and not args.no_model_config:
             agy_model_changes = _plan_agy_model(
                 default_config_root.parent, dry_run=args.dry_run, overwrite=args.sync_model_defaults,
+                repo_root=repo_root,
             )
     except (OSError, ValueError, sqlite3.Error) as exc:
         parser.error(str(exc))

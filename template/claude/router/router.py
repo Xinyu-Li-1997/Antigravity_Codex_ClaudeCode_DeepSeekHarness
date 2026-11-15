@@ -321,7 +321,14 @@ def card_key(cfg, card_name):
         row = rows[0]
         try:
             env = json.loads(row[0])["env"]
-            key = env.get("ANTHROPIC_AUTH_TOKEN") or env.get("ANTHROPIC_API_KEY")
+            raw_auth = env.get("ANTHROPIC_AUTH_TOKEN")
+            raw_api = env.get("ANTHROPIC_API_KEY")
+            if isinstance(raw_auth, str) and raw_auth.strip():
+                key = raw_auth
+            elif raw_auth is None or raw_auth == "" or (isinstance(raw_auth, str) and not raw_auth.strip()):
+                key = raw_api if raw_api is not None else raw_auth
+            else:
+                key = raw_auth
         except (ValueError, TypeError, KeyError, AttributeError):
             raise RuntimeError("cc-switch card has invalid settings") from None
         if (not isinstance(key, str) or not key.strip() or key.strip().upper().startswith("PASTE_")
@@ -332,15 +339,74 @@ def card_key(cfg, card_name):
         return key
 
 
+def invalidate_card_key_cache(cfg, card_name):
+    if not card_name:
+        return
+    try:
+        db = Path(cfg["ccswitch_db"]).expanduser().resolve()
+        cache_id = (os.path.normcase(str(db)), card_name)
+    except OSError:
+        return
+    with _key_lock:
+        _key_cache.pop(cache_id, None)
+
+
+def _ascii_reason(msg):
+    return str(msg or "").encode("ascii", "backslashreplace").decode("ascii")[:200]
+
+
+class _BodyTooLargeError(ValueError):
+    pass
+
+
+def _read_chunked_body(rfile, max_bytes):
+    chunks = []
+    total = 0
+    while True:
+        size_line = rfile.readline(65537)
+        if not size_line or len(size_line) > 65536:
+            raise ValueError("invalid chunked header")
+        semi = size_line.find(b";")
+        hex_part = (size_line[:semi] if semi >= 0 else size_line).strip()
+        if not hex_part:
+            raise ValueError("empty chunk size")
+        chunk_len = int(hex_part, 16)
+        if chunk_len < 0:
+            raise ValueError("negative chunk size")
+        if chunk_len == 0:
+            while True:
+                trailer = rfile.readline(65537)
+                if not trailer or trailer in (b"\r\n", b"\n"):
+                    break
+            break
+        if total + chunk_len > max_bytes:
+            raise _BodyTooLargeError("chunked body exceeds max_body_bytes")
+        data = rfile.read(chunk_len)
+        if len(data) != chunk_len:
+            raise ValueError("truncated chunk body")
+        crlf = rfile.readline(4)
+        if crlf not in (b"\r\n", b"\n"):
+            raise ValueError("missing chunk CRLF")
+        chunks.append(data)
+        total += chunk_len
+    return b"".join(chunks)
+
+
 def log_line(cfg, rec):
     path = os.path.abspath(os.path.expanduser(cfg["log"]))
     line = json.dumps(rec, ensure_ascii=False) + "\n"
     with _log_lock:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        if os.path.exists(path) and os.path.getsize(path) > 5_000_000:
-            os.replace(path, path + ".1")
-        with open(path, "a", encoding="utf-8", newline="\n") as f:
-            f.write(line)
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            if os.path.exists(path) and os.path.getsize(path) > 5_000_000:
+                try:
+                    os.replace(path, path + ".1")
+                except OSError:
+                    pass
+            with open(path, "a", encoding="utf-8", newline="\n") as f:
+                f.write(line)
+        except OSError:
+            pass
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -364,6 +430,20 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         max_bytes = int(self.server.cfg.get("max_body_bytes") or (64 * 1024 * 1024))
+        te_hdr = (self.headers.get("Transfer-Encoding") or "").lower()
+        if "chunked" in te_hdr:
+            try:
+                body = _read_chunked_body(self.rfile, max_bytes)
+            except _BodyTooLargeError:
+                self.send_error(413, "request body exceeds router max_body_bytes")
+                return
+            except ValueError:
+                self.send_error(400, "invalid chunked request body")
+                return
+            except OSError:
+                return
+            self.forward(body)
+            return
         try:
             n = int(self.headers.get("Content-Length") or 0)
             if n < 0:
@@ -374,7 +454,11 @@ class Handler(BaseHTTPRequestHandler):
         if n > max_bytes:
             self.send_error(413, "request body exceeds router max_body_bytes")
             return
-        self.forward(self.rfile.read(n) if n else b"")
+        try:
+            body = self.rfile.read(n) if n else b""
+        except OSError:
+            return
+        self.forward(body)
 
     do_PUT = do_POST
     do_DELETE = do_GET
@@ -437,7 +521,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 rec.update(status=502, err=str(e))
                 log_line(cfg, rec)
-                self.send_error(502, "router: %s" % e)
+                self.send_error(502, _ascii_reason("router: %s" % e))
                 return
             for k in list(headers):
                 if k.lower() in ("x-api-key", "authorization"):
@@ -471,6 +555,8 @@ class Handler(BaseHTTPRequestHandler):
             conn.request(self.command, path, body=body if body else None, headers=headers)
             resp = conn.getresponse()
             rec["status"] = resp.status
+            if resp.status in (401, 403) and key_card:
+                invalidate_card_key_cache(cfg, key_card)
             side = "client"
             self.send_response(resp.status, resp.reason)
             for k, v in end_to_end_headers(resp.getheaders()):

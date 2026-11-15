@@ -64,7 +64,7 @@ _DEFAULT_MAX_ARCHIVE_SUBAGENT_ITEM_CHARS = 1200
 MAX_RECENT_SUBAGENT_RETURNS = _DEFAULT_MAX_RECENT_SUBAGENT_RETURNS
 MAX_ARCHIVE_SUBAGENT_ITEM_CHARS = _DEFAULT_MAX_ARCHIVE_SUBAGENT_ITEM_CHARS
 
-_FLEET_PROFILE_CACHE: Dict[str, Any] = {"key": None, "data": {}}
+_FLEET_PROFILE_CACHE: Dict[str, Any] = {"key": None, "version": 0, "data": {}}
 
 DEFAULT_COMPACTION_TUNABLES: Dict[str, Any] = {
     "inline_total_chars": 8000,
@@ -93,7 +93,7 @@ def _is_link_or_reparse(path: Path) -> bool:
 
 
 def load_fleet_profile(anchor_dir: Optional[Path] = None) -> Dict[str, Any]:
-    """按 mtime 缓存读取 fleet_profile.json（支持 CAE_FLEET_PROFILE 覆盖，异常时安全降级为空字典）。"""
+    """按 mtime 缓存读取 fleet_profile.json（支持 CAE_FLEET_PROFILE 覆盖与缺失负缓存，异常时安全降级为空字典）。"""
     env_override = os.environ.get("CAE_FLEET_PROFILE", "").strip()
     anchor = Path(anchor_dir).resolve() if anchor_dir is not None else Path(__file__).resolve().parent
     candidates: List[Path] = []
@@ -102,23 +102,36 @@ def load_fleet_profile(anchor_dir: Optional[Path] = None) -> Dict[str, Any]:
     candidates.extend([
         anchor.parent / "skills" / "cae-harness" / "fleet_profile.json",
         anchor / "fleet_profile.json",
+        Path.home() / ".gemini" / "config" / "plugins" / "user-guard" / "skills" / "cae-harness" / "fleet_profile.json",
     ])
     for cand in candidates:
         try:
             if not cand.is_file() or _is_link_or_reparse(cand):
                 continue
             st = cand.stat()
-            cache_key = (str(cand), st.st_mtime_ns, st.st_size)
+            cache_key: Any = ("file", str(cand), st.st_mtime_ns, st.st_size)
             if _FLEET_PROFILE_CACHE.get("key") == cache_key:
                 return _FLEET_PROFILE_CACHE["data"]
             parsed = json.loads(cand.read_text(encoding="utf-8-sig"))
             if isinstance(parsed, dict) and parsed.get("schema_version") == 1:
                 _FLEET_PROFILE_CACHE["key"] = cache_key
+                _FLEET_PROFILE_CACHE["version"] = int(_FLEET_PROFILE_CACHE.get("version", 0)) + 1
                 _FLEET_PROFILE_CACHE["data"] = parsed
                 return parsed
         except (OSError, UnicodeError, ValueError, RecursionError):
             continue
-    return {}
+    miss_key = ("missing", env_override, str(anchor))
+    if _FLEET_PROFILE_CACHE.get("key") != miss_key:
+        _FLEET_PROFILE_CACHE["key"] = miss_key
+        _FLEET_PROFILE_CACHE["version"] = int(_FLEET_PROFILE_CACHE.get("version", 0)) + 1
+        _FLEET_PROFILE_CACHE["data"] = {}
+    return _FLEET_PROFILE_CACHE["data"]
+
+
+def get_fleet_profile_cache_token(anchor_dir: Optional[Path] = None) -> Tuple[Any, int]:
+    """返回稳定的配置文件缓存令牌，避免临时空字典引发 id() 地址复用假命中。"""
+    load_fleet_profile(anchor_dir)
+    return _FLEET_PROFILE_CACHE.get("key"), int(_FLEET_PROFILE_CACHE.get("version", 0))
 
 
 def get_runtime_tunables(section: str = "", anchor_dir: Optional[Path] = None) -> Dict[str, Any]:
@@ -419,6 +432,96 @@ def session_state_lock(state_dir: Path, session_id: str, timeout_sec: float = 1.
         os.close(fd)
 
 
+def _try_unlink_unheld_lock(lock_path: Path) -> bool:
+    """仅在确认无进程持有文件锁时删除陈旧 .lock 锚点，避免与活跃会话发生竞态。"""
+    if _is_reparse_or_link(lock_path):
+        return False
+    fd = -1
+    locked = False
+    try:
+        fd = os.open(lock_path, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0))
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+            return False
+        if os.name == "nt":
+            import msvcrt
+
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            locked = True
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            locked = True
+            lock_path.unlink(missing_ok=True)
+            return True
+    except OSError:
+        return False
+    finally:
+        if fd >= 0:
+            if os.name == "nt" and locked:
+                with contextlib.suppress(OSError):
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    import msvcrt
+
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            with contextlib.suppress(OSError):
+                os.close(fd)
+    if os.name == "nt" and locked:
+        with contextlib.suppress(OSError):
+            lock_path.unlink(missing_ok=True)
+            return True
+    return False
+
+
+def sweep_stale_lock_files(state_root: Path, anchor_dir: Optional[Path] = None) -> int:
+    """按受控周期低频清理超过保留天数的空闲 .lock 文件，不触碰任何原话归档与状态 JSON。"""
+    try:
+        if not state_root.is_dir() or _is_reparse_or_link(state_root):
+            return 0
+        guard_cfg = get_runtime_tunables("loop_guards", anchor_dir)
+        cleanup_days = _coerce_pos_int(guard_cfg.get("stale_lock_cleanup_days"), 7, minimum=1)
+        sweep_interval = _coerce_pos_int(guard_cfg.get("stale_lock_sweep_interval_sec"), 86400, minimum=60)
+        now = time.time()
+        stamp = state_root / ".lock_sweep.stamp"
+        try:
+            if stamp.is_file() and not _is_reparse_or_link(stamp) and (now - stamp.stat().st_mtime) < sweep_interval:
+                return 0
+        except OSError:
+            pass
+        with contextlib.suppress(OSError):
+            atomic_write_text(stamp, f"{int(now)}\n")
+        cutoff = now - cleanup_days * 86400
+        scan_dirs = [state_root]
+        for sub_name in ("handoff", "session-context", "user-words"):
+            sub_dir = state_root / sub_name
+            if sub_dir.is_dir() and not _is_reparse_or_link(sub_dir):
+                scan_dirs.append(sub_dir)
+        removed = 0
+        for folder in scan_dirs:
+            with contextlib.suppress(OSError):
+                for entry in os.scandir(folder):
+                    name = entry.name
+                    is_dot_lock = name.startswith(".") and name.endswith(".lock") and len(name) > 6
+                    is_legacy_lock = name.startswith("session-") and name.endswith(".json.lock")
+                    if not (is_dot_lock or is_legacy_lock):
+                        continue
+                    try:
+                        st = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    if not stat.S_ISREG(st.st_mode):
+                        continue
+                    if not is_legacy_lock and st.st_mtime > cutoff:
+                        continue
+                    if _try_unlink_unheld_lock(Path(entry.path)):
+                        removed += 1
+        return removed
+    except OSError:
+        return 0
+
+
 def current_iso_time() -> str:
     """返回带本机时区偏移的 ISO-8601 时间戳"""
     return datetime.now(timezone.utc).astimezone().isoformat()
@@ -657,7 +760,8 @@ def format_user_words_markdown(
             if item.get("log_path"):
                 lines.append(f"- **原始日志**: `{item['log_path']}`")
             lines.append("")
-            lines.append(summarize_subagent_return(item.get("content", ""), item_cap, head_ratio))
+            raw_sub_text = item.get("raw_body") if isinstance(item.get("raw_body"), str) and item.get("raw_body") else item.get("content", "")
+            lines.append(summarize_subagent_return(raw_sub_text, item_cap, head_ratio))
             lines.append("")
             lines.append("---")
             lines.append("")
@@ -943,17 +1047,23 @@ def extract_agy_archive(
                     continue
 
                 if step_type == "SYSTEM_MESSAGE" and not include_subagent_msgs:
-                    raw_sys = step.get("content")
-                    if isinstance(raw_sys, str):
+                    raw_sys = step.get("content") if isinstance(step.get("content"), str) else ""
+                    is_sys_noise = "BROWSER_HOST_FACTS" in raw_sys or any(
+                        noise in raw_sys for noise in SYSTEM_NOISE_PATTERNS
+                    )
+                    if not is_sys_noise:
                         sender_id, sub_body = _extract_agy_subagent_return_body(raw_sys)
-                        if sender_id and sub_body and (sender_id in subagent_registry or valid_session_id(sender_id)):
+                        valid_sender = bool(
+                            sender_id and sub_body and (sender_id in subagent_registry or valid_session_id(sender_id))
+                        )
+                        if valid_sender or (is_content_truncated and subagent_registry):
                             raw_subagent_returns.append(
                                 {
                                     "step_index": step_index,
                                     "created_at": created_at,
-                                    "sender": sender_id,
+                                    "sender": sender_id if valid_sender else "",
                                     "raw_content": raw_sys,
-                                    "fallback_body": sub_body,
+                                    "fallback_body": sub_body if valid_sender else "",
                                     "needs_full": is_content_truncated,
                                 }
                             )
@@ -986,24 +1096,51 @@ def extract_agy_archive(
         result["issues"].append(f"读取 {transcript_path.name} 失败（{exc}）")
 
     agy_policy = get_compaction_tunables("antigravity")
+    subagent_truncated_needed = {
+        item["step_index"] for item in raw_subagent_returns if item["needs_full"]
+    }
+
+    # 单次按需补全所有被截断的用户记录与子代理返回（仅用户记录计入 unresolved_steps 完整性门禁）
+    full_map = _load_truncated_contents_map(full_transcript_path, truncated_needed | subagent_truncated_needed)
+    unresolved_steps = sorted(truncated_needed.difference(full_map))
+
+    resolved_sub_candidates: List[Dict[str, Any]] = []
+    for sub_item in raw_subagent_returns:
+        s_idx = sub_item["step_index"]
+        sender_id = sub_item["sender"]
+        body_text = sub_item["fallback_body"]
+        still_truncated = bool(sub_item["needs_full"])
+        if sub_item["needs_full"] and s_idx in full_map:
+            full_sender, full_body = _extract_agy_subagent_return_body(full_map[s_idx])
+            if full_sender and full_body and (full_sender in subagent_registry or valid_session_id(full_sender)):
+                sender_id = full_sender
+                body_text = full_body
+                still_truncated = False
+            elif sender_id and full_body:
+                body_text = full_body
+                still_truncated = False
+        if not (sender_id and body_text and (sender_id in subagent_registry or valid_session_id(sender_id))):
+            continue
+        resolved_sub_candidates.append(
+            {
+                "step_index": s_idx,
+                "created_at": sub_item["created_at"],
+                "sender": sender_id,
+                "body_text": body_text,
+                "needs_full": still_truncated,
+            }
+        )
 
     def _agy_cand_label(item: Dict[str, Any]) -> str:
         meta = subagent_registry.get(item["sender"], {})
         return f"{meta.get('type_name') or ''} {meta.get('role') or ''} {item['sender']}".strip()
 
     recent_sub_candidates = select_recent_subagent_returns(
-        raw_subagent_returns,
+        resolved_sub_candidates,
         agy_policy,
-        body_getter=lambda item: item.get("fallback_body") or "",
+        body_getter=lambda item: item.get("body_text") or "",
         label_getter=_agy_cand_label,
     )
-    subagent_truncated_needed = {
-        item["step_index"] for item in recent_sub_candidates if item["needs_full"]
-    }
-
-    # 单次按需补全所有被截断的用户记录与最近子代理返回（仅用户记录计入 unresolved_steps 完整性门禁）
-    full_map = _load_truncated_contents_map(full_transcript_path, truncated_needed | subagent_truncated_needed)
-    unresolved_steps = sorted(truncated_needed.difference(full_map))
 
     results: List[Dict[str, Any]] = []
     turn_counter = 0
@@ -1044,13 +1181,8 @@ def extract_agy_archive(
     for sub_item in recent_sub_candidates:
         s_idx = sub_item["step_index"]
         sender_id = sub_item["sender"]
-        if sub_item["needs_full"] and s_idx in full_map:
-            _, full_body = _extract_agy_subagent_return_body(full_map[s_idx])
-            body_text = full_body or sub_item["fallback_body"]
-            still_truncated = False
-        else:
-            body_text = sub_item["fallback_body"]
-            still_truncated = bool(sub_item["needs_full"])
+        body_text = sub_item["body_text"]
+        still_truncated = bool(sub_item["needs_full"])
         meta = subagent_registry.get(sender_id, {})
         type_name = meta.get("type_name") or ""
         role_name = meta.get("role") or ""
@@ -1065,6 +1197,7 @@ def extract_agy_archive(
                 "agent_id": sender_id,
                 "label": label,
                 "log_path": meta.get("log_path") or "",
+                "raw_body": body_text,
                 "content": summarize_subagent_return(body_text, agy_archive_cap, agy_head_ratio),
                 "truncated": still_truncated,
             }
@@ -1592,6 +1725,11 @@ def extract_codex_session_words(
     seen_subagent_keys: Set[Tuple[str, str, str]] = set()
     raw_subagent_returns: List[Dict[str, Any]] = []
 
+    codex_policy = get_compaction_tunables("codex")
+    codex_archive_cap = int(codex_policy["archive_subagent_item_chars"])
+    codex_head_ratio = float(codex_policy["subagent_head_ratio"])
+    global_step_counter = 0
+
     for seg_path in segments:
         digest = hashlib.sha256()
         offset = 0
@@ -1604,6 +1742,7 @@ def extract_codex_session_words(
                 initial_size = before.st_size
                 for raw_line in f:
                     line_counter += 1
+                    global_step_counter += 1
                     if not raw_line.strip():
                         offset += len(raw_line)
                         digest.update(raw_line)
@@ -1630,7 +1769,7 @@ def extract_codex_session_words(
                     )
                     if isinstance(item_obj, dict):
                         item_type = item_obj.get("type")
-                        step_no = entry.get("ordinal") if isinstance(entry.get("ordinal"), int) else line_counter
+                        step_no = entry.get("ordinal") if isinstance(entry.get("ordinal"), int) else global_step_counter
                         ts_str = str(entry.get("timestamp") or "")
                         if item_type in ("function_call", "custom_tool_call"):
                             raw_tool = str(item_obj.get("name") or item_obj.get("tool_name") or "").strip()
@@ -1681,7 +1820,6 @@ def extract_codex_session_words(
                                     if dedup_key in seen_subagent_keys:
                                         continue
                                     seen_subagent_keys.add(dedup_key)
-                                    codex_policy = get_compaction_tunables("codex")
                                     raw_subagent_returns.append(
                                         {
                                             "step_index": step_no,
@@ -1689,15 +1827,14 @@ def extract_codex_session_words(
                                             "agent_id": sub_aid,
                                             "label": sub_label,
                                             "log_path": sub_log,
+                                            "raw_body": sub_body,
                                             "content": summarize_subagent_return(
-                                                sub_body,
-                                                int(codex_policy["archive_subagent_item_chars"]),
-                                                float(codex_policy["subagent_head_ratio"]),
+                                                sub_body, codex_archive_cap, codex_head_ratio
                                             ),
                                             "truncated": False,
                                         }
                                     )
-                    rec_id, record = _extract_codex_record(entry, fallback_step=line_counter)
+                    rec_id, record = _extract_codex_record(entry, fallback_step=global_step_counter)
                     if record is None:
                         continue
                     record["source_path"] = str(seg_path)
@@ -1748,11 +1885,12 @@ def extract_codex_session_words(
     for index, item in enumerate(words, start=1):
         item["turn"] = index
 
-    codex_policy = get_compaction_tunables("codex")
     return {
         "session_id": resolved_sid or session_id or "unknown",
         "words": words,
-        "subagent_returns": select_recent_subagent_returns(raw_subagent_returns, codex_policy),
+        "subagent_returns": select_recent_subagent_returns(
+            raw_subagent_returns, codex_policy, body_getter=lambda item: item.get("raw_body") or item.get("content") or ""
+        ),
         "segments": [str(p) for p in segments],
         "sources": sources,
         "issues": issues,
@@ -1990,14 +2128,41 @@ def claude_hook_session(payload: Dict[str, Any]) -> Tuple[str, Optional[Path], s
 
 
 def _claude_clean_text(text: str) -> str:
-    if re.search(r"<local-command-(?:stdout|caveat)\b", text, re.IGNORECASE):
+    stripped = text.strip()
+    while stripped:
+        lead = CLAUDE_INJECTED_TAG_RE.match(stripped)
+        if lead:
+            stripped = stripped[lead.end():].strip()
+            continue
+        # 尾部宿主自动追加的注入块同样剥离，但正文内部讨论同名标签时原样保留
+        tail_removed = re.sub(
+            r"(?:\s*<(ide_opened_file|ide_selection|ide_diagnostics|system-reminder)\b[^>]*>.*?</\1\s*>\s*)+\Z",
+            "",
+            stripped,
+            flags=re.DOTALL | re.IGNORECASE,
+        ).strip()
+        if tail_removed != stripped:
+            stripped = tail_removed
+            continue
+        break
+    if not stripped:
         return ""
-    text = CLAUDE_INJECTED_TAG_RE.sub("", text).strip()
-    command = re.search(r"<command-name>(.*?)</command-name>", text, re.DOTALL)
-    if command:
-        args = re.search(r"<command-args>(.*?)</command-args>", text, re.DOTALL)
-        return (command[1].strip() + (" " + args[1].strip() if args and args[1].strip() else "")).strip()
-    return text
+    if re.fullmatch(
+        r"(?:\s*<local-command-(?:stdout|stderr|caveat)\b[^>]*>.*?</local-command-(?:stdout|stderr|caveat)\s*>\s*)+",
+        stripped,
+        re.DOTALL | re.IGNORECASE,
+    ):
+        return ""
+    if re.fullmatch(
+        r"(?:\s*<command-(?:message|name|args)\b[^>]*>.*?</command-(?:message|name|args)\s*>\s*)+",
+        stripped,
+        re.DOTALL | re.IGNORECASE,
+    ):
+        command = re.search(r"<command-name>(.*?)</command-name>", stripped, re.DOTALL | re.IGNORECASE)
+        if command:
+            args = re.search(r"<command-args>(.*?)</command-args>", stripped, re.DOTALL | re.IGNORECASE)
+            return (command[1].strip() + (" " + args[1].strip() if args and args[1].strip() else "")).strip()
+    return stripped
 
 
 def _claude_answer_text(value: Any) -> str:
@@ -2149,6 +2314,7 @@ def _extract_claude_subagent_returns_from_user(
     line_index: int,
     pending_subagents: Dict[str, Dict[str, str]],
     transcript_path: Path,
+    claude_policy: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     if entry.get("isSidechain") is True or entry.get("isMeta") is True or entry.get("type") != "user":
         return []
@@ -2172,6 +2338,9 @@ def _extract_claude_subagent_returns_from_user(
     ):
         return []
 
+    policy = claude_policy if isinstance(claude_policy, dict) else get_compaction_tunables("claude")
+    archive_cap = int(policy["archive_subagent_item_chars"])
+    head_ratio = float(policy["subagent_head_ratio"])
     returns: List[Dict[str, Any]] = []
     ts_str = str(entry.get("timestamp") or "")
     for block, call_meta in matched:
@@ -2198,7 +2367,6 @@ def _extract_claude_subagent_returns_from_user(
             label = f"{sub_type} ({desc})"
         else:
             label = sub_type or desc or agent_id or "Agent"
-        claude_policy = get_compaction_tunables("claude")
         returns.append(
             {
                 "step_index": line_index,
@@ -2206,11 +2374,8 @@ def _extract_claude_subagent_returns_from_user(
                 "agent_id": agent_id,
                 "label": label,
                 "log_path": _resolve_claude_subagent_log(transcript_path, agent_id, explicit_log),
-                "content": summarize_subagent_return(
-                    body_text,
-                    int(claude_policy["archive_subagent_item_chars"]),
-                    float(claude_policy["subagent_head_ratio"]),
-                ),
+                "raw_body": body_text,
+                "content": summarize_subagent_return(body_text, archive_cap, head_ratio),
                 "truncated": False,
             }
         )
@@ -2228,6 +2393,7 @@ def extract_claude_user_words(transcript_path: Path) -> Dict[str, Any]:
     queued_index: Optional[int] = None
     question_ids: Set[str] = set()
     pending_subagents: Dict[str, Dict[str, str]] = {}
+    claude_policy = get_compaction_tunables("claude")
     try:
         with transcript_path.open("rb") as stream:
             before = os.fstat(stream.fileno())
@@ -2250,7 +2416,7 @@ def extract_claude_user_words(transcript_path: Path) -> Dict[str, Any]:
                 if pending_subagents:
                     subagent_returns.extend(
                         _extract_claude_subagent_returns_from_user(
-                            entry, line_index, pending_subagents, transcript_path
+                            entry, line_index, pending_subagents, transcript_path, claude_policy=claude_policy
                         )
                     )
                 text, kind = claude_user_content(entry, question_ids=question_ids)
@@ -2279,10 +2445,11 @@ def extract_claude_user_words(transcript_path: Path) -> Dict[str, Any]:
                         "observed_size": before.st_size, "sha256": digest.hexdigest()})
     except OSError as exc:
         issues.append(f"读取 Claude 轨迹失败（{exc}）")
-    claude_policy = get_compaction_tunables("claude")
     return {
         "words": words,
-        "subagent_returns": select_recent_subagent_returns(subagent_returns, claude_policy),
+        "subagent_returns": select_recent_subagent_returns(
+            subagent_returns, claude_policy, body_getter=lambda item: item.get("raw_body") or item.get("content") or ""
+        ),
         "issues": issues,
         "sources": sources,
         "complete": not issues,

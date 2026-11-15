@@ -866,6 +866,56 @@ class TestClaudeRouter(OfflineSandbox):
         self.assertEqual(handler.wfile.getvalue(), b"data: partial\n\n")
         connection.close.assert_called_once()
 
+    def test_chunked_request_401_cache_invalidation_and_ascii_error_reason(self):
+        # 1) Transfer-Encoding: chunked 正常解码转发与超上限 413 拦截
+        payload_bytes = json.dumps({"model": "deepseek-chat", "messages": []}).encode("utf-8")
+        chunked_stream = f"{len(payload_bytes):x}\r\n".encode("ascii") + payload_bytes + b"\r\n0\r\n\r\n"
+        handler = self.handler()
+        del handler.headers["Content-Length"]
+        handler.headers["Transfer-Encoding"] = "chunked"
+        handler.rfile = io.BytesIO(chunked_stream)
+        connection = self.upstream()
+        with mock.patch.object(router.http.client, "HTTPSConnection", return_value=connection), \
+                mock.patch.object(router, "card_key", return_value="tok_ds_unit_test"):
+            handler.do_POST()
+        sent_body = json.loads(connection.request.call_args.kwargs["body"])
+        self.assertEqual(sent_body["model"], "deepseek-chat")
+
+        too_large_handler = self.handler()
+        del too_large_handler.headers["Content-Length"]
+        too_large_handler.headers["Transfer-Encoding"] = "chunked"
+        too_large_handler.server.cfg["max_body_bytes"] = 8
+        too_large_handler.rfile = io.BytesIO(chunked_stream)
+        too_large_handler.do_POST()
+        self.assertEqual(too_large_handler.send_error.call_args.args[0], 413)
+
+        # 2) 上游返回 401 时自动失效密钥缓存，下次请求立即读取轮换后的新密钥
+        db = self.database()
+        admin.prepare_cards(db, 8240)
+        self.replace_card(db, "Kimi", {"env": {"ANTHROPIC_AUTH_TOKEN": "   ", "ANTHROPIC_API_KEY": "tok_old_key_01"}})
+        router.invalidate_card_key_cache({"ccswitch_db": str(db)}, "Kimi")
+        h401 = self.handler({"model": "kimi-k2"})
+        h401.server.cfg["ccswitch_db"] = str(db)
+        unauth_resp = mock.Mock(status=401, reason="Unauthorized")
+        unauth_resp.getheaders.return_value = [("Content-Type", "application/json")]
+        unauth_resp.read1.side_effect = [b'{"error":"invalid_key"}', b""]
+        unauth_conn = mock.Mock()
+        unauth_conn.getresponse.return_value = unauth_resp
+        with mock.patch.object(router.http.client, "HTTPSConnection", return_value=unauth_conn):
+            h401.do_POST()
+        self.assertEqual(unauth_conn.request.call_args.kwargs["headers"]["Authorization"], "Bearer tok_old_key_01")
+        self.replace_card(db, "Kimi", {"env": {"ANTHROPIC_AUTH_TOKEN": "tok_rotated_key_02"}})
+        self.assertEqual(router.card_key({"ccswitch_db": str(db)}, "Kimi"), "tok_rotated_key_02")
+
+        # 3) 非 ASCII 卡片名异常信息转换为纯 ASCII reason，确保 BaseHTTPRequestHandler Latin-1 编码安全
+        h_cn = self.handler({"model": "custom-cn"})
+        h_cn.server.cfg["default_key_from_card"] = "中文自定义卡"
+        h_cn.server.cfg["ccswitch_db"] = str(db)
+        h_cn.do_POST()
+        err_code, err_reason = h_cn.send_error.call_args.args[:2]
+        self.assertEqual(err_code, 502)
+        err_reason.encode("latin-1")
+
 
 class TestCCSwitchAdmin(OfflineSandbox):
     def test_schema_supported_newer_warns_and_older_rejected(self):
@@ -2138,6 +2188,41 @@ class TestClaudeInstallerAndUpgradeAudit(OfflineSandbox):
         meta = json.loads(meta_file.read_text(encoding="utf-8"))
         self.assertEqual(meta["sha256"], hashlib.sha256(md_file.read_bytes()).hexdigest())
         self.assertEqual(meta["count"], 1)
+
+    def test_direct_card_selected_never_triggers_false_router_start_action(self):
+        # 激活直连卡片（如 DeepSeek）且存在空白 ANTHROPIC_AUTH_TOKEN 回退 ANTHROPIC_API_KEY 时，
+        # 非沙箱态 --audit-upgrade --with-cc-router 不探测本地路由端口，也不误报 start_cc_router。
+        db = self.database()
+        self.install("--app", "claude", "--claude-home", self.claude_home, "--with-cc-router",
+                     "--ccswitch-db", db, "--disable-ccswitch-prompts")
+        admin.prepare_cards(db, 8240)
+        self.replace_card(db, "DeepSeek", {
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
+                "ANTHROPIC_AUTH_TOKEN": "   ",
+                "ANTHROPIC_API_KEY": "tok_ds_fallback_valid",
+                "ANTHROPIC_MODEL": "deepseek-reasoner",
+            }
+        })
+        admin.prepare_cards(db, 8240)
+        admin.switch_card(db, self.claude_home / "settings.json", "DeepSeek")
+        detection = {
+            "antigravity": {"native_installed": False},
+            "codex": {"native_installed": False},
+            "claude": {"native_installed": True},
+            "dsh": {"native_installed": False},
+            "cc_switch": {"native_installed": True},
+        }
+        loaded_admin = installer._load_ccswitch_admin(REPO_ROOT)
+        with mock.patch.object(installer, "_load_ccswitch_admin", return_value=loaded_admin), \
+                mock.patch.object(loaded_admin.urllib.request, "urlopen") as probe_http:
+            report = installer.audit_upgrade_status(
+                REPO_ROOT, self.plugin, self.codex, self.claude_home, db,
+                detection=detection, expect_cc_router=True, is_sandbox_run=False, app_scope="claude",
+            )
+        probe_http.assert_not_called()
+        self.assertNotIn("start_cc_router", report["summary"]["recommended_actions"])
+        self.assertTrue(report["summary"]["all_aligned"], report["summary"])
 
 
 if __name__ == "__main__":

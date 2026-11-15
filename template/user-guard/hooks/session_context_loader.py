@@ -216,8 +216,9 @@ def _reconcile_agy_controls(transcript_path: Path, state: Dict[str, Any], steps:
     if pending:
         signature = _agy_source_signatures(transcript_path)[1]
         now = time.time()
+        retry_sec = int(_resolve_loader_policy("antigravity")["archive_retry_interval_sec"])
         if (new_pending or signature != state["controlFullSignature"]
-                or now - state["controlFullCheckedAt"] >= ARCHIVE_RETRY_INTERVAL_SEC):
+                or now - state["controlFullCheckedAt"] >= retry_sec):
             full = user_words._load_truncated_contents_map(
                 transcript_path.parent / "transcript_full.jsonl", {int(index) for index in pending},
             )
@@ -472,15 +473,48 @@ def _scan_transcript_incrementally(
 
 # ④ 原话内联摘要与字符预算
 
+def _unclosed_markdown_fence(text: str) -> str:
+    fence = ""
+    for line in text.splitlines():
+        match = user_words.MARKDOWN_FENCE_RE.match(line)
+        if fence:
+            if match and match[1][0] == fence[0] and len(match[1]) >= len(fence) and not match[2].strip():
+                fence = ""
+        elif match:
+            fence = match[1]
+    return fence
+
+
+def _close_unbalanced_fence(text: str, max_len: Optional[int] = None) -> str:
+    if max_len is not None and len(text) > max_len:
+        text = text[:max_len]
+    fence = _unclosed_markdown_fence(text)
+    if not fence:
+        return text
+    closing = ("\n" if text and not text.endswith("\n") else "") + fence
+    if max_len is not None and len(text) + len(closing) > max_len:
+        keep = max(0, max_len - len(closing))
+        text = text[:keep]
+        fence = _unclosed_markdown_fence(text)
+        if not fence:
+            return text
+        closing = ("\n" if text and not text.endswith("\n") else "") + fence
+        if len(text) + len(closing) > max_len:
+            return text[:max_len]
+    return text + closing
+
+
 def _truncate_single_item(content: str, turn: int, max_chars: int = MAX_INLINE_ITEM_CHARS) -> str:
     if len(content) <= max_chars:
-        return content
+        return _close_unbalanced_fence(content)
     head_len = max(max_chars - 220, 200)
     tail_len = 120
+    head_part = _close_unbalanced_fence(content[:head_len].rstrip())
+    tail_part = _close_unbalanced_fence(content[-tail_len:].lstrip())
     return (
-        f"{content[:head_len].rstrip()}\n"
+        f"{head_part}\n"
         f"...[第 {turn} 条记录的中间部分省略]...\n"
-        f"{content[-tail_len:].lstrip()}"
+        f"{tail_part}"
     )
 
 
@@ -501,7 +535,8 @@ def _format_inline_subagent_section(
         label = str(item.get("label") or item.get("agent_id") or "subagent").strip()
         trunc_tag = " | 轨迹截断" if item.get("truncated") else ""
         log_hint = f"\n原始日志：{item['log_path']}" if item.get("log_path") else ""
-        body = user_words.summarize_subagent_return(item.get("content", ""), sub_item_cap, sub_head_ratio)
+        raw_sub_text = item.get("raw_body") if isinstance(item.get("raw_body"), str) and item.get("raw_body") else item.get("content", "")
+        body = _close_unbalanced_fence(user_words.summarize_subagent_return(raw_sub_text, sub_item_cap, sub_head_ratio))
         blk = f"· [{label} | Step {item['step_index']}{trunc_tag}]{log_hint}\n{body}"
         cost = len(blk) + (2 if chosen_blocks else 1)
         if used + cost > sub_total_cap:
@@ -577,7 +612,7 @@ def build_compaction_system_message(
     joined_all = "\n\n".join(formatted_blocks)
     if len(header_text) + len(joined_all) <= words_total_budget or not formatted_blocks:
         combined = header_text + joined_all + subagent_section
-        return combined if len(combined) <= total_cap else (header_text + joined_all)[:total_cap]
+        return combined if len(combined) <= total_cap else _close_unbalanced_fence(header_text + joined_all, total_cap)
 
     # 超出总预算时：按策略保留开篇立项轮次 + 逆序尽可能多地保留最近定论轮次
     kept_head = formatted_blocks[:1]
@@ -610,10 +645,10 @@ def build_compaction_system_message(
         words_rendered = header_text + "\n\n".join(kept_head + [omit_notice] + tail_blocks)
         if len(words_rendered) + len(subagent_section) <= total_cap:
             return words_rendered + subagent_section
-        return words_rendered[:total_cap]
+        return _close_unbalanced_fence(words_rendered, total_cap)
 
     combined_fallback = header_text + joined_all + subagent_section
-    return combined_fallback[:total_cap]
+    return _close_unbalanced_fence(combined_fallback, total_cap)
 
 
 # ⑤ Antigravity 恢复流程与兼容入口
@@ -775,6 +810,8 @@ def handle_context_check(payload: Dict[str, Any], event_name: str = "PreInvocati
         return {"injectSteps": []}
 
     state_dir, _ = get_data_dirs()
+    if event_name == "SessionStart":
+        user_words.sweep_stale_lock_files(state_dir, HOOKS_DIR)
     try:
         with user_words.session_state_lock(state_dir, conversation_id):
             return _handle_context_locked(conversation_id, event_name, explicit_source, transcript_path, state_dir)
@@ -808,6 +845,7 @@ def handle_codex_session_start(
     state_dir = Path(os.path.expanduser(state_dir_str)) if state_dir_str else (default_codex_home / "hooks" / "state" / "session-context")
     user_words_dir = (state_dir.parent / "user-words") if state_dir.name == "session-context" else (state_dir / "user-words")
     log_path = Path(os.path.expanduser(log_path_str)) if log_path_str else (default_codex_home / "hooks" / "logs" / "session-context.jsonl")
+    user_words.sweep_stale_lock_files(state_dir.parent if state_dir.name == "session-context" else state_dir, HOOKS_DIR)
 
     source = str(payload.get("source") or "unknown").strip()
     session_id, transcript, identity_error, skip = user_words.codex_hook_session(payload)
@@ -862,7 +900,7 @@ def handle_codex_session_start(
     )
     if len(full_context) > codex_cap:
         suffix = "\n（内联内容已截断，请查阅原话档案。）"
-        full_context = full_context[:codex_cap - len(suffix)] + suffix
+        full_context = _close_unbalanced_fence(full_context, codex_cap - len(suffix)) + suffix
 
     _append_codex_log(
         log_path,
@@ -894,6 +932,7 @@ def handle_claude_session_start(
     """Claude SessionStart：恢复原话并按宿主协议注入有界上下文。"""
     home = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude").expanduser()
     state_dir = Path(state_dir_str).expanduser() if state_dir_str else home / "hooks" / "state" / "session-context"
+    user_words.sweep_stale_lock_files(state_dir.parent if state_dir.name == "session-context" else state_dir, HOOKS_DIR)
     result = user_words.archive_claude_session_words(payload, state_dir)
     if result.get("skipped"):
         return {}
@@ -923,7 +962,7 @@ def handle_claude_session_start(
     # 路径、来源和时间戳也可能很长，最终输出仍须遵守 SessionStart 字符预算。
     if len(full_context) > claude_cap:
         suffix = "\n（内联内容已截断，请查阅原话档案。）"
-        full_context = full_context[:claude_cap - len(suffix)] + suffix
+        full_context = _close_unbalanced_fence(full_context, claude_cap - len(suffix)) + suffix
     if log_path_str:
         user_words.append_jsonl_log(Path(log_path_str).expanduser(), {
             "ts": get_current_iso_time(), "event": "SessionStart", "client": "claude",

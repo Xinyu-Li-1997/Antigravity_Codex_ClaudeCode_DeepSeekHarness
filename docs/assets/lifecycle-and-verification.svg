@@ -31,17 +31,17 @@
 
   <!-- Upper Lane: Interactive Lifecycle Hooks -->
   <rect x="24" y="70" width="1032" height="192" rx="10" class="lane-hook"/>
-  <text x="40" y="93" class="lane-hdr-g">A. 交互式主会话钩子管线（Antigravity / Codex / Claude Code 事件驱动 · 阈值读取 runtime_tunables）</text>
+  <text x="40" y="93" class="lane-hdr-g">A. 交互式主会话事件钩子管线（Antigravity / Codex / Claude Code 事件驱动 · 阈值读取 runtime_tunables）</text>
 
   <!-- Hook Step 1 -->
   <rect x="40" y="106" width="320" height="142" rx="7" class="card"/>
   <text x="52" y="126" class="card-hdr">① 恢复与调用前：动态双路恢复</text>
   <text x="52" y="143" class="mono">session_context_loader.py + user_words.py</text>
   <text x="52" y="162" class="body">• 无新压缩检查点：返回空对象（0 B 注入）</text>
-  <text x="52" y="180" class="body">• 压缩恢复时按 per_client 预算动态注入：</text>
-  <text x="64" y="198" class="body">- 全部人类原话与选项回答（保首轮总纲）</text>
+  <text x="52" y="180" class="body">• 先还原截断全文，再按 per_client 恢复：</text>
+  <text x="64" y="198" class="body">- 全部人类原话与问答选择（保首轮总纲）</text>
   <text x="64" y="216" class="body">- 保留最新及窗口内实质子代理摘要与指针</text>
-  <text x="64" y="234" class="body">- 与人类指令严格分区，防短回执挤占证据</text>
+  <text x="64" y="234" class="body">- 自动闭合截断代码围栏并与人类指令分区</text>
 
   <path d="M 360 177 L 380 177" class="arrow-g"/>
 
@@ -49,9 +49,9 @@
   <rect x="382" y="106" width="320" height="142" rx="7" class="card"/>
   <text x="394" y="126" class="card-hdr">② 工具执行前：写边界与防轮询门禁</text>
   <text x="394" y="143" class="mono">status_guard.py + handoff_gate.py</text>
-  <text x="394" y="162" class="body">• 拦截未获批项目外写删、重定向、worktree 与</text>
-  <text x="406" y="180" class="body">内联 Python AST 越界写入（无头子进程直接 deny）</text>
-  <text x="394" y="198" class="body">• 阻止对大小与修改时间未变的日志同区间重复读取</text>
+  <text x="394" y="162" class="body">• 拦截未获批项目外写删、重定向、worktree、</text>
+  <text x="406" y="180" class="body">编码子壳与 Python AST 越界写（无头直接 deny）</text>
+  <text x="394" y="198" class="body">• 阻止对大小与修改时间未变的日志同区间重读</text>
   <text x="394" y="216" class="body">• 达 handoff_thresholds 进入 drain / freeze，</text>
   <text x="406" y="234" class="body">阻断新开子代理与 git push，预留预算收尾</text>
 
@@ -63,9 +63,9 @@
   <text x="736" y="143" class="mono">reply_repeat_guard.py + handoff_gate.py</text>
   <text x="736" y="162" class="body">• 连续达 consecutive_wait_limit 输出无新数值</text>
   <text x="748" y="180" class="body">进展的短句等待时单次拦截（保留迭代残差汇报）</text>
-  <text x="736" y="198" class="body">• 冻结交接期核验已验证进展、Git 状态、未完成项</text>
+  <text x="736" y="198" class="body">• 冻结交接期核验已验证进展、Git 状态、待办项</text>
   <text x="748" y="216" class="body">及可复制的【新对话提示词】（含 GOAL_CANCELLED）</text>
-  <text x="736" y="234" class="body">• 生命周期日志按 lifecycle_log 上限滚动裁剪</text>
+  <text x="736" y="234" class="body">• 日志按上限滚动裁剪，低频清理空闲过期锁文件</text>
 
   <!-- Lower Lane: CAE Harness Closed-Loop Verification -->
   <rect x="24" y="278" width="1032" height="198" rx="10" class="lane-ver"/>

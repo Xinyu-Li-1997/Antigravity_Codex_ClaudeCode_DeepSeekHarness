@@ -96,29 +96,31 @@ wait_visible() {
 }
 
 RUNNING=$( { pgrep -u "$UID_CUR" -f "$PAT" || true; } | tr '\n' ' ')
-start_app
-
 if [ -n "$RUNNING" ]; then
-    echo "CC Switch already running (PID ${RUNNING% }); requested window restore."
-    for i in 1 2 3 4 5; do
-        sleep 1
-        [ "$( { pgrep -u "$UID_CUR" -f "$PAT" || true; } | wc -l)" -le 1 ] && break
-    done
-    for p in $(pgrep -u "$UID_CUR" -f "$PAT" || true); do
-        case " $RUNNING " in
-            *" $p "*) ;;
-            *) if kill "$p" 2>/dev/null; then echo "Terminated duplicate instance (PID $p)."; fi ;;
-        esac
-    done
-fi
-
-if wait_visible 4; then
-    exit 0
+    echo "CC Switch already running (PID ${RUNNING% }); requesting window restore."
+    st=$(window_state)
+    case "$st" in
+        VISIBLE|RESTORED)
+            echo "Window state: $st"
+            exit 0
+            ;;
+        NOTVISIBLE)
+            ;;
+        *)
+            echo "Windows RAIL visibility query unavailable; keeping running instance."
+            exit 0
+            ;;
+    esac
 else
-    status=$?
-    if [ "$status" -eq 2 ]; then
-        echo "Windows RAIL visibility query unavailable; skipping window check."
+    start_app
+    if wait_visible 4; then
         exit 0
+    else
+        status=$?
+        if [ "$status" -eq 2 ]; then
+            echo "Windows RAIL visibility query unavailable; skipping window check."
+            exit 0
+        fi
     fi
 fi
 

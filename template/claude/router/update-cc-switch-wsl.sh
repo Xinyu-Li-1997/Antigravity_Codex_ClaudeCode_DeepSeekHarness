@@ -46,7 +46,16 @@ else
         exit 2
     fi
     mkdir -p "$PKGS"
-    name="CC-Switch-v${ver}-Linux-x86_64.deb"
+    arch_raw="$(uname -m)"
+    case "$arch_raw" in
+        x86_64|amd64) deb_arch="x86_64" ;;
+        aarch64|arm64) deb_arch="aarch64" ;;
+        *)
+            echo "Unsupported CPU architecture for CC Switch Linux .deb: $arch_raw" >&2
+            exit 2
+            ;;
+    esac
+    name="CC-Switch-v${ver}-Linux-${deb_arch}.deb"
     deb="$PKGS/$name"
     want="$(curl -fsSL --proto '=https' --tlsv1.2 --connect-timeout 10 --max-time 30 \
         "https://api.github.com/repos/farion1231/cc-switch/releases/tags/v${ver}" \

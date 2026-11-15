@@ -96,11 +96,32 @@ def _run_repo_grounding_gate(repo_root: Path) -> Dict[str, Any]:
     return module.audit_doc_grounding(repo_root, repo_root)
 
 
+def _default_ttl_seconds(repo_root: Path | None = None) -> int:
+    candidates: list[Path] = []
+    env_profile = os.environ.get("CAE_FLEET_PROFILE", "").strip()
+    if env_profile:
+        candidates.append(Path(env_profile).expanduser())
+    if repo_root is not None:
+        candidates.append(repo_root / "template" / "user-guard" / "skills" / "cae-harness" / "fleet_profile.json")
+    candidates.append(Path(__file__).resolve().parents[2] / "cae-harness" / "fleet_profile.json")
+    for candidate in candidates:
+        try:
+            if candidate.is_file():
+                raw = json.loads(candidate.read_text(encoding="utf-8-sig"))
+                hd = ((raw.get("runtime_tunables") or {}).get("headless_dispatch") or {}) if isinstance(raw, dict) else {}
+                val = hd.get("fleet_state_ttl_sec") if isinstance(hd, dict) else None
+                if isinstance(val, int) and not isinstance(val, bool) and val > 0:
+                    return val
+        except (OSError, ValueError):
+            continue
+    return 86400
+
+
 def _repo_meta(repo_root: Path) -> Dict[str, str]:
     plugin_json = repo_root / "template" / "user-guard" / "plugin.json"
     skill_md = repo_root / "template" / "user-guard" / "skills" / "fleet-evolve" / "SKILL.md"
     profile_json = repo_root / "template" / "user-guard" / "skills" / "cae-harness" / "fleet_profile.json"
-    plugin_version = json.loads(plugin_json.read_text(encoding="utf-8")).get("version", "") if plugin_json.is_file() else ""
+    plugin_version = json.loads(plugin_json.read_text(encoding="utf-8-sig")).get("version", "") if plugin_json.is_file() else ""
     skill_sha256 = hashlib.sha256(skill_md.read_bytes()).hexdigest() if skill_md.is_file() else ""
     profile_sha256 = hashlib.sha256(profile_json.read_bytes()).hexdigest() if profile_json.is_file() else ""
     core_digest = hashlib.sha256()
@@ -207,16 +228,23 @@ def _int_field(data: Dict[str, Any], key: str, default: int, *, positive: bool =
     return parsed
 
 
-def _load_state(path: Path) -> Dict[str, Any]:
-    try:
-        raw = path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return {}
+def _load_state(path: Path, default_ttl: int = 86400) -> Dict[str, Any]:
+    raw = ""
+    for attempt in range(3):
+        try:
+            raw = path.read_text(encoding="utf-8-sig")
+            break
+        except FileNotFoundError:
+            return {}
+        except PermissionError:
+            if attempt == 2:
+                raise
+            time.sleep(0.02)
     loaded = json.loads(raw)
     if not isinstance(loaded, dict):
         raise ValueError("state file root must be a JSON object")
     if loaded:
-        _int_field(loaded, "ttl_seconds", 86400, positive=True)
+        _int_field(loaded, "ttl_seconds", default_ttl, positive=True)
         _int_field(loaded, "updated_at_epoch", 0)
         _int_field(loaded, "last_verified_epoch", 0)
     return loaded
@@ -231,10 +259,11 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("status", help="Read current bootstrap or approval phase without modifying disk")
 
+    default_ttl = _default_ttl_seconds()
     p_prop = sub.add_parser("propose", help="Record candidate client-model table and pause for user sign-off")
     p_prop.add_argument("--session-id", required=True)
     p_prop.add_argument("--summary", required=True, help="Brief summary of proposed role/model changes requiring user approval")
-    p_prop.add_argument("--ttl", type=int, default=86400)
+    p_prop.add_argument("--ttl", type=int, default=default_ttl)
 
     p_app = sub.add_parser("approve", help="Record explicit user sign-off on the proposed client-model table")
     p_app.add_argument("--session-id", required=True)
@@ -242,7 +271,7 @@ def main(argv: list[str] | None = None) -> int:
     p_rec = sub.add_parser("record-pass1", help="Record Pass 1 completion awaiting Master reload")
     p_rec.add_argument("--session-id", required=True)
     p_rec.add_argument("--target-master", required=True)
-    p_rec.add_argument("--ttl", type=int, default=86400)
+    p_rec.add_argument("--ttl", type=int, default=default_ttl)
     p_rec.add_argument("--force", action="store_true", help="Overwrite even if an active Pass 2 session has claimed the lock")
 
     p_ver = sub.add_parser("verify-pass2", help="Validate Pass 2 re-entry from a reloaded Master session")
@@ -263,37 +292,37 @@ def main(argv: list[str] | None = None) -> int:
             "error": str(exc),
         }, ensure_ascii=False, indent=2))
         return 2
-    state_file = _validated_state_file(repo_root)
-    meta = _repo_meta(repo_root)
+    try:
+        default_ttl = _default_ttl_seconds(repo_root)
+        state_file = _validated_state_file(repo_root)
+        meta = _repo_meta(repo_root)
+    except (ValueError, OSError) as exc:
+        print(json.dumps({"ok": False, "reason": "invalid_state_or_repo", "error": str(exc)}, ensure_ascii=False, indent=2))
+        return 2
     now = int(time.time())
 
     if args.cmd == "status":
         corrupt = False
         try:
-            saved = _load_state(state_file)
-        except ValueError:
+            saved = _load_state(state_file, default_ttl)
+        except (ValueError, OSError):
             saved = {}
             corrupt = True
         raw_phase = "CORRUPT" if corrupt else str(saved.get("phase") or "IDLE")
-        ttl = _int_field(saved, "ttl_seconds", 86400, positive=True)
-        updated = _int_field(saved, "updated_at_epoch", 0)
+        ttl = _int_field(saved, "ttl_seconds", default_ttl, positive=True) if not corrupt else default_ttl
+        updated = _int_field(saved, "updated_at_epoch", 0) if not corrupt else 0
         side_mismatch = bool(saved and saved.get("execution_side") != _side())
         active_phases = ("AWAITING_MASTER_RELOAD", "AWAITING_USER_APPROVAL")
         expired = bool(raw_phase in active_phases and (now - updated > ttl))
         aligned = _is_aligned_with_repo(saved, meta)
         stale_reason = "corrupt_state" if corrupt else None
-        if raw_phase == "AWAITING_MASTER_RELOAD":
+        if raw_phase in active_phases:
             if side_mismatch:
                 stale_reason = "side_mismatch"
             elif expired:
                 stale_reason = "expired_ttl"
             elif not aligned:
                 stale_reason = "repo_drift"
-        elif raw_phase == "AWAITING_USER_APPROVAL":
-            if side_mismatch:
-                stale_reason = "side_mismatch"
-            elif expired:
-                stale_reason = "expired_ttl"
         effective_phase = raw_phase if (raw_phase in active_phases and stale_reason is None) else "IDLE"
         print(json.dumps({
             "workspace_mode": "upstream_config_repo",

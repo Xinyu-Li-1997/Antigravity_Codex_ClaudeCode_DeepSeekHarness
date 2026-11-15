@@ -4,6 +4,27 @@
 
 ---
 
+## [1.14.0] - 2026-11-15
+
+完成全仓运行期定量参数（`runtime_tunables`）深度收口、会话生命周期钩子静态拆壳与截断全文恢复加固、无头编排器 JSON 解析与子进程树清理增强、本地分流代理与升级审计边界修复，以及全仓文档、子代理契约与矢量图的整篇重写润色：
+
+- **无头编排器、动态配置收口与状态锁加固（`fleet_profile.json`、`cae_harness.py`、`fleet_state.py`）**：
+  - 在 `fleet_profile.json` 的 `runtime_tunables` 中统一收口 Shell 包装深度上限（`max_wrapper_depth = 4`）、过期锁清理周期（`stale_lock_cleanup_days = 7`、`stale_lock_sweep_interval_sec = 86400`）、跨子系统副本上限（`interop_stage_max_mib = 64`）、审查并发数（`audit_max_workers = 4`）、双盲共识行号容差（`consensus_line_tolerance = 8`）、`agy` 强杀宽限与目录探测超时（`15s`／`30s`）、状态锁有效期（`fleet_state_ttl_sec = 86400`）及 WSL2 路由默认端口（`wsl_port = 8241`）；
+  - 重写 `_decode_output_json` 为外层代码围栏剥离、字符串内非法单反斜杠转义修复（兼容 Windows 路径与 LaTeX 公式）及 `JSONDecoder.raw_decode` 平衡对象扫描，修复正文中内嵌三重反引号代码片段或未转义反斜杠导致的 `dsh` 无头输出解析失败；
+  - 补充宿主环境变量自动识别调用方客户端、Windows Job Object 子进程树绑定强杀、`--clean-room` 配额回退自动排除 `agy`、双盲 `audit` 配额回退跳过对侧已占用客户端以保持双源独立、消费 `agy_retiring_patterns` 过滤退役模型，并修复 `audit_doc_grounding` 对单行闭合围栏、行内代码 `$VAR`、尖括号占位符、中英文相邻大写缩写及互补百分比的边界判定；
+  - 加固 `fleet_state.py` 对 UTF-8 BOM 的读取兼容、Windows 文件替换 `PermissionError` 短退避重试、`AWAITING_USER_APPROVAL` 阶段版本漂移校验及顶层异常结构化 JSON 输出。
+- **会话生命周期钩子安全与压缩恢复加固（`user_words.py`、`session_context_loader.py`、`status_guard.py`、`handoff_gate.py`、`reply_repeat_guard.py`）**：
+  - 引入稳定文件缓存键 `get_fleet_profile_cache_token`（含缺失负缓存与宿主全局插件目录路径兜底）及 `was_unpatched` 单元测试属性打桩基线保护，新增非阻塞低频清理空闲过期 `.lock` 锁文件机制；
+  - 修复 Antigravity `SYSTEM_MESSAGE` 长篇子代理返回触发 `truncated_fields` 时先回查 `transcript_full.jsonl` 还原完整正文再做实质筛选的顺序，保留 `raw_body` 消除归档与内联注入的双重摘要省略，保持 Codex 跨分段全局步骤号单调递增，收紧 Claude Code 包裹性系统块剥离规则，并在内联截断切中代码块时自动补齐闭合围栏且不超字符上限；
+  - 扩展 `status_guard.py` 支持 PowerShell `-EncodedCommand`／`-ec` UTF-16LE Base64 拆壳（非法编码保守拦截）、PowerShell 写删移复内置别名（`rd`、`ri`、`ni`、`ac`、`clc`、`mi`、`rni`、`cpi`，排除 `sc` 防误伤 Windows 服务查询）、GNU `cp/mv -t`／`--target-directory`（区分大小写 `-t` 与 `-T`）、`sys.executable`／`os.getcwd()`／`Path.cwd()` AST 静态求值，以及多子句命令链按滚动工作目录逐句检查重定向与内联 Python 脚本。
+- **安装器、本地分流代理与卡片管理边界修复（`install.py`、`router.py`、`ccswitch_admin.py`、`launch-cc-switch-wsl.sh`、`update-cc-switch-wsl.sh`）**：
+  - 修复 Windows 多版本 Codex CLI 按文件时间戳择新与 `DeepSeek Harness.exe` 探测、WSL2 互操作探测完整性标记、清理废弃 `session-*.json.lock`、私网 IPv4 `<private-ip>` 与自定义卡片 ID `<custom-card-id>` 脱敏，以及激活直连供应商卡片时不误探本地路由健康或误报 `start_cc_router`；
+  - 加固 `router.py` 支持 `Transfer-Encoding: chunked` 请求体解析与体积限制、空白 `ANTHROPIC_AUTH_TOKEN` 自动回退 `ANTHROPIC_API_KEY`、上游返回 `401`／`403` 时自动失效密钥缓存、中文卡片名 ASCII 错误短语编码保护，以及 `ccswitch_admin.py` 异常回滚时自动清理孤儿备份文件；完善 WSLg 启动脚本已有实例复用与 `.deb` 更新脚本架构自适应。
+- **全仓图文文档、规则与子代理模板整篇重写及回归单测扩展（`README.md`、`AGENTS.md`、`docs/`、`template/`、`tests/`）**：
+  - 结合 `--clean-room` 空上下文新读者盲读反馈，按自然平实工程书面语整篇重写全仓文档、全局规则、技能说明、三端 9 个 `readonly-*` 子代理配置与两张 SVG 矢量图，通过 `check-grounding --strict` 零黑名单核验并补齐全部新增边界的离线回归单测。
+
+---
+
 ## [1.13.0] - 2026-11-15
 
 完成五类角色槽位与运行期定量参数（`runtime_tunables`）全动态收口、压缩后高价值子代理实质筛选、零黑名单文档事实锚定硬门禁（`check-grounding`）、通用课题项目与上游配置仓库双场景分类隔离，以及全仓图文文档校准与国家留学基金委资助致谢补充：

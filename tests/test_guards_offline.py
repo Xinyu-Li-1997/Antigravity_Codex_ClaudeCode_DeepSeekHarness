@@ -1827,6 +1827,52 @@ class TestGuardsOffline(unittest.TestCase):
         self.assertEqual(freeze_cmd("sudo -u root git push origin main"), "deny")
         self.assertEqual(freeze_cmd("command -v git"), "allow")
 
+    def test_34_powershell_encoded_cmd_aliases_gnu_target_dir_and_clause_cwd(self) -> None:
+        import base64
+
+        parent_root = self.tmp_root / "proj34_parent"
+        project = parent_root / "solver_ws"
+        outside = parent_root / "outside_neighbor"
+        project.mkdir(parents=True)
+        outside.mkdir(parents=True)
+        out_posix = outside.as_posix()
+        base = {"conversationId": "guard-34", "cwd": str(project), "workspacePaths": [str(project)]}
+
+        def decide(cmd: str) -> str:
+            return status_guard.handle_pre_tool_use(
+                {**base, "toolCall": {"name": "run_command", "args": {"CommandLine": cmd}}}
+            )["decision"]
+
+        # 1) PowerShell -EncodedCommand / -ec Base64 拆壳检查与坏编码保守拦截
+        ps_bad = base64.b64encode(f"Remove-Item -Force '{out_posix}/secret.dat'".encode("utf-16le")).decode("ascii")
+        ps_good = base64.b64encode("Get-ChildItem -Name .".encode("utf-16le")).decode("ascii")
+        self.assertEqual(decide(f"powershell -NoProfile -EncodedCommand {ps_bad}"), "force_ask")
+        self.assertEqual(decide(f"pwsh -ec {ps_good}"), "allow")
+        self.assertEqual(decide("powershell -EncodedCommand !!!not_base64!!!"), "force_ask")
+
+        # 2) PowerShell 写删别名拦截（rd / ri / ni / cpi）与 sc.exe 只读服务查询放行
+        for ps_alias_cmd in (
+            f"rd {out_posix}/cache_dir",
+            f"ri {out_posix}/old.vtk",
+            f"ni {out_posix}/created.txt",
+            f"cpi local.txt {out_posix}/copied.txt",
+        ):
+            self.assertEqual(decide(ps_alias_cmd), "force_ask", ps_alias_cmd)
+        self.assertEqual(decide("sc query Spooler"), "allow")
+
+        # 3) GNU cp/mv -t / --target-directory 越界拦截与 -T 项目内放行
+        self.assertEqual(decide(f"cp -t {out_posix} mesh.msh"), "force_ask")
+        self.assertEqual(decide(f"mv --target-directory={out_posix} mesh.msh"), "force_ask")
+        self.assertEqual(decide("cp -T src_mesh.msh dst_mesh.msh"), "allow")
+
+        # 4) 非首句切换目录后的重定向/内联 Python 拦截，以及 sys.executable 子进程递归 AST 拦截
+        self.assertEqual(decide("echo step1 && cd .. && echo leaked > outside_neighbor/leak.txt"), "force_ask")
+        self.assertEqual(decide("echo step1 && cd .. && python -c \"open('outside_neighbor/leak.txt', 'w')\""), "force_ask")
+        self.assertEqual(
+            decide("python -c \"import subprocess, sys; subprocess.run([sys.executable, '-c', \\\"open('../outside_neighbor/x.txt', 'w')\\\"])\""),
+            "force_ask",
+        )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -67,6 +67,25 @@ RESIDUE_ENV = {
 
 
 def default_router_port() -> int:
+    here = Path(__file__).resolve()
+    candidates: List[Path] = []
+    env_override = os.environ.get("CAE_FLEET_PROFILE", "").strip()
+    if env_override:
+        candidates.append(Path(env_override).expanduser())
+    candidates.append(here.parent.parent / "skills" / "cae-harness" / "fleet_profile.json")
+    candidates.append(here.parents[2] / "user-guard" / "skills" / "cae-harness" / "fleet_profile.json")
+    for candidate in candidates:
+        try:
+            if candidate.is_file() and not _is_reparse_or_symlink(candidate):
+                doc = json.loads(candidate.read_text(encoding="utf-8-sig"))
+                rt = (((doc.get("runtime_tunables") or {}).get("headless_dispatch") or {}).get("router") or {})
+                if isinstance(rt, dict):
+                    key = "port" if os.name == "nt" else "wsl_port"
+                    val = rt.get(key)
+                    if isinstance(val, int) and not isinstance(val, bool) and 1 <= val <= 65535:
+                        return val
+        except (OSError, UnicodeError, ValueError, AttributeError):
+            continue
     return 8240 if os.name == "nt" else 8241
 
 
@@ -389,7 +408,13 @@ def inspect_status(
                     if invalid_json:
                         report["warnings"].append(f"Invalid JSON in provider card {app_type}:{name}")
                     env = cfg_obj.get("env") if isinstance(cfg_obj, dict) and isinstance(cfg_obj.get("env"), dict) else {}
-                    token_raw = env.get("ANTHROPIC_AUTH_TOKEN") or env.get("ANTHROPIC_API_KEY")
+                    raw_auth = env.get("ANTHROPIC_AUTH_TOKEN")
+                    raw_api = env.get("ANTHROPIC_API_KEY")
+                    token_raw = (
+                        raw_auth
+                        if isinstance(raw_auth, str) and raw_auth.strip()
+                        else (raw_api if raw_api is not None else raw_auth)
+                    )
                     entry = {
                         "id": row_id,
                         "app_type": app_type,
@@ -502,7 +527,7 @@ def prepare_cards(
 
     cards_spec = _build_card_templates(port, kimi_model, deepseek_model, max_context, compact_window)
     timestamp = time.strftime("%Y%m%d-%H%M%S") + f"-{time.time_ns()}"
-    backup_path = Path(f"{db_path}.bak-before-cards-{timestamp}")
+    backup_path: Optional[Path] = Path(f"{db_path}.bak-before-cards-{timestamp}")
 
     mode_flag = "ro" if dry_run else "rw"
     con = sqlite3.connect(db_path.resolve().as_uri() + f"?mode={mode_flag}", uri=True, timeout=15)
@@ -622,6 +647,11 @@ def prepare_cards(
     except BaseException:
         if not dry_run:
             con.rollback()
+            if backup_path is not None and backup_path.exists():
+                try:
+                    backup_path.unlink()
+                except OSError:
+                    pass
         raise
     finally:
         con.close()
@@ -704,6 +734,12 @@ def switch_card(
                     atomic_write_bytes(settings_path, original_bytes)
             finally:
                 con.rollback()
+                for orphan in (db_backup, settings_backup):
+                    if orphan.exists():
+                        try:
+                            orphan.unlink()
+                        except OSError:
+                            pass
             raise
         return {
             "dry_run": False,
@@ -730,6 +766,7 @@ def disable_prompts(
         return {"db_exists": False, "dry_run": dry_run, "disabled": [], "backup": None, "warnings": []}
 
     mode_flag = "ro" if dry_run else "rw"
+    backup_path: Optional[Path] = None
     con = sqlite3.connect(db_path.resolve().as_uri() + f"?mode={mode_flag}", uri=True, timeout=15)
     try:
         if not dry_run:
@@ -791,6 +828,11 @@ def disable_prompts(
     except BaseException:
         if not dry_run:
             con.rollback()
+            if backup_path is not None and backup_path.exists():
+                try:
+                    backup_path.unlink()
+                except OSError:
+                    pass
         raise
     finally:
         con.close()
@@ -816,6 +858,7 @@ def retire_prompts_and_skills(
         }
 
     mode_flag = "ro" if dry_run else "rw"
+    backup_path: Optional[Path] = None
     con = sqlite3.connect(db_path.resolve().as_uri() + f"?mode={mode_flag}", uri=True, timeout=15)
     try:
         if not dry_run:
@@ -897,6 +940,11 @@ def retire_prompts_and_skills(
     except BaseException:
         if not dry_run:
             con.rollback()
+            if backup_path is not None and backup_path.exists():
+                try:
+                    backup_path.unlink()
+                except OSError:
+                    pass
         raise
     finally:
         con.close()
