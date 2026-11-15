@@ -1,76 +1,124 @@
-# `user-guard`、`cae-harness` 与 `fleet-evolve` 底层架构、生命周期钩子及安全规范
+# 底层架构、生命周期钩子与实测数据说明
 
-本文是本仓库底层工程实现的**唯一技术真源（SSOT）**，集中记录全仓代码模块分区、四端宿主事件挂载协议、AST／Shell 静态边界守卫、本地混合分流路由、SQLite 原子切卡事务、全栈工具链耦合体检以及受控实机标定数据。日常科研与求解器协作流见[仓库总 README](../README.md)与[协作实践指南](workflow-guide.md)。
-
----
-
-## 一、全仓核心代码分区（仅依赖 Python 3.11+ 标准库）
-
-运行 `install.py` 后，四端配置各自落盘至宿主机全局根目录（`~/.gemini/config/plugins/user-guard`、`~/.codex`、`~/.claude`、`~/.dsh`），钩子并非后台常驻进程，而是宿主在特定生命周期节点通过 `stdin/stdout` JSON 同步调用的毫秒级标准库脚本：
-
-| 模块分组 | 源码路径 | 核心职责与安全不变量 |
-| --- | --- | --- |
-| **安装与全栈体检器** | `install.py`、`install.ps1`、`install.sh` | 软链接／目录联接（Reparse Point）越界防护、四端目标目录互不包含校验、基于 `tomllib` 的保留注释 TOML 更新、`_rules_equal` 规则正文精确对齐（完整检测 `R0–R11` 漂移同时保留用户自定义 `## 工具与...` 尾段）、Codex `hooks.json` 规范化无损比对、以及零写入 `--audit-upgrade`（含四端字节漂移、CC Switch 退役审计与 `_audit_host_toolchain` 三级工具链 ABI 耦合诊断） |
-| **五类共用生命周期钩子** | `template/user-guard/hooks/*.py` | `user_words.py`（UTF-8 流重配置、重解析点预检、原子写盘、跨平台文件锁、三端轨迹原话提取）、`session_context_loader.py`（检查点／恢复原话注入）、`status_guard.py`（`R4` 目录硬边界 AST／Shell 静态守卫与算例日志复合指纹防空转）、`reply_repeat_guard.py`（数值进展放行与空等刷屏阻断）、`handoff_gate.py`（长会话 `normal->advisory->drain->freeze` 四态收口与交接四要素校验） |
-| **四端无头编排与物理门禁** | `template/user-guard/skills/cae-harness/scripts/cae_harness.py` | 统一预检 `codex`、`agy`、`claude`/`cc`、`dsh` 底层 LLM／登录态／本地路由就绪度；匹配专长旗舰模型、单模型纯思考最高挡与声明最大窗口；按运行侧管理 `quota_exhausted` 冷却与零改动 `--fallback-on-quota` 顺位回退；单次 `lstat` 快照校验 `--write-scope`（含 `.github` 等受管隐藏目录）；Windows PowerShell `finally` 无条件进程树清理；WSL 跨子系统 `.cmd`/`.bat` `%`->`%%` 防环境变量注入转义；纯 `probe` 与 `--dry-run` 严格零写盘 |
-| **自举演进二阶段状态锁** | `template/user-guard/skills/fleet-evolve/scripts/fleet_state.py` | 独立存放于宿主机本地状态目录（零污染 Git 工作区）；采用 `msvcrt`/`fcntl` 跨平台文件锁保护并发读写，绑定 `execution_side`、`repo_root`、`repo_commit`、`plugin_version`、`skill_sha256`、`core_sha256` 与 `24h` TTL，并在 `verify-pass2` 中原子写入 `claimed_by_session_id` 阻断同会话死循环与多窗口重入竞态；损坏 JSON 自动暴露 `corrupt_state` |
-| **Claude 本地分流路由与切卡** | `template/claude/router/` | `router.py`（多线程本地 HTTP 分流：主请求走 Kimi `k3.1-pro[1m]`、子代理 `deepseek*` 走 DeepSeek 并强制 `max` 挡；内置 `64 MiB` 请求体上限返回 `413`、`BoundedSemaphore(64)` 并发上限返回 `503`、`60s` 套接字超时、SQLite 只读 URI 60s 密钥缓存及 WSL 5s 宿主代理／Fake-IP 跟随；原生 Linux 无 `powershell.exe` 时零子进程快速短路）；`ccswitch_admin.py`（符号链接写盘拦截、SQLite 在线原子备份、归档先于 `commit` 失败自动还原、切卡 `rollback` 前先恢复 `settings.json`、核验 `project_claude_settings` 与损坏 JSON 卡片状态）；WSLg 脚本收紧 `0700` 日志目录与当前用户进程匹配（`pgrep -u`／`pkill -u`）及 `curl --proto '=https' --tlsv1.2` |
+本文面向希望了解内部实现、排查钩子拦截原因或二次维护本仓库的工程师，说明全仓代码分工、四个客户端的配置文件挂载细节、每个钩子的触发条件与失败处理策略、本地分流服务参数，以及本机实测数据。日常安装与求解器协作用法见 [仓库总 README](../README.md) 与 [求解器研发实践指南](workflow-guide.md)。
 
 ---
 
-## 二、四端宿主事件挂载与运行态目录隔离
+## 一、核心代码模块职责一览
 
-1. **Google Antigravity（`template/user-guard/hooks.json`）**：
-   - 挂载 `SessionStart`、`PreInvocation`（`session_context_loader.py`）、`PreToolUse`（`status_guard.py`）与 `Stop`（`reply_repeat_guard.py` 内联调用 `handoff_gate.py`），通过 `stdin` 接收 camelCase JSON 并返回单行 JSON（协议见[反重力钩子文档](https://antigravity.google/docs/hooks)）。运行态游标（`state/`）与诊断日志（`logs/`）严格隔离在 `PLUGIN_DATA` 目录，`PLUGIN_ROOT` 保持纯只读。
-2. **OpenAI Codex（`template/codex/hooks.json`）**：
-   - 将钩子同步至 `~/.codex/hooks/`，在 `~/.codex/hooks.json` 挂载 `SessionStart`（`^(compact|resume)$`）、`PostCompact`、`UserPromptSubmit`、`PreToolUse`、`Stop` 五类事件（协议见[Codex 钩子文档](https://learn.chatgpt.com/docs/hooks)）。`install.py` 以规范化结构比对托管钩子，实质未变时不重写文件，保护客户端信任哈希。
-3. **Anthropic Claude Code（`template/claude/hooks.json`）**：
-   - 将 5 个钩子同步至 `~/.claude/hooks/`（运行态存于 `hooks/state/` 与 `hooks/logs/`），无损合并进 `~/.claude/settings.json` 顶层 `hooks` 键（自动清理旧版拆分式 `"args"` 条目并补齐 `effortLevel: "xhigh"`）。`cae-harness` 启动 `claude -p` 时刻意**不传 `--bare`**，使其在 Windows 与 WSL2 双侧完整继承 `~/.claude/CLAUDE.md`、激活的 CC Switch 卡片或本地 `router.py` 分流端点、只读子代理及五类钩子。
-4. **DeepSeek Harness（`DSH` 临时补丁协议）**：
-   - `install.py` 同步 `~/.dsh/AGENTS.md` 与 `~/.dsh/skills/`，绝不触碰 `.credentials.yaml`。因 `--profile headless` 默认禁用凭据插件，`cae-harness` 在系统临时目录生成一次性 `--patch` YAML 覆盖层，按实测就绪的 `deepseek-official` 或 `deepseek-account` 启用对应凭据插件并注入模型（`deepseek-v4-pro`／`deepseek-flash`）与 `reasoningEffort`，解码时自动剥离尾随泄漏的 `</｜｜DSML｜｜...>` 停止标签，结束后立即清理临时文件。
+全仓脚本仅使用 Python 3.11+ 标准库，钩子不是常驻后台服务，而是客户端在特定事件发生时通过标准输入输出（`stdin` / `stdout` JSON）单次调用的短脚本：
 
-> **解释器统一重写**：`install.py` 自动探测合规 Python 3.11+，将全部钩子命令重写为 `<python> -X utf8 -I -B ...`；未检出合规解释器时直接报错中止，绝不落盘失效钩子。
-
----
-
-## 三、关键确定性守卫与工具链体检机制细节
-
-### 1. 增量原话回溯与重解析点防御（`user_words.py` + `session_context_loader.py`）
-- **反重力增量游标**：每次 `PreInvocation` 从上次 `scannedByteOffset` 增量扫描 `transcript.jsonl`（$O(\Delta\text{bytes})$），遇 `truncated_fields` 精确回查 `transcript_full.jsonl`；未发生新 `CHECKPOINT` 时直接返回 `{"injectSteps": []}` 零开销。
-- **Codex 与 Claude Code 轨迹提纯**：Codex 跨 `sessions/` 与 `archived_sessions/` 合并同一逻辑会话分段并写入 `user-guard-codex-v2` SHA-256 校验清单；Claude Code 过滤 `isSidechain`、`isMeta` 与非 `AskUserQuestion` 的普通 `tool_result`。所有状态文件打开与原子替换前均执行 `_is_reparse_or_link` 校验，阻断符号链接／目录联接劫持。
-
-### 2. `R4` 目录硬边界静态分析与日志防空转（`status_guard.py`）
-- **合法放行白名单**：当前项目根目录（自动等价映射 Windows `<盘符>:/...` 与 WSL `/mnt/<盘符>/...`）、经真实物理路径核验的系统标准临时目录（`%TEMP%`、`$TMPDIR`、以及固定通过 `/usr/bin/python3 -B -I -c` 防 `PATH` 劫持核验的 WSL `/tmp`）、宿主会话记忆／轨迹／制品目录、标准 `.cache`/`$XDG_CACHE_HOME` 缓存区，以及显式指向临时沙箱的 `install.py` 回归命令。
-- **Shell 与内联 Python AST 深度静态解包**：
-  - 递归包装深度超过 `4` 层直接失败闭合拦截；剥离 `if`/`elif`/`while`/`until` 条件头与子壳分组 `( ... )`；精确解析 `env`（含 `-C` 切换目录）、`sudo`、`command`（跳过 `-v`/`-V` 纯查询）、`timeout` 参数；跨子句串联追踪 `cd`/`pushd` 当前工作目录变化；识别紧邻无空格重定向（如 `echo x>/outside/f`、`>|`、`<>`、`&>`）与外部 `git worktree add`。
-  - 识别 `python`/`python3`/`py` 及其组合短选项（如 `-Bc`、`-Ic`）内联代码与 `run_workflow` 脚本，按求值顺序追踪海象表达式、容器解包、分支合并、`pathlib.Path()` 无参当前目录、`.resolve()`/`os.path.abspath()` 以及 CAE 步号整数格式化（如 `f"field_{step:04d}.vtk"`）；交互会话返回请示（`ask`），无头子任务（`CAE_HARNESS_DEPTH=1`）直接拒绝（`deny`）。
-- **算例日志复合指纹防空转**：仅对 `.log`/`.out`/`.err`/`.output` 及宿主任务日志在相同读取范围且内容未变时阻断原地轮询，大文件采用头尾分块哈希避免 I/O 阻塞：
-$$\text{Fingerprint} = \begin{cases} (\text{mtime\_ns},\ \text{size},\ \text{SHA256}_{\text{full}}), & \text{size} \le 4\ \text{MiB} \\ (\text{mtime\_ns},\ \text{size},\ \text{SHA256}_{\text{head 1MiB} \parallel \text{tail 1MiB}}), & \text{size} > 4\ \text{MiB} \end{cases}$$
-
-### 3. 防刷屏守卫与长会话收口状态机（`reply_repeat_guard.py` + `handoff_gate.py`）
-- 短回复剥离时间戳后提取数值特征：只要迭代步数、残差量级或物理时间推进即正常放行，连续 3 次同质空等才提示静默等待后台唤醒。
-- 反重力四态收口机（`normal -> advisory -> drain -> freeze`）在进入 `freeze` 时统一记录 `enteredFreezeAtStep` 并刷新冻结提示，禁止新开子代理、`cae_harness.py` 与 `git push`；Codex 与 Claude Code 默认运行 `advisory` 提醒模式（可选 `enforce`）。
-
-### 4. 全栈工具链三级耦合体检（`install.py --audit-upgrade` `host.toolchain`）
-`audit_upgrade_status` 零写入扫描当前 Python 运行时的次版本、是否处于 `venv`/`conda` 隔离环境、`uv` 可用性、`git` 版本以及全局 `site-packages` 中已安装的编译型科学计算扩展包（`jax`、`jaxlib`、`jaxopt`、`scipy`、`matplotlib`、`torch`、`cupy`、`mpi4py`、`petsc4py`、`h5py`、`numba`、`vtk`、`gmsh`、`fenics-dolfinx`）：
-- 一旦检出宿主机全局非隔离 Python 直接挂载上述 ABI 敏感编译扩展且同时承担全局生命周期钩子解释器，立即在 `host.toolchain.coupling_warnings` 中生成显式耦合告警，指导 `fleet-evolve` 拦截跨次版本原地覆盖（如 `3.13 -> 3.14`）并推荐 `uv`／独立 `venv` 隔离方案。
+| 模块 | 源码路径 | 一句话职责 |
+| :--- | :--- | :--- |
+| **安装与环境体检脚本** | `install.py`、`install.ps1`、`install.sh` | 检查本机客户端与 Python 3.11+ 解释器，将规则、钩子、子代理和技能写入四个客户端的全局目录，并提供只读对齐与依赖耦合检查（`--audit-upgrade`） |
+| **原话提取与文件锁公共库** | `template/user-guard/hooks/user_words.py` | 从 Antigravity、Codex 与 Claude Code 本地会话记录中提取用户历轮原话，提供跨平台文件锁与符号链接防护 |
+| **压缩与恢复注入钩子** | `template/user-guard/hooks/session_context_loader.py` | 在发生上下文压缩或会话恢复时，将保存的用户原话路径与提醒注入当前轮次 |
+| **目录边界与日志轮询钩子** | `template/user-guard/hooks/status_guard.py` | 在调用写文件或命令行工具前，拦截未经授权的项目外写入，并阻止对未变化日志文件做原地重复读取 |
+| **防重复空等钩子** | `template/user-guard/hooks/reply_repeat_guard.py` | 在模型结束单轮回复时，拦截连续三次无新数值进展的“仍在运行请稍候”式刷屏回复 |
+| **长对话交接管理钩子** | `template/user-guard/hooks/handoff_gate.py` | 跟踪长对话压缩次数与读图体积，按阶段提醒或引导整理交接信息 |
+| **四端后台调用与验证脚本** | `template/user-guard/skills/cae-harness/scripts/cae_harness.py` | 检查四个客户端登录与模型就绪状态，启动独立无头子进程（支持 `--clean-room` 纯净模式），核对文件改动范围并运行 `--verify-cmd` |
+| **升级状态锁脚本** | `template/user-guard/skills/fleet-evolve/scripts/fleet_state.py` | 在需要手动重启主控客户端的两步升级流程中记录当前进度，防止重启后重复执行第一轮调研 |
+| **Claude 本地分流与切卡工具** | `template/claude/router/` | `router.py` 按主对话与子代理将请求分流至不同模型 API；`ccswitch_admin.py` 在线备份数据库并切换 CC Switch 供应商配置卡片 |
 
 ---
 
-## 四、受控实机验收与上下文压力标定数据
+## 二、四个客户端的挂载位置与无头隔离机制
 
-以下定量数据均在本机与独立临时沙箱中经真实宿主受控实测取得（完全脱敏）：
+`install.py` 安装时会先验证目标路径不包含指向外部目录的符号链接或 Windows 目录联接（Reparse Point），再探测可用的 Python 3.11+ 解释器，把钩子命令统一写成 `<python> -X utf8 -I -B ...`（若本机找不到 Python 3.11+ 则直接报错退出，不会写入无法运行的钩子）。
 
-1. **四端生命周期钩子与无头 CLI 往返实测**：
-   - **Codex CLI（Windows）**：`advisory` 五类事件真实触发且跨进程 `resume` 不重复累加压缩计数；`enforce` 准确拦截 `drain` 期 `git push` 与 `freeze` 期源码写改；无头 `codex:sol` 审查与门禁 `returncode=0`。
-   - **Antigravity CLI（Windows 与 WSL `Ubuntu-24.04`）**：双平台四类钩子原生触发；WSL 原生 Linux 链路（`side=posix`、`windows_interop=false`）下 `Hydrogen (High)` 写入任务以 `49.64s` 一次通过三单元周期通量差 9 组精确分数守恒验收，`Orchestrator (Carbon)` 在 `--timeout 900` 下以 `342.07s` 通过同一验收。
-   - **Claude Code CLI（Windows 与 WSL `Ubuntu-24.04`）**：Windows 侧不加 `--bare` 继承 CC Switch 卡片环境（`deepseek-flash[1M]`，`1,048,576` 配置窗口）驱动 `claude -p --output-format json --json-schema ... --tools Read,Grep,Glob` 一次返回 `returncode=0`、`changed_files=[]`；WSL 侧在宿主 TUN Fake-IP（`198.18.0.0/15`）环境下经本地 `router.py`（`127.0.0.1:8241` 自动跟随宿主代理）驱动原生 `claude` 一次返回 `returncode=0`，且预检对未挂代理的 WSL 直连 Fake-IP 卡片实现毫秒级拦截提示。
-   - **DeepSeek Harness CLI（Windows 原生与 WSL 互操作）**：裸装仅含 `deepseek-account` 官方登录态下，`probe`／`assess` 零写入检出双模型 `deepseek-v4-pro`／`deepseek-flash`（`1,048,576` 窗口）；双侧运行 `dsh:default` 只读审查均动态注入临时 `--patch` YAML 并精确提取末尾 `type="final"` 回执（`returncode=0`、`changed_files=[]`、`~/.dsh` 零改动）。
-2. **上下文窗口容量与自动检查点压缩边界压力标定**（合成随机口令语料，禁止调用工具或读盘，核对首／中／尾 6 处随机值）：
+1. **Google Antigravity（`~/.gemini/config/plugins/user-guard`）**：
+   - 挂载 `SessionStart`、`PreInvocation`、`PreToolUse`、`Stop` 四个事件（协议参考 [Antigravity Hooks 文档](https://antigravity.google/docs/hooks)）。
+   - 运行过程中产生的原话归档（`state/`）与日志（`logs/`）全部写入客户端提供的 `PLUGIN_DATA` 目录，插件安装目录自身保持只读。
+2. **OpenAI Codex（`~/.codex`）**：
+   - 将钩子脚本复制到 `~/.codex/hooks/`，在 `~/.codex/hooks.json` 挂载 `SessionStart`（匹配事件 JSON 中 `source` 字段满足正则 `^(compact|resume)$` 的压缩与恢复场景）、`PostCompact`、`UserPromptSubmit`、`PreToolUse`、`Stop` 五个事件（协议参考 [Codex Hooks 文档](https://learn.chatgpt.com/docs/hooks)）。
+   - 重复运行 `install.py` 时，如果托管钩子配置实质内容未变，脚本不会重写 `hooks.json`，以免变动文件哈希导致 Codex 重新弹出钩子信任确认。
+3. **Anthropic Claude Code（`~/.claude`）**：
+   - 将五个钩子复制到 `~/.claude/hooks/`，合并进 `~/.claude/settings.json` 的顶层 `hooks` 字段（自动升级旧版拆分式 `"args"` 写法；仅当原文件尚未设置 `effortLevel` 时补上默认 `"xhigh"`，除非用户显式传入 `--sync-model-defaults`，否则不会覆盖你原有的 `effortLevel`）。
+   - 常规模式下，`cae-harness` 调用 `claude -p` 时**不加 `--bare`**，以便完整沿用 `~/.claude/CLAUDE.md`、当前激活的 CC Switch 卡片、本地 `router.py` 分流服务和五个钩子。
+4. **DeepSeek Harness（`~/.dsh`）**：
+   - `install.py` 只更新 `~/.dsh/AGENTS.md` 与 `~/.dsh/skills/`，不读取也不修改 `.credentials.yaml`（目前四个客户端里只有 Antigravity、Codex、Claude Code 三端开放了本地生命周期钩子接口，`DSH` 尚无客户端钩子机制）。
+   - 因为 `dsh --profile headless` 默认关闭凭据插件，`cae-harness` 后台调用它时会在系统临时目录生成一份一次性 `--patch` YAML 配置文件，启用已就绪的 `deepseek-official`（读取 `DEEPSEEK_API_KEY`）或 `deepseek-account` 官方登录态并填入模型与推理强度，读取结果时自动剔除偶发尾随的 `</｜｜DSML｜｜...>` 停止标记，任务结束后立即删除临时文件。
+5. **无头调用常规模式 vs. `--clean-room` 纯净盲读模式**：
+   - 常规无头调用虽然没有历史聊天记录，但仍会加载上述全局规则、钩子、技能与项目根目录下的 `AGENTS.md`。
+   - 当传入 `cae_harness.py task --clean-room`（支持 `codex`、`claude`、`dsh` 的只读任务）时，脚本会在临时目录构造仅含登录凭据或环境变量的干净配置目录（`codex` 只复制 `auth.json` 与 `models_cache.json`；`claude` 启用 `--bare` 并传入仅含 `env` 的最小 `--settings`；`dsh` 只复制 `.credentials.yaml`），同时在只读工作区镜像中排除 `AGENTS.md` 与 `CLAUDE.md`，实现真正的零规则、零钩子、零技能纯净环境。
 
-| 测试对象与场景 | 实测输入规模与宿主行为 | 命中率与工程设计结论 |
-| --- | --- | --- |
-| Codex `GPT-6.1-Sol`（分轮累积，同轮提取） | 单次请求输入达 `808,892` token（占宿主 `828,400` 有效窗口 **97.65%**），未触发压缩 | **6/6 精确命中**，证实 `872,000` 声明最大窗口下的超长同轮检索真实可用 |
-| Codex 单条 RPC 载荷上限探针 | 单条 `3,444,360` 字符被 `turn/start` 拒绝，服务端返回单条上限 `1,048,576` 字符 | 超长源码或算例日志须让模型在工作目录内按文件读取或分轮送入 |
-| 反重力 CLI `Hydrogen`（单条超大输入探针） | 单条 44～66 万字节消息出现入口截断标记 | CLI 无头单条提示词不宜过长，大体积材料应走文件读取 |
-| 反重力 CLI `Hydrogen`（分块累积与检查点标定） | 每轮约 13 万字节无截断：累积至 `241,625` token 时未压缩，**6/6 精确命中**；继续追加至 `290,028` token 触发自动检查点压缩，输入降至 `14,063` token | 自动检查点压缩后早期散落细节无法仅凭摘要还原（0/6），直接证实了**检查点后从磁盘恢复用户原话**与**将大体积源码分流至独立窗口子代理／大窗口无头后端**的必要性 |
+---
+
+## 三、钩子拦截行为一览、异常兜底策略与关闭方法
+
+### 1. 哪些操作会被放行或拦截
+
+| 钩子脚本 | 触发时机 | 默认放行什么 | 什么情况下会提醒或拦截 | 拦截后的表现 |
+| :--- | :--- | :--- | :--- | :--- |
+| `session_context_loader.py` | 会话恢复、压缩后或每轮调用前 | 未发生新压缩时直接返回空结果，不注入额外内容 | 检测到新的上下文压缩（`CHECKPOINT` / `compact`）或跨会话恢复（`resume`） | 自动注入已保存的用户原话文件路径与核对提示，从不阻断会话 |
+| `status_guard.py`（目录边界） | 写文件或执行命令前（`PreToolUse`） | 当前项目根目录（自动互通 Windows `D:/...` 与 WSL `/mnt/d/...`）、系统临时目录（`%TEMP%`、`$TMPDIR`、`/tmp`）、客户端会话记忆与制品目录、标准 `.cache` 目录 | 写文件、Shell 重定向、`git worktree add` 或内联 Python / `run_workflow` 脚本试图创建、修改、删除上述范围之外的路径；或命令嵌套超过 `4` 层、目标写路径无法静态确认 | **交互会话**弹出确认框（Antigravity 返回 `force_ask`，Claude 返回 `ask`），由你决定是否批准；**后台无头子任务**（`CAE_HARNESS_DEPTH=1`）直接拒绝（`deny`） |
+| `status_guard.py`（日志防空读） | 读取文件或运行只读查看命令前（`PreToolUse`） | 正常阅读任何源码；首次读取 `.log` / `.out` / `.err` 日志、算例写出新内容后再次读取、或改换读取起止行号与查询参数翻页查看 | 连续**第 2 次**用完全相同的行号区间（`StartLine` / `EndLine` / `ByteOffset`）或完全相同的命令参数去读同一个未发生任何变化的日志文件 | 返回拒绝提示，请模型等待后台任务通知或改读其他内容；一旦日志文件大小、修改时间或内容哈希变化立即自动放行 |
+| `reply_repeat_guard.py` | 单轮回复结束时（`Stop`） | 所有正常技术汇报、向用户提问拍板的回复，以及包含新迭代步数、新残差值或新物理时间的进度回复 | 同一用户回合内，连续 **3 次**输出长度不超过 300 字、不含新数值进展的同质等待短句（如反复说“仍在后台运行，请稍候”） | 每回合最多提醒 1 次，要求简明结束本轮等待后台唤醒 |
+| `handoff_gate.py` | 压缩后、工具调用前与回复结束时 | Codex 与 Claude Code 默认处于 `advisory` 模式，仅做非阻断文字提醒；Antigravity 在压缩未超阈值前完全静默 | Antigravity 累积压缩达 11 次进入 `advisory` 提醒，达 16 次（或轨迹超 `6 MiB`、读图超 `100 MiB`）依次进入 `drain`（允许最多 4 轮调用 / 8 次收尾操作）和 `freeze` | `drain` / `freeze` 期间禁止新开子代理、`cae_harness.py` 与 `git push`，引导写清：**① 已验证进展、② Git 状态、③ 待办事项、④ 新对话提示词**（你在对话里说“暂不交接 / 继续当前对话”即可延后） |
+
+> **为什么只有 Antigravity 默认启用四阶段交接控制，而 Codex / Claude 默认用 `advisory` 提醒？** 因为 Antigravity 桌面与 CLI 在约二十多万 token 时就会触发自动检查点压缩，且提供了精确的检查点与读图遥测；而 Codex（`872k`）与 Claude Code（`1M`）单会话窗口更大，默认只发提醒更符合终端使用习惯。若希望在终端也强制拦截，安装时传 `--codex-handoff-mode enforce` 或 `--claude-handoff-mode enforce` 即可。
+
+### 2. 钩子自身出错时会不会卡死会话？
+
+日常对话不会被未预期异常卡死，钩子按场景区分处理：
+- **分析目标命令时的保守原则**：在 `status_guard.py` 正常解析命令期间，如果遇到超过 `4` 层嵌套包装（如多层 `bash -c` 套 `python -c`）或无法静态确定写入位置的参数解包，按“不确定即询问”处理（交互窗口弹确认框 `force_ask` / `ask`，后台无头任务拒绝 `deny`）。
+- **钩子未预期异常的默认放行与两条安全例外**：钩子最外层 `main()` 捕获到未预期异常时默认放行或仅附带提示（Antigravity 将堆栈写入 `logs/lifecycle.log` 并返回 `{"decision": "allow"}` 或 `{"injectSteps": []}`；Claude 与 Codex 输出到 `stderr` 并返回 `{}` 或异常提示文本），但保留两处显式安全例外：① 若当前会话已生成交接状态文件（`<conversation_id>_handoff_gate.json`）而读取校验时发现该文件损坏，返回 `deny` 防止交接冻结期失守；② `session_context_loader.py` 在 Codex 或 Claude 下收到非合法 JSON 标准输入时以退出码 `2` 报错。
+- **大日志文件哈希保护**：检查日志文件是否变化时，`4 MiB` 以内的日志计算全文 SHA-256；超过 `4 MiB` 的大算例日志只取文件开头 `1 MiB` 和末尾 `1 MiB` 连同文件大小、纳秒级修改时间一起计算指纹，避免读几百兆残差日志时卡顿磁盘。
+
+### 3. 排查日志位置与临时关闭方法
+
+- **查看钩子诊断日志**：Antigravity 位于 `~/.gemini/antigravity/plugin_data/user-guard/logs/`；Codex 位于 `~/.codex/hooks/logs/`；Claude Code 位于 `~/.claude/hooks/logs/`。
+- **临时关闭或卸载**：
+  - 交互会话中遇到 `status_guard.py` 拦截合理的项目外写入时，直接在客户端弹窗点击允许即可单次放行；
+  - 关闭 Codex 或 Claude Code 的长对话提醒：`python -B install.py --app codex --codex-handoff-mode off`（或 `--app claude --claude-handoff-mode off`）；
+  - 在 Antigravity 界面插件管理器中可随时一键禁用 `user-guard` 插件。
+
+---
+
+## 四、本地混合分流路由、CC Switch 切卡与工具链耦合检查
+
+### 1. Claude Code 本地分流服务（`template/claude/router/router.py`）
+- **它做什么**：在 `127.0.0.1`（Windows 默认端口 `8240`，WSL 默认端口 `8241`）启动一个纯标准库多线程 HTTP 服务，把 Claude Code 主会话请求转发给 Kimi（`k3.1-pro[1m]`），把子代理（模型名以 `deepseek` 开头）转发给官方 DeepSeek API 并自动加上 `max` 推理强度。
+- **关键保护参数与设置原因**：
+  - 单次请求体上限 `64 MiB`（超出返回 HTTP `413`）：防止误把整个网格文件或大型 VTK 流场塞进请求导致内存暴涨；
+  - 最大并发请求数 `64`（`BoundedSemaphore(64)`，超出返回 HTTP `503`）与空闲连接超时 `60 秒`：防止异常循环打满本地端口；
+  - SQLite 只读 URI `60 秒` 密钥缓存：减少每次转发重复读盘；
+  - WSL 环境在转发请求时按需探测 Windows 宿主代理与 TUN Fake-IP（`198.18.0.0/15`）网段，探测结果在内存中缓存 `5 秒`（`powershell.exe` 查询超时 `8 秒`；纯原生 Linux 且无 `powershell.exe` 时直接跳过探测，不额外起子进程）。
+
+### 2. CC Switch 安全切卡（`template/claude/router/ccswitch_admin.py`）
+- 切换供应商卡片前，脚本先拒绝任何符号链接目标，再通过 SQLite 在线备份接口备份 `cc-switch.db` 与 `~/.claude/settings.json`；
+- 切卡时只替换模型名称与连接环境变量，保留 `settings.json` 中的五个生命周期钩子和 `effortLevel`；若数据库提交失败，优先还原 `settings.json` 再回滚事务。
+
+### 3. 为什么钩子已经用了 `-I` 隔离模式，还要做全局 Python 依赖耦合检查？
+- 钩子启动命令带有 `python -I`（隔离模式，不加载用户 `site-packages`），所以你装任何第三方包都不会把钩子搞崩。
+- **但反过来有风险**：如果宿主机全局 Python 里已经装了 `jax`、`jaxlib`、`scipy`、`mpi4py`、`petsc4py`、`torch`、`h5py` 等带 C/C++/Fortran 编译扩展的科学计算库（与具体次版本如 `cp313` 绑定），一旦在“全套升级”时把全局 Python 从 `3.13` 原地替换成 `3.14`，这些编译扩展会集体失效。
+- 因此 `install.py --audit-upgrade` 会在**不改任何文件**的前提下扫描全局 `site-packages`，一旦发现这类编译扩展，就在 `host.toolchain.coupling_warnings` 中输出警告，供 [`fleet-evolve`](../template/user-guard/skills/fleet-evolve/SKILL.md) 第 2 阶段识别并阻止跨次版本原地升级。
+
+---
+
+## 五、本机实测记录与上下文窗口测试数据
+
+### 1. 三个“上下文窗口”数字分别是什么意思
+
+阅读模型参数或 `cae_harness.py probe` 输出时，会看到三个不同口径的窗口数值：
+- **模型声明最大窗口**：模型目录或内置契约标明支持的最大上下文长度（如 Codex `GPT-6.1-Sol` / `Astra` 为 `872,000` token，Gemini 4 与 DeepSeek 为 `1,048,576` token）；`cae-harness` 调用 Codex 时会显式传入 `-c model_context_window=872000`。
+- **客户端配置窗口**：用户在客户端配置文件或 CC Switch 卡片中填写的窗口上限（如 `1,000,000` 或 `1,048,576` token）。
+- **有效可用窗口与安全输入预算**：扣除模型有效上下文比例（如 Codex 模型缓存声明有效比 `95%`，即 `828,400` token）及输出预留（默认预留 `10%`）后，`cae-harness audit` 用于计算单批最多送审多少源码的预算值。
+
+### 2. 四端真机无头调用与钩子实测记录（已去除个人路径与硬件信息）
+
+- **Codex CLI（Windows）**：`advisory` 模式下五类钩子正常触发，跨进程 `resume` 不重复累加压缩次数；`enforce` 模式下准确拦住 `drain` 阶段的 `git push` 与 `freeze` 阶段的源码修改；后台 `codex:sol` 只读审查（含 `--clean-room` 模式）与 `gate` 验证返回码均为 `0`。
+- **Antigravity CLI（Windows 与 WSL `Ubuntu-24.04`）**：双侧四类钩子正常触发；在三单元一维周期网格通量差离散守恒测试（检验 9 组有理数通量组合下右端项之和精确为零）中，WSL 原生 Linux 环境下的 `Hydrogen (High)` 约 `50 秒` 一次通过，`Orchestrator (Carbon)` 在放宽超时后约 `5 分 40 秒` 通过。
+- **Claude Code CLI（Windows 与 WSL `Ubuntu-24.04`）**：Windows 侧常规模式与 `--clean-room` 模式调用 `claude -p` 均一次返回 `returncode=0`、`changed_files=[]`；WSL 侧在宿主开启 TUN Fake-IP 环境下通过本地 `router.py`（`127.0.0.1:8241`）成功完成无头审查，且预检逻辑可在启动前直接提示未配置代理的 Fake-IP 直连卡片。
+- **DeepSeek Harness CLI（Windows 原生与 WSL 跨系统调用）**：在仅配置官方登录凭据的环境下，`probe` 与 `assess` 零写入识别出 `deepseek-v4-pro` 与 `deepseek-flash`；常规模式与 `--clean-room` 模式下的只读审查均正常返回结构化 JSON（`returncode=0`、`changed_files=[]`、`~/.dsh` 原文件零改动）。
+
+### 3. 上下文长度与自动压缩边界测试记录
+
+以下测试使用合成随机口令文本（禁止模型调用工具或读盘，在文本首、中、尾共埋入 6 处随机口令并在同一轮末尾抽检）：
+
+| 测试对象与方式 | 实测输入规模与客户端表现 | 本次抽检结果与工程启示 |
+| :--- | :--- | :--- |
+| Codex `GPT-6.1-Sol`（分轮追加，同轮抽检） | 单次请求累积至约 `80.9 万` token（占 `828,400` 有效窗口约 `97.7%`），未触发自动压缩 | 本次 6 处随机口令 **6/6 命中**，说明在显式传入 `872,000` 窗口参数后，分轮送入长文本做同轮核对是可行的 |
+| Codex 单条消息长度上限测试 | 单条传入约 `344 万` 字符时被 `turn/start` 接口拒绝，服务端返回单条上限为 `1,048,576` 字符 | 超长源码或大算例日志不能硬塞进单条提示词，应让子进程在目录内按文件读取 |
+| Antigravity CLI `Hydrogen`（单条超长输入测试） | 单条消息达到 `44 万～66 万` 字节时出现入口截断标记 | CLI 单条提示词不宜过长，大体积材料应改走文件读取 |
+| Antigravity CLI `Hydrogen`（分轮累积与压缩测试） | 每轮追加约 `13 万` 字节：累积至约 `24.2 万` token 时未压缩，**6/6 命中**；继续追加至约 `29.0 万` token 时触发自动检查点压缩，上下文被压缩至约 `1.4 万` token | 触发自动压缩后，早期散落在正文里的随机细节仅凭压缩摘要已无法还原（0/6），说明**压缩后从磁盘恢复用户原话**以及**把大体积源码分流给独立子代理或大窗口后台进程**确有必要 |

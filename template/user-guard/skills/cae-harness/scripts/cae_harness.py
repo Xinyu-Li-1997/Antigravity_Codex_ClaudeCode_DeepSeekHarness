@@ -524,13 +524,18 @@ def _ps_literal(text):
     return "'" + text.replace("'", "''") + "'"
 
 
-def _stage_wsl_readonly_workspace(target_dir, stage_root, rel_files=None):
-    """将纯 Linux 文件镜像到 Windows 临时盘；清单不能逃出原目标树。"""
+def _stage_wsl_readonly_workspace(target_dir, stage_root, rel_files=None, *, exclude_agent_instructions=False):
+    """将只读目标文件镜像到临时目录；清单不能逃出原目标树。"""
     target_dir = target_dir.resolve()
     stage_dir = stage_root / 'workspace'
     stage_dir.mkdir(parents=True, exist_ok=True)
     if rel_files is None:
         records = collect_target_files(target_dir)
+        if exclude_agent_instructions:
+            records = [
+                item for item in records
+                if Path(item['rel_path']).name.upper() not in ('AGENTS.MD', 'CLAUDE.MD')
+            ]
     else:
         records = []
         for rel in rel_files:
@@ -2846,9 +2851,14 @@ def _backend_diagnostics(result, *, structured_only=False):
 
 def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, timeout_sec=600,
                   agent='readonly-collaborator', stage_files=None, effort=None, retry_quota=False,
-                  *, profile=None, batch=None, receipt=None):
+                  *, profile=None, batch=None, receipt=None, clean_room=False):
     batch = batch or _QuotaBatch(retry_quota)
     prefix, _ = _engine_parts(spec)
+    if clean_room:
+        if not readonly:
+            raise HarnessError('--clean-room 仅支持只读任务，写入任务必须保留全局安全钩子')
+        if prefix == 'agy':
+            raise HarnessError('agy 后端不支持剥离全局插件目录，--clean-room 请选用 codex、claude 或 dsh')
     info = backends.get(prefix, {})
     if not info.get('available'):
         raise HarnessError(f'未发现所选后端 {prefix}')
@@ -2886,29 +2896,76 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
         output_file = temp_path / 'result.json'
         env = os.environ.copy()
         env['CAE_HARNESS_DEPTH'] = '1'
-        if prefix == 'codex' and info.get('config_home') and not interop:
-            env['CODEX_HOME'] = info['config_home']
+        effective_codex_home = info.get('config_home')
+        effective_dsh_home = info.get('config_home')
+        clean_claude_settings = None
+        if clean_room:
+            src_home = Path(info['config_home']) if info.get('config_home') else None
+            if prefix == 'codex':
+                clean_codex = temp_path / 'clean-codex-home'
+                clean_codex.mkdir(parents=True, exist_ok=True)
+                if src_home and src_home.is_dir():
+                    for fname in ('auth.json', 'models_cache.json'):
+                        fsrc = src_home / fname
+                        if fsrc.is_file() and not _is_link(fsrc):
+                            shutil.copy2(fsrc, clean_codex / fname)
+                effective_codex_home = str(clean_codex)
+            elif prefix == 'claude':
+                env_only = {}
+                if src_home and (src_home / 'settings.json').is_file() and not _is_link(src_home / 'settings.json'):
+                    try:
+                        raw_cfg = json.loads((src_home / 'settings.json').read_text(encoding='utf-8-sig'))
+                    except (OSError, ValueError):
+                        raw_cfg = {}
+                    if isinstance(raw_cfg, dict) and isinstance(raw_cfg.get('env'), dict):
+                        env_only = {'env': raw_cfg['env']}
+                clean_claude_settings = temp_path / 'clean-claude-settings.json'
+                clean_claude_settings.write_text(json.dumps(env_only, ensure_ascii=False), encoding='utf-8')
+            elif prefix == 'dsh':
+                clean_dsh = temp_path / 'clean-dsh-home'
+                clean_dsh.mkdir(parents=True, exist_ok=True)
+                if src_home and (src_home / '.credentials.yaml').is_file() and not _is_link(src_home / '.credentials.yaml'):
+                    shutil.copy2(src_home / '.credentials.yaml', clean_dsh / '.credentials.yaml')
+                effective_dsh_home = str(clean_dsh)
+        if prefix == 'codex' and effective_codex_home and not interop:
+            env['CODEX_HOME'] = effective_codex_home
         if prefix == 'claude' and not interop and (os.environ.get('CAE_CLAUDE_HOME') or os.environ.get('CLAUDE_CONFIG_DIR')):
             env['CLAUDE_CONFIG_DIR'] = info['config_home']
         if prefix == 'dsh':
             env['DSH_TELEMETRY_DISABLED'] = '1'
-            if info.get('config_home') and not interop:
-                env['DSH_HOME'] = info['config_home']
+            if effective_dsh_home and not interop:
+                env['DSH_HOME'] = effective_dsh_home
         native_pid_file = None
         exec_dir = target_dir
         stage_dir = None
         exec_prompt = prompt
         translate = _wsl_path if interop else str
         win_target = translate(target_dir)
-        if interop and win_target.startswith('\\\\'):
+        if (interop and win_target.startswith('\\\\')) or clean_room:
             if not readonly:
                 cli_label = Path(binary).name
                 native_hint = f'安装并登录原生 {prefix}'
                 raise HarnessError(f'WSL 纯 Linux 文件系统路径无法在 Windows {cli_label} 沙箱内直接写入；请在 WSL {native_hint}，或在 /mnt/<盘符> 工作区执行写入任务')
-            stage_dir = _stage_wsl_readonly_workspace(target_dir, temp_path, stage_files)
+            stage_dir = _stage_wsl_readonly_workspace(
+                target_dir, temp_path, stage_files, exclude_agent_instructions=bool(clean_room)
+            )
             exec_dir = stage_dir
             win_target = translate(stage_dir)
             exec_prompt = prompt + STAGED_PROMPT_SUFFIX
+            if clean_room and prefix == 'codex':
+                staged_records = collect_target_files(stage_dir)
+                total_bytes = sum(item['bytes'] for item in staged_records)
+                if staged_records and total_bytes <= 262_144:
+                    blocks = []
+                    for item in staged_records:
+                        try:
+                            lines = item['path'].read_text(encoding='utf-8').splitlines()
+                        except (OSError, UnicodeDecodeError):
+                            continue
+                        numbered = '\n'.join(f'{idx}: {line}' for idx, line in enumerate(lines, 1))
+                        blocks.append(f"=== FILE: {item['rel_path']} ===\n{numbered}")
+                    if blocks:
+                        exec_prompt += '\n\n【只读目标文件带行号原文快照（可直接阅读，无需调用外部命令）】\n' + '\n\n'.join(blocks)
         if prefix == 'codex':
             command = [binary, 'exec', '-s', 'read-only' if readonly else 'workspace-write',
                        '-c', 'approval_policy="never"', '--ephemeral',
@@ -2938,6 +2995,10 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
         elif prefix == 'claude':
             command = [binary, '-p', '--output-format', 'json', '--json-schema', json.dumps(schema, ensure_ascii=False),
                        '--no-session-persistence']
+            if clean_room:
+                command.append('--bare')
+                if clean_claude_settings is not None:
+                    command.extend(['--settings', translate(clean_claude_settings)])
             if model:
                 command.extend(['--model', model])
             if effort in ('low', 'medium', 'high', 'xhigh', 'max'):
@@ -2961,15 +3022,16 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
             exec_prompt = f'{exec_prompt}\n\n请仅输出一个严格符合以下 JSON Schema 的 JSON 对象，不要输出任何额外解释：\n{json.dumps(schema, ensure_ascii=False)}'
             input_text = exec_prompt
         receipt.update(argv=list(command), work_dir=str(exec_dir), staged_readonly_workspace=stage_dir is not None,
+                       clean_room=bool(clean_room),
                        command_transport='windows_interop' if interop else 'native')
         if interop:
             extra_env = {}
             if prefix == 'claude':
                 extra_env['CLAUDE_CONFIG_DIR'] = _wsl_path(Path(info['config_home']))
-            elif prefix == 'dsh':
-                extra_env = {'DSH_HOME': _wsl_path(Path(info['config_home'])), 'DSH_TELEMETRY_DISABLED': '1'}
+            elif prefix == 'dsh' and effective_dsh_home:
+                extra_env = {'DSH_HOME': _wsl_path(Path(effective_dsh_home)), 'DSH_TELEMETRY_DISABLED': '1'}
             command, native_pid_file = _interop_command(command, exec_dir, temp_path, input_text,
-                                                        info.get('config_home') if prefix == 'codex' else None,
+                                                        effective_codex_home if prefix == 'codex' else None,
                                                         extra_env=extra_env)
             input_text = None
         # Queued units must recheck after staging. A success already in flight
@@ -3962,6 +4024,11 @@ def cmd_task(args):
     readonly = args.kind != 'code'
     if readonly and (scopes or args.verify_cmd):
         raise HarnessError('只读任务不可声明写入范围或验收命令')
+    clean_room = bool(getattr(args, 'clean_room', False))
+    if clean_room and not readonly:
+        raise HarnessError('--clean-room 仅支持只读任务（review/direction/polish/math），写入任务不可剥离安全钩子')
+    if clean_room and engine.startswith('agy'):
+        raise HarnessError('agy 后端不支持剥离全局插件目录，--clean-room 请显式指定 codex、cc 或 dsh')
     rel_single_file = requested_target.relative_to(root).as_posix() if requested_target.is_file() else None
     if not readonly and rel_single_file and not scopes:
         scopes = [rel_single_file]
@@ -4029,7 +4096,7 @@ def cmd_task(args):
         try:
             result = invoke_engine(profile['spec'], root, prompt, backends, TASK_JSON_SCHEMA,
                                    readonly, args.timeout, 'readonly-collaborator', stage_files, profile['cli_effort'], args.retry_quota,
-                                   profile=profile, batch=batch, receipt=invocation)
+                                   profile=profile, batch=batch, receipt=invocation, clean_room=clean_room)
         except HarnessError as exc:
             fb_engine = _local_fallback_engine(caller, engine, backends, text) if (
                 getattr(exc, 'status', None) == 'quota_exhausted'
@@ -4039,7 +4106,7 @@ def cmd_task(args):
                 and _workspace_unchanged(before, root)
                 and _workspace_unchanged(fallback_before, root)
             ) else None
-            if not fb_engine:
+            if not fb_engine or (clean_room and fb_engine.startswith('agy')):
                 raise
             payload['quota_fallback'] = _quota_fallback_record(engine, fb_engine, exc.details)
             _prepare_execution(backends, (fb_engine,), batch, dry_run=False)
@@ -4055,7 +4122,7 @@ def cmd_task(args):
             invocation = {}
             result = invoke_engine(fb_profile['spec'], root, prompt, backends, TASK_JSON_SCHEMA,
                                    readonly, args.timeout, 'readonly-collaborator', stage_files, fb_profile['cli_effort'], args.retry_quota,
-                                   profile=fb_profile, batch=batch, receipt=invocation)
+                                   profile=fb_profile, batch=batch, receipt=invocation, clean_room=clean_room)
     except Exception as exc:
         status = getattr(exc, 'status', 'failed')
         error = {'error': str(exc), **getattr(exc, 'details', {})}
@@ -4102,6 +4169,8 @@ def build_arg_parser():
     task.add_argument('--engine', default='', help='后端与模型规格（agy、codex、claude/cc、dsh；支持精确 slug、显示名或模糊模型别名）')
     task.add_argument('--base-commit')
     task.add_argument('--verify-cmd')
+    task.add_argument('--clean-room', action='store_true',
+                      help='纯净盲读模式（仅限 codex/cc/dsh 只读任务）：仅保留底层登录/API 凭据，剥离宿主机全局规则、钩子、全局技能及工作区自动加载的 AGENTS.md/CLAUDE.md')
     for command in (gate, task):
         group = command.add_mutually_exclusive_group(required=True)
         group.add_argument('--task')

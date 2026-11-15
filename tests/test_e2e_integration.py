@@ -2195,6 +2195,8 @@ class TestEndToEndIntegration(unittest.TestCase):
 
         repo_resolved = REPO_ROOT.resolve()
         version_token_re = re.compile(rf"(?<![\d.]){re.escape(plugin_version)}(?![\d.])")
+        static_date_re = re.compile(r"\b202\d-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])\b")
+        patch_prefix_re = re.compile(r"(?m)^\s*(?:>\s*)?(?:\*{0,2})(?:补充说明|更新说明|补丁说明|历史补丁)\s*[：:]")
         checked_md_count = 0
         for path in repo_files:
             rel_posix = path.relative_to(REPO_ROOT).as_posix()
@@ -2207,6 +2209,14 @@ class TestEndToEndIntegration(unittest.TestCase):
                 self.assertIsNone(
                     version_token_re.search(md_text),
                     f"{rel_posix} 不应硬编码当前插件版本号 {plugin_version}，须以 plugin.json 为唯一真源",
+                )
+                self.assertIsNone(
+                    static_date_re.search(md_text),
+                    f"{rel_posix} 不应残留静态日期戳补丁，时效演进统一归入 CHANGELOG.md",
+                )
+                self.assertIsNone(
+                    patch_prefix_re.search(md_text),
+                    f"{rel_posix} 检出补丁式堆叠抬头，请整篇通顺重写而非追加附注",
                 )
             for raw_target in extract_md_targets(md_text):
                 target = urllib.parse.unquote(raw_target.split("#", 1)[0].split("?", 1)[0].strip())
@@ -2389,10 +2399,16 @@ class TestEndToEndIntegration(unittest.TestCase):
             self.assertEqual(json.loads(expired.stdout)["reason"], "expired_ttl")
             self.assertEqual(json.loads(run_state("status").stdout)["phase"], "IDLE")
 
-            self.assertEqual(run_state("clear", "--verified").returncode, 0)
+            clr_pending = json.loads(run_state("clear", "--verified").stdout)
+            self.assertFalse(clr_pending["readback_verified"])
+            self.assertEqual(clr_pending["notice"], "pending_cold_readback")
+            clr_done = json.loads(run_state("clear", "--verified", "--readback-done").stdout)
+            self.assertTrue(clr_done["readback_verified"])
+            self.assertNotIn("notice", clr_done)
             ver_st = json.loads(run_state("status").stdout)
             self.assertEqual(ver_st["phase"], "IDLE")
             self.assertIn("last_verified_epoch", ver_st["saved"])
+            self.assertTrue(ver_st["saved"]["readback_verified"])
             self.assertEqual(run_state("clear").returncode, 0)
             self.assertEqual(json.loads(run_state("status").stdout)["phase"], "IDLE")
             self.assertIsNone(json.loads(run_state("status").stdout)["saved"])

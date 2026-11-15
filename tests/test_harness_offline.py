@@ -2677,6 +2677,89 @@ else:
         fenced = f'```json\n{json.dumps(payload)}\n```\n</||DSML||tool_calls>'
         self.assertEqual(harness._decode_output_json(fenced), payload)
 
+    def test_clean_room_mode_isolates_global_configs_and_strips_agent_instructions(self):
+        (self.root / 'AGENTS.md').write_text('# internal maintainer rules\n', encoding='utf-8')
+        (self.root / 'CLAUDE.md').write_text('# internal claude rules\n', encoding='utf-8')
+        (self.root / 'README.md').write_text('line one\nline two\n', encoding='utf-8')
+
+        engines = self.four_backends()
+        cx_home = self.root / 'host-codex'
+        cx_home.mkdir()
+        (cx_home / 'auth.json').write_text('{"token":"ok"}', encoding='utf-8')
+        (cx_home / 'models_cache.json').write_text('{"models":[]}', encoding='utf-8')
+        (cx_home / 'AGENTS.md').write_text('# global codex rules', encoding='utf-8')
+        (cx_home / 'hooks.json').write_text('{"hooks":{}}', encoding='utf-8')
+        engines['codex']['config_home'] = str(cx_home)
+
+        cl_home = self.root / 'host-claude'
+        cl_home.mkdir()
+        (cl_home / 'settings.json').write_text(json.dumps({
+            'env': {'ANTHROPIC_BASE_URL': 'http://127.0.0.1:8240', 'ANTHROPIC_AUTH_TOKEN': 'via-router'},
+            'hooks': {'PreToolUse': [{'hooks': [{'command': 'guard'}]}]},
+            'effortLevel': 'xhigh',
+        }), encoding='utf-8')
+        engines['claude']['config_home'] = str(cl_home)
+
+        dsh_home = self.root / 'host-dsh'
+        dsh_home.mkdir()
+        (dsh_home / '.credentials.yaml').write_text('provider: deepseek\n', encoding='utf-8')
+        (dsh_home / 'AGENTS.md').write_text('# global dsh rules', encoding='utf-8')
+        engines['dsh']['config_home'] = str(dsh_home)
+
+        with self.assertRaisesRegex(harness.HarnessError, '只读任务'):
+            harness.invoke_engine('codex:default', self.root, '写任务', engines, harness.TASK_JSON_SCHEMA,
+                                  readonly=False, clean_room=True)
+        with self.assertRaisesRegex(harness.HarnessError, 'agy 后端不支持'):
+            harness.invoke_engine('agy:default', self.root, '盲读', engines, harness.TASK_JSON_SCHEMA,
+                                  readonly=True, clean_room=True)
+
+        def fake_codex_run(command, cwd, input_text, timeout_sec, env=None, native_pid_file=None):
+            clean_home = Path(env['CODEX_HOME'])
+            self.assertTrue((clean_home / 'auth.json').is_file())
+            self.assertFalse((clean_home / 'AGENTS.md').exists())
+            self.assertFalse((clean_home / 'hooks.json').exists())
+            self.assertFalse((Path(cwd) / 'AGENTS.md').exists())
+            self.assertFalse((Path(cwd) / 'CLAUDE.md').exists())
+            self.assertTrue((Path(cwd) / 'README.md').is_file())
+            self.assertIn('=== FILE: README.md ===\n1: line one', input_text)
+            out_idx = command.index('-o') + 1
+            Path(command[out_idx]).write_text(json.dumps(TASK), encoding='utf-8')
+            return subprocess.CompletedProcess(command, 0, '', '')
+
+        receipt_cx = {}
+        with patch.object(harness, 'run_process', side_effect=fake_codex_run):
+            res_cx = harness.invoke_engine('codex:default', self.root, '新手盲读', engines, harness.TASK_JSON_SCHEMA,
+                                           readonly=True, receipt=receipt_cx, clean_room=True)
+        self.assertEqual(res_cx, TASK)
+        self.assertTrue(receipt_cx['clean_room'])
+        self.assertTrue(receipt_cx['staged_readonly_workspace'])
+
+        def fake_claude_run(command, cwd, input_text, timeout_sec, env=None, native_pid_file=None):
+            self.assertIn('--bare', command)
+            settings_idx = command.index('--settings') + 1
+            clean_cfg = json.loads(Path(command[settings_idx]).read_text(encoding='utf-8'))
+            self.assertEqual(set(clean_cfg.keys()), {'env'})
+            self.assertNotIn('hooks', clean_cfg)
+            self.assertFalse((Path(cwd) / 'AGENTS.md').exists())
+            return subprocess.CompletedProcess(command, 0, json.dumps({'structured_output': TASK}), '')
+
+        with patch.object(harness, 'run_process', side_effect=fake_claude_run):
+            res_cl = harness.invoke_engine('claude:default', self.root, '新手盲读', engines, harness.TASK_JSON_SCHEMA,
+                                           readonly=True, clean_room=True)
+        self.assertEqual(res_cl, TASK)
+
+        def fake_dsh_run(command, cwd, input_text, timeout_sec, env=None, native_pid_file=None):
+            clean_dsh = Path(env['DSH_HOME'])
+            self.assertTrue((clean_dsh / '.credentials.yaml').is_file())
+            self.assertFalse((clean_dsh / 'AGENTS.md').exists())
+            stream = json.dumps({'type': 'final', 'reason': {'kind': 'completed'}, 'text': json.dumps(TASK)})
+            return subprocess.CompletedProcess(command, 0, stream, '')
+
+        with patch.object(harness, 'run_process', side_effect=fake_dsh_run):
+            res_dsh = harness.invoke_engine('dsh:default', self.root, '新手盲读', engines, harness.TASK_JSON_SCHEMA,
+                                            readonly=True, clean_room=True)
+        self.assertEqual(res_dsh, TASK)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

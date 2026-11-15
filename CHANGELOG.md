@@ -1,6 +1,18 @@
 # 更新日志（Changelog）
 
-记录 `Antigravity_Codex_ClaudeCode_DeepSeekHarness`（含 `user-guard` 原生插件、`cae-harness` 多引擎验证台架与 `fleet-evolve` 自举演进协议）各版本的功能演进、宿主协议适配与安全加固。
+记录 `Antigravity_Codex_ClaudeCode_DeepSeekHarness`（含 `user-guard` 全局插件、`cae-harness` 四端后台调用与验证工具及 `fleet-evolve` 升级整理流程）各版本的功能更新、客户端适配与安全修复。
+
+---
+
+## [1.11.1] - 2026-11-15
+
+新增 `cae-harness` 无头纯净盲读模式（`--clean-room`），建立“多端新手视角盲读 -> 主控重写自然工程中文 -> 独立核对技术准确度与脱敏”三步文档演进机制，完成全仓文档去黑话重写与 CC Switch 退役残留清理：
+
+- **无头纯净盲读隔离模式（`cae_harness.py`、`tests/test_harness_offline.py`）**：在 `cae_harness.py task` 中新增只读专用的 `--clean-room` 选项（支持 `codex`、`claude`、`dsh`；对不支持剥离全局插件的 `agy` 或写任务显式报错拦截）。开启后自动在系统临时目录构造仅保留底层登录凭据或 API 环境变量的隔离配置目录（`claude` 自动启用 `--bare` 与最小环境变量 `--settings`，`codex` 与 `dsh` 剥离全局 `AGENTS.md`、钩子与技能，并在只读工作区镜像中排除 `AGENTS.md` / `CLAUDE.md`；当 `codex` 只读镜像不超过 `256 KiB` 时自动附带行号文件快照以兼容空配置 Windows 只读沙箱），提供真正空历史上下文、无全局规则、无生命周期钩子、无全局技能的零预设盲读环境。
+- **三步文档回看校核机制与全仓自然工程文风重写（`README.md`、`docs/`、`AGENTS.md`、`rules/AGENTS.md`、`SKILL.md`、`fleet_state.py`、`tests/test_e2e_integration.py`）**：
+  - 在 `R0` / `R2`、`fleet-evolve/SKILL.md` 与根 `AGENTS.md` 中确立不设死板字数上限的三步文档更新流程：① 先用 `--clean-room` 并发启动 `codex:sol`、`cc:default`、`dsh:default` 按不同目标群体新手视角盲读挑刺；② 主控汇总反馈后从头重写逻辑顺序与平实 CAE 工程中文；③ 由 `readonly-auditor` 对照源码独立校核技术事实与脱敏，并在 `fleet_state.py clear --verified --readback-done` 中记录校核状态；
+  - 采纳三端纯净盲读反馈，按“先上手、后全貌、再查表与底层细节”重排 `README.md`（单客户端直连起步前置、示例统一 `--caller auto`、补充概念解释与关闭卸载说明），在 `docs/workflow-guide.md` 中新增可直接复制的 HLLC 通量任务单模板与 JSON 回执字段解读，将 `docs/architecture-and-hooks.md` 中的压缩长表格拆解为清晰的钩子拦截一览表、异常放行（Fail-Open）说明与窗口口径定义；
+  - 在 `test_41` 中补充非 `CHANGELOG.md` 文档禁止残留静态日期戳与补丁式附注抬头的回归检查，并在双侧清理已停用的 CC Switch 旧提示词与旧技能残留记录。
 
 ---
 
@@ -118,32 +130,13 @@
 
 ---
 
-## [1.6.0] - 2026-11-13
+## [1.6.1] - 2026-11-14
 
-- **五层上下文能力边界与受控实测基线**：完成并记录 Codex `GPT-6.1-Sol`（累积 `808,892` token 零压缩、6/6 口令全中）与反重力 CLI `1.5.8`（`241,625` token 全中、`290,028` token 触发自动检查点压缩）受控压力实测，建立五层上下文窗口管理规范。
-- **WSL2 `<->` Windows 跨子系统互操作验证**：补齐 WSL 原生环境安装、路径映射与跨子系统只读镜像／共享盘读写实测验证。
+- **长会话两阶段交接停机门禁（`handoff_gate.py`）**：新增 `normal -> advisory -> drain -> freeze` 增量状态机，联动 `PreInvocation`、`PreToolUse` 与 `Stop` 钩子验收交接完整性与 `<!-- GOAL_CANCELLED -->` 终止标记。
+- **多表面跨平台同步与 Zotero 可选集成**：完善 `install.py`、`install.ps1`、`install.sh` 三入口及 `mcp_config.json` 安全合并。
 
 ---
 
 ## [1.5.0] - 2026-11-13
 
-- **Codex 生命周期交接钩子与 `assess` 能力评估**：新增 Codex 侧 `SessionStart`／`UserPromptSubmit`／`PreToolUse`／`PostCompact`／`Stop` 原话增量归档与长会话交接提醒钩子（默认 `advisory` 模式），并在 `cae-harness` 中新增零写入 `assess` 选路与目录时效评估子命令。
-
----
-
-## [1.4.0] - 2026-11-13
-
-- **反重力两阶段长会话交接停机门禁（`handoff_gate.py`）**：基于紧凑轨迹遥测构建 `normal -> advisory -> drain -> freeze` 状态机，支持 R8 用户显式暂缓宽限窗口、`/goal` 终止标记核验与交接四要素完整性检查。
-- **双层非套娃模型路由**：区分深度数理推理模型与工程编码主力模型，建立单模型纯思考挡位匹配逻辑。
-
----
-
-## [1.3.0-rc1] - 2026-11-13
-
-- **单端独立闭环与双端自举配置统一**：重构 `install.py` 支持 `--probe-apps`、`--app codex|antigravity|both|auto`、`--dry-run`、TOML 表结构无损合并及 `~/.codex/AGENTS.md` 末尾自定义环境段保留，确立仓库根目录 `AGENTS.md` 四步双向自举流程。
-
----
-
-## [1.2.0] - 2026-11-13
-
-- **初始开源发布**：发布 `user-guard` 反重力原生插件、`R0–R11` 工程与科学计算全局规则、压缩后用户原话自动回溯（`session_context_loader.py`／`user_words.py`）、R4 项目目录硬边界与防空转／防刷屏守卫（`status_guard.py`／`reply_repeat_guard.py`）、三个严格只读子代理及 `cae-harness` 跨端协作技能。
+- **初始化 `user-guard` 原生插件与 `cae-harness` 确定性编排器**：建立 `R0–R11` 全局规则、压缩原话增量归档回溯（`session_context_loader.py`）、`R4` 项目目录硬边界与防空转门禁（`status_guard.py`）、防重复等待刷屏门禁（`reply_repeat_guard.py`）、只读子代理三件套及端到端单测套件。

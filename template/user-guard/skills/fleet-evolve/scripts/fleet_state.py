@@ -216,6 +216,7 @@ def main(argv: list[str] | None = None) -> int:
 
     p_clr = sub.add_parser("clear", help="Reset bootstrap state lock to IDLE (optionally recording last_verified metadata)")
     p_clr.add_argument("--verified", action="store_true")
+    p_clr.add_argument("--readback-done", action="store_true", help="Confirm cold full-file readback pass completed")
 
     args = parser.parse_args(argv)
     repo_root = _resolve_repo_root(args.repo)
@@ -326,13 +327,22 @@ def main(argv: list[str] | None = None) -> int:
                 "schema_version": 1,
                 "phase": "IDLE",
                 "last_verified_epoch": now,
+                "readback_verified": bool(args.readback_done),
                 "execution_side": _side(),
                 **meta,
             }
             _atomic_write_json(state_file, payload)
         else:
             state_file.unlink(missing_ok=True)
-    print(json.dumps({"ok": True, "phase": "IDLE", "verified": bool(args.verified)}, ensure_ascii=False, indent=2))
+    out: Dict[str, Any] = {
+        "ok": True,
+        "phase": "IDLE",
+        "verified": bool(args.verified),
+        "readback_verified": bool(args.verified and args.readback_done),
+    }
+    if args.verified and not args.readback_done:
+        out["notice"] = "pending_cold_readback"
+    print(json.dumps(out, ensure_ascii=False, indent=2))
     return 0
 
 
