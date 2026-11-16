@@ -362,7 +362,7 @@
         "windows_proxy_ttl_sec": 5,
         "key_cache_ttl_sec": 60
       },
-      "inline_readonly_max_kib": 256,
+      "inline_readonly_max_kib": 512,
       "snapshot_ignored_dirs": [
         ".git",
         ".venv",

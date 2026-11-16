@@ -601,8 +601,8 @@ def _native_completion_bill(payload, state=None):
 
 
 def _render_heavy_bill(entries):
-    lines = ["流号 | 通道与 agent/模型 | 执行结果 | Token 明细 | 回执或子代理轨迹完整路径",
-             "--- | --- | --- | --- | ---"]
+    lines = ["| 流号 | 通道与模型 | 执行结果 | Token 明细与回执路径 |",
+             "| --- | --- | --- | --- |"]
     def usage_text(usage):
         if not isinstance(usage, dict):
             usage = {}
@@ -613,10 +613,10 @@ def _render_heavy_bill(entries):
             outcome = row.get("status") or ("成功" if row.get("succeeded") else "失败")
             if "succeeded" in row:
                 outcome = ("成功" if row["succeeded"] else "失败") + " / " + str(outcome)
-            lines.append(" | ".join(str(v).replace("\n", " ").replace("|", "\\|") for v in (
+            lines.append("| " + " | ".join(str(v).replace("\n", " ").replace("|", "\\|") for v in (
                 row.get("stream_id", "未提供流号"), str(row.get("channel") or "cae_harness_headless") + " " +
                 str(row.get("engine") or "未提供 agent") + " / " + str(row.get("model") or "未提供模型"),
-                outcome, usage_text(row.get("token_usage")), row.get("receipt_file") or entry.get("receipt_file") or "未提供回执路径")))
+                outcome, usage_text(row.get("token_usage")) + "；" + str(row.get("receipt_file") or entry.get("receipt_file") or "未提供回执路径"))) + " |")
         lines.append("Token 汇总：" + usage_text(entry.get("token_usage_summary")) + "；回执：" + str(entry.get("receipt_file") or "未提供"))
     return "\n".join(lines)
 

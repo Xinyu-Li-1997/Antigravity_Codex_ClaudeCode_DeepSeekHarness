@@ -16,6 +16,7 @@ import concurrent.futures
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -57,6 +58,9 @@ def _new_temp_dir(prefix: str = "lifecycle-test-") -> tempfile.TemporaryDirector
 
 class TestLifecycleCompactionEngine(unittest.TestCase):
     def setUp(self) -> None:
+        depth_patch = mock.patch.dict(os.environ, {"CAE_HARNESS_DEPTH": ""})
+        depth_patch.start()
+        self.addCleanup(depth_patch.stop)
         self.tmp_obj = _new_temp_dir()
         self.tmp_root = Path(self.tmp_obj.name)
         self.plugin_data = self.tmp_root / "plugin_data"
@@ -1154,6 +1158,9 @@ class TestCodexHandoffAdapter(unittest.TestCase):
     """Codex 独立协议、保守默认值和严格模式的可观察状态转换。"""
 
     def setUp(self):
+        depth_patch = mock.patch.dict(os.environ, {"CAE_HARNESS_DEPTH": ""})
+        depth_patch.start()
+        self.addCleanup(depth_patch.stop)
         import handoff_gate
         self.gate = handoff_gate
         self.tmp = _new_temp_dir(prefix="codex-handoff-test-")
@@ -2402,7 +2409,9 @@ class TestHeavyWorkflowLifecycle(unittest.TestCase):
             "run_id": "unreported-fixture", "all_succeeded": True, "reported_to_user": False,
             "receipt_file": "receipts/finished.json", "streams": [{"stream_id": "S1", "succeeded": True,
                 "status": "ok", "token_usage": {"total_tokens": 42}}], "token_usage_summary": {"total_tokens": 42}}])
-        self.assertEqual(len(next(line for line in expected.splitlines() if line.startswith("| 流号")).split("|")) - 2, 14)
+        table_rows = [line for line in expected.splitlines() if line.startswith("|")]
+        self.assertTrue(all(len(re.split(r"(?<!\\)\|", line)[1:-1]) == 3 for line in table_rows))
+        self.assertEqual(expected.count("| 序号 | 参数项 | 当前值 |"), len(ticket["streams"]))
         for client in ("antigravity", "codex", "claude"):
             with self.subTest(client=client):
                 if client == "antigravity":
@@ -2536,10 +2545,88 @@ class TestHeavyWorkflowLifecycle(unittest.TestCase):
         handoff_gate._record_handoff_baseline(unchanged, document)
         self.assertFalse(handoff_gate._has_valid_handoff_file(unchanged, [ticket]))
 
+    def test_vertical_workflow_requires_every_parameter_and_accepts_legacy_rows(self):
+        _, ticket = self.ticket()
+        for number, stream in enumerate(ticket["streams"], 1):
+            stream.update(target=f"target-{number}", access_mode=f"access-{number}", write_scope=[f"scope-{number}.py"],
+                          verify_cmd=f"verify-{number}", unavailable_reason=f"reason-{number}", currently_available=False)
+        block = "【新对话提示词】\n" + user_words.render_pending_workflow_block(ticket, for_handoff=True)
+        self.assertTrue(handoff_gate._workflow_handoff_present(block, [ticket]))
+        lines = block.splitlines()
+        rows = [line for line in lines if re.match(r"^\| (?:[1-9]|1[0-4]) \|", line)]
+        self.assertEqual(len(rows), 28)
+        columns = ["流号", "子任务与范围", "通道", "客户端及子代理类型", "模型名字", "挡位", "上下文窗口",
+                   "是否无头", "是否净室", "访问模式、写入范围与验收命令", "内联与超时", "当前是否可用",
+                   "本机配置额度类型与当前状态", "回执或子代理日志位置"]
+        self.assertTrue(all(len(re.split(r"(?<!\\)\|", line)[1:-1]) == 3 for line in rows))
+        for number in range(2):
+            cells = [[part.strip() for part in re.split(r"(?<!\\)\|", row)[1:-1]] for row in rows[number * 14:(number + 1) * 14]]
+            self.assertEqual([cell[0] for cell in cells], [str(i) for i in range(1, 15)])
+            self.assertEqual([cell[1] for cell in cells], columns)
+        for row in rows:
+            with self.subTest(missing=row):
+                self.assertFalse(handoff_gate._workflow_handoff_present(block.replace(row, "", 1), [ticket]))
+        two_columns = re.sub(r"^(\| )\d+ \| ", r"\1", block, flags=re.MULTILINE)
+        self.assertTrue(handoff_gate._workflow_handoff_present(two_columns, [ticket]))
+        for stream in ticket["streams"]:
+            for key in ("stream_id", "subtask", "target", "channel", "client", "agent_type", "model_display", "tier",
+                        "context_window", "access_mode", "verify_cmd", "timeout", "unavailable_reason", "quota_scheme",
+                        "quota_summary", "receipt_location"):
+                with self.subTest(stream=stream["stream_id"], missing_value=key):
+                    # Remove the value only from this stream's rows, leaving headings and all other streams intact.
+                    start = block.index("| 1 | 流号 | " + stream["stream_id"])
+                    end = block.index("| 14 | 回执或子代理日志位置 |", start)
+                    end = block.index("\n", end)
+                    detail = block[start:end].replace(str(stream[key]), "")
+                    self.assertFalse(handoff_gate._workflow_handoff_present(block[:start] + detail + block[end:], [ticket]))
+            for key, label in (("headless", "是否无头"), ("clean_room", "是否净室"),
+                               ("inline_readonly", "内联与超时"), ("currently_available", "当前是否可用")):
+                index = columns.index(label)
+                row = rows[(0 if stream["stream_id"] == "S1" else 14) + index]
+                boolean = "是" if stream[key] else "否"
+                changed = row.replace("| " + boolean, "| 缺失") if key != "inline_readonly" else row.replace("内联：" + boolean, "内联：缺失")
+                self.assertFalse(handoff_gate._workflow_handoff_present(block.replace(row, changed, 1), [ticket]))
+            self.assertFalse(handoff_gate._workflow_handoff_present(block.replace(stream["write_scope"][0], ""), [ticket]))
+        legacy = ["| " + " | ".join(columns) + " |", "|" + "---|" * 14]
+        for number in range(2):
+            values = [re.split(r"(?<!\\)\|", row)[-2].strip() for row in rows[number * 14:(number + 1) * 14]]
+            legacy.append("| " + " | ".join(values) + " |")
+        table_start = next(i for i, line in enumerate(lines) if line.startswith("#### 流"))
+        ledger_start = next(i for i, line in enumerate(lines) if line.startswith("离线性能记录更新时间："))
+        old_block = "\n".join(lines[:table_start] + legacy + lines[ledger_start:])
+        self.assertTrue(handoff_gate._workflow_handoff_present(old_block, [ticket]))
+        for stored_key, for_handoff in (("human_popup_markdown", False), ("handoff_prompt_block", True)):
+            ticket[stored_key] = old_block
+            rendered = user_words.render_pending_workflow_block(ticket, for_handoff=for_handoff)
+            self.assertIn(old_block, rendered)
+            self.assertEqual(rendered.count("| 序号 | 参数项 | 当前值 |"), 2)
+
+    def test_complete_stored_popup_is_rendered_once(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("lifecycle_plan_renderer", HOOKS_DIR.parent / "skills/cae-harness/scripts/cae_harness.py")
+        harness = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(harness)
+        _, ticket = self.ticket()
+        ticket["streams"][0]["subtask"] = "核对 | 通量\n耦合接口"
+        ticket["streams"][0]["receipt_location"] = "receipts/a|b.json"
+        harness._render_plan(ticket)
+        for for_handoff in (False, True):
+            block = user_words.render_pending_workflow_block(ticket, for_handoff=for_handoff)
+            stored = ticket["handoff_prompt_block" if for_handoff else "human_popup_markdown"]
+            self.assertIn(stored, block)
+            self.assertEqual(block.count("| 序号 | 参数项 | 当前值 |"), 2)
+            self.assertIn(r"核对 \| 通量 耦合接口", block)
+            self.assertIn(r"receipts/a\|b.json", block)
+            self.assertEqual(block.count("工作流背景："), 1)
+            self.assertEqual(block.count("恢复命令：plan --resume-ticket"), 1)
+            self.assertTrue(all(len(re.split(r"(?<!\\)\|", row)[1:-1]) <= 4
+                                for row in block.splitlines() if row.startswith("|")))
+            self.assertTrue(handoff_gate._workflow_handoff_present("【新对话提示词】\n" + block, [ticket]))
+
     def test_original_harness_popup_layout_is_accepted_without_canonical_labels(self):
         _, ticket = self.ticket()
         block = user_words.render_pending_workflow_block(ticket, for_handoff=True)
-        # 保留字段与 14 列数据，采用 cae_harness._render_plan 的原有标签与选项格式。
+        # 保留纵向 14 项明细，采用 cae_harness._render_plan 的标签与选项格式。
         original = (block.replace("要做什么与后续计划：", "要做什么：").replace("预计后果与边界影响：", "预计后果：")
                     .replace("离线性能记录更新时间：", "capability_ledger 离线性能记录更新时间：")
                     .replace("选项卡：", "选项：").replace("64000", "64000 tokens"))

@@ -1,6 +1,6 @@
 """Claude 生命周期、模型路由与 CC Switch 管理的纯离线回归。
 
-临时文件仅写入仓库内的测试沙箱；HTTP、DNS、代理和上游响应均使用本地夹具。
+临时文件仅写入仓库 .pytest_cache 内的测试沙箱；HTTP、DNS、代理和上游响应均使用本地夹具。
 """
 
 import copy
@@ -67,19 +67,23 @@ class OfflineSandbox(unittest.TestCase):
     def setUp(self):
         import time
 
-        temporary = tempfile.TemporaryDirectory(prefix="claude-offline-", dir=REPO_ROOT / "tests")
+        cache_dir = REPO_ROOT / ".pytest_cache"
+        cache_dir.mkdir(exist_ok=True)
+        temporary = tempfile.TemporaryDirectory(prefix="claude-offline-", dir=cache_dir)
 
         def _cleanup_tempdir() -> None:
-            for attempt in range(5):
-                try:
-                    if Path(temporary.name).exists():
-                        shutil.rmtree(temporary.name)
-                    break
-                except OSError:
-                    if attempt == 4:
-                        raise
-                    time.sleep(0.05)
-            temporary.cleanup()
+            try:
+                for attempt in range(5):
+                    try:
+                        if Path(temporary.name).exists():
+                            shutil.rmtree(temporary.name)
+                        break
+                    except OSError:
+                        if attempt == 4:
+                            raise
+                        time.sleep(0.05)
+            finally:
+                temporary.cleanup()
 
         self.addCleanup(_cleanup_tempdir)
         self.root = Path(temporary.name).resolve()
@@ -788,13 +792,17 @@ class TestClaudeRouter(OfflineSandbox):
             router.card_key(cfg, "Official")
 
     def test_health_endpoint_uses_no_upstream(self):
-        handler = self.handler()
-        handler.path = "/__router/health"
-        with mock.patch.object(router.http.client, "HTTPSConnection") as connection:
-            handler.do_GET()
-            connection.assert_not_called()
-        handler.send_response.assert_called_once_with(200)
-        self.assertEqual(json.loads(handler.wfile.getvalue()), {"ok": True, "port": 8240})
+        for port in (None, 8240, 8241):
+            with self.subTest(port=port):
+                handler = self.handler()
+                if port is not None:
+                    handler.server.cfg["port"] = port
+                handler.path = "/__router/health"
+                with mock.patch.object(router.http.client, "HTTPSConnection") as connection:
+                    handler.do_GET()
+                    connection.assert_not_called()
+                handler.send_response.assert_called_once_with(200)
+                self.assertEqual(json.loads(handler.wfile.getvalue()), {"ok": True, "port": handler.server.cfg["port"]})
 
     def test_kimi_default_route_maps_effort_replaces_auth_and_relays_chunks(self):
         handler = self.handler({"model": "k3.1-pro[1m]", "output_config": {"effort": "xhigh"}, "stream": True})
@@ -1633,12 +1641,22 @@ class TestClaudeInstallerAndUpgradeAudit(OfflineSandbox):
         for name in installer.CLAUDE_HOOK_SCRIPTS:
             self.assertEqual((self.claude_home / "hooks" / name).read_bytes(),
                              (REPO_ROOT / "template/user-guard/hooks" / name).read_bytes())
+        exact_chmod = False
+        if os.name != "nt":
+            chmod_probe = self.root / "chmod-probe"
+            chmod_probe.write_bytes(b"probe")
+            chmod_probe.chmod(0o755)
+            exact_chmod = chmod_probe.stat().st_mode & 0o777 == 0o755
+            chmod_probe.unlink()
         for path in (REPO_ROOT / "template/claude/router").iterdir():
             if path.is_file():
                 target = self.claude_home / "router" / path.name
                 self.assertEqual(target.read_bytes(), path.read_bytes())
                 if os.name != "nt" and target.suffix in {".sh", ".py"}:
-                    self.assertEqual(target.stat().st_mode & 0o777, 0o755)
+                    if exact_chmod:
+                        self.assertEqual(target.stat().st_mode & 0o777, 0o755)
+                    else:
+                        self.assertEqual(target.stat().st_mode & 0o111, 0o111)
         platform_file = "router.windows.json" if os.name == "nt" else "router.wsl.json"
         self.assertEqual((self.claude_home / "router/router.json").read_bytes(),
                          (REPO_ROOT / "template/claude/router" / platform_file).read_bytes())
@@ -2079,6 +2097,7 @@ class TestClaudeInstallerAndUpgradeAudit(OfflineSandbox):
                 mock.patch.object(installer, "_native_cli", return_value=None), \
                 mock.patch.object(installer, "_first_executable", return_value=None), \
                 mock.patch.object(installer, "_find_windows_codex_package", return_value=(None, None)), \
+                mock.patch.object(installer, "_windows_app_binaries", return_value=(None, None)), \
                 mock.patch.object(installer, "_probe_windows_wsl", return_value={"apps": {}, "status": "unknown"}), \
                 mock.patch.object(installer, "_is_wsl", return_value=False), \
                 mock.patch.object(installer, "detect_zotero_mcp_executable", return_value=None):
@@ -2362,7 +2381,8 @@ class TestClaudeInstallerAndUpgradeAudit(OfflineSandbox):
         self.addCleanup(relay.shutdown)
         relay_port = relay.server_address[1]
 
-        with urllib.request.urlopen(f"http://127.0.0.1:{relay_port}/__router/health", timeout=5) as resp:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(f"http://127.0.0.1:{relay_port}/__router/health", timeout=5) as resp:
             health = json.loads(resp.read().decode("utf-8"))
         self.assertTrue(health["ok"])
 
@@ -2372,7 +2392,7 @@ class TestClaudeInstallerAndUpgradeAudit(OfflineSandbox):
             headers={"Content-Type": "application/json", "x-api-key": "via-router"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=5) as resp:
+        with opener.open(req, timeout=5) as resp:
             out = json.loads(resp.read().decode("utf-8"))
         self.assertEqual(out["model"], "deepseek-flash")
         self.assertEqual(received["path"], "/anthropic/v1/messages")

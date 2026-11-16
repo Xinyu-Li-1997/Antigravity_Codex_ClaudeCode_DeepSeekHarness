@@ -1598,9 +1598,13 @@ def _extract_prompt_backend_hint(prompt_text):
     action = r'(?:请)?(?:使用|调用|采用|切到|切换至|指定|选用|改用|交给|让|用)\s*'
     english = r'\b(?:use|invoke|via|switch\s+to)\s+'
     candidates = []
+    backend_names = '|'.join(_BACKEND_HINT_NAMES.values())
+    parallel_tail = r'\s*(?:等|(?:和|与|及|、|/|或|\band\b|\bor\b)\s*(?:' + backend_names + r')(?![A-Za-z0-9_.=-]))'
     for name, pattern in _BACKEND_HINT_NAMES.items():
         for match in re.finditer('(?:' + action + '|' + english + ')' + pattern + r'(?![A-Za-z0-9_.=-])', text, re.I):
             if not _cue_is_negated(_CUE_BOUNDARIES.split(text[:match.start()])[-1]):
+                if re.match(parallel_tail, text[match.end():], re.I):
+                    return ''
                 candidates.append((match.start(), name))
     return min(candidates)[1] if candidates else ''
 
@@ -2329,9 +2333,10 @@ def _redact_runtime_secret(text):
     raw = str(text or '')
     if not raw:
         return ''
-    raw = re.sub(r'https?://[^\s"<>]+', lambda m: _sanitize_endpoint_url(m.group(0)), raw)
+    raw = re.sub(r'(?i)https?://[^\s"<>]+', lambda m: _sanitize_endpoint_url(m.group(0)), raw)
     raw = re.sub(
-        r'(?i)\b(DEEPSEEK_API_KEY|ANTHROPIC_AUTH_TOKEN|ANTHROPIC_API_KEY|OPENAI_API_KEY)\s*([=:])\s*(["\']?)[^\s"\']+\3',
+        r'(?i)(?:^|(?<=[\s"\'{,;]))([A-Za-z0-9_]*(?:DEEPSEEK_API_KEY|ANTHROPIC_AUTH_TOKEN|ANTHROPIC_API_KEY|OPENAI_API_KEY|'
+        r'api[_-]?key|auth[_-]?token|access[_-]?token|secret[_-]?key))(["\']?\s*[=:]\s*)(["\']?)[^\s"\',}]+\3',
         r'\1\2<redacted>',
         raw,
     )
@@ -2982,6 +2987,8 @@ def _enforce_preflight_quota(backends, specs, retry_quota=False, *, batch=None, 
 
 def _local_fallback_engine(caller, engine, backends, prompt_text='', *, clean_room=False, exclude_prefixes=()):
     cur_prefix, _ = _engine_parts(engine)
+    if _extract_prompt_backend_hint(prompt_text) or _extract_prompt_model_hint(prompt_text):
+        return None
     excluded = set(_extract_negated_backends(prompt_text)) | {str(p).strip().lower() for p in exclude_prefixes if p}
     if clean_room:
         excluded.add('agy')
@@ -4166,20 +4173,23 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
                     command.extend(['--permission-mode', 'bypassPermissions', '--tools', 'Read,Grep,Glob,Edit,Write,Bash'])
                 input_text = exec_prompt
             else:
+                supports_perm_flags = _dsh_supports_cli_permission_flags(binary, env)
+                mode_str = 'read-only' if readonly else 'workspace-write'
                 patch_file = temp_path / 'dsh-headless.patch.yml'
                 provider = 'deepseek-official' if info.get('dsh_provider') == 'deepseek-official' else 'deepseek-account'
                 dsh_default_slug = str(_catalog_rules('dsh').get('default_model') or info.get('model') or 'default')
+                legacy_permissions = (
+                    '- id: sandbox-policy\n  config:\n    mode: ' + mode_str + '\n'
+                    '- id: approval\n  config:\n    policy: never\n- id: permission\n  config:\n    mode: ' + mode_str + '\n'
+                ) if not supports_perm_flags else ''
                 patch_file.write_text(
-                    '- id: sandbox-policy\n  config:\n    mode: ' + ('read-only' if readonly else 'workspace-write') + '\n'
-                    '- id: approval\n  config:\n    policy: never\n- id: permission\n  config:\n    mode: ' + ('read-only' if readonly else 'workspace-write') + '\n'
-                    '- id: credentials\n  disabled: false\n- id: authorization\n  disabled: false\n'
+                    legacy_permissions + '- id: credentials\n  disabled: false\n- id: authorization\n  disabled: false\n'
                     '- id: deepseek-account\n  disabled: false\n- id: agent-default-model\n'
                     "  name: '@deepseek-ai/dsh-agent-default-model'\n  config:\n"
                     f'    provider: {provider}\n    model: {json.dumps(model or dsh_default_slug)}\n'
                     f'    reasoningEffort: {effort or "high"}\n', encoding='utf-8')
-                mode_str = 'read-only' if readonly else 'workspace-write'
                 command = [binary, '--profile', 'headless', '--patch', translate(patch_file), '--json']
-                if _dsh_supports_cli_permission_flags(binary, env):
+                if supports_perm_flags:
                     command.extend(['--permission-mode', mode_str, '--approval-policy', 'never'])
                 else:
                     env['DSH_PERMISSION_MODE'] = mode_str
@@ -4765,8 +4775,8 @@ def run_physics_gate_loop(target_dir, task_desc, verify_cmd, worker_fn, verify_f
             try:
                 entry['verification_executed'] = True
                 code, output = verifier(verify_cmd, target_dir)
-                entry.update(verify_exit_code=code, verify_output_tail=output[-2000:], passed=code == 0)
                 status = 'ok' if code == 0 else 'verification_failed'
+                entry.update(verify_exit_code=code, verify_output_tail=output[-2000:], passed=code == 0, status=status)
                 last_error = output
             except HarnessError as exc:
                 status = exc.status
@@ -4974,7 +4984,8 @@ def _run_gate_with_fallback(args, root, requested_target, text, caller, engine, 
     result = _run_cli_gate(args, root, requested_target, text, caller, engine, backends,
                            scopes, profile, kind, estimated_tokens, batch)
     if (result.get('status') != 'quota_exhausted' or not getattr(args, 'fallback_on_quota', False)
-            or 'quota_fallback' in meta or not _gate_can_replay(result, before, root)):
+            or getattr(args, '_approved_ticket', None) or 'quota_fallback' in meta
+            or not _gate_can_replay(result, before, root)):
         return result
     fallback = _local_fallback_engine(caller, engine, backends, text)
     if not fallback:
@@ -5375,12 +5386,18 @@ def cmd_check_grounding(args):
     return _print({'status': status, 'workspace_mode': detect_workspace_mode(args.root or args.target), **report})
 
 
+def _inspection_print(args, payload):
+    if getattr(args, 'output', ''):
+        _atomic_json(args.output, payload if getattr(args, 'no_redact_output', False) else _redact_public(payload))
+    return _print(_redact_public(payload) if getattr(args, 'redact', False) else payload)
+
+
 def cmd_probe(args):
     refresh = bool(getattr(args, 'discover_models', False))
     backends = _args_backends(args, refresh_model_cache=refresh)
     for prefix, info in backends.items():
         info['subscription_status'] = inspect_backend_quota_and_availability(prefix, info, info.get('model'), redact_usage=True)
-    return _print({'status': 'ok', 'caller': resolve_caller(args.caller),
+    return _inspection_print(args, {'status': 'ok', 'caller': resolve_caller(args.caller),
                    'workspace_mode': detect_workspace_mode(),
                    'fleet_profile': _fleet_profile_summary(),
                    'capability_ledger': _fleet_profile().get('capability_ledger', {}),
@@ -5444,7 +5461,7 @@ def cmd_assess(args):
             }
         except HarnessError as exc:
             resolved_roles[role_name] = {'selected_engine': None, 'blocked_reason': str(exc), 'dynamic_slot': True}
-    return _print({'status': 'ok', 'caller': caller, 'workspace_mode': detect_workspace_mode(),
+    return _inspection_print(args, {'status': 'ok', 'caller': caller, 'workspace_mode': detect_workspace_mode(),
                    'fleet_profile': _fleet_profile_summary(),
                    'capability_ledger': _fleet_profile().get('capability_ledger', {}),
                    'subscription_status': _fleet_profile().get('subscription_matrix', {}),
@@ -5479,7 +5496,8 @@ def cmd_audit(args):
     try:
         engines = _audit_engines(backends, not args.single, args.left, args.right, args.dry_run, caller, args.focus)
     except HarnessError as exc:
-        if exc.status != 'quota_exhausted' or not getattr(args, 'fallback_on_quota', False):
+        if (exc.status != 'quota_exhausted' or not getattr(args, 'fallback_on_quota', False)
+                or getattr(args, '_approved_ticket', None)):
             return _dispatch_print(args, {'status': exc.status, 'error': str(exc), **exc.details})
         prefix = exc.details.get('quota_backend')
         fallback = _local_fallback_engine(caller, (prefix or 'codex') + ':default', backends, args.focus)
@@ -5502,6 +5520,7 @@ def cmd_audit(args):
         q_backend = exc.details.get('quota_backend') or ''
         fb_engine = _local_fallback_engine(caller, f'{q_backend}:default', backends, args.focus) if (
             exc.status == 'quota_exhausted' and q_backend and getattr(args, 'fallback_on_quota', False)
+            and not getattr(args, '_approved_ticket', None)
             and _workspace_unchanged(fallback_before, root)
         ) else None
         if not fb_engine:
@@ -5655,6 +5674,7 @@ def cmd_gate(args):
     except HarnessError as exc:
         fb_engine = _local_fallback_engine(caller, engine, backends, text, clean_room=False) if (
             exc.status == 'quota_exhausted' and getattr(args, 'fallback_on_quota', False)
+            and not getattr(args, '_approved_ticket', None)
             and _workspace_unchanged(fallback_before, root)
         ) else None
         if not fb_engine:
@@ -5729,6 +5749,7 @@ def cmd_task(args):
     except HarnessError as exc:
         fb_engine = _local_fallback_engine(caller, engine, backends, text, clean_room=clean_room) if (
             exc.status == 'quota_exhausted' and getattr(args, 'fallback_on_quota', False)
+            and not getattr(args, '_approved_ticket', None)
             and _workspace_unchanged(fallback_before, root)
         ) else None
         if not fb_engine:
@@ -5785,6 +5806,7 @@ def cmd_task(args):
             fb_engine = _local_fallback_engine(caller, engine, backends, text, clean_room=clean_room) if (
                 getattr(exc, 'status', None) == 'quota_exhausted'
                 and getattr(args, 'fallback_on_quota', False)
+                and not getattr(args, '_approved_ticket', None)
                 and 'quota_fallback' not in payload
                 and _quota_can_replay(exc.details, invocation)
                 and _workspace_unchanged(before, root)
@@ -5896,7 +5918,7 @@ def _choose_dispatch_engine(args, backends, caller, explicit, text):
         prefix = exc.details.get('quota_backend')
         if prefix and (getattr(args, 'dry_run', False) or getattr(args, 'retry_quota', False)):
             return prefix + ':default'
-        if prefix and getattr(args, 'fallback_on_quota', False):
+        if prefix and getattr(args, 'fallback_on_quota', False) and not getattr(args, '_approved_ticket', None):
             fallback = _local_fallback_engine(caller, prefix + ':default', backends, text)
             if fallback:
                 args._selection_fallback = _quota_fallback_record(prefix + ':default', fallback, exc.details)
@@ -5926,10 +5948,21 @@ def _begin_dispatch(args):
         args._approved_ticket = _load_ticket(ticket_id, getattr(args, 'plan_dir', None), approved=True)
 
 
+_SECRET_FIELD_KEY_RE = re.compile(r'(?i)(?:^|[_-])(?:api_?key|auth_?token|access_?token|secret(?:_?key)?|password|credential)$|(?:api|auth|access|secret)(?:Key|Token)$')
+
+
 def _redact_public(value):
     if isinstance(value, dict):
-        return {k: _redact_public(v) for k, v in value.items()
-                if k not in ('total_cost_usd', 'cost_usd', 'modelUsage', 'plan_type')}
+        out = {}
+        for k, v in value.items():
+            if k in ('total_cost_usd', 'cost_usd', 'modelUsage', 'plan_type'):
+                continue
+            rk = _redact_public(k) if isinstance(k, str) else k
+            if isinstance(k, str) and _SECRET_FIELD_KEY_RE.search(k) and isinstance(v, str) and v:
+                out[rk] = '<redacted>'
+            else:
+                out[rk] = _redact_public(v)
+        return out
     if isinstance(value, list):
         return [_redact_public(v) for v in value]
     if not isinstance(value, str):
@@ -5939,14 +5972,15 @@ def _redact_public(value):
         if len(path) > 3:
             text = re.sub(re.escape(path), lambda _: replacement, text, flags=re.I)
             text = re.sub(re.escape(path.replace('\\', '/')), lambda _: replacement, text, flags=re.I)
-    text = re.sub(r'(?i)(?:[A-Z]:[\\/]Users[\\/][^\\/\s"\n]+|/home/[^/\s"\n]+)', '<HOME>', text)
+    text = re.sub(r'(?i)(?:[A-Z]:[\\/]Users[\\/][^\\/\s"\n]+|/mnt/[a-z]/Users/[^/\s"\n]+|/home/[^/\s"\n]+)', '<HOME>', text)
     def mask_ip(match):
         try:
-            address = ipaddress.IPv4Address(match.group())
+            address = ipaddress.ip_address(match.group())
             return '<PRIVATE_IP>' if address.is_private else match.group()
         except ValueError:
             return match.group()
     text = re.sub(r'(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])', mask_ip, text)
+    text = re.sub(r'(?i)(?<![\w:])(?:f[cd][0-9a-f]{2}:[0-9a-f:]{2,}|fe80:[0-9a-f:]{2,})(?![\w:])', mask_ip, text)
     text = re.sub(r'cae-harness-[A-Za-z0-9_-]+', '<STAGING>', text)
     if 'quota_summary' not in text:
         text = re.sub(r'\b\d+(?:\.\d+)?%', '<USAGE>', text)
@@ -6011,7 +6045,7 @@ def record_heavy_completion_for_stop_hook(args, payload):
                               'engine': stream.get('engine') or payload.get('engine'),
                               'model': stream.get('model') or payload.get('model'),
                               'succeeded': stream.get('succeeded', stream.get('status') == 'ok'),
-                              'status': stream.get('status', 'failed'), 'elapsed_sec': stream.get('elapsed_sec'),
+                              'status': stream.get('status') or ('ok' if stream.get('succeeded', payload.get('status') == 'ok') else 'failed'), 'elapsed_sec': stream.get('elapsed_sec'),
                               'token_usage': stream.get('token_usage') or stream.get('invocation', {}).get('token_usage')
                                              or extract_cli_token_usage('', '')}
                              for i, stream in enumerate(_result_streams(payload), 1)],
@@ -6223,7 +6257,13 @@ def _render_plan(ticket):
     columns = ['流号', '子任务与范围', '通道', '客户端及子代理类型', '模型名字', '挡位', '上下文窗口',
                '是否无头', '是否净室', '访问模式、写入范围与验收命令', '内联与超时', '当前是否可用',
                '本机配置额度类型与当前状态', '回执或子代理日志位置']
-    rows = ['| ' + ' | '.join(columns) + ' |', '|' + '---|' * len(columns)]
+    rows = ['| 流号 | 通道与执行端 | 模型与挡位 | 可用性与额度状态 |',
+            '| --- | --- | --- | --- |']
+    details = []
+
+    def row(values):
+        return '| ' + ' | '.join(str(value).replace('|', r'\|').replace('\n', ' ') for value in values) + ' |'
+
     yes_no = lambda value: '是' if value else '否'
     for stream in ticket['streams']:
         available = yes_no(stream['currently_available'])
@@ -6236,7 +6276,12 @@ def _render_plan(ticket):
                   yes_no(stream['headless']), yes_no(stream['clean_room']), stream['access_mode'],
                   '内联：' + yes_no(stream['inline_readonly']) + '；超时：' + str(stream['timeout']) + ' 秒',
                   available, stream['quota_scheme'] + '；' + stream['quota_summary'], stream['receipt_location']]
-        rows.append('| ' + ' | '.join(str(value).replace('|', r'\|').replace('\n', ' ') for value in values) + ' |')
+        rows.append(row([values[0], values[2] + '；' + values[3], values[4] + '；' + values[5],
+                         values[11] + '；' + values[12]]))
+        details += ['', '#### 流 ' + stream['stream_id'] + '（14 项完整参数明细）', '',
+                    '| 序号 | 参数项 | 当前值 |', '| --- | --- | --- |']
+        details.extend(row([index, name, value]) for index, (name, value) in enumerate(zip(columns, values), 1))
+    rows.extend(details)
     ledger = ticket.get('capability_ledger', {})
     markdown = ('工作流背景：' + ticket['workflow_bg'] + '\n\n要做什么：' + ticket['workflow_goal']
                 + '\n\n预计后果：' + ticket['workflow_impact'] + '\n\n' + '\n'.join(rows)
@@ -6564,11 +6609,12 @@ def build_arg_parser():
                               help='目标触发额度熔断且未修改工作区时，优先回退发起方，再选择其他已就绪且未冷却的端')
         command.add_argument('--timeout', type=_positive_arg, default=default_timeout)
         command.add_argument('--dry-run', action='store_true')
-    for command in (audit, gate, task, plan, batch):
-        command.add_argument('--user-prompt', default='')
+    for command in (probe, assess, audit, gate, task, plan, batch):
         command.add_argument('--output', default='')
         command.add_argument('--no-redact-output', action='store_true')
         command.add_argument('--redact', action='store_true')
+    for command in (audit, gate, task, plan, batch):
+        command.add_argument('--user-prompt', default='')
         command.add_argument('--session-id', default='')
         command.add_argument('--plan-dir', default='')
         command.add_argument('--ticket', default='')
@@ -6603,9 +6649,11 @@ def main():
         }[args.subcommand]
         code = handler(args)
     except HarnessError as exc:
-        code = _print({'status': exc.status, 'error': str(exc), 'caller': resolve_caller(args.caller), **exc.details})
+        err_payload = {'status': exc.status, 'error': str(exc), 'caller': resolve_caller(args.caller), **exc.details}
+        code = _print(_redact_public(err_payload) if getattr(args, 'redact', False) else err_payload)
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
-        code = _print({'status': 'failed', 'error': str(exc), 'caller': resolve_caller(args.caller)})
+        err_payload = {'status': 'failed', 'error': str(exc), 'caller': resolve_caller(args.caller)}
+        code = _print(_redact_public(err_payload) if getattr(args, 'redact', False) else err_payload)
     sys.exit(code)
 
 

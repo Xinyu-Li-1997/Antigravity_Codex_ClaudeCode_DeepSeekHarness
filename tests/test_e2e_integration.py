@@ -217,6 +217,68 @@ class TestEndToEndIntegration(unittest.TestCase):
         else:
             os.environ["CAE_HARNESS_DEPTH"] = self._old_harness_depth
 
+    def _managed_repo_files(self, pattern=None):
+        if (REPO_ROOT / ".git").exists():
+            cmd = ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"]
+            if pattern:
+                cmd.extend(["--", pattern])
+            proc = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True)
+            if proc.returncode == 0:
+                return [item for item in proc.stdout.decode("utf-8").split("\0") if item]
+        ignored = {".git", ".pytest_cache", "__pycache__", ".venv", "venv"}
+        return sorted(
+            path.relative_to(REPO_ROOT).as_posix()
+            for path in REPO_ROOT.rglob(pattern or "*")
+            if path.is_file() and not any(part in ignored for part in path.relative_to(REPO_ROOT).parts)
+        )
+
+    def test_markdown_tables_never_exceed_five_columns(self):
+        managed = self._managed_repo_files("*.md")
+        self.assertTrue(any(managed))
+        for name in filter(None, managed):
+            fence = ""
+            for number, line in enumerate((REPO_ROOT / name).read_text(encoding="utf-8").splitlines(), 1):
+                match = re.match(r"^ {0,3}(`{3,}|~{3,})", line)
+                if match:
+                    marker = match[1]
+                    if not fence:
+                        fence = marker
+                    elif marker[0] == fence[0] and len(marker) >= len(fence) and not line[match.end():].strip():
+                        fence = ""
+                    continue
+                if fence or "|" not in line:
+                    continue
+                cells = re.split(r"(?<!\\)\|", line.strip().strip("|"))
+                if len(cells) > 1:
+                    self.assertLessEqual(len(cells), 5, f"{name}:{number} {line}")
+
+    def test_rules_preserve_arbitrary_heading_after_standard_environment(self):
+        template = TEMPLATE_DIR / "rules/AGENTS.md"
+        expected = template.read_text(encoding="utf-8").rstrip()
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "rules.txt"
+            for newline in ("\n", "\r\n"):
+                with self.subTest(newline=repr(newline)):
+                    tail = newline.join(["## 本机特定约束", "R10. 本机构建。", "R11. 本机调试。",
+                                         "## 附加约束", "完整保留后续内容。", ""])
+                    original = ("# 旧规则" + newline + "## 工具与运行环境  " + newline
+                                + "R10. 旧标准规则。" + newline + tail).encode("utf-8")
+                    target.write_bytes(original)
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        INSTALLER._sync_global_rules(template, target, "fixture", dry_run=True)
+                    self.assertEqual(target.read_bytes(), original)
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        INSTALLER._sync_global_rules(template, target, "fixture", dry_run=False)
+                    local = tail.replace("R10.", "L1.").replace("R11.", "L2.")
+                    merged = (expected.replace("\n", newline) + newline * 2 + local).encode("utf-8")
+                    self.assertEqual(target.read_bytes(), merged)
+                    self.assertTrue(INSTALLER._rules_equal(target.read_bytes(), template.read_bytes()))
+                    before = target.stat().st_mtime_ns
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        INSTALLER._sync_global_rules(template, target, "fixture", dry_run=False)
+                    self.assertEqual(target.read_bytes(), merged)
+                    self.assertEqual(target.stat().st_mtime_ns, before)
+
     def test_01_plugin_manifest_rules_and_agents_compliance(self) -> None:
         """验证插件结构严格符合 Antigravity 官方 Native Plugin 规范"""
         plugin_json = json.loads((ACTIVE_PLUGIN_DIR / "plugin.json").read_text(encoding="utf-8"))
@@ -1651,8 +1713,11 @@ class TestEndToEndIntegration(unittest.TestCase):
                 disabled = INSTALLER._plan_codex_hooks(path, template, cmd, "off", 0)
             hooks = json.loads(disabled.change.content)["hooks"]
             remaining = [handler for groups in hooks.values() for group in groups for handler in group["hooks"]]
-            self.assertEqual(len(remaining), 1)
-            self.assertIn("session_context_loader.py", remaining[0]["command"])
+            self.assertEqual(len(remaining), 3)
+            commands = "\n".join(handler["command"] for handler in remaining)
+            for name in ("session_context_loader.py", "status_guard.py", "reply_repeat_guard.py"):
+                self.assertIn(name, commands)
+            self.assertNotIn("handoff_gate.py", commands)
 
     def test_22_codex_toml_preflight_preserves_quoted_keys_comments_and_trust(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2371,6 +2436,35 @@ class TestEndToEndIntegration(unittest.TestCase):
                 hooks_path.write_bytes(plan.change.content)
                 self.assertIsNone(INSTALLER._plan_codex_hooks(hooks_path, template, "python -X utf8 -I -B").change)
 
+    def _copy_fleet_repo(self, sandbox):
+        repo = sandbox / "upstream"
+        managed = self._managed_repo_files()
+        for name in filter(None, managed):
+            source = REPO_ROOT / name
+            if source.is_file():
+                target = repo / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, target)
+        return repo
+
+    def _fleet_state_command(self, script, sandbox, *args):
+        # 仓内临时目录的上级仍有真实仓库。仅模拟夹具的发现边界，状态重叠检查保持原实现。
+        bootstrap = """
+import importlib.util
+import sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("fleet_state_sandbox", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+sandbox = Path(sys.argv[2]).resolve()
+original = module._is_upstream_repo
+def within_sandbox(candidate):
+    return candidate.resolve().is_relative_to(sandbox) and original(candidate)
+module._is_upstream_repo = within_sandbox
+raise SystemExit(module.main(sys.argv[3:]))
+"""
+        return [sys.executable, "-B", "-X", "utf8", "-c", bootstrap, str(script), str(sandbox), *args]
+
     def test_43_fleet_evolve_skill_and_two_pass_bootstrap_state_lock(self) -> None:
         skill_md = TEMPLATE_DIR / "skills" / "fleet-evolve" / "SKILL.md"
         state_py = TEMPLATE_DIR / "skills" / "fleet-evolve" / "scripts" / "fleet_state.py"
@@ -2398,12 +2492,14 @@ class TestEndToEndIntegration(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             tmp_root = Path(tmp)
+            repo = self._copy_fleet_repo(tmp_root)
+            state_py = repo / state_py.relative_to(REPO_ROOT)
             state_dir = tmp_root / "fleet_state"
             env = {**os.environ, "CAE_FLEET_STATE_DIR": str(state_dir)}
 
             auto_repo = subprocess.run(
-                [sys.executable, "-B", "-X", "utf8", str(state_py), "status"],
-                cwd=tmp_root, capture_output=True, text=True, encoding="utf-8", env=env, timeout=15,
+                self._fleet_state_command(state_py, tmp_root, "status"),
+                cwd=repo, capture_output=True, text=True, encoding="utf-8", env=env, timeout=15,
             )
             self.assertEqual(auto_repo.returncode, 0, auto_repo.stderr)
             self.assertEqual(json.loads(auto_repo.stdout)["phase"], "IDLE")
@@ -2412,7 +2508,7 @@ class TestEndToEndIntegration(unittest.TestCase):
             installed_copy.parent.mkdir(parents=True)
             installed_copy.write_bytes(state_py.read_bytes())
             no_repo_err = subprocess.run(
-                [sys.executable, "-B", "-X", "utf8", str(installed_copy), "status"],
+                self._fleet_state_command(installed_copy, tmp_root, "status"),
                 cwd=tmp_root, capture_output=True, text=True, encoding="utf-8", env=env, timeout=15,
             )
             self.assertNotEqual(no_repo_err.returncode, 0)
@@ -2425,23 +2521,23 @@ class TestEndToEndIntegration(unittest.TestCase):
                 "CAE_FLEET_STATE_DIR": str(tmp_root / "custom_codex" / "sub"),
             }
             tilde_overlap = subprocess.run(
-                [sys.executable, "-B", "-X", "utf8", str(state_py), "--repo", str(REPO_ROOT), "status"],
+                self._fleet_state_command(state_py, tmp_root, "--repo", str(repo), "status"),
                 capture_output=True, text=True, encoding="utf-8", env=tilde_env, timeout=15,
             )
             self.assertNotEqual(tilde_overlap.returncode, 0)
 
             def run_state(*cli_args: str) -> subprocess.CompletedProcess[str]:
                 return subprocess.run(
-                    [sys.executable, "-B", "-X", "utf8", str(state_py), "--repo", str(REPO_ROOT), *cli_args],
+                    self._fleet_state_command(state_py, tmp_root, "--repo", str(repo), *cli_args),
                     capture_output=True, text=True, encoding="utf-8", env=env, timeout=15,
                 )
 
             st0 = json.loads(run_state("status").stdout)
             self.assertEqual(st0["phase"], "IDLE")
 
-            bad_env = {**os.environ, "CAE_FLEET_STATE_DIR": str(REPO_ROOT / "bad_state")}
+            bad_env = {**os.environ, "CAE_FLEET_STATE_DIR": str(repo / "bad_state")}
             bad = subprocess.run(
-                [sys.executable, "-B", "-X", "utf8", str(state_py), "--repo", str(REPO_ROOT), "status"],
+                self._fleet_state_command(state_py, tmp_root, "--repo", str(repo), "status"),
                 capture_output=True, text=True, encoding="utf-8", env=bad_env, timeout=15,
             )
             self.assertNotEqual(bad.returncode, 0)
@@ -2566,12 +2662,14 @@ class TestEndToEndIntegration(unittest.TestCase):
         # 验证 fleet_state.py 推荐搭配表用户拍板硬门禁 (propose -> AWAITING_USER_APPROVAL -> approve -> IDLE)
         state_py = TEMPLATE_DIR / "skills" / "fleet-evolve" / "scripts" / "fleet_state.py"
         with tempfile.TemporaryDirectory() as tmp:
-            state_dir = Path(tmp) / "approval_state"
+            sandbox = Path(tmp)
+            repo = self._copy_fleet_repo(sandbox)
+            state_dir = sandbox / "approval_state"
             env = {**os.environ, "CAE_FLEET_STATE_DIR": str(state_dir)}
 
             def run_state(*args: str) -> subprocess.CompletedProcess[str]:
                 return subprocess.run(
-                    [sys.executable, "-B", "-X", "utf8", str(state_py), "--repo", str(REPO_ROOT), *args],
+                    self._fleet_state_command(state_py, sandbox, "--repo", str(repo), *args),
                     cwd=REPO_ROOT, capture_output=True, text=True, encoding="utf-8", env=env, timeout=15,
                 )
 
@@ -2620,7 +2718,7 @@ class TestEndToEndIntegration(unittest.TestCase):
             self.assertIn("recommended_tier", profile["roles"][role_name])
 
         readme_text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn("中国国家留学基金委", readme_text)
+        self.assertIn("国家留学基金管理委员会", readme_text)
         self.assertIn("China Scholarship Council", readme_text)
         self.assertIn("202506280162", readme_text)
         self.assertIn("留金选[2025]37号", readme_text)
@@ -2641,7 +2739,7 @@ class TestEndToEndIntegration(unittest.TestCase):
             installed_state.write_bytes(state_py.read_bytes())
 
             gen_res = subprocess.run(
-                [sys.executable, "-B", "-X", "utf8", str(installed_state), "status"],
+                self._fleet_state_command(installed_state, tmp_root, "status"),
                 cwd=general_proj, capture_output=True, text=True, encoding="utf-8", env=env, timeout=15,
             )
             self.assertEqual(gen_res.returncode, 2)

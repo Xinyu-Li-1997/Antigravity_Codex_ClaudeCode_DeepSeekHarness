@@ -332,8 +332,12 @@ def get_plugin_data_state_dir() -> Path:
     return Path.home() / ".gemini/antigravity/plugin_data/user-guard/state"
 
 
-def candidate_dispatch_plan_dirs(state_dir=None) -> List[Path]:
+def candidate_dispatch_plan_dirs(state_dir=None, extra_plan_dirs=()) -> List[Path]:
     candidates = []
+    for directory in extra_plan_dirs:
+        path = Path(directory).expanduser().absolute()
+        if not any(_is_reparse_or_link(parent) for parent in (path, *path.parents)):
+            candidates.append(path)
     if os.environ.get("CAE_PLAN_STATE_DIR"):
         candidates.append(Path(os.environ["CAE_PLAN_STATE_DIR"]).expanduser())
     if state_dir is not None:
@@ -354,11 +358,11 @@ def _read_state_json(path: Path) -> Any:
         return None
 
 
-def _session_tickets(session_id, state_dir=None, statuses=("PENDING",)):
+def _session_tickets(session_id, state_dir=None, statuses=("PENDING",), extra_plan_dirs=()):
     if not valid_session_id(session_id):
         return
     seen = set()
-    for directory in candidate_dispatch_plan_dirs(state_dir):
+    for directory in candidate_dispatch_plan_dirs(state_dir, extra_plan_dirs):
         pointer = _read_state_json(directory / f"session_{session_id}_pending.json")
         preferred = pointer.get("ticket_id") if isinstance(pointer, dict) else None
         paths = ([directory / (preferred + ".json")] if valid_session_id(preferred) else [])
@@ -387,8 +391,8 @@ def find_session_pending_ticket(session_id, state_dir=None):
     return next((ticket for _, ticket in _session_tickets(session_id, state_dir)), None)
 
 
-def find_session_approved_tickets(session_id, state_dir=None, *, ticket_id=None, channel=None):
-    return [ticket for _, ticket in _session_tickets(session_id, state_dir, ("APPROVED",))
+def find_session_approved_tickets(session_id, state_dir=None, *, ticket_id=None, channel=None, extra_plan_dirs=()):
+    return [ticket for _, ticket in _session_tickets(session_id, state_dir, ("APPROVED",), extra_plan_dirs)
             if (ticket_id is None or ticket.get("ticket_id") == ticket_id)
             and (channel is None or any(isinstance(row, dict) and row.get("channel") == channel
                                         for row in ticket.get("streams", [])))]
@@ -472,18 +476,31 @@ def render_pending_workflow_block(ticket, for_handoff=False) -> str:
         return value(raw).replace("|", r"\|").replace("\r", " ").replace("\n", " ")
 
     title = ("【新对话待选重负载工作流详述与选项卡块】" if for_handoff else
-             "【未决重负载工作流专项计划（压缩前待拍板弹框，非回读摘要——请向用户完整详述工作流背景、要做的事、预计后果、14列全字段矩阵及选项卡）】")
+             "【未决重负载工作流专项计划（压缩前待拍板弹框，非回读摘要——请向用户完整详述工作流背景、要做的事、预计后果、14项全字段参数表及选项卡）】")
     lines = [title, "票据：" + value(ticket.get("ticket_id")), "状态：" + value(ticket.get("status"))]
     stored = ticket.get("handoff_prompt_block" if for_handoff else "human_popup_markdown")
     if stored:
         lines += [str(stored)]
+        ledger = ticket.get("capability_ledger") or {}
+        required = [ticket.get("workflow_bg") or ticket.get("workflow_background"),
+                    ticket.get("workflow_goal"), ticket.get("workflow_impact"),
+                    ledger.get("last_online_refresh_at"), ledger.get("local_bench_verified_at"), "①", "②", "③"]
+        for stream in ticket.get("streams", []):
+            if isinstance(stream, dict):
+                required += [stream.get("stream_id"), stream.get("receipt_location")]
+        old_table = any(len(re.split(r"(?<!\\)\|", line.strip())[1:-1]) == 14
+                        for line in str(stored).splitlines() if line.strip().startswith("|"))
+        if not old_table and all(raw is not None and raw != "" and (str(raw) in str(stored) or cell(raw) in str(stored))
+                                 for raw in required):
+            if "恢复命令：plan --resume-ticket" not in str(stored):
+                lines.append("恢复命令：plan --resume-ticket " + value(ticket.get("ticket_id")))
+            return "\n".join(lines)
     lines += ["工作流背景：" + value(ticket.get("workflow_bg") or ticket.get("workflow_background")),
               "要做什么与后续计划：" + value(ticket.get("workflow_goal")),
               "预计后果与边界影响：" + value(ticket.get("workflow_impact"))]
     columns = ["流号", "子任务与范围", "通道", "客户端及子代理类型", "模型名字", "挡位", "上下文窗口",
                "是否无头", "是否净室", "访问模式、写入范围与验收命令", "内联与超时", "当前是否可用",
                "本机配置额度类型与当前状态", "回执或子代理日志位置"]
-    lines += ["| " + " | ".join(columns) + " |", "|" + "---|" * len(columns)]
     for stream in ticket.get("streams", []):
         if not isinstance(stream, dict):
             continue
@@ -496,7 +513,10 @@ def render_pending_workflow_block(ticket, for_handoff=False) -> str:
                   "内联：" + value(stream.get("inline_readonly")) + "；超时：" + value(stream.get("timeout")),
                   value(stream.get("currently_available")) + "；" + value(stream.get("unavailable_reason")),
                   value(stream.get("quota_scheme")) + "；" + value(stream.get("quota_summary")), stream.get("receipt_location")]
-        lines.append("| " + " | ".join(cell(field) for field in fields) + " |")
+        lines += ["", "#### 流 " + value(stream.get("stream_id")) + "（14 项完整参数明细）", "",
+                  "| 序号 | 参数项 | 当前值 |", "| --- | --- | --- |"]
+        lines.extend("| " + str(index) + " | " + name + " | " + cell(field) + " |"
+                     for index, (name, field) in enumerate(zip(columns, fields), 1))
     ledger = ticket.get("capability_ledger") or {}
     lines += ["离线性能记录更新时间：在线刷新 " + value(ledger.get("last_online_refresh_at"))
               + "；本机实测 " + value(ledger.get("local_bench_verified_at")),
@@ -722,11 +742,32 @@ def _effective_log_limits(anchor_dir: Optional[Path] = None) -> Tuple[int, int]:
     return max_bytes, trim_bytes
 
 
+_LIFECYCLE_SECRET_RE = re.compile(
+    r"(?i)(?:Bearer\s+[A-Za-z0-9._~+/=-]{8,}|"
+    r"(?:sk-[A-Za-z0-9_-]{12,}|AIza[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|"
+    r"github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|hf_[A-Za-z0-9]{20,}|glpat-[A-Za-z0-9_-]{16,})|"
+    r"(?:DEEPSEEK_API_KEY|ANTHROPIC_AUTH_TOKEN|ANTHROPIC_API_KEY|OPENAI_API_KEY|"
+    r"api[_-]?key|auth[_-]?token|access[_-]?token|secret[_-]?key)[\"\']?\s*[=:]\s*[\"\']?[^\s\"\',}]+)"
+)
+
+
+def _scrub_lifecycle_entry(val: Any) -> Any:
+    if isinstance(val, str):
+        val = re.sub(r"(?i)(https?://)([^/\s@]+@)", r"\1<redacted>@", val)
+        val = re.sub(r"(?i)([?&](?:key|api_key|token|access_token|secret)=)[^&\s\"']+", r"\1<redacted>", val)
+        return _LIFECYCLE_SECRET_RE.sub("<redacted>", val)
+    if isinstance(val, dict):
+        return {k: _scrub_lifecycle_entry(v) for k, v in val.items()}
+    if isinstance(val, list):
+        return [_scrub_lifecycle_entry(v) for v in val]
+    return val
+
+
 def append_jsonl_log(log_path: Path, entry: Dict[str, Any]) -> None:
     """日志共用独立锁；裁剪仅读尾部，避免大会话日志全量入内存或并发丢行。"""
     try:
         max_bytes, trim_bytes = _effective_log_limits()
-        row = json.dumps(entry, ensure_ascii=False) + "\n"
+        row = json.dumps(_scrub_lifecycle_entry(entry), ensure_ascii=False) + "\n"
         lock_id = "log-" + hashlib.sha256(_canonical_path_key(log_path).encode("utf-8")).hexdigest()[:24]
         with session_state_lock(log_path.parent, lock_id):
             if log_path.exists() and log_path.stat().st_size > max_bytes:

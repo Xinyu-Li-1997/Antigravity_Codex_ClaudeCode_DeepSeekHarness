@@ -2742,12 +2742,15 @@ def _check_dispatch_locked(payload, tool_name, args, sid, state_dir):
                 except (TypeError, ValueError, OverflowError):
                     long_task = False
                 large_target = False
-                target_arg = _dispatch_option(tail, "--target")
-                if tail[:1] == ["task"] and target_arg and "--dry-run" not in tail:
-                    base = Path(payload.get("cwd") or Path.cwd())
-                    command_cwd = args.get("Cwd") or args.get("cwd") or args.get("workdir")
-                    if command_cwd:
-                        base = base / Path(command_cwd).expanduser()
+                base = Path(payload.get("cwd") or Path.cwd())
+                command_cwd = args.get("Cwd") or args.get("cwd") or args.get("workdir")
+                if command_cwd:
+                    base = base / Path(command_cwd).expanduser()
+                plan_dir_arg = _dispatch_option(tail, "--plan-dir")
+                custom_plan_dir = base / Path(plan_dir_arg).expanduser() if plan_dir_arg else None
+                extra_plan_dirs = (custom_plan_dir,) if custom_plan_dir is not None else ()
+                target_arg = _dispatch_option(tail, "--target") or "."
+                if tail[:1] == ["task"] and "--dry-run" not in tail:
                     target = (base / Path(target_arg).expanduser()).resolve()
                     if target.exists():
                         # 复用派工端的过滤与字节估算，目录链接、空文件等判据只维护一处。
@@ -2759,7 +2762,7 @@ def _check_dispatch_locked(payload, tool_name, args, sid, state_dir):
                         large_target = (count > config.get("heavy_max_light_files", 2)
                                         or tokens_estimate > config.get("heavy_max_light_tokens", 24000))
                 if tail and (tail[0] in ("batch", "audit", "gate") or code_task or long_task or large_target) and "--dry-run" not in tail:
-                    heavy_tickets.append(_dispatch_option(tail, "--ticket"))
+                    heavy_tickets.append((_dispatch_option(tail, "--ticket"), extra_plan_dirs))
                 continue
             head, tail = names[0], tokens[1:]
             low = [t.lower() for t in tail]
@@ -2812,16 +2815,16 @@ def _check_dispatch_locked(payload, tool_name, args, sid, state_dir):
             if identity:
                 state.setdefault("calls", []).append(identity)
             user_words.atomic_write_json(file, state)
-    for ticket_id in heavy_tickets:
+    for ticket_id, extra_plan_dirs in heavy_tickets:
         if not ticket_id or not user_words.find_session_approved_tickets(
-                sid, state_dir, ticket_id=ticket_id, channel="cae_harness_headless"):
+                sid, state_dir, ticket_id=ticket_id, channel="cae_harness_headless", extra_plan_dirs=extra_plan_dirs):
             return _ticket_required_reason(sid)
     return None
 
 
 def _ticket_required_reason(sid):
     return ("【user-guard 重负载派工门禁】未找到当前会话有效且未过期的 APPROVED 批次票据。"
-            f"请先调用 cae_harness.py plan --session-id {sid} ...，生成人话弹卡，包含内部与外部子代理完整 14 列参数矩阵；"
+            f"请先调用 cae_harness.py plan --session-id {sid} ...，生成人话弹卡，包含内部与外部子代理完整 14 项参数确认单；"
             "获用户确认并执行 --approve-ticket 后再启动；原生调用须在票据中列出原生通道。")
 
 

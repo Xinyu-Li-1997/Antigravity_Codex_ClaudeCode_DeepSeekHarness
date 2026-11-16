@@ -1004,7 +1004,8 @@ def _workflow_handoff_present(text: str, tickets) -> bool:
                 fence = match[1]
             elif match[1][0] == fence[0] and len(match[1]) >= len(fence):
                 fence = ""
-        if not fence and re.match(r"^\s*#{1,6}\s+", line):
+        if (not fence and re.match(r"^\s*#{1,6}\s+", line)
+                and not re.match(r"^\s*#### 流 .+（14 项完整参数明细）\s*$", line)):
             break
         body_lines.append(line)
     def normalize(value):
@@ -1012,12 +1013,28 @@ def _workflow_handoff_present(text: str, tickets) -> bool:
 
     body = "\n".join(body_lines)
     normalized = normalize(body)
-    rows = []
+    columns = ["流号", "子任务与范围", "通道", "客户端及子代理类型", "模型名字", "挡位", "上下文窗口",
+               "是否无头", "是否净室", "访问模式、写入范围与验收命令", "内联与超时", "当前是否可用",
+               "本机配置额度类型与当前状态", "回执或子代理日志位置"]
+    rows, vertical = [], {}
+
+    def finish_vertical():
+        if all(column in vertical for column in columns):
+            rows.append([vertical[column] for column in columns])
+
     for line in body_lines:
         if line.strip().startswith("|") and line.strip().endswith("|"):
             cells = re.split(r"(?<!\\)\|", line.strip())[1:-1]
             if len(cells) == 14:
                 rows.append([normalize(cell) for cell in cells])
+            elif len(cells) == 2 or (len(cells) == 3 and re.fullmatch(r"\s*(?:[1-9]|1[0-4])\s*", cells[0])):
+                key, value = cells[-2].strip(), normalize(cells[-1])
+                if key == "流号":
+                    finish_vertical()
+                    vertical = {}
+                if key in columns:
+                    vertical[key] = value
+    finish_vertical()
 
     def contains(cell, value):
         return value in (None, "", []) or normalize(value) in cell
@@ -1065,7 +1082,7 @@ def _workflow_handoff_present(text: str, tickets) -> bool:
 def _workflow_handoff_notice(tickets) -> str:
     if not tickets:
         return ""
-    return ("\n必须将以下未决重负载工作流的背景、要做什么、预计后果、14列全字段矩阵、"
+    return ("\n必须将以下未决重负载工作流的背景、要做什么、预计后果、14项全字段参数表、"
             "离线性能更新时间及选项卡完整写入【新对话提示词】，由新对话读取磁盘票据再请用户拍板。\n"
             + "\n\n".join(user_words.render_pending_workflow_block(ticket, for_handoff=True) for ticket in tickets))
 

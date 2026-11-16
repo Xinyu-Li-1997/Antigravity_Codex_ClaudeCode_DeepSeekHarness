@@ -47,9 +47,9 @@ description: >
 
 `plan` 可接收单流参数，也可通过 `--spec-file` 读取非空对象列表。流内字段覆盖相应公共默认值。通道有 `cae_harness_headless`、`native_subagent`、`native_workflow`、`native_swarm`。原生通道必须指定或识别 `--caller`，默认模型为 `inherit`；确认单显示配置解析出的实际模型，无法解析时保留未解析状态。原生通道不属于无头调用，也不提供净室隔离。
 
-重负载确认单先说明工作流背景、要做什么和预计后果，再展示源码定义的 14 列全字段矩阵。不能省略未知字段，也不能以角色槽位代替实际模型。
+重负载确认单先说明工作流背景、要做什么和预计后果，再输出 4 列各路总览表与每路纵向展开的 14 项完整参数表。不能省略未知字段，也不能以角色槽位代替实际模型。
 
-| 列号 | 字段 | 应显示的内容 |
+| 序号 | 参数项 | 应显示的内容 |
 | --- | --- | --- |
 | 1 | 流号 | 每路唯一标识。 |
 | 2 | 子任务与范围 | 工作内容与目标路径。 |
@@ -66,7 +66,7 @@ description: >
 | 13 | 本机配置额度类型与当前状态 | 额度来源、可读状态及冷却情况。 |
 | 14 | 回执或子代理日志位置 | 结构化回执或原生轨迹位置。 |
 
-矩阵后附性能记录的联网刷新和本机实测更新时间，并给出批准当前计划、微调引擎或挡位或超时后批准、暂缓并交接三个选项。主会话结合证据说明推荐，用户明确选择前不执行重负载。`--session-id` 关联当前会话；轻计划如需保存，加 `--save-ticket`。`--plan-dir` 可指定票据目录，所有票据、回执、日志和临时制品均受当前授权边界约束。
+参数表后附性能记录的联网刷新和本机实测更新时间，并给出批准当前计划、微调引擎、挡位或超时后批准、暂缓并交接三个选项。主会话结合证据说明推荐，用户明确选择前不执行重负载。`--session-id` 关联当前会话；轻计划如需保存，加 `--save-ticket`。`--plan-dir` 可指定票据目录，所有票据、回执、日志和临时制品均受当前授权边界约束。
 
 ## 批准、执行与跨中断恢复
 
@@ -74,9 +74,9 @@ description: >
 
 `status_guard.py` 在工具执行前核验获批票据，拦截未经确认的重负载和裸 CLI 旁路。不要直接启动原始客户端命令绕过窗口、快照、额度或确认检查。`batch` 只执行 `cae_harness_headless`；含原生通道的计划由对应客户端按获批内容调用，不能整份交给 `batch`。在工作流中声明 `kind: gate` 时仍须提供范围与验收命令，不把批处理标签本身当作已完成验证。
 
-等待弹卡期间发生自动压缩，钩子从磁盘未决票据独立加载背景、要做什么、预计后果、完整矩阵和选项卡。恢复时分成两块：常规用户原话及子代理摘要；未决重负载工作流与完整确认单。票据缺失时报告缺口，不凭印象补写，也不把压缩或超时当作批准。
+等待弹卡期间发生自动压缩，钩子从磁盘未决票据独立加载背景、要做什么、预计后果、完整 14 项参数表和选项卡。恢复时分成两块：常规用户原话及子代理摘要；未决重负载工作流与完整确认单。票据缺失时报告缺口，不凭印象补写，也不把压缩或超时当作批准。
 
-进入 `drain` 或 `freeze` 强制交接时，`handoff_gate.py` 放行 `check-grounding --strict`，并在 `Stop` 硬门禁要求把完整工作流、全字段矩阵、性能更新时间、选项卡和票据写入【新对话提示词】。Codex 与 Claude Code 默认是 `advisory` 提醒，强制行为以实际模式为准。
+进入 `drain` 或 `freeze` 强制交接时，`handoff_gate.py` 放行 `check-grounding --strict`，并在 `Stop` 硬门禁要求把完整工作流、14 项全字段参数表、性能更新时间、选项卡和票据写入【新对话提示词】。Codex 与 Claude Code 默认是 `advisory` 提醒，强制行为以实际模式为准。
 
 新会话先用 `plan --resume-ticket` 读取并重新核对完整确认内容。该接口保留原票据的 `session_id`，不会因传入新会话标识自动改绑；跨会话接力应据原流内容和当前会话标识重新生成确认票据，再按用户选择登记批准。内容变化、过期或校验失败时重新形成确认单，恢复本身不代表批准。
 
@@ -107,7 +107,7 @@ python -B -X utf8 scripts/cae_harness.py check-grounding --target "<项目根目
 python -B -X utf8 scripts/cae_harness.py plan --spec-file "<工作流文件路径>" --tier high --session-id "<当前会话标识>" --workflow-bg "核心文档已重写，需要核对实现" --workflow-goal "分路检查指定文件" --workflow-impact "只读核查并生成回执，不修改源文件"
 ```
 
-完整展示矩阵及选项，待用户明确批准后登记，再执行外部批处理：
+完整展示参数表及选项，待用户明确批准后登记，再执行外部批处理：
 
 ```powershell
 python -B -X utf8 scripts/cae_harness.py plan --approve-ticket "<票据标识>" --session-id "<当前会话标识>"
@@ -116,10 +116,10 @@ python -B -X utf8 scripts/cae_harness.py batch --ticket "<票据标识>" --sessi
 
 如用户有点名要求，在形成计划和执行任务时通过 `--user-prompt "<用户点名原话>"` 保留同一约束。不要在执行时增加会改变已批准模型或挡位的参数。
 
-原生只读代理可先用以下入口形成计划，`plan` 不会启动代理。多路时通过同一 `--spec-file` 列全所有流，并按实际客户端设置 `--caller`：
+原生只读代理可先用以下入口形成计划，`plan` 不会启动代理。多路时通过同一 `--spec-file` 列全所有流，并按当前客户端自动识别或显式设置 `--caller`：
 
 ```powershell
-python -B -X utf8 scripts/cae_harness.py plan --channel native_subagent --caller codex --agent-type readonly-auditor --model inherit --kind review --target "<目标文件路径>" --session-id "<当前会话标识>" --save-ticket --workflow-bg "需要原文行号复核" --workflow-goal "读取目标并返回原文行号" --workflow-impact "只读，不运行构建或测试"
+python -B -X utf8 scripts/cae_harness.py plan --channel native_subagent --caller auto --agent-type readonly-auditor --model inherit --kind review --target "<目标文件路径>" --session-id "<当前会话标识>" --save-ticket --workflow-bg "需要原文行号复核" --workflow-goal "读取目标并返回原文行号" --workflow-impact "只读，不运行构建或测试"
 ```
 
 跨会话先读取旧票据；此命令不转移会话归属：

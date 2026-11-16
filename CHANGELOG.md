@@ -2,12 +2,23 @@
 
 本文件记录四客户端共用规则、会话钩子、后台验证工具与上游维护流程的版本演进。当前插件版本以 `template/user-guard/plugin.json` 为准；常驻使用文档只说明机制和配置键，不重复维护版本号与性能日期。
 
-## 工程闭环修复
+## [1.15.1] - 2026-11-16
 
-- 完工门禁绑定流标识与实际回执文件名，保留跨回合未报账原生任务，覆盖单路可写代理及交接放行后的报账检查。
-- 派工门禁剥离常见命令包装器，外部重负载绑定显式票据，原生调用核对通道及批准流数，超时阈值读取动态配置。
-- 重启记录保护有效待批提案；首次路由配置采用动态端口；自定义规则撞号迁移覆盖常见 Markdown 前缀；更新卡片保留合法元数据。
-- 校准状态锁入口与完工检查文档，收紧个人路径扫描豁免，补充离线回归测试。
+修复 14 列超宽横向表格窄视口挤压变形、GitHub Actions `ubuntu-latest` 与 WSL2 跨平台测试断言偏差、DSH 新版命令行无头权限补丁冲突及派工门禁目录边界问题，并由 Antigravity 完成全仓文档整篇润色、由 Codex `gpt-6-astra` 完成全仓脱敏核查：
+
+- **确认单与文档窄视口纵向排版重构（`cae_harness.py`、`user_words.py`、`handoff_gate.py`、`reply_repeat_guard.py`、`README.md`、`docs/`、`docs/assets/*.svg`）**：
+  - 将 `_render_plan`、`render_pending_workflow_block`、`README.md` 与 `docs/workflow-guide.md` 中在窄屏视口和侧栏被挤压成单字竖条的 14 列横向大表重构为 **4 列各路总览表 + 每路 3 列纵向 14 项完整参数明细表**，零省略保留全部 14 个标准字段；同时在 `test_e2e_integration.py` 新增全仓 Markdown 表格列数上限（不超过 5 列）静态回归门禁；
+  - 修复 `user_words.py:render_pending_workflow_block` 在票据已存完整 `human_popup_markdown` 或 `handoff_prompt_block` 时重复拼接第二份背景与参数表的问题；更新 `handoff_gate.py:_workflow_handoff_present` 同时校验纵向 14 项参数明细表与历史 14 列横向行；将 `reply_repeat_guard.py:_render_heavy_bill` 规范为 4 列标准 GFM 表格。
+- **跨客户端无头调用与门禁边界修复（`cae_harness.py`、`status_guard.py`、`install.py`、`fleet_profile.json`）**：
+  - 修复 DSH 支持 `--permission-mode` 新版 CLI（`@deepseek-ai/dsh-permission-presets`）时，临时补丁仍写入旧版 `sandbox-policy`、`approval`、`permission` 导致预设服务启动报错退出码 `1` 的真机缺陷；
+  - 修复 `_extract_prompt_backend_hint` 在用户发出“用 Codex 等多工作流”等多端并列指令时误锁单端覆盖分路配置的问题，并在 `--fallback-on-quota` 配额回退中严守用户单端 P0 点名与重负载获批票据绑定边界；为 `probe` 与 `assess` 子命令补齐 `--redact`、`--output`、`--no-redact-output` 参数，补齐 `cae_harness.py` 异常出口、WSL `/mnt/<盘符>/Users/` 路径、私网 IPv6、敏感字段键值的 `--redact` 脱敏及 `router.py`、`user_words.py` 诊断日志密钥擦除；将 `inline_readonly_max_kib` 提升至 `512` 以覆盖大型源码文件的带行号内联读取；
+  - 修复 `status_guard.py` 在显式传入 `--plan-dir` 时未将该目录纳入获批票据检索、以及静态分析未带 `--target` 的 `cae_harness.py task` 命令时按当前工作目录估算规模阈值的判定；统一 `install.py:_sync_global_rules` 与 `_rules_equal` 对标准 `## 工具与运行环境` 之后任意二级标题自定义尾段的识别与防漂移判等；修复 `gate` 完工账单子项状态标记与无 `.git` 归档目录测试文件枚举回退；
+  - 合并前序闭环加固：完工门禁按完整词项绑定流标识与实际回执文件名并覆盖跨回合原生任务，派工门禁剥离常见命令包装器，状态锁保护有效待批提案，首次路由配置读取动态端口，卡片更新保留合法元数据。
+- **Linux（`ubuntu-latest`）与 WSL2 跨平台回归及文档润色脱敏（`tests/`、`README.md`、`docs/`、`CHANGELOG.md`）**：
+  - 修复 `test_claude_and_router_offline.py` 健康检查硬编码 Windows 端口 `8240`（POSIX 默认 `8241`）、Windows 应用探测缺少 `_windows_app_binaries` 隔离、WSL2 DrvFS 挂载盘 `chmod` 权限位差异及回环请求未隔离系统代理的问题；修复 `test_e2e_integration.py` POSIX 专属用例在 Codex 五钩子对齐后 `--codex-handoff-mode off` 剩余 `3` 个非交接钩子的断言；将仓库内测试临时沙箱统一迁入已忽略的 `.pytest_cache/` 目录；
+  - 按**用户层**（一键安装、明确点名 P0 矩阵、日常课题角色矩阵、本仓库元自动更新独立章节）与**原理层**（两层解耦、双门检查、共有门禁与四客户端协议适配）重构 `README.md`、`AGENTS.md`、`template/user-guard/README.md`、`docs/` 并新增 `docs/assets/user-and-evolution-flow.svg`，消除单一客户端事件视角偏差与密集术语堆砌，统一自定义尾段识别条件、`--disable-ccswitch-prompts` / `--purge-ccswitch-legacy` 说明、国家留学基金管理委员会唯一资助声明及 Apache-2.0 第 4 条 `NOTICE` 原创归属说明。
+
+---
 
 ## [1.15.0] - 2026-11-16
 

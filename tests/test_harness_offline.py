@@ -6,6 +6,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import signal
 import sqlite3
 import stat
@@ -90,6 +91,48 @@ class HarnessTests(unittest.TestCase):
         for name, info in engines.items():
             info['config_home'] = str(self.root / (name + '-config'))
         return engines
+
+    def test_prompt_backend_parallel_cues_preserve_routing(self):
+        for prompt in ("用codex等多工作流", "使用 codex 等做检查", "用 codex 和 dsh 审查",
+                       "用 codex 与 cc 检查", "用 codex 及 agy 检查", "用 codex、dsh 检查",
+                       "用 codex/dsh 检查", "用 codex 或 dsh 检查", "use codex and dsh", "use codex or dsh"):
+            with self.subTest(prompt=prompt):
+                self.assertEqual(harness._extract_prompt_backend_hint(prompt), '')
+        for prompt, backend in (("用 codex 审查", 'codex'), ("请交给 dsh 处理", 'dsh'),
+                                ("用 codex 高挡位", 'codex'), ("不要用 codex 审查", '')):
+            self.assertEqual(harness._extract_prompt_backend_hint(prompt), backend)
+
+    def test_probe_assess_public_stdout_and_output_options(self):
+        for command, function in (('probe', harness.cmd_probe), ('assess', harness.cmd_assess)):
+            for redact_stdout in (False, True):
+                for raw_file in (False, True):
+                    with self.subTest(command=command, redact_stdout=redact_stdout, raw_file=raw_file):
+                        output = self.root / (command + '.json')
+                        tokens = [command, '--caller', 'codex', '--output', str(output)]
+                        if redact_stdout:
+                            tokens.append('--redact')
+                        if raw_file:
+                            tokens.append('--no-redact-output')
+                        args = self.args(*tokens)
+                        sentinel = 'private-fixture-marker'
+                        with patch.object(harness, '_args_backends', return_value={}), \
+                             patch.object(harness, '_fleet_profile_summary', return_value={'marker': sentinel}), \
+                             patch.object(harness, '_redact_public', side_effect=lambda payload: json.loads(
+                                 json.dumps(payload).replace(sentinel, '[redacted]'))):
+                            code, result = self.capture(function, args)
+                        self.assertEqual(code, 0)
+                        self.assertEqual(result['fleet_profile']['marker'], '[redacted]' if redact_stdout else sentinel)
+                        saved = json.loads(output.read_text(encoding='utf-8'))
+                        self.assertEqual(saved['fleet_profile']['marker'], sentinel if raw_file else '[redacted]')
+
+    def test_probe_assess_redact_real_home_paths(self):
+        for command, function in (('probe', harness.cmd_probe), ('assess', harness.cmd_assess)):
+            args = self.args(command, '--caller', 'codex', '--redact')
+            with patch.object(harness, '_args_backends', return_value={}), \
+                 patch.object(harness, '_fleet_profile_summary', return_value={'path': str(self.root / 'private.json')}):
+                code, payload = self.capture(function, args)
+            self.assertEqual(code, 0)
+            self.assertEqual(payload['fleet_profile']['path'], '<HOME>' + os.sep + 'private.json')
 
     def test_four_peer_alias_callers_routing_and_budgets(self):
         engines = self.four_backends()
@@ -385,33 +428,41 @@ class HarnessTests(unittest.TestCase):
         before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in (cordis, credentials)}
         for provider in ('deepseek-official', 'deepseek-account'):
             engines['dsh']['dsh_provider'] = provider
-            for readonly in (True, False):
-                def run(command, cwd, input_text, timeout_sec, **kwargs):
-                    self.assertEqual(cwd, self.root)
-                    self.assertEqual(command[:3], ['dsh.cmd', '--profile', 'headless'])
-                    self.assertEqual(command[-1], '-')
-                    self.assertIn('--json', command)
-                    self.assertNotIn('--json-schema', command)
-                    self.assertEqual(command[command.index('--permission-mode') + 1], 'read-only' if readonly else 'workspace-write')
-                    self.assertEqual(command[command.index('--approval-policy') + 1], 'never')
-                    runtime_patch = Path(command[command.index('--patch') + 1]).read_text(encoding='utf-8')
-                    for plugin in ('credentials', 'authorization', 'deepseek-account'):
-                        self.assertIn(f'- id: {plugin}\n  disabled: false', runtime_patch)
-                    self.assertIn(f'provider: {provider}', runtime_patch)
-                    self.assertIn('model: "deepseek-v4-pro"', runtime_patch)
-                    self.assertIn('reasoningEffort: low', runtime_patch)
-                    self.assertTrue(input_text.startswith('执行输入\n\n'))
-                    self.assertIn(json.dumps(harness.TASK_JSON_SCHEMA, ensure_ascii=False), input_text)
-                    self.assertEqual(kwargs['env']['DSH_HOME'], str(root))
-                    self.assertEqual(kwargs['env']['DSH_TELEMETRY_DISABLED'], '1')
-                    stream = json.dumps({'type': 'init'}) + '\n' + json.dumps({'type': 'final',
-                        'reason': {'kind': 'completed'}, 'text': json.dumps(TASK)})
-                    return subprocess.CompletedProcess(command, 0, stream, '')
-                with self.subTest(provider=provider, readonly=readonly), patch.object(harness, 'run_process', side_effect=run), \
-                     patch.object(harness, '_dsh_supports_cli_permission_flags', return_value=True):
-                    result = harness.invoke_engine('dsh:default', self.root, '执行输入', engines, harness.TASK_JSON_SCHEMA,
-                                                   readonly=readonly, effort='medium')
-                self.assertEqual(result, TASK)
+            for supported in (False, True):
+                for readonly in (True, False):
+                    def run(command, cwd, input_text, timeout_sec, **kwargs):
+                        self.assertEqual(cwd, self.root)
+                        self.assertEqual(command[:3], ['dsh.cmd', '--profile', 'headless'])
+                        self.assertEqual(command[-1], '-')
+                        self.assertIn('--json', command)
+                        self.assertNotIn('--json-schema', command)
+                        if supported:
+                            self.assertEqual(command[command.index('--permission-mode') + 1], 'read-only' if readonly else 'workspace-write')
+                            self.assertEqual(command[command.index('--approval-policy') + 1], 'never')
+                        else:
+                            self.assertNotIn('--permission-mode', command)
+                            self.assertNotIn('--approval-policy', command)
+                            self.assertEqual(kwargs['env']['DSH_PERMISSION_MODE'], 'read-only' if readonly else 'workspace-write')
+                        runtime_patch = Path(command[command.index('--patch') + 1]).read_text(encoding='utf-8')
+                        for plugin in ('sandbox-policy', 'approval', 'permission'):
+                            self.assertEqual('- id: ' + plugin + '\n' in runtime_patch, not supported)
+                        for plugin in ('credentials', 'authorization', 'deepseek-account'):
+                            self.assertIn(f'- id: {plugin}\n  disabled: false', runtime_patch)
+                        self.assertIn(f'provider: {provider}', runtime_patch)
+                        self.assertIn('model: "deepseek-v4-pro"', runtime_patch)
+                        self.assertIn('reasoningEffort: low', runtime_patch)
+                        self.assertTrue(input_text.startswith('执行输入\n\n'))
+                        self.assertIn(json.dumps(harness.TASK_JSON_SCHEMA, ensure_ascii=False), input_text)
+                        self.assertEqual(kwargs['env']['DSH_HOME'], str(root))
+                        self.assertEqual(kwargs['env']['DSH_TELEMETRY_DISABLED'], '1')
+                        stream = json.dumps({'type': 'init'}) + '\n' + json.dumps({'type': 'final',
+                            'reason': {'kind': 'completed'}, 'text': json.dumps(TASK)})
+                        return subprocess.CompletedProcess(command, 0, stream, '')
+                    with self.subTest(provider=provider, readonly=readonly, supported=supported), patch.object(harness, 'run_process', side_effect=run), \
+                         patch.object(harness, '_dsh_supports_cli_permission_flags', return_value=supported):
+                        result = harness.invoke_engine('dsh:default', self.root, '执行输入', engines, harness.TASK_JSON_SCHEMA,
+                                                       readonly=readonly, effort='medium')
+                    self.assertEqual(result, TASK)
         self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in before}, before)
 
     def test_dsh_final_ndjson_fenced_text_and_incomplete_states(self):
@@ -3539,8 +3590,10 @@ else:
                 if not supported:
                     self.assertEqual(env['DSH_PERMISSION_MODE'], 'read-only')
                 patch_text = Path(command[command.index('--patch') + 1]).read_text(encoding='utf-8')
-                for plugin in ('sandbox-policy', 'approval', 'permission', 'agent-default-model', 'credentials', 'authorization', 'deepseek-account'):
+                for plugin in ('agent-default-model', 'credentials', 'authorization', 'deepseek-account'):
                     self.assertIn('- id: ' + plugin, patch_text)
+                for plugin in ('sandbox-policy', 'approval', 'permission'):
+                    self.assertEqual('- id: ' + plugin + '\n' in patch_text, not supported)
                 return subprocess.CompletedProcess(command, 0, json.dumps(TASK), '')
             with patch.object(harness, '_dsh_supports_cli_permission_flags', return_value=supported), \
                  patch.object(harness, 'run_process', side_effect=runner), patch.dict(os.environ, {}, clear=True):
@@ -3613,6 +3666,17 @@ else:
             self.assertFalse(pending[0]['reported_to_user'])
             self.assertTrue(pending[0]['all_succeeded'])
             self.assertEqual(pending[0]['receipt_file'], str(output))
+            gate_payload = {
+                'status': 'ok',
+                'engine': 'codex:gpt-6.1-sol',
+                'model': 'gpt-6.1-sol',
+                'history': [{'round': 1, 'passed': True, 'succeeded': True, 'token_usage': {'total_tokens': 5, 'usage_source': 'cli_reported'}}],
+                'token_usage_summary': {'total_tokens': 5, 'reported_streams': 1, 'unreported_streams': 0},
+            }
+            harness.record_heavy_completion_for_stop_hook(
+                self.args('gate', '--target', str(self.root), '--verify-cmd', 'true', '--task', 'x', '--plan-dir', str(plans), '--session-id', 'session_gate'), gate_payload)
+            gate_pending = json.loads((plans.parent / 'heavy_completions' / 'session_gate.json').read_text(encoding='utf-8'))
+            self.assertEqual(gate_pending[0]['streams'][0]['status'], 'ok')
 
     def test_wp1b_plan_mixed_channels_full_matrix_and_handoff(self):
         engines = self.four_backends()
@@ -3655,18 +3719,37 @@ else:
         for key in ('human_popup_markdown', 'handoff_prompt_block'):
             text = ticket[key]
             rows = [line for line in text.splitlines() if line.startswith('|')]
-            self.assertEqual(len(rows), 4)
-            self.assertTrue(all(len(line.split('|')[1:-1]) == 14 for line in rows))
-            for label in ('是否无头', '是否净室', '当前是否可用', '本机配置额度类型与当前状态', '上下文窗口'):
-                self.assertIn(label, rows[0])
-            for stream, row in zip(ticket['streams'], rows[2:]):
-                cells = [cell.strip() for cell in row.split('|')[1:-1]]
-                self.assertEqual(cells[7:9], ['是' if stream['headless'] else '否', '是' if stream['clean_room'] else '否'])
-                self.assertEqual(cells[11], '是')
+            self.assertTrue(all(len(re.split(r'(?<!\\)\|', line)[1:-1]) <= 4 for line in rows))
+            self.assertEqual(rows[0], '| 流号 | 通道与执行端 | 模型与挡位 | 可用性与额度状态 |')
+            self.assertEqual(len(rows), 4 + 16 * len(ticket['streams']))
+            columns = ['流号', '子任务与范围', '通道', '客户端及子代理类型', '模型名字', '挡位', '上下文窗口',
+                       '是否无头', '是否净室', '访问模式、写入范围与验收命令', '内联与超时', '当前是否可用',
+                       '本机配置额度类型与当前状态', '回执或子代理日志位置']
+            for number, stream in enumerate(ticket['streams']):
+                detail = rows[4 + number * 16:4 + (number + 1) * 16]
+                self.assertEqual(detail[0], '| 序号 | 参数项 | 当前值 |')
+                cells = [re.split(r'(?<!\\)\|', line)[1:-1] for line in detail[2:]]
+                self.assertEqual([cell[0].strip() for cell in cells], [str(i) for i in range(1, 15)])
+                self.assertEqual([cell[1].strip() for cell in cells], columns)
+                values = [cell[2].strip() for cell in cells]
+                yes_no = lambda value: '是' if value else '否'
+                available = yes_no(stream['currently_available'])
+                if stream.get('unavailable_reason'):
+                    available += '（' + stream['unavailable_reason'] + '）'
+                expected = [stream['stream_id'], stream['subtask'] + '；范围：' + stream['target'],
+                            harness._PLAN_CHANNEL_LABELS[stream['channel']] + ' (' + stream['channel'] + ')',
+                            stream['client'] + '；' + stream['agent_type'], stream['model_display'], stream['tier'],
+                            str(stream['context_window']) + ' tokens' if stream['context_window'] else '未声明',
+                            yes_no(stream['headless']), yes_no(stream['clean_room']), stream['access_mode'],
+                            '内联：' + yes_no(stream['inline_readonly']) + '；超时：' + str(stream['timeout']) + ' 秒',
+                            available, stream['quota_scheme'] + '；' + stream['quota_summary'], stream['receipt_location']]
+                self.assertEqual(values, [str(value).replace('|', r'\|').replace('\n', ' ') for value in expected])
+                self.assertEqual(values[7:9], ['是' if stream['headless'] else '否', '是' if stream['clean_room'] else '否'])
+                self.assertEqual(values[11], '是')
                 for field in ('stream_id', 'subtask', 'target', 'channel', 'client', 'agent_type', 'model_display',
                               'tier', 'access_mode', 'quota_scheme', 'quota_summary', 'receipt_location'):
-                    self.assertIn(str(stream[field]), row)
-                self.assertIn(str(stream['timeout']), cells[10])
+                    self.assertIn(str(stream[field]), '\n'.join(detail))
+                self.assertIn(str(stream['timeout']), values[10])
             for field in ('workflow_bg', 'workflow_goal', 'workflow_impact'):
                 self.assertIn(ticket[field], text)
             for date in ticket['capability_ledger'].values():
@@ -3930,6 +4013,21 @@ else:
         self.assertNotIn(sample_lan_ip, public)
         self.assertNotIn('1.234', public)
         self.assertNotIn(str(self.root), public)
+        scrubbed = harness._redact_public({
+            '/mnt/c/Users/<user>/proj': 'HTTPS://u:p@example.com/v1?api_key=rawsecret123',
+            'api_key': 'plain_unprefixed_secret',
+            'secret_key': 'plain_secret_key_val',
+            'secretKey': 'plain_camel_secret_val',
+            'ipv6_note': 'peer FD00::1 and fe80::1 connected',
+        })
+        self.assertIn('<HOME>/proj', scrubbed)
+        self.assertEqual(scrubbed['api_key'], '<redacted>')
+        self.assertEqual(scrubbed['secret_key'], '<redacted>')
+        self.assertEqual(scrubbed['secretKey'], '<redacted>')
+        self.assertNotIn('rawsecret123', json.dumps(scrubbed))
+        self.assertEqual(scrubbed['ipv6_note'], 'peer <PRIVATE_IP> and <PRIVATE_IP> connected')
+        self.assertIsNone(harness._local_fallback_engine('antigravity', 'codex:default', self.four_backends(), '用 codex 跑这次推导'))
+        self.assertIsNone(harness._local_fallback_engine('antigravity', 'codex:gpt-6-astra', self.four_backends(), '请交给 gpt-6-astra 推导'))
         self.assertEqual(result['token_usage_summary']['unreported_streams'], 1)
         dry = self.args('batch', '--dry-run', '--plan-dir', str(self.root / 'never'))
         _, result = self.capture(lambda unused: harness._dispatch_print(dry, {'status': 'ok', 'streams': []}), dry)

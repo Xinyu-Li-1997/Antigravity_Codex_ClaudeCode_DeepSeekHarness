@@ -1,182 +1,222 @@
-# 科学计算与工程研发的四客户端配置工具
+# 面向科学计算与工程研发的四客户端配置与验证工具
 
-本仓库 `Antigravity_Codex_ClaudeCode_DeepSeekHarness` 为 Antigravity（`agy`）、Codex（`codex`）、Claude Code（`claude` 或 `cc`）和 DeepSeek Harness（`dsh`）提供共用的工程规则、会话事件钩子、只读子代理与后台验证工具。适用场景包括科学计算、CAE、计算流体力学（CFD）、有限元分析（FEA）、偏微分方程（PDE）数值离散和高性能计算（HPC）。工具全部基于 Python 3.11+ 标准库编写，可在 Windows、WSL2 与 Linux 环境运行。
+本仓库 `Antigravity_Codex_ClaudeCode_DeepSeekHarness` 为 **Google Antigravity**（`agy`）、**OpenAI Codex**（`codex`）、**Claude Code**（`claude` 或 `cc`）与 **DeepSeek Harness**（`dsh`）提供一套**共用的全局工程规则、会话生命周期门禁、只读审查代理与跨客户端无头验证机制**。全仓仅依赖 Python 3.11+ 标准库，支持 Windows、WSL2 与 Linux；**只安装任意一个客户端即可独立工作**，多端并存时可按各自专长协同推导、编码与审查。
 
-四个客户端处于同一对等层级，只安装其中一个客户端也能独立完成研发工作。日常研发时，主会话在课题仓库内直接调用已安装的全局规则、钩子与 `cae-harness`，无需向业务仓库复制任何模板文件；仅在更新或维护本配置仓库时，才使用安装器 `install.py` 和工具链维护流程 `fleet-evolve`。交互主会话始终保留用户自己选定的模型与推理强度，后台子进程按动态配置单独选择执行客户端与模型。
+全文分为**用户层**（快速安装、用户明确点名与角色选路、配置仓库自我更新）与**原理层**（常驻机制与动态配置解耦、共有生命周期门禁与四客户端协议适配）上下两篇，底层细节通过指针跳转查阅：
 
-导航：[一、架构与使用边界](#一架构与使用边界) · [二、准备与安装](#二准备与安装) · [三、任务派工与中断接续](#三任务派工与中断接续) · [四、默认角色快照与事件绑定](#四默认角色快照与事件绑定) · [五、日常与维护入口](#五日常与维护入口) · [六、致谢与许可](#六致谢english-overview--license)
+- **导言**：[目标群体与解决的问题](#目标群体与解决的问题)
+- **上篇 · 用户层**：[一、一键安装与课题接入](#一一键安装与课题接入) · [二、日常课题用法与点名矩阵](#二日常课题用法与点名矩阵) · [三、本配置仓库的自我更新与维护闭环](#三本配置仓库的自我更新与维护闭环)
+- **下篇 · 原理层**：[四、两层解耦与双门额度机制](#四两层解耦与双门额度机制) · [五、共有会话门禁与四端协议适配](#五共有会话门禁与四端协议适配) · [六、进阶文档指针与目录速览](#六进阶文档指针与目录速览)
+- **附录**：[七、致谢、英文概览与开源许可](#七致谢英文概览与开源许可)
 
-## 一、架构与使用边界
+---
 
-![四客户端配置、双门可用性与全通道派工架构](docs/assets/architecture-overview.svg)
+## 目标群体与解决的问题
 
-本仓库将稳定的执行机制与随模型迭代更新的参数配置分开维护。工程规则只在 [全局规则模板](template/user-guard/rules/AGENTS.md) 中维护一份；五个角色槽位、运行阈值、启用矩阵与性能记录时间统一保存在 [fleet_profile.json](template/user-guard/skills/cae-harness/fleet_profile.json) 中。第四章的角色表格仅供阅读审阅，不作为第二份配置来源。
+本工具专为**科学计算、计算机辅助工程（CAE）、计算流体力学（CFD）、有限元分析（FEA）、偏微分方程（PDE）数值离散、高性能计算（HPC）及高可靠系统软件工程**领域的科研人员与工程师打造。
 
-| 模块组成 | 职责范围 | 验证与约束方式 |
+各家官方客户端已具备成熟的交互编辑循环与**服务端自动前缀缓存**（连续工具调用保持消息前缀一致时可复用缓存）。本仓库不重写客户端内核，而是通过一套全局规则（编号 `R0–R11`）、生命周期钩子与验证脚本，在外围挡住工程研发中最常见的六类失误：
+
+| 研发常见痛点 | 客户端默认行为的局限 | 本仓库的共有确定性保护 |
 | --- | --- | --- |
-| 全局规则与 `readonly-*` 子代理 | 约束物理符号约定、目录写入边界、只读审查权限及主会话原文复核责任 | 主会话采纳审查意见前必须打开原文件核对精确行号；审查任务严禁修改源码或运行构建测试 |
-| 会话生命周期钩子 | 自动压缩后恢复用户原话与待确认任务单，拦截越界写入、重复轮询及遗漏汇报 | 依据宿主事件载荷、保存在磁盘的确认记录与会话轨迹做确定性检查 |
-| `cae-harness` | 解析用户明确指定的客户端或角色槽位，复查本机可用性，组织无头子进程执行与验证 | 只读任务前后比对文件哈希快照；可写任务锁定 `--write-scope` 白名单，`gate` 强制执行非空 `--verify-cmd` |
-| `fleet-evolve` | 在本配置仓库中评估外部工具升级、角色分工与运行期参数 | 变更方案经用户批准后应用；归位前运行 `check-grounding --strict` 检查文档词法依据 |
+| **长对话压缩失忆与待批计划丢失** | 自动摘要易丢掉早期物理符号、法向约定与容差红线；简短状态回执会挤掉长篇审查行号 | 压缩恢复时分两块独立还原：**历轮用户原话 + 达到有效篇幅的子代理关键结论**，以及磁盘原样保存的**未决重负载确认单** |
+| **点名被忽略，或无头调用参数残缺降级** | 口头点名客户端或挡位易被覆盖；手写无头命令常漏传最大窗口、单模型高挡或快照检查 | **用户明确点名**（P0 优先）与**角色槽位**并列：无头调用自动补全声明最大窗口、小文件带行号内联与快照；不可用直接报错，绝不静默降级 |
+| **测试未过擅改容差，或跑完漏报账单** | 倾向把 `rtol=1e-13` 放宽、删改断言，或多路任务跑完漏报成败与 Token 消耗 | 全局规则 `R3.6` 严禁弱化容差、守恒残差与收敛阶判据；`gate` 强制跑通验收命令；回合结束检查成败词、Token 说明与回执标识 |
+| **只读审查误改源码、越界写目录或死轮询** | 审查时顺手改代码、越界改动项目外目录或创建外部 `git worktree`，或反复读旧日志空转 | 原生 `readonly-*` 代理禁写文件、禁跑构建测试；无头只读任务前后比对文件哈希快照；工具前静态拦截越界写删与重复读日志 |
+| **文档重写或润色凭空编造外行术语** | 润色时易混入源码从未涉及的陌生缩写、未实现参数或失步数字 | `check-grounding --strict` 自动扫描仓库源码与配置构建词法依据集合，配合 `--clean-room` 空上下文新读者盲读校核 |
+| **模型换代返工，或环境升级破坏 ABI** | 在规则和编排中写死时期性模型名极易失步；跨次版本升级系统级 Python 会破坏编译扩展 | 常驻机制与 `fleet_profile.json` 动态参数分层维护，并提供 `--audit-upgrade` 检查配置漂移与科学计算包 ABI 风险 |
 
-脚本通过 `workspace_mode` 区分两类工作目录：普通业务课题识别为 `general_project`，仅开放日常研发与验证能力；工作区或父目录同时包含 `install.py` 与 `template/user-guard/plugin.json` 时识别为 `upstream_config_repo`，额外开放全局分发与状态锁维护入口。
+---
 
-调整推荐角色矩阵或 `runtime_tunables`、向宿主机全局配置目录写入文件或切换主会话客户端、升级与编译型科学计算包强耦合的底层环境（如系统 Python 次版本、CUDA 大版本、WSL LTS 发行版），以及执行 `git push` 推送远端仓库，均须单独取得用户明确批准。单次后台任务派工的确认不包含上述长期变更授权。
+## 上篇 · 用户层：怎么装、日常怎么用、怎么自我更新
 
-## 二、准备与安装
+下图展示了安装接入后的两类使用路径：左侧蓝色泳道为**日常业务课题仓**的点名与角色选路闭环，右侧紫色泳道为**本配置仓库**的自我更新闭环，中间通过工作区身份识别严格隔离。
 
-安装前请准备至少一个客户端程序、可用网络以及官方账号登录或 API Key。客户端可执行文件已安装不代表登录有效，两项状态由探测命令分别核实。安装器不会代办账号登录，也不会改动凭据文件中的密钥。
+![用户层总览：日常课题协作与配置仓库自我更新双闭环](docs/assets/user-and-evolution-flow.svg)
 
-在仓库根目录执行下列只读探测与试运行（`--dry-run`）命令。Windows 使用 `python -B -X utf8`，WSL2 与 Linux 改用 `python3 -B -X utf8`：
+### 一、一键安装与课题接入
+
+请先准备至少一个官方客户端、合规网络及官方登录（OAuth）或 API Key（支持配合 CC Switch 管理供应商配置卡片）。本仓库**不内置任何第三方反代中转，不创建也不修改任何账号凭据**。
+
+在本仓库根目录运行一次 `install.py`，模板即同步至本机客户端全局目录（`~/.gemini/config/plugins/user-guard`、`~/.codex`、`~/.claude`、`~/.dsh`）。此后打开任意业务课题仓库即可使用，**无需向课题目录复制任何配置文件**：
 
 ```powershell
-python -B -X utf8 install.py --probe-apps
-python -B -X utf8 install.py --audit-upgrade
-python -B -X utf8 install.py --dry-run --yes
+# Windows 使用 python -B -X utf8；WSL2 与 Linux 改用 python3 -B -X utf8（也可运行 install.ps1 或 install.sh）
+python -B -X utf8 install.py --probe-apps        # 1. 只读探测本机客户端程序、配置目录与 WSL2 互操作状态
+python -B -X utf8 install.py --dry-run --yes     # 2. 跳过交互提示，纯只读预览拟写入路径（零文件修改）
+python -B -X utf8 install.py                     # 3. 交互确认后幂等同步本机已安装的客户端（非交互可加 --yes）
+python -B -X utf8 install.py --audit-upgrade     # 4. 校验 summary.all_aligned == true 及科学计算扩展 ABI 状态
 ```
 
-先检查试运行输出中的完整目标路径、默认模型补齐行为，以及现有全局规则末尾自定义段落的保留方式，确认无误后再执行正式安装。`--yes` 仅跳过安装器命令行交互提问，不能替代用户对全局目录写入的授权。
+- **按需选择客户端与本地路由**：默认 `--app auto` 自动同步已装端；也可指定 `--app antigravity`、`codex`、`claude`、`dsh`、`both`（指 `Antigravity + Codex`）或 `all`。Claude Code 如需本地 API 协议转换分流或清理旧提示词，可显式附加 `--with-cc-router`、`--disable-ccswitch-prompts` 或 `--purge-ccswitch-legacy`（修改前自动对 `cc-switch.db` 做本地在线热备份）。
+- **自定义全局规则保留边界**：Antigravity 以独立插件目录 `plugins/user-guard` 安装，不触碰用户自有的 `~/.gemini/GEMINI.md`；Codex、Claude Code 与 DSH 在更新顶层全局规则文件（`AGENTS.md` 或 `CLAUDE.md`）时，完整保留标准 `## 工具与运行环境` 及 `R10.`、`R11.`，同时自动保留排在其后的用户自定义二级标题尾段（含 `## 工具与` 开头的自定义环境段落），并将冲突编号迁为 `L1.`、`L2.`。
 
-| 安装目标 | 正式安装命令 | 同步的全局目录内容 |
-| --- | --- | --- |
-| Codex | `python -B -X utf8 install.py --app codex` | `~/.codex/AGENTS.md`、`agents/`、`hooks/`、`hooks.json` 与 `skills/` |
-| Antigravity | `python -B -X utf8 install.py --app antigravity` | `~/.gemini/config/plugins/user-guard` |
-| Claude Code | `python -B -X utf8 install.py --app claude` | `~/.claude/CLAUDE.md`、`agents/`、`skills/`、`hooks/` 及 `settings.json` 事件绑定 |
-| DeepSeek Harness | `python -B -X utf8 install.py --app dsh` | `~/.dsh/AGENTS.md` 与 `skills/`，原样保留 `.credentials.yaml` |
-| 双端组合（`both`） | `python -B -X utf8 install.py --app both` | 同时同步 Antigravity 与 Codex 两端配置 |
-| 四端全量或自动识别 | `python -B -X utf8 install.py` | 默认 `--app auto` 按本机已检测客户端同步；`--app all` 强制指定全部四端 |
+---
 
-同步全局规则时，安装器写入完整的标准模板（含标准章节 `## 工具与运行环境` 及 `R10.`、`R11.`），并保留用户规则末尾另起标题的本机环境自定义段落。若自定义段落中使用了与标准条目重名的 `R10.`、`R11.` 编号，安装器自动将其改标为 `L1.`、`L2.`，防止遮蔽标准规则。
+### 二、日常课题用法与点名矩阵
 
-对于使用 CC Switch 管理 API 供应商配置卡片的环境，`--app claude` 默认随钩子同步卡片读取与切换脚本 `~/.claude/hooks/ccswitch_admin.py`；加 `--with-cc-router` 时另行同步本地协议转发脚本 `~/.claude/router/`；加 `--no-claude-hooks` 则跳过钩子与管理脚本同步。如需停用或清理 CC Switch 中的旧提示词与旧技能记录，须显式传入对应清理选项，脚本会先在本地对正在使用的 `cc-switch.db` 生成一致性热备份文件再执行修改。
+打开任意业务课题仓库时，系统自动识别为通用课题模式（`workspace_mode: "general_project"`）。你只需在习惯的客户端窗口中用自然中文提需求，主会话会自动调用已安装的 `cae-harness` 技能（入口脚本 `cae_harness.py`）编排后台子任务，你也可按需直接运行对应命令。
 
-安装完成后可再次运行 `--audit-upgrade` 确认 `summary.all_aligned` 为 `true`。卸载时只需移除对应全局目录下的托管文件与事件注册项，或使用本地备份还原，详见 [架构与钩子说明](docs/architecture-and-hooks.md)。
+#### 1. 明确点名矩阵（P0 第一优先级 + 底层参数自动补全）
 
-## 三、任务派工与中断接续
+只要你在对话中明确指定了客户端、具体模型、推理挡位或省额度要求，外部无头调用一律通过 `--user-prompt` 将其作为 **P0 硬约束**锁定，并自动补齐手写命令容易遗漏的底层参数（客户端内部原生子代理则按当前宿主配置解析 `inherit` 模型与挡位）：
 
-### 1. 用户明确指定与角色槽位并列
-
-用户明确指定的客户端、模型简称、推理强度或省额度要求具有最高优先级（规则中记为 **P0 第一优先级**）。调用 `cae_harness.py` 时通过 `--user-prompt` 传入用户原话，脚本锁定用户已指定的维度，其余未指定参数按模型目录与配置补齐。用户未点名时，使用 `role:*` 角色槽位按任务职责选择候选客户端与模型；角色推荐不会覆盖用户点名。若点名对象在本机不可用或已在配置中停用，脚本直接报错说明原因，不会静默换用其他客户端或降级模型。
-
-| 指定方式 | 锁定的选择 | 自动补齐的参数与边界 |
-| --- | --- | --- |
-| 用户点名客户端、模型或推理强度 | 保留用户指定的维度 | 自动补齐模型声明的最大上下文窗口、无头参数与快照检查；仍执行可用性复查 |
-| `role:orchestrator`、`role:math`、`role:code`、`role:review`、`role:fast` | 按工作职责选择槽位 | 按配置顺序选取就绪客户端与模型；常规后台任务使用单个模型，默认选非自动委派的最高强度 |
-| `<client>:@<role>` | 指定客户端及职责槽位 | 在该客户端内选取对应职责模型；显式非 `fast` 角色即使降到 `low` 强度也保留主力模型 |
-| `<client>:default`、`<client>:<model>` | 指定该端默认或具体模型 | 补齐上下文窗口与非交互运行标志；不以轻量模型冒充非 `fast` 角色主力 |
-| 客户端内部原生 `readonly-*` | 默认 `inherit` 继承当前主会话模型 | 任务确认单展示从客户端配置解析出的实际模型名；无法解析时如实标明，不套用外部无头隔离承诺 |
-
-术语说明：**无头**（headless）指启动独立的非交互命令行子进程运行任务，不占用主会话上下文；**净室**（`task --clean-room`）指在支持的外部只读任务中构造临时配置目录，剥离全局规则、钩子、技能与仓库自动说明，用于模拟新读者检查文档可读性。外部调用默认开启 `--inline-readonly`，在配置体积上限内将只读目标小文件附带精确行号直接嵌入提示词；`--output` 默认对写入磁盘的结构化回执做公开路径脱敏。常规任务跳过会自动派生多层子代理的 `ultra` 挡位；纯文字润色 `polish` 按篇幅自动选用 `medium` 或 `high`。命令行中 `--kind` 表示工作性质，`--engine` 或 `--worker` 表示执行引擎，两者须明确搭配。
-
-### 2. 两阶段可用性与本地额度复查
-
-| 检查阶段 | 数据来源与判断内容 | 结论边界 |
-| --- | --- | --- |
-| 第一阶段：独立 `fleet-evolve` 维护评估 | 结合官方更新与本机探测，展示各客户端和模型的本机可用性及配置的额度类型；由用户决定启停并写入 `subscription_matrix.agents`、`subscription_matrix.models` | 设为 `enabled: false` 的客户端或模型在全局自动跳过；修改长期启用矩阵须经用户批准 |
-| 第二阶段：展示任务确认单前 `cae_harness.py plan` 离线复查 | 纯离线检查本机可执行文件、凭据配置、本地回环路由健康、本地会话记录中的滚动窗口已用百分比与重置时间、CC Switch 卡片计费类型与日月费用上限，以及运行侧冷却记录 | 自动过滤不可用或已超限通道；本机未记录服务端实时余额时标明剩余额度未知，不推断为余额充足 |
-| 离线性能记录：`capability_ledger` | 在确认单末尾展示 `last_online_refresh_at` 与 `local_bench_verified_at` | 日常派工只读取本地记录时间，不联网查询模型榜单；在线刷新由 `fleet-evolve` 独立完成 |
-
-运行中若触发 `quota_exhausted`（配额耗尽），脚本立即停止重试并写入运行侧冷却记录。仅当显式传入 `--fallback-on-quota` 且工作区尚未发生任何文件修改时，才允许按配置顺序回退；用户明确点名的约束及重负载重新确认要求仍然生效。
-
-### 3. 日常最小流程与全通道 14 列确认单
-
-![确认票据、压缩接力与完成核验流程](docs/assets/lifecycle-and-verification.svg)
-
-单路小规模只读检查（文件数、估算 Token 与超时均未超过 `runtime_tunables.dispatch_confirmation` 轻任务上限）可直接执行。多路并发任务、可写编码任务，或超出轻任务阈值的调用均属于**重负载**——无论调用外部无头进程，还是在客户端内部发起多路或可写原生子代理（如 `invoke_subagent`、`run_workflow`、`spawn_agent`、`Agent`），都必须先生成任务确认单，获用户批准后再执行：
-
-```powershell
-# 1. 离线生成任务确认单与待批票据（不启动子代理）
-python -B -X utf8 template/user-guard/skills/cae-harness/scripts/cae_harness.py plan --spec-file "<工作流配置.json>" --session-id "<当前会话标识>" --workflow-bg "核心模块已修改" --workflow-goal "分两路只读核查接口与测试" --workflow-impact "只读检查并保存回执，不改动源码"
-
-# 2. 用户明确批准后登记票据状态为 APPROVED，再绑定票据执行
-python -B -X utf8 template/user-guard/skills/cae-harness/scripts/cae_harness.py plan --approve-ticket "<票据标识>" --session-id "<当前会话标识>"
-python -B -X utf8 template/user-guard/skills/cae-harness/scripts/cae_harness.py batch --ticket "<票据标识>" --session-id "<当前会话标识>" --output "<回执输出路径.json>" --redact
-```
-
-`plan` 先用平实中文说明本次工作流的背景、要做什么与预计后果，再生成包含以下 **14 列完整字段** 的参数矩阵（任何未知项均如实保留，不用角色名代替具体模型名）：
-
-| 流号 | 子任务与范围 | 通道 | 客户端及子代理类型 | 模型名字 | 挡位 | 上下文窗口 | 是否无头 | 是否净室 | 访问模式、写入范围与验收命令 | 内联与超时 | 当前是否可用 | 本机配置额度类型与当前状态 | 回执或子代理日志位置 |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 每路唯一标识 | 任务描述与目标路径 | 外部无头或内部原生 | 实际执行端与代理类型 | 实际模型及 `inherit` 解析结果 | 推理强度 | 声明值或未声明 | 布尔状态 | 布尔状态 | 只读，或写入白名单及验证命令 | 行号内联与秒数 | 可用判断及原因 | 额度来源、可读状态或未知说明 | 回执文件或原生轨迹路径 |
-
-矩阵下方附离线性能记录更新时间，并提供三个选项：批准当前计划、微调引擎或挡位或超时后批准、暂缓并交接。工具执行前钩子 `status_guard.py` 在 `PreToolUse` 阶段核验当前会话未过期的 `APPROVED` 票据，并拦截绕过 `cae_harness.py` 直接调用底层客户端无头 CLI 的命令。`batch` 仅执行外部 `cae_harness_headless` 通道；含内部原生子代理的计划由当前客户端按获批内容直接调用。
-
-### 4. 中断接续与完成报告检查
-
-- **同会话自动压缩恢复**：等待用户确认期间若发生上下文自动压缩，`session_context_loader.py` 将恢复内容严格分为两块：一块是常规的历轮用户原话与实质子代理结论摘要；另一块直接从磁盘待批票据加载本次重负载工作流的背景、目标、预计后果、完整 14 列矩阵与选项卡。票据缺失或损坏时直接报告缺口，不凭摘要猜补，也不将压缩恢复视同用户已批准。
-- **长会话交接与新会话接续**：当会话达到 `runtime_tunables.handoff_thresholds` 阈值进入 `drain`（收尾）或 `freeze`（冻结）强制交接模式时（注：Codex 与 Claude Code 默认配置为 `advisory` 仅提醒模式，是否强制阻断取决于实际启用模式），`handoff_gate.py` 在 `Stop` 阶段核验【新对话提示词】是否已完整嵌入待确认工作流详述、14 列矩阵、性能更新时间、选项卡及票据号。进入新会话后先运行 `plan --resume-ticket` 读取复核旧票据；该命令保留原票据的 `session_id` 不自动改绑，跨会话正式执行前须按原流内容生成绑定当前新会话标识的确认票据。
-- **重负载完成报告检查**：重负载执行结束后，`reply_repeat_guard.py` 在回合结束 `Stop` 事件做静态词项检查：
-  1. 回复须包含成败结果词、Token 用量数字或“该通道未提供、无法统计”的明确说明，以及回执或轨迹与日志词项；
-  2. 外部无头任务须按完整词项覆盖各流标识（单路 `task` 或 `gate` 的默认流号 `S1` 允许用模型名或任务状态替代）及非空回执的实际文件名；内部原生任务须覆盖完成数量、全部流标识或互不重复的角色名之一，并提供日志或轨迹说明；
-  3. 若有遗漏且同一回合尚未触发重复回复门禁或交接门禁阻断，钩子单次阻断并附上磁盘记录供补齐；钩子仅检查上述要素是否出现，各路真实状态、Token 明细核对与汇总算术仍由主会话负责逐路核实。详细命令模板见 [工作流指南](docs/workflow-guide.md)。
-
-## 四、默认角色快照与事件绑定
-
-### 表一：仓库随附默认配置中的角色分工
-
-下表展示本仓库随附 `fleet_profile.json` 当前记录的默认角色配置，用于说明设计分工，不代表读者本机的安装、登录或实时额度状态。执行任务前仍须通过第二阶段离线可用性复查；具体模型版本、上下文窗口与支持挡位以客户端本地目录解析结果为准。
-
-| 角色槽位 | 随附配置推荐端与模型系列 | 推荐挡位 | 适用工作与运行约束 |
+| 你的点名方式 | 自然中文指令示例 | P0 锁定的约束 | 系统自动补全与安全边界 |
 | --- | --- | --- | --- |
-| `orchestrator` | Antigravity，`carbon` 系列 | `high` | 适合中文工程需求沟通与方案统筹；压缩恢复按客户端预算执行，目录未提供整数窗口时采用保守分片预算 |
-| `math` | Codex，`astra` 系列（如 `gpt-6-astra`） | `max` | 适合长链条偏微分方程离散推导、守恒性与边界条件论证；显式传入模型声明的最大窗口，跳过自动委派挡位 |
-| `code` | Codex，`sol` 系列（如 `gpt-6.1-sol`） | `max` | 适合核心求解器实现、跨文件重构与 `gate --verify-cmd` 闭环验证；须限定目标文件与行号范围，避免全目录遍历超时 |
-| `review` | Codex `sol` 系列，候选含 DeepSeek Harness `deepseek-v4-pro` | `max` | 优先跨客户端执行独立代码与文档审查；Claude Code 按已启用主力卡片参与调度，轻量模型卡片不冒充非 `fast` 主力 |
-| `fast` | DeepSeek Harness，`deepseek-flash` | `low` | 用于用户明确要求省额度或快速表面初筛；按本机 CLI 能力自动适配权限参数，不替代核心独立审查 |
+| **点名客户端或具体模型** | “这步编码用 Codex 高挡位做”“请交给 gpt-6-astra 做脱敏审查” | 锁定指定的客户端、模型标识或模型系列 | 自动补全模型声明的最大上下文窗口、无头标志、小文件带行号内联、前后哈希快照与脱敏；目标不可用或已停用时直接报错，不静默换端 |
+| **点名推理挡位** | “这轮用高挡位推导”“用中挡润色这段说明” | 锁定指定的推理强度挡位 | 显式专长角色即使降到 `low` 挡仍保留主力模型，防止静默退化为轻量模型或轻量套餐 |
+| **点名省额度或回退策略** | “这轮省点额度快速扫一遍”“加 `--fallback-on-quota` 遇限额再回退” | 切入低消耗策略或启用未改文件时的配额回退 | 遇 `quota_exhausted` 立即停试熔断；仅在未锁死单端 P0 点名、未绑定重负载票据且工作区零改动时按配置回退 |
+| **多端并列点名** | “用 Codex 等多工作流全仓校核验证一下” | 识别“等、和、与、及”多端并列语义，不误锁单端 | 完整保留多流计划中各分路配置的不同客户端与模型组合 |
 
-五个槽位均维护有序候选列表，不与单一客户端永久绑定。离线性能记录时间保存在 `capability_ledger.last_online_refresh_at` 与 `capability_ledger.local_bench_verified_at`。
+#### 2. 模糊交办与日常课题任务矩阵（按五个动态角色选路）
 
-### Codex 与 Claude Code 五类事件对齐
+当你只交代物理或软件目标而不指定具体模型时，系统通过 `orchestrator`、`math`、`code`、`review`、`fast` 五个动态角色槽位自动选取本机已启用且额度正常的对等端：
 
-Codex 的 [hooks.json](template/codex/hooks.json) 与 Claude Code 的事件配置均挂载以下五类生命周期事件（共用脚本模块共五个，其中 `user_words.py` 为底层共享模块，事件数与脚本文件数分别统计）：
-
-| 事件名称 | 触发时机与检查职责 |
-| --- | --- |
-| `SessionStart` | 在 `compact` 或 `resume` 入口运行 `session_context_loader.py` 恢复用户原话、实质子代理摘要及待确认工作流，随后运行 `handoff_gate.py` |
-| `PostCompact` | 运行 `handoff_gate.py`，更新自动压缩后的长会话交接计数与阶段判断 |
-| `UserPromptSubmit` | 运行 `handoff_gate.py`，根据用户最新指令更新交接状态或暂缓宽限期 |
-| `PreToolUse` | 运行 `status_guard.py` 检查目录写边界、重复读日志、绕过脚本的裸 CLI 调用与重负载批准票据，随后检查交接阶段限制 |
-| `Stop` | 运行 `reply_repeat_guard.py` 检查重复空等回复与重负载完成报告，随后由 `handoff_gate.py` 检查强制交接提示词完整性 |
-
-五个共用钩子脚本为 `user_words.py`、`session_context_loader.py`、`status_guard.py`、`reply_repeat_guard.py` 与 `handoff_gate.py`。Antigravity 通过原生插件事件 `SessionStart`、`PreInvocation`、`PreToolUse`、`Stop` 挂载上述检查；DeepSeek Harness 当前命令行未提供同类事件钩子接口，安装时仅同步全局规则与技能目录。
-
-## 五、日常与维护入口
-
-| 使用场景 | 对应入口 | 执行边界 |
+| 日常课题场景 | 自然中文指令示例 | 调度的角色槽位与验证机制 |
 | --- | --- | --- |
-| 业务课题推导、编码验证与独立审查 | [cae-harness 技能](template/user-guard/skills/cae-harness/SKILL.md) | 支持用户点名或角色选路；重负载须先生成计划、获批登记票据后再执行 |
-| 全局工具链全面更新 | [fleet-evolve 技能](template/user-guard/skills/fleet-evolve/SKILL.md) 的 `full` 流程 | 联网核查客户端升级、评估五角色与运行参数，在关键节点停下请用户决定 |
-| 代码加固与文档整篇重写 | 同技能的 `hygiene` 流程 | 基于已审定配置修复缺陷并重写文档，不擅自升级外部工具或改动长期推荐矩阵 |
-| 本机配置只读巡检 | 同技能的 `audit` 流程 | 只读检查配置漂移、卡片状态、配额冷却与 ABI 耦合风险，零文件修改 |
-| 文档词法事实核验 | `cae_harness.py check-grounding --target . --strict` | 扫描源码与配置建立词法集合，拦截文档中无依据的参数名、缩写或失步数字（不替代数学证明与运行测试） |
+| **需求沟通、方案权衡与局部修改** | 直接在主窗口讨论方案、改局部脚本，或发起小范围单路只读检查 | `role:orchestrator`（主会话保留你自己选定的客户端与模型；轻任务静默执行不弹窗） |
+| **多文献摘录与大源码行号初筛** | “把这三篇文献的控制方程和对应源码行号摘出来” | 当前客户端内部 `readonly-*` 只读代理并行读取，禁写文件、禁跑构建与测试 |
+| **控制方程与离散守恒推导** | “推导弯曲网格几何守恒律（GCL）离散条件与熵稳定判据” | `role:math`，默认采用单模型最高非委派挡位（跳过会自动派生多层子代理的 `ultra`） |
+| **核心求解器编码与验证闭环** | “实现二维 Euler 方程 HLLC 界面通量并跑通守恒单测” | `role:code` 配合 `gate`，锁定 `--write-scope` 白名单并强制跑通非空 `--verify-cmd` |
+| **关键代码审查与新读者盲读** | “独立审查 `src/flux/` 边界相容性”“按新读者视角检查文档” | 优先跨客户端调度 `role:review` 或双源双盲 `audit`；文档可读性用 `--clean-room` 空上下文盲读 |
+| **表面格式快检与低消耗初筛** | “用快速槽位低成本扫一遍目录格式与明显拼写问题” | `role:fast`，采用轻量快速模型低消耗执行，不替代核心数理与代码审查 |
+| **技术文档重写、润色与供应商切卡** | “整篇理顺说明文档并核对源码事实”“切换到备用供应商卡片” | 主会话整篇重写（或 `polish` 按篇幅自动选 `medium` 或 `high`）后跑 `check-grounding --strict`；切卡由 `ccswitch_admin.py` 热备数据库后执行 |
 
-常用安装器附加选项包括 `--sync-model-defaults`、`--no-model-config`、`--codex-handoff-mode`、`--claude-handoff-mode`、`--no-zotero` 与 `--skip-test`。默认模型配置采取“缺省补齐、已有保留”策略；覆盖已有模型设置须显式传入对应选项并获批准。完整参数说明见 `install.py --help`。
+#### 3. 多路或可写重负载：纵向 14 项确认单与完工报账
 
-仓库目录结构：`install.py` 为跨平台分发入口；`template/user-guard/` 存放四端共用规则、钩子、代理与技能模板；`template/codex/` 与 `template/claude/` 存放客户端专属适配文件；`docs/` 存放架构与日常工作流文档；`tests/` 存放离线单元测试与端到端沙箱集成测试。插件唯一版本号定义在 [plugin.json](template/user-guard/plugin.json)，版本演进历史记录在 [CHANGELOG.md](CHANGELOG.md)。
+- **先看清再启动**：无论是客户端内部多路或可写原生子代理（如 `invoke_subagent`、`run_workflow`、`swarm`、`spawn_agent`、`Agent`），还是外部无头 `batch`、`gate`、`audit`，启动前均由 `cae_harness.py plan` 生成平实中文**背景、要做什么、预计后果**，配合 **4 列总览表 + 每路 3 列纵向 14 项参数明细表**及离线模型能力台账日期（提示上次联网评估的新旧程度）。
+- **三选一拍板与不断线接力**：提供**批准当前计划、微调后批准、暂缓并交接**三个选项；用户批准并登记 `--approve-ticket` 后门禁才放行。等待拍板期间若遇自动压缩或长会话交接，待批确认单会原样独立恢复或完整写入【新对话提示词】。
+- **跑完必报账**：重负载结束后，回合结束门禁自动检查回复是否包含成败结论词、Token 用量数字（通道未暴露整数时须明确说明无法统计）以及回执或轨迹标识；主会话再亲自核对原文行号与汇总算术。
 
-```powershell
-python -B -X utf8 template/user-guard/skills/cae-harness/scripts/cae_harness.py check-grounding --target . --strict
-python -B -X utf8 -m unittest tests.test_e2e_integration
+---
+
+### 三、本配置仓库的自我更新与维护闭环
+
+当打开本配置仓库本身时，系统自动识别为上游维护模式（`workspace_mode: "upstream_config_repo"`）。**面对外部大模型季度换代、客户端 CLI 升级或你增减订阅套餐，无需手工翻改散落的规则和脚本**——直接在本仓库对话中说出维护需求，即可通过 `fleet-evolve` 技能驱动仓库完成自我演进。
+
+#### 1. 三种维护模式的触发方式
+
+| 维护模式 | 你在本仓库怎么说 | 适用时机与自动执行的闭环动作 |
+| --- | --- | --- |
+| **全面更新**（`full`） | “全面更新一下四端配置”“我停用了某套餐，重算一下推荐矩阵” | **外部模型换代、客户端升级或订阅变动时使用**。联网核查最新客户端与模型能力，探测本机可用性与额度类型，呈交客户端与模型启停表及五角色推荐草案供你拍板 |
+| **全量优化**（`hygiene`） | “多工作流全仓 debug 优化校核一下，再润色脱敏” | **模型选型已定、需打磨代码与文档质量时使用**。不改模型矩阵，基于已审定配置开展跨端代码加固、文档整篇重写、公开脱敏审查、Windows 与 Linux 回归单测及严格锚定校验 |
+| **只读巡检**（`audit`） | “巡检一下本机四端对齐和 ABI 状态” | **日常健康检查时使用**。纯只读运行 `--probe-apps`、`--audit-upgrade`、`cae_harness.py probe` 与 `check-grounding --strict`，核查配置漂移、退订候选与科学计算包 ABI 风险，全程零写入 |
+
+#### 2. 四个必停拍板节点与防误触硬隔离
+
+上游维护流程遵循以下四道人工审批边界，未获明确同意绝不落盘或推送：
+
+1. **角色推荐矩阵、运行参数与订阅启停变更**：通过 `fleet_state.py propose` 登记具体提案；你退订停用的客户端或模型在 `subscription_matrix` 中置为 `enabled: false` 后，后续所有选路全局自动跳过；
+2. **写入宿主机全局配置目录或切换主客户端**：先运行 `install.py --dry-run --yes` 展示完整目标路径与自定义尾段保留方式，获批后才执行同步；
+3. **科学计算扩展 ABI 强耦合升级**：涉及系统级 Python 跨次版本、CUDA 跨大版本或 WSL 跨 LTS 发行版升级时，必须先评估编译型科学计算包兼容性并获专门批准；
+4. **远端推送**：完成本地验证、润色与脱敏核查后，经你明确同意才执行 `git push`。
+
+若同步涉及当前正在使用的主会话客户端自身配置，状态机通过 `record-pass1` 与 `verify-pass2` 完成**跨越当前主客户端重启前后的两步接力验收**，最后执行 `fleet_state.py clear --verified --readback-done` 强制跑通事实锚定门禁后归位。**在普通业务课题目录误调已安装的 `fleet_state.py` 会直接返回 `not_upstream_config_repo`（退出码 `2`）拒绝执行**，彻底隔离日常课题与全局维护。
+
+---
+
+## 下篇 · 原理层：为什么跨端通用、不失忆、不幻觉
+
+### 四、两层解耦与双门额度机制
+
+下图自上而下展示了常驻机制层与动态配置层的分工、两道可用性检查门，以及外部无头与内部原生双通道的受控派工链路：
+
+![原理层一：两层解耦、双门额度检查与全通道派工架构](docs/assets/architecture-overview.svg)
+
+#### 1. 常驻机制层与动态参数层（`fleet_profile.json`）分离
+
+- **常驻机制层不绑死时期性模型**：全局规则模板（`R0–R11`）、5 个共用钩子脚本模块、3 类 `readonly-*` 只读代理、`cae_harness.py`、`install.py`、`fleet_state.py`、默认随 Claude 钩子同步的 `ccswitch_admin.py` 以及可选启用的本地 `router.py` 均面向抽象角色槽位与配置键工作，不在规则和选路逻辑中写死时期性模型名。
+- **动态参数层集中收口**：`orchestrator`、`math`、`code`、`review`、`fast` 五个角色槽位、运行期核心定量阈值 `runtime_tunables`（恢复预算、交接阈值、防轮询、分片安全系数、轻重任务与额度阈值）、`subscription_matrix` 与 `capability_ledger` 统一维护在 [fleet_profile.json](template/user-guard/skills/cae-harness/fleet_profile.json)。
+
+下表为仓库随附配置的默认角色分工快照（仅供说明机制，不代表读者本机的安装或实时订阅状态）：
+
+| 角色槽位 | 随附默认推荐端与模型系列 | 推荐挡位 | 核心职责与短板隔离设计 |
+| --- | --- | --- | --- |
+| `orchestrator` | Antigravity，`carbon` 系列 | `high` | 中文需求沟通、物理与数值方案权衡及总控协调；未暴露整数窗口时采用保守分片预算 |
+| `math` | Codex，`astra` 系列 | `max` | 长链条 PDE 离散推导、守恒与熵稳定证明；显式声明最大窗口，过滤 `ultra` 自动委派挡 |
+| `code` | Codex，`sol` 系列 | `max` | 核心求解器实现与 `gate --verify-cmd` 闭环修正；锁定 `--write-scope` 与目标行号范围 |
+| `review` | Codex `sol` 系列（备选含 DSH、Antigravity、Claude Code） | `max` | 优先跨客户端独立审查（同端 `readonly-*` 仅作摘录与行号初筛）；拦截轻量模型或套餐冒充主力 |
+| `fast` | DeepSeek Harness，`deepseek-flash` | `low` | 用户明确要求省额度或快速表面初筛；按本机 CLI 能力自适应权限参数，不替代核心审查 |
+
+#### 2. 两道可用性与本地动态额度检查门
+
+1. **第一道门（维护期联网评估与启停拍板）**：在独立 `fleet-evolve` 维护流程中完成模型性能联网核查与本机可用性探测，由用户拍板写入 `subscription_matrix` 并在 `capability_ledger` 记录评估日期；**日常课题派工绝不联网查性能榜单**。
+2. **第二道门（日常确认前纯离线复查）**：`cae_harness.py plan` 在生成确认单前纯离线检查本机可执行文件、凭据配置与所需本地回环路由健康状态。同时读取本地可得的滚动窗口已用百分比与重置时间、CC Switch 卡片套餐或余额计费类型与日月限额、以及当前运行侧配额冷却记录，自动过滤不可用或超限通道；本机未暴露服务端实时余额时如实标为未知，绝不虚构余额充足。
+
+---
+
+### 五、共有会话门禁与四端协议适配
+
+下图左侧为“计划确认—受控执行—完工核验”主流程，右侧为等待确认期间遇到自动压缩或长会话交接时的无损接力分支，底部汇总五个共用钩子模块的职责分工：
+
+![原理层二：共有生命周期门禁、中断接力与完工核验](docs/assets/lifecycle-and-verification.svg)
+
+#### 1. 五个共用钩子模块承载的四阶段会话防护
+
+`template/user-guard/hooks/` 下共有 5 个脚本文件（底层共享库 `user_words.py` 负责跨平台锁、动态参数读取、轨迹解析与日志密钥脱敏，其余 4 个入口脚本均为事件触发后即退出的短生命周期进程），共同承载四阶段确定性保障：
+
+1. **压缩双块恢复与前缀缓存保护**（`session_context_loader.py` + `handoff_gate.py`）：既无新压缩也未触发交接提醒的普通回合保持零字节注入，不扰动服务端前缀缓存；发生压缩或恢复时，一块按客户端专属预算注入历轮原话与关键子代理返回首尾摘要（含截断全文回查与代码围栏自动闭合），另一块从磁盘票据原样加载未决重负载确认单。
+2. **工具前写边界、防轮询与票据门禁**（`status_guard.py` + `handoff_gate.py`）：静态拆解文件工具、多层 Shell 包装、重定向与内联 Python 语法树，拦截未获批的项目外写删与外部 `git worktree`；阻止对未变化日志重复轮询；拦截绕过 `cae_harness.py` 直接调用底层无头 CLI，并核验有效 `APPROVED` 票据。
+3. **长会话分级交接与跨会话接力**（`handoff_gate.py`）：达到阈值进入强制收尾（`drain` 或 `freeze`）阶段时限制新派工，并在回合结束核验【新对话提示词】完整内嵌待选工作流、14 项参数表、台账记录日期、选项卡与票据号；新会话通过 `plan --resume-ticket` 离线复核后重建当前会话票据。
+4. **回合结束防空等与完工词项检查**（`reply_repeat_guard.py` + `handoff_gate.py`）：拦截连续无新数值进展的等待短句；重负载完工后在 `Stop` 检查成败词、Token 说明，以及外部任务的各流标识与回执文件名（或内部原生任务的完成数量、角色名与轨迹说明），漏报单次阻断并附磁盘账单。
+
+#### 2. 零黑名单文档事实锚定（`check-grounding --strict`）
+
+文档校核不依赖人工维护违禁词黑名单，而是直接扫描当前仓库源码、配置与测试文件，自动构建合法命令行选项、文件名、全大写缩写、定量数值与中文双字技术词干集合，逐行拦截无依据标志、陌生缩写与虚构举例。该检查属于静态词法与参数锚定门禁，不替代数学证明与算例运行验证。
+
+#### 3. 共有机制在四个对等客户端的协议适配
+
+不同客户端的宿主事件名称与配置格式各异，安装器按各端原生协议接入同一套共有机制，不将单一客户端的事件结构强加给其他端：
+
+| 对等客户端 | 宿主接入方式与事件映射 | 默认交接模式与专属适配 |
+| --- | --- | --- |
+| **Antigravity** (`agy`) | 原生插件挂载 `SessionStart`、`PreInvocation`、`PreToolUse`、`Stop` 四类事件（在 `PreInvocation` 内完成压缩恢复与交接控制步对账，运行态写入 `PLUGIN_DATA`） | 默认启用长会话分段收口；遇 `truncated_fields` 自动回查 `transcript_full.jsonl` |
+| **Codex** (`codex`) | `~/.codex/hooks.json` 挂载 `SessionStart`、`PostCompact`、`UserPromptSubmit`、`PreToolUse`、`Stop` 五类事件（同样联动 `handoff_gate.py`） | 默认 `advisory` 提醒；钩子实质内容未变时不重写文件以保留信任指纹 |
+| **Claude Code** (`claude` 或 `cc`) | `~/.claude/settings.json` 合并上述五类事件，默认随钩子同步 `ccswitch_admin.py` | 默认 `advisory` 提醒；可选启用本地 `127.0.0.1` `router.py` 协议转换分流 |
+| **DeepSeek Harness** (`dsh`) | 当前 CLI 未开放交互式事件钩子接口，同步全局 `AGENTS.md` 与 `skills/` | 经 `cae_harness.py` 无头调用时自适应新旧 CLI 权限参数，同样享有双门检查、行号内联、净室盲读、尾随工具标记（`DSML`）清洗与文件哈希快照保护 |
+
+---
+
+### 六、进阶文档指针与目录速览
+
+| 查阅需求 | 对应文档指针 |
+| --- | --- |
+| **点名与角色命令对照、纵向 14 项确认单详解、Euler HLLC 任务单模板、中断接力与四级（L1–L4）验证矩阵** | [日常工作流实战指南](docs/workflow-guide.md) |
+| **共用钩子模块映射、`runtime_tunables` 参数表、压缩恢复细节、单分片上下文预算公式、本地路由与卸载还原** | [架构设计与钩子说明](docs/architecture-and-hooks.md) |
+| **`cae_harness.py` 全部子命令（`probe`、`assess`、`plan`、`batch`、`gate`、`audit`、`task`、`check-grounding`）规程** | [cae-harness 技能规程](template/user-guard/skills/cae-harness/SKILL.md) |
+| **配置仓库自我更新（`full`、`hygiene`、`audit`）、`fleet_state.py` 状态机与 `install.py` 维护说明** | [fleet-evolve 维护规程](template/user-guard/skills/fleet-evolve/SKILL.md) · [仓库维护说明](AGENTS.md) |
+| **插件模板目录归属与历次版本演进记录** | [插件模板说明](template/user-guard/README.md) · [更新日志](CHANGELOG.md) |
+
+```text
+Antigravity_Codex_ClaudeCode_DeepSeekHarness/
+├── README.md                              # 总览：目标群体、用户层（安装、点名与自我更新）、原理层与指针
+├── AGENTS.md / CHANGELOG.md               # 上游配置仓维护说明与版本演进记录
+├── LICENSE / NOTICE                       # Apache License 2.0 许可证与第 4(d) 条原创归属声明
+├── install.py / install.ps1 / install.sh  # 跨平台幂等安装器、配置漂移与科学计算包 ABI 耦合审计
+├── docs/                                  # 工作流实战指南、底层架构与钩子说明及 3 张分层 SVG 架构图
+├── template/
+│   ├── user-guard/                        # 四端共用规则 (R0-R11)、5 个共用钩子模块、只读代理、fleet_profile.json 与双技能
+│   ├── codex/                             # Codex 事件适配模板与 read-only 只读子代理配置
+│   └── claude/                            # Claude Code 事件适配模板、只读代理及 router/ 本地分流与切卡管理脚本
+└── tests/                                 # Windows 与 Linux 六模式沙箱安装、钩子门禁、编排器与事实锚定离线回归套件
 ```
 
-修订重要文档时，先按需要运行 `cae_harness.py task --kind review --clean-room` 从新读者视角排查生硬行话与阅读断层，再由主会话整篇重写，最后对照源码核实技术事实、公开脱敏并通过 `check-grounding --strict` 校验。
+---
 
-汇报研发与验证进展时，严格区分“源码或配置已写好”“编译或离线单测已通过”“本机实际环境或算例实测已通过”三个层次；测试验收严禁通过放宽 `rtol`、`atol`、弱化离散守恒或网格收敛阶判据、删改断言来换取通过。
+## 七、致谢、英文概览与开源许可
 
-延伸阅读：[架构与钩子说明](docs/architecture-and-hooks.md) · [日常工作流指南](docs/workflow-guide.md) · [插件模板说明](template/user-guard/README.md) · [仓库维护说明](AGENTS.md)。
+### 1. 资助致谢
 
-## 六、致谢、English Overview & License
+本项目获**国家留学基金管理委员会**（简称**国家留学基金委**，**China Scholarship Council, CSC**）资助，学号为 `202506280162`，批准文号为 `留金选[2025]37号`；该项资助为本项目目前的唯一资助来源。
 
-**致谢**（Acknowledgments）：本项目获**中国国家留学基金委**（**China Scholarship Council, CSC**）资助，学号为 `202506280162`，批准文号为 `留金选[2025]37号`；目前唯一资助来源为该项资助。
+### 2. English Overview
 
-### English Overview
+`Antigravity_Codex_ClaudeCode_DeepSeekHarness` provides shared engineering rules, deterministic session lifecycle hooks, read-only review subagents, zero-blacklist lexical grounding checks, and cross-client headless verification workflows across **Google Antigravity** (`agy`), **OpenAI Codex** (`codex`), **Claude Code** (`claude` / `cc`), and **DeepSeek Harness** (`dsh`). Built solely on the Python 3.11+ standard library across Windows, WSL2, and Linux, it targets scientific computing, CAE, CFD, FEA, numerical PDE solvers, HPC, and high-reliability software engineering—preserving official client prefix caching and subscription quotas while preventing post-compaction context loss, silent model downgrades, tolerance relaxation, out-of-workspace writes, and ungrounded documentation drift.
 
-`Antigravity_Codex_ClaudeCode_DeepSeekHarness` provides shared engineering rules, deterministic session hooks, read-only review subagents, lexical grounding checks, and headless verification workflows for Google Antigravity, OpenAI Codex, Claude Code, and DeepSeek Harness. Built solely on the Python 3.11+ standard library across Windows, WSL2, and Linux, it is designed for scientific computing, CAE, CFD, FEA, numerical PDE solvers, HPC, and high-reliability software engineering.
+On the **user layer**, running `install.py` once equips all general research repositories (`general_project`) without copying config files: explicit user naming takes top priority (P0) on headless dispatches alongside five dynamic role slots (`orchestrator`, `math`, `code`, `review`, `fast`), automatically completing maximum declared context windows, non-delegating effort tiers, line-numbered read-only inlining, and hash snapshots, while multi-stream or write-capable workloads present a narrow-viewport-friendly 14-item vertical confirmation plan before execution. Opening this upstream repository (`upstream_config_repo`) unlocks self-evolution via `fleet-evolve` (`full`, `hygiene`, `audit`) with four mandatory user approval checkpoints and hard `workspace_mode` isolation. On the **principle layer**, permanent mechanisms are decoupled from `fleet_profile.json`, gated by two-stage availability and local quota checks, and adapted cleanly to each client's native event and CLI protocol.
 
-All five role slots and quantitative runtime thresholds are configured in `fleet_profile.json` while keeping the user's interactive model selection untouched. Explicit user choices take top priority (P0), with role-based selection filling unspecified parameters. Availability is checked in two stages: user-approved enablement in `subscription_matrix` during `fleet-evolve` maintenance, followed by an offline local pre-dispatch check of binaries, credentials, local router health, and locally readable quota records (leaving unexposed server balances explicitly marked as unknown, and reading offline benchmark timestamps from `capability_ledger` without live web lookups).
+Network access, official client installations, and credentials are prepared by the user. This project is currently supported solely by the China Scholarship Council (CSC), CSC No. `202506280162`, Approval No. `留金选[2025]37号`. Licensed under the [Apache License 2.0](LICENSE); redistributions and derivative works must retain the attribution notices in [NOTICE](NOTICE) (`Copyright 2026 Xinyu Li (Xinyu-Li-1997)`) per Section 4.
 
-Multi-stream or write-capable workloads across both in-client native subagents and external headless processes require a 14-column confirmation plan and an approved ticket enforced at `PreToolUse`. Pending confirmation plans are reloaded independently after context compaction and embedded into session-handoff prompts. At turn completion, the `Stop` hook checks that completion reports include outcome terms, actual Token usage (or an explicit unavailable notice), and channel-specific stream/receipt identifiers, while leaving semantic and arithmetic verification to the main session; see [Workflow Guide](docs/workflow-guide.md) for exact rules.
+### 3. 开源许可
 
-Network access, client installations, and official credentials are prepared by the user. Built-in rules and prompts are written in Simplified Chinese. This project is currently supported solely by the China Scholarship Council (CSC), No. `202506280162`, Approval No. `留金选[2025]37号`.
-
-本项目采用 [Apache License 2.0](LICENSE)。衍生分发须按协议第 4(d) 条保留 [NOTICE](NOTICE) 原创归属声明：`Copyright 2026 Xinyu Li (Xinyu-Li-1997)`。
+本项目采用 [Apache License 2.0](LICENSE) 开源许可，版权归属 `Copyright 2026 Xinyu Li (Xinyu-Li-1997)`。复制或分发本仓库及其衍生作品时，须遵守协议第 4 条及第 4(d) 条，附带许可证副本并保留 [NOTICE](NOTICE) 中的完整原创归属声明。

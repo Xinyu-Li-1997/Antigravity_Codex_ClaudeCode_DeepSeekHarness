@@ -1690,25 +1690,36 @@ def _sync_codex_global_rules(template_rules_path: Path, codex_root: Path, dry_ru
 _LOCAL_ENV_COLLISIONS = re.compile(r"^([ \t]*(?:(?:[-*+]|\d+\.)[ \t]+)?(?:#{1,6}[ \t]+)?(?:\*{1,2})?)(R10|R11)\.", re.MULTILINE)
 
 
+def _find_custom_rules_tail_start(text: str) -> Optional[int]:
+    env_sec_re = re.compile(r"^##[ \t]+工具与([^\r\n]*)[^\S\n]*(?:\r?\n|$)", re.MULTILINE)
+    env_matches = list(env_sec_re.finditer(text))
+    custom_env = next((m for m in env_matches if m.group(1).strip() != "运行环境"), None)
+    tail_start = custom_env.start() if custom_env is not None else None
+    standard_env = re.search(r"^##[ \t]+工具与运行环境[^\S\n]*(?:\r?\n|$)", text, re.MULTILINE)
+    if standard_env is not None:
+        following = re.search(r"^##[ \t]+\S[^\r\n]*", text[standard_env.end():], re.MULTILINE)
+        if following is not None:
+            following_start = standard_env.end() + following.start()
+            tail_start = min(tail_start, following_start) if tail_start is not None else following_start
+    return tail_start
+
+
 def _sync_global_rules(template_rules_path: Path, rules_path: Path, label: str, dry_run: bool) -> None:
     """以完整模板更新规则，保留自定义尾段并迁移与标准规则冲突的编号。"""
     if not template_rules_path.is_file():
         return
     template_text = _decode_utf8(template_rules_path, template_rules_path.read_bytes()).replace("\r\n", "\n")
 
-    env_sec_re = re.compile(r"^##[ \t]+工具与([^\r\n]*)[^\S\n]*(?:\r?\n|$)", re.MULTILINE)
-
     codex_agents = rules_path
     original = _read_optional_bytes(codex_agents)
     existing = _decode_utf8(codex_agents, original or b"")
 
-    env_matches = list(env_sec_re.finditer(existing))
-    custom_env = next((m for m in env_matches if m.group(1).strip() != "运行环境"), None)
+    tail_start = _find_custom_rules_tail_start(existing)
     newline = "\r\n" if "\r\n" in existing else "\n"
-    if custom_env is not None:
+    if tail_start is not None:
         custom_tail = _LOCAL_ENV_COLLISIONS.sub(
             lambda match: match[1] + ("L1" if match[2] == "R10" else "L2") + ".",
-            existing[custom_env.start():],
+            existing[tail_start:],
         )
         # 旧版安装器为尾段补一个末尾换行，继续兼容这一输出约定。
         if not custom_tail.endswith("\n"):
@@ -2412,12 +2423,10 @@ def _rules_core(raw: bytes) -> str:
 def _rules_equal(actual_raw: bytes, expected_raw: bytes) -> bool:
     actual_text = actual_raw.decode("utf-8-sig").replace("\r\n", "\n")
     expected_text = expected_raw.decode("utf-8-sig").replace("\r\n", "\n")
-    env_sec_re = re.compile(r"^##[ \t]+工具与([^\r\n]*)[^\S\n]*(?:\r?\n|$)", re.MULTILINE)
-    env_matches = list(env_sec_re.finditer(actual_text))
-    custom_env = next((m for m in env_matches if m.group(1).strip() != "运行环境"), None)
-    if custom_env is not None:
-        return (actual_text[:custom_env.start()].rstrip() == expected_text.rstrip()
-                and _LOCAL_ENV_COLLISIONS.search(actual_text[custom_env.start():]) is None)
+    tail_start = _find_custom_rules_tail_start(actual_text)
+    if tail_start is not None:
+        return (actual_text[:tail_start].rstrip() == expected_text.rstrip()
+                and _LOCAL_ENV_COLLISIONS.search(actual_text[tail_start:]) is None)
     return actual_text.rstrip() == expected_text.rstrip()
 
 

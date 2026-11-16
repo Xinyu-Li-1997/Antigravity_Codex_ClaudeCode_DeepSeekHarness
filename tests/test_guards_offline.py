@@ -14,6 +14,7 @@ test_guards_offline.py - 防空转门禁 (status_guard) 与防刷屏门禁 (repl
 import concurrent.futures
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -27,6 +28,7 @@ sys.path.insert(0, str(HOOKS_DIR))
 
 import reply_repeat_guard  # noqa: E402
 import status_guard  # noqa: E402
+import user_words  # noqa: E402
 
 
 def _append_jsonl(path: Path, obj: dict) -> None:
@@ -1880,7 +1882,9 @@ class TestGuardsOffline(unittest.TestCase):
 
 class TestDispatchAndBillingGuards(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(dir=REPO_ROOT)
+        cache_dir = REPO_ROOT / ".pytest_cache"
+        cache_dir.mkdir(exist_ok=True)
+        self.temp = tempfile.TemporaryDirectory(dir=cache_dir)
         self.root = Path(self.temp.name)
         self.state = self.root / "state"
         self.logs = self.root / "logs"
@@ -1911,6 +1915,55 @@ class TestDispatchAndBillingGuards(unittest.TestCase):
         (directory / "ticket-fixture.json").write_text(json.dumps({"ticket_id": "ticket-fixture",
             "session_id": sid, "status": status, "expires_at": expires or time.time() + 3600,
             "streams": [{"stream_id": "S" + str(i + 1), "channel": channel} for i in range(count)]}), encoding="utf-8")
+
+    def test_custom_plan_directory_ticket_is_command_scoped(self):
+        self.approve(channel="cae_harness_headless")
+        custom = self.project / "custom plans"
+        custom.mkdir()
+        source = self.state / "dispatch_plans/ticket-fixture.json"
+        (custom / source.name).write_bytes(source.read_bytes())
+        source.unlink()
+        command = 'python cae_harness.py batch --plan-dir "custom plans" --ticket ticket-fixture'
+        self.assertEqual(self.pre("run_command", {"CommandLine": command})["decision"], "allow")
+        for changed in (command.replace("ticket-fixture", "missing"), command.replace("custom plans", "missing plans"),
+                        command + " && python cae_harness.py batch --ticket ticket-fixture"):
+            self.assertEqual(self.pre("run_command", {"CommandLine": changed})["decision"], "deny")
+        self.assertEqual(user_words.candidate_dispatch_plan_dirs(self.state, (custom,))[0], custom.resolve())
+        with unittest.mock.patch.object(user_words, "_is_reparse_or_link", side_effect=lambda path: path == custom):
+            self.assertNotIn(custom.resolve(), user_words.candidate_dispatch_plan_dirs(self.state, (custom,)))
+        for field, value in (("status", "PENDING"), ("expires_at", time.time() - 1), ("session_id", "other")):
+            ticket = json.loads((custom / source.name).read_text(encoding="utf-8"))
+            ticket[field] = value
+            (custom / source.name).write_text(json.dumps(ticket), encoding="utf-8")
+            self.assertEqual(self.pre("run_command", {"CommandLine": command})["decision"], "deny")
+            self.approve(channel="cae_harness_headless")
+            (custom / source.name).write_bytes(source.read_bytes())
+            source.unlink()
+
+    def test_review_without_target_checks_current_directory_size(self):
+        for i in range(3):
+            (self.project / f"source{i}.py").write_bytes(b"value = 1\n")
+        command = "python cae_harness.py task --kind review"
+        self.assertEqual(self.pre("run_command", {"CommandLine": command})["decision"], "deny")
+        self.assertEqual(self.pre("run_command", {"CommandLine": command + " --dry-run"})["decision"], "allow")
+        self.approve(channel="cae_harness_headless")
+        self.assertEqual(self.pre("run_command", {"CommandLine": command + " --ticket ticket-fixture"})["decision"], "allow")
+        small = self.project / "small"
+        small.mkdir()
+        self.assertEqual(self.pre("run_command", {"CommandLine": command, "Cwd": str(small)})["decision"], "allow")
+
+    def test_heavy_bill_four_columns_preserve_fields_and_escaping(self):
+        entry = {"receipt_file": "receipt|all.json", "token_usage_summary": {"total_tokens": 42},
+                 "streams": [{"stream_id": "S1", "channel": "native_subagent", "engine": "fixture-engine",
+                              "model": "fixture-model", "status": "ok", "succeeded": True,
+                              "token_usage": {"input_tokens": 12, "output_tokens": 30}, "receipt_file": "stream|one.json"}]}
+        text = reply_repeat_guard._render_heavy_bill([entry])
+        rows = [line for line in text.splitlines() if line.startswith("|")]
+        self.assertEqual(rows[0], "| 流号 | 通道与模型 | 执行结果 | Token 明细与回执路径 |")
+        self.assertTrue(all(line.endswith("|") and len(re.split(r"(?<!\\)\|", line)[1:-1]) == 4 for line in rows))
+        for value in ("S1", "native_subagent", "fixture-engine", "fixture-model", "成功 / ok", '"input_tokens": 12',
+                      '"output_tokens": 30', r"stream\|one.json", 'Token 汇总：{"total_tokens": 42}；回执：receipt|all.json'):
+            self.assertIn(value, text)
 
     def test_bare_cli_and_readonly_self_checks(self):
         for command in ("codex exec work", "claude -p work", "claude --print work",
@@ -1972,7 +2025,7 @@ class TestDispatchAndBillingGuards(unittest.TestCase):
         for command in ("batch", "gate", "audit", "task --kind code", "task --kind=code"):
             result = self.pre("run_command", {"CommandLine": "python -B cae_harness.py " + command})
             self.assertEqual(result["decision"], "deny", command)
-            self.assertIn("14 列", result["reason"])
+            self.assertIn("14 项", result["reason"])
         for flags in ("batch --dry-run", "task --kind review"):
             self.assertEqual(self.pre("run_command", {"CommandLine": "python cae_harness.py " + flags})["decision"], "allow")
         payload = {"conversationId": "offline", "cwd": str(self.project),

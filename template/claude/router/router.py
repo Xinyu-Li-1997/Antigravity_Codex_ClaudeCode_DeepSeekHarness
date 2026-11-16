@@ -393,9 +393,29 @@ def _read_chunked_body(rfile, max_bytes):
     return b"".join(chunks)
 
 
+_LOG_SECRET_RE = re.compile(
+    r"(?i)(?:Bearer\s+[A-Za-z0-9._~+/=-]{8,}|"
+    r"(?:sk-[A-Za-z0-9_-]{12,}|AIza[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|"
+    r"github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|hf_[A-Za-z0-9]{20,}|glpat-[A-Za-z0-9_-]{16,})|"
+    r"(?:api[_-]?key|auth[_-]?token|access[_-]?token|secret[_-]?key)\s*[=:]\s*[^\s\"',}]+)"
+)
+
+
+def _scrub_log_value(val):
+    if isinstance(val, str):
+        val = re.sub(r"(?i)(https?://)([^/\s@]+@)", r"\1<redacted>@", val)
+        val = re.sub(r"(?i)([?&](?:key|api_key|token|access_token|secret)=)[^&\s\"']+", r"\1<redacted>", val)
+        return _LOG_SECRET_RE.sub("<redacted>", val)
+    if isinstance(val, dict):
+        return {k: _scrub_log_value(v) for k, v in val.items()}
+    if isinstance(val, list):
+        return [_scrub_log_value(v) for v in val]
+    return val
+
+
 def log_line(cfg, rec):
     path = os.path.abspath(os.path.expanduser(cfg["log"]))
-    line = json.dumps(rec, ensure_ascii=False) + "\n"
+    line = json.dumps(_scrub_log_value(rec), ensure_ascii=False) + "\n"
     with _log_lock:
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)

@@ -1,11 +1,11 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1440" height="1158" viewBox="0 0 1440 1158" role="img" aria-labelledby="title desc">
-  <title id="title">四客户端配置与全通道派工架构</title>
-  <desc id="desc">稳定执行机制与动态配置分开维护；长期启停决策与日常可用性复查分开执行。</desc>
+  <title id="title">四客户端共有机制与全通道派工架构</title>
+  <desc id="desc">常驻共有机制与动态配置分层维护；长期启停决策与日常离线可用性复查分阶段执行。</desc>
   <defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M 0 1 L 8 5 L 0 9" fill="none" stroke="#64748b" stroke-width="1.5"/></marker></defs>
   <style>text { font-family: "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; fill: #23354d; } .title { font-size: 28px; font-weight: 700; } .subtitle { font-size: 17px; fill: #52657b; } .heading { font-size: 21px; font-weight: 700; } .body { font-size: 16px; } .link { fill: none; stroke: #64748b; stroke-width: 2; marker-end: url(#arrow); }</style>
-  <rect width="1440" height="1158" fill="#f3f6fb"/>
-  <text x="32" y="49" class="title">四客户端配置与全通道派工架构</text>
-  <text x="32" y="80" class="subtitle">稳定执行机制与动态配置分开维护；长期启停决策与日常可用性复查分开执行。</text>
+  <rect width="1440" height="1158" rx="18" fill="#f3f6fb"/>
+  <text x="32" y="49" class="title">原理层一：两层解耦、双门额度检查与全通道派工架构</text>
+  <text x="32" y="80" class="subtitle">常驻共有机制与动态配置分层维护；长期启停决策与日常离线可用性复查分阶段执行。</text>
   <path class="link" d="M 367 274 L 367 304"/>
   <path class="link" d="M 1073 274 L 1073 304"/>
   <path class="link" d="M 720 430 L 720 460"/>
@@ -15,51 +15,51 @@
   <path class="link" d="M 367 968 L 367 998"/>
   <path class="link" d="M 1073 968 L 1073 998"/>
   <g><rect x="32" y="112" width="670" height="162" rx="14" fill="#ffffff" stroke="#b5c8e5"/>
-    <text x="54" y="146" class="heading">常驻机制：规则、钩子与验证入口</text>
-    <text x="54" y="177" class="body">全局规则与 readonly-* 代理约束工程边界。</text>
-    <text x="54" y="203" class="body">install.py 分发模板；cae_harness.py 组织后台验证。</text>
-    <text x="54" y="229" class="body">交互主会话保留用户选择的模型与推理强度。</text>
+    <text x="54" y="146" class="heading">常驻机制层：共用规则、钩子与验证入口</text>
+    <text x="54" y="177" class="body">全局规则 R0–R11、5 个共用钩子模块与 readonly-* 代理约束工程边界。</text>
+    <text x="54" y="203" class="body">install.py 按客户端协议分发；cae_harness.py 组织后台验证与事实锚定。</text>
+    <text x="54" y="229" class="body">交互主会话保留用户自选客户端、模型与推理强度，零时期性模型名硬编码。</text>
   </g>
   <g><rect x="738" y="112" width="670" height="162" rx="14" fill="#ffffff" stroke="#b5c8e5"/>
-    <text x="760" y="146" class="heading">动态来源：fleet_profile.json</text>
-    <text x="760" y="177" class="body">五角色：orchestrator、math、code、review、fast。</text>
-    <text x="760" y="203" class="body">runtime_tunables 集中维护运行参数。</text>
-    <text x="760" y="229" class="body">subscription_matrix 与 capability_ledger 分别记录启停和性能。</text>
+    <text x="760" y="146" class="heading">动态配置层：fleet_profile.json</text>
+    <text x="760" y="177" class="body">五个动态角色槽位：orchestrator、math、code、review、fast。</text>
+    <text x="760" y="203" class="body">runtime_tunables 集中维护各端恢复预算、交接、防轮询与派工阈值。</text>
+    <text x="760" y="229" class="body">subscription_matrix 与 capability_ledger 分别记录启停和离线性能时间。</text>
   </g>
   <g><rect x="32" y="304" width="1376" height="126" rx="14" fill="#f3efff" stroke="#b8a7dc"/>
-    <text x="54" y="338" class="heading">第一道门：独立维护与用户拍板</text>
-    <text x="54" y="369" class="body">fleet-evolve 联网评估能力，展示本机可用性与额度类型；用户决定 agent 和 LLM 启停。</text>
-    <text x="54" y="395" class="body">subscription_matrix 中 enabled: false 的项全局跳过；日常派工不联网更新性能。</text>
+    <text x="54" y="338" class="heading">第一道门：独立 fleet-evolve 维护评估与用户拍板</text>
+    <text x="54" y="369" class="body">结合联网评估与本机探测展示各客户端和模型的可用性及额度类型；由用户拍板决定启停。</text>
+    <text x="54" y="395" class="body">subscription_matrix 中 enabled: false 的项全局跳过；日常派工只读本地时间，不联网查榜单。</text>
   </g>
   <g><rect x="32" y="460" width="1376" height="150" rx="14" fill="#eefaf4" stroke="#81bfa0"/>
-    <text x="54" y="494" class="heading">第二道门：plan 弹卡前离线复查</text>
-    <text x="54" y="525" class="body">核对程序、凭据配置、所需路由存活和当前运行侧冷却。</text>
-    <text x="54" y="551" class="body">读取本机可得的滚动窗口百分比与重置时间、卡片套餐或余额类型、日月限额。</text>
-    <text x="54" y="577" class="body">过滤不可用或超限通道；未知信息保持未知，不推断服务端实时余额。</text>
+    <text x="54" y="494" class="heading">第二道门：plan 弹卡前纯离线复查</text>
+    <text x="54" y="525" class="body">离线核对本机可执行文件、凭据配置、所需本地回环路由存活与当前配额冷却记录。</text>
+    <text x="54" y="551" class="body">读取本地可得的滚动窗口百分比与重置时间、卡片套餐或余额类型、日月费用限额。</text>
+    <text x="54" y="577" class="body">过滤不可用或超限通道；本机未暴露的信息保持未知，不推断服务端实时余额充足。</text>
   </g>
   <g><rect x="32" y="640" width="1376" height="166" rx="14" fill="#fff8e9" stroke="#d7b265"/>
-    <text x="54" y="674" class="heading">全通道重负载确认：用户点名 P0 与角色入口并列</text>
-    <text x="54" y="705" class="body">plan 生成人话背景、目标、预计后果与 14 列完整矩阵，列全模型、权限、额度和回执位置。</text>
-    <text x="54" y="731" class="body">显示 last_online_refresh_at 与 local_bench_verified_at；选项为批准、微调后批准、暂缓并交接。</text>
-    <text x="54" y="757" class="body">批准后以 --approve-ticket 登记；PreToolUse 检查票据并拦截裸 CLI 旁路。</text>
-    <text x="54" y="783" class="body">点名锁定已指定维度；窗口、非委派挡位、无头标志、行号内联与快照按实际通道补齐。</text>
+    <text x="54" y="674" class="heading">全通道重负载确认：用户明确点名（P0）与动态角色选路并列</text>
+    <text x="54" y="705" class="body">plan 生成平实中文背景、目标、预计后果与纵向 14 项完整参数表，列全模型、权限、额度和回执位置。</text>
+    <text x="54" y="731" class="body">附 last_online_refresh_at 与 local_bench_verified_at；提供批准、微调后批准、暂缓并交接三选项。</text>
+    <text x="54" y="757" class="body">获批后以 --approve-ticket 登记；PreToolUse 门禁核验有效票据并拦截裸调底层 CLI。</text>
+    <text x="54" y="783" class="body">点名锁定用户指定维度；声明最大窗口、非委派挡位、无头标志、行号内联与快照按通道自动补齐。</text>
   </g>
   <g><rect x="32" y="836" width="670" height="132" rx="14" fill="#ffffff" stroke="#b5c8e5"/>
-    <text x="54" y="870" class="heading">外部通道：cae-harness 无头子进程</text>
-    <text x="54" y="901" class="body">batch 仅执行 cae_harness_headless，按后端限制并发。</text>
-    <text x="54" y="927" class="body">只读快照与行号内联；可写绑定范围及验收命令。</text>
-    <text x="54" y="953" class="body">DSH 按命令能力适配权限参数与补丁。</text>
+    <text x="54" y="870" class="heading">外部通道：cae-harness 跨端无头子进程</text>
+    <text x="54" y="901" class="body">batch 按各后端并发上限执行 cae_harness_headless 通道。</text>
+    <text x="54" y="927" class="body">只读任务带行号内联与前后哈希快照；可写任务锁定范围与验收命令。</text>
+    <text x="54" y="953" class="body">各客户端按自身 CLI 协议能力适配参数、结构化输出与脱敏。</text>
   </g>
   <g><rect x="738" y="836" width="670" height="132" rx="14" fill="#ffffff" stroke="#b5c8e5"/>
-    <text x="760" y="870" class="heading">内部通道：客户端原生子代理与工作流</text>
-    <text x="760" y="901" class="body">native_subagent、native_workflow、native_swarm。</text>
-    <text x="760" y="927" class="body">inherit 显示解析结果；多路或可写委派纳入确认。</text>
-    <text x="760" y="953" class="body">由对应客户端执行，不交给 batch，不声明净室隔离。</text>
+    <text x="760" y="870" class="heading">内部通道：各客户端原生子代理与工作流</text>
+    <text x="760" y="901" class="body">覆盖 native_subagent、native_workflow、native_swarm。</text>
+    <text x="760" y="927" class="body">inherit 展示本地配置解析出的实际模型；多路或可写委派统一纳入确认。</text>
+    <text x="760" y="953" class="body">由当前主会话客户端按获批计划调用，不交给 batch，不套用净室隔离承诺。</text>
   </g>
   <g><rect x="32" y="998" width="1376" height="132" rx="14" fill="#eefaf4" stroke="#81bfa0"/>
-    <text x="54" y="1032" class="heading">事件恢复、交接与完成核验</text>
-    <text x="54" y="1063" class="body">Codex 五事件：SessionStart、PostCompact、UserPromptSubmit、PreToolUse、Stop。</text>
-    <text x="54" y="1089" class="body">压缩后常规摘要与未决专项计划分开恢复；强制交接 Stop 检查【新对话提示词】和选项卡。</text>
-    <text x="54" y="1115" class="body">完工 Stop 按外部与原生规则检查成败词、Token 说明及回执或轨迹标识；主会话逐路核对状态与汇总。</text>
+    <text x="54" y="1032" class="heading">共有会话生命周期门禁与四客户端协议适配</text>
+    <text x="54" y="1063" class="body">Antigravity、Codex、Claude Code 按各自宿主事件协议接入 5 个共用钩子模块；DSH 同步全局规则与技能。</text>
+    <text x="54" y="1089" class="body">压缩后常规原话摘要与未决确认单分块独立恢复；强制交接阶段由 Stop 校验【新对话提示词】与选项卡。</text>
+    <text x="54" y="1115" class="body">重负载完工后由 Stop 按外部与原生规则核验成败词、Token 说明及回执或轨迹标识，主会话逐路复核原文与算术。</text>
   </g>
 </svg>
