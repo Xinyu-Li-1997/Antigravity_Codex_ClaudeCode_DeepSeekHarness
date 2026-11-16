@@ -2907,6 +2907,10 @@ def audit_upgrade_status(
         client = entry.get("agent")
         available = subscription_candidates["agents"].get(client, {}).get("currently_available", False)
         scheme = entry.get("quota_scheme")
+        detected_client = detection.get("antigravity" if client == "agy" else str(client), {})
+        interop_delegated = bool(
+            not peer_reports.get(str(client), {}).get("native_installed") and detected_client.get("interop_available")
+        )
         if entry.get("card"):
             cards = [card for card in (cc.get("cards") or []) if isinstance(card, dict)
                      and card.get("app_type") == client and card.get("name") == entry["card"]]
@@ -2915,10 +2919,14 @@ def audit_upgrade_status(
             available = available and bool(ready_cards)
             scheme = next((card["quota_scheme"] for card in ready_cards if card.get("quota_scheme")), scheme)
         elif client in catalogs:
-            available = available and any(item["slug"] == model and item.get("visibility") != "hide"
-                                          for item in catalogs[client])
+            available = available and (
+                (interop_delegated and not catalogs[client])
+                or any(item["slug"] == model and item.get("visibility") != "hide" for item in catalogs[client])
+            )
         elif client == "dsh":
-            available = available and (dsh["credentials_present"] or bool(os.environ.get("DEEPSEEK_API_KEY")))
+            available = available and (
+                dsh["credentials_present"] or bool(os.environ.get("DEEPSEEK_API_KEY")) or interop_delegated
+            )
         subscription_candidates["models"][model] = {
             "agent": client, "enabled_in_profile": bool(entry.get("enabled", False)),
             "currently_available": bool(available), "quota_scheme": scheme,

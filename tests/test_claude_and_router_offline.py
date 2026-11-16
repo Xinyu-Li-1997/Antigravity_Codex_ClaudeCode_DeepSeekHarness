@@ -1543,6 +1543,21 @@ class TestClaudeInstallerAndUpgradeAudit(OfflineSandbox):
         self.assertTrue(candidates["models"]["card-model"]["currently_available"])
         self.assertFalse(candidates["models"]["placeholder-model"]["currently_available"])
         self.assertEqual(candidates["models"]["card-model"]["quota_scheme"], "balance")
+        interop_detected = {
+            "antigravity": {"native_installed": False, "interop_available": False},
+            "codex": {"native_installed": False, "interop_available": True},
+            "claude": {"native_installed": True, "interop_available": False},
+            "dsh": {"native_installed": False, "interop_available": True},
+        }
+        empty_codex = self.root / "wsl-empty-codex"
+        empty_codex.mkdir(parents=True)
+        with mock.patch.object(installer, "_load_fleet_profile", return_value=profile):
+            interop_report = installer.audit_upgrade_status(
+                REPO_ROOT, self.plugin, empty_codex, self.claude_home, db,
+                detection=interop_detected, is_sandbox_run=True, dsh_home=self.root / "wsl-empty-dsh")
+        interop_models = interop_report["subscription_candidates"]["models"]
+        self.assertTrue(interop_models["fixture-model"]["currently_available"])
+        self.assertTrue(interop_models["dsh-model"]["currently_available"])
         cli_report = json.loads(self.install("--audit-upgrade", "--app", "claude", "--claude-home", self.claude_home,
                                              "--ccswitch-db", db).stdout)
         self.assertIn("subscription_candidates", cli_report)
