@@ -188,12 +188,14 @@ python -B -X utf8 install.py --audit-upgrade     # 4. 校验 summary.all_aligned
 | **`cae_harness.py` 全部子命令（`probe`、`assess`、`plan`、`batch`、`gate`、`audit`、`task`、`check-grounding`）规程** | [cae-harness 技能规程](template/user-guard/skills/cae-harness/SKILL.md) |
 | **配置仓库自我更新（`full`、`hygiene`、`audit`）、`fleet_state.py` 状态机与 `install.py` 维护说明** | [fleet-evolve 维护规程](template/user-guard/skills/fleet-evolve/SKILL.md) · [仓库维护说明](AGENTS.md) |
 | **插件模板目录归属与历次版本演进记录** | [插件模板说明](template/user-guard/README.md) · [更新日志](CHANGELOG.md) |
+| **V1.0.0 存档时间戳、Concept DOI 与 Version DOI 分工、后续发版流程** | [时间戳与 DOI 说明](.timestamps/README.md) |
 
 ```text
 Antigravity_Codex_ClaudeCode_DeepSeekHarness/
 ├── README.md                              # 总览：目标群体、用户层（安装、点名与自我更新）、原理层与指针
 ├── AGENTS.md / CHANGELOG.md               # 上游配置仓维护说明与版本演进记录
 ├── LICENSE / NOTICE                       # Apache License 2.0 许可证与第 4(d) 条原创归属声明
+├── .timestamps/                           # RFC 3161 时间戳凭证与 DOI 发版说明
 ├── install.py / install.ps1 / install.sh  # 跨平台幂等安装器、配置漂移与科学计算包 ABI 耦合审计
 ├── docs/                                  # 工作流实战指南、底层架构与钩子说明及 3 张分层 SVG 架构图
 ├── template/
