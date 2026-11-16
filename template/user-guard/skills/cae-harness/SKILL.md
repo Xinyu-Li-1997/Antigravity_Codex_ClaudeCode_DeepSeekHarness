@@ -1,62 +1,145 @@
 ---
 name: cae-harness
 description: >
-  Orchestrate bounded engineering, mathematical derivation, review, polish grounding verification,
-  and closed-loop testing across four peer CLI agents: Codex, Antigravity (agy), Claude Code (claude / cc),
-  and DeepSeek Harness (dsh). Dynamically route all five role slots from fleet_profile.json, enforce
-  workspace write scopes and verification commands, and run zero-blacklist document grounding audits.
+  按动态配置组织本机对等客户端的有界推导、编码验证、只读审查和文档润色，
+  提供离线可用性与额度检查、全通道派工确认、票据交接、完成回执及事实锚定。
 ---
 
-# 四客户端动态角色路由、事实锚定与后台验证工具（`cae-harness`）
+# cae-harness 使用规程
 
-`cae-harness` 通过纯 Python 3.11+ 标准库脚本 `scripts/cae_harness.py` 按需启动本机已就绪的 **Codex**、**Antigravity（`agy`）**、**Claude Code（`claude` 或 `cc`）** 与 **DeepSeek Harness（`dsh`）** 无头命令行（Headless CLI）子进程，并提供零外部依赖的文档事实锚定核验子命令 `check-grounding`。本技能在**通用课题项目**（`general_project`）与**上游配置仓库**（`upstream_config_repo`）中均可直接使用；每次后台调用均在独立进程与全新上下文中运行，不占用交互式主会话窗口。
+本技能的执行入口是 `scripts/cae_harness.py`，依赖 Python 3.11+ 标准库。它使用本机已准备好的 Codex、Antigravity（`agy`）、Claude Code（`claude` 或 `cc`）和 DeepSeek Harness（`dsh`）。外部后台任务在新进程、独立上下文中运行，主会话保留用户选定的模型与推理强度。`check-grounding` 只做确定性检查，不调用模型。
 
-## 一、动态选路、工作区识别与安全门禁
+## 先确定任务，再选择执行入口
 
-1. **五个角色槽位与运行期定量参数全部由 [fleet_profile.json](fleet_profile.json) 动态驱动**：
-   - 脚本不含任何特定时期的模型名称硬编码，从同目录 [fleet_profile.json](fleet_profile.json)（可通过环境变量 `CAE_FLEET_PROFILE` 覆盖做离线沙箱测试）读取五个对等动态角色槽位（`orchestrator`、`math`、`code`、`review`、`fast`）的候选顺序、推荐模型系列、推荐推理挡位、暂缓与退役过滤规则，以及 `runtime_tunables.headless_dispatch` 定量参数（分片安全系数、默认分片上限、超时、验证轮数、配额默认冷却、目录缓存有效期、双盲行号容差与润色长短篇分界）。
-   - 支持跨端角色选路（`role:orchestrator`、`role:math`、`role:code`、`role:review`、`role:fast`）、指定客户端角色选路（`<client>:@orchestrator`、`<client>:@math`、`<client>:@code`、`<client>:@review`、`<client>:@fast`，及兼容简写 `codex:math`、`codex:code`、`codex:review`、`dsh:fast`、`claude:fast`）或显式指定模型（`<client>:default`、`<client>:<model_slug>`）。
-2. **工作区身份硬判别（`workspace_mode`）与防递归保护**：
-   - `probe`、`assess` 与 `check-grounding` 均自动识别 `workspace_mode`：仅当目标目录或其父目录同时包含 `install.py` 与 `template/user-guard/plugin.json` 时标记为 `upstream_config_repo`；其余业务仓库标记为 `general_project`（将 `fleet-evolve`、`fleet_state.py` 与 `install.py` 列入 `upstream_only_capabilities`，防止日常课题优化误触宿主机全局配置演进）。
-   - 启动无头子进程时自动注入 `CAE_HARNESS_DEPTH=1`；子进程内除只读探测与 `check-grounding` 外再次调用编排器会被直接拦截。
-3. **运行前凭据、路由与配额冷却预检**：
-   - 派发前核实可执行文件、官方登录态或 API Key、本地 `router.py` `/__router/health` 状态及当前运行侧（Windows 与 WSL2 独立计量）的配额冷却记录。
-   - 遇到滚动窗口限额、周度限额或余额不足（退出码 `5`，`quota_exhausted`）时立即停止重试；仅当显式开启 `--fallback-on-quota` 且工作区文件尚未发生任何改动时，才按 `peer_fallback_order` 切换至下一个就绪客户端（双盲 `audit` 回退自动跳过另一侧已占用的客户端以保持双源独立）。
-4. **推理挡位规则、`--clean-room` 空上下文盲读与读写快照门禁**：
-   - **推理挡位与窗口**：常规推导、编码、审查与验证任务显式传入模型声明的最大上下文窗口与单模型非委派最高推理强度（`max`、`xhigh` 或 `high`），过滤 `ultra` 自动委派挡；`polish` 润色按篇幅阈值自动选用 `medium`（短篇）或 `high`（长篇）；`role:fast` 省额度快检默认选用 `low` 挡。`claude` 只读调用固定附加 `--permission-mode dontAsk`，`dsh` 自动附加单 JSON 输出约束并清洗尾随 `DSML` 标记与外层代码围栏。
-   - **空上下文盲读模式（`task --clean-room`）**：支持 `codex`、`claude`、`dsh` 只读任务，在系统临时目录构造仅含最小认证凭据的隔离配置并剔除 `AGENTS.md` 与 `CLAUDE.md`，从零预设新读者视角检验文档可读性。
-   - **确定性事实锚定核验（`check-grounding` 与 `polish` 自动审计）**：零硬编码领域黑名单，直接扫描工作区源码与配置文件构建词法锚点集合，逐行校验文档与 SVG 中的行内 `--<选项>` 及文件名标识符、全大写技术缩写、带单位定量数字以及举例与括注并列领域词干；`task --kind polish` 自动附带相对原稿的 `grounding_audit` 核验结果。
-   - **读写边界校验**：只读任务前后计算全目录（含 `.github`）文件哈希快照，任何改动立即报 `scope_violation`；改码任务通过 `--write-scope` 锁定路径白名单，`gate` 强制要求非空 `--verify-cmd`。
+实质性数理推导、多文件编码验证、关键代码与文档审查应主动核实本机可用端，再组织协作。多个对等端就绪时，推导、实现验证和关键独立审查优先跨客户端执行。同端 `readonly-*` 代理用于原文摘录、多文件读取和行号初筛，不替代跨客户端独立审查。用户限定为本会话执行或禁止再次编排时，服从当前任务边界。
 
-## 二、常用命令示例
+用户点名与角色槽位是并列入口。用户用精确标识符或日常口语指定客户端、模型简称、推理挡位或省额度意图时，按 P0 第一优先级锁定已指定维度，通过 `--user-prompt` 携带原话；任务文本或自动推荐不得覆盖点名。未指定部分由配置补齐。角色可写为 `role:orchestrator`、`role:math`、`role:code`、`role:review`、`role:fast`；也支持 `<client>:@<role>`、`<client>:default`、`<client>:<model>`。点名不可用时说明原因，不自行换端或降级。
 
-在已安装技能目录或仓库对应路径下执行（Windows 使用 `python -B -X utf8`，WSL2 或 Linux 使用 `python3 -B -X utf8`）：
+`--kind` 表示工作性质，`--engine` 或 `--worker` 表示角色与选路。应按下表明确组合，不声称脚本仅凭 `--kind` 就固定绑定某个槽位。
 
-```bash
-# 1. 只读探测工作区类型（general_project / upstream_config_repo）、四端凭据、冷却记录与预算摘要
+| 工作性质 | 命令入口 | 角色与限制 |
+| --- | --- | --- |
+| 技术方向与总体推演 | `task --kind direction` | 用 `--engine role:orchestrator`，只读给出路线与依据。 |
+| 数理推导 | `task --kind math` | 用 `--engine role:math`，核对定义、公式、离散格式及成立条件。 |
+| 代码实现 | `task --kind code` | 用 `--engine role:code`，必须声明 `--write-scope`。 |
+| 实现与强制验收 | `gate` | 用 `--worker role:code`，提供 `--write-scope` 和非空 `--verify-cmd`。 |
+| 独立审查 | `task --kind review` 或 `audit` | 前者用 `--engine role:review`；后者用 `--left`、`--right` 指定双源，`--single` 为单源。 |
+| 文字润色 | `task --kind polish` | 可用 `--engine role:review`；只读返回改写稿和 `grounding_audit`，不得改源码。 |
+| 省额度快检 | 按实际工作选择 `--kind` | 用 `--engine role:fast`；不存在 `--kind fast`。 |
+
+五个槽位的候选、声明窗口与推荐挡位均读取 [fleet_profile.json](fleet_profile.json)。后台常规任务默认采用所选模型支持的单模型非委派最高强度，跳过自动委派的 `ultra`。`polish` 按配置篇幅阈值选短篇 `medium` 或长篇 `high`；`role:fast` 按其低消耗配置执行。显式非 `fast` 角色即使降到 `low`，仍保留该槽位主力模型。轻量卡片承担非 `fast` 角色或所需本地路由未存活时，必须明确报错。
+
+外部调用由脚本补齐声明最大上下文窗口、无头非交互标志、只读小文件行号内联、前后快照与脱敏。`--inline-readonly` 默认开启，实际内联还受目标规模和配置限制。`--output` 保存结构化回执，文件默认脱敏；`--redact` 控制标准输出脱敏。原生通道的能力按客户端实际支持说明，不把外部无头隔离承诺套用于原生代理。
+
+## 两道可用性检查
+
+第一道门在独立的 `fleet-evolve` 流程中完成。维护者联网评估能力，同时展示本机当前能否使用及本机配置的额度类型，由用户决定哪些 agent 与 LLM 启用或停用，写入 `subscription_matrix.agents` 和 `subscription_matrix.models`。退订项设 `enabled: false`，全局选路跳过。一次任务批准不授权修改长期矩阵或 `runtime_tunables`。
+
+第二道门由 `plan` 在重负载弹卡前纯离线复查。检查本机程序、凭据配置、所需路由存活和可读取的额度状态，按实际配置读取滚动窗口百分比与重置时间、卡片套餐或余额类型、日月限额以及配额冷却，过滤不可用或超限通道。本地回环路由健康检查不等于查询外部服务余额。未暴露的信息保持未知，本地记录未显示超限也不能证明服务端尚有足额余额。
+
+日常派工不联网更新性能。确认单展示 `capability_ledger.last_online_refresh_at` 和 `capability_ledger.local_bench_verified_at`，联网刷新仅由 `fleet-evolve` 负责。派工读取当前配置与本地记录，不把维护阶段的历史实测当成本轮服务端验证。
+
+执行返回 `quota_exhausted` 后立即停止重试，按运行侧记录冷却。只有显式开启 `--fallback-on-quota` 且工作区尚无任何文件改动时，才能按配置回退；P0 点名仍须遵守，重负载计划发生变化时重新确认。`batch` 的各后端并发由 `runtime_tunables.headless_dispatch.batch_max_workers_per_backend` 控制，同后端触发额度中止后停止其排队流。
+
+## 轻任务、重负载与确认单
+
+轻任务按 `runtime_tunables.dispatch_confirmation` 的流数、文件数、估算 Token 和超时阈值静默执行。多路、可写或超出轻任务阈值的调用进入重负载流程，不能仅凭名称自行判轻。内部 `invoke_subagent`、`run_workflow`、`spawn_agent`、`Agent` 等多路或可写委派与外部无头调用均须纳入确认。
+
+`plan` 可接收单流参数，也可通过 `--spec-file` 读取非空对象列表。流内字段覆盖相应公共默认值。通道有 `cae_harness_headless`、`native_subagent`、`native_workflow`、`native_swarm`。原生通道必须指定或识别 `--caller`，默认模型为 `inherit`；确认单显示配置解析出的实际模型，无法解析时保留未解析状态。原生通道不属于无头调用，也不提供净室隔离。
+
+重负载确认单先说明工作流背景、要做什么和预计后果，再展示源码定义的 14 列全字段矩阵。不能省略未知字段，也不能以角色槽位代替实际模型。
+
+| 列号 | 字段 | 应显示的内容 |
+| --- | --- | --- |
+| 1 | 流号 | 每路唯一标识。 |
+| 2 | 子任务与范围 | 工作内容与目标路径。 |
+| 3 | 通道 | 外部无头或具体原生通道。 |
+| 4 | 客户端及子代理类型 | 实际客户端和代理类型。 |
+| 5 | 模型名字 | 实际模型及 `inherit` 解析结果。 |
+| 6 | 挡位 | 本路推理强度。 |
+| 7 | 上下文窗口 | 已解析窗口或未声明状态。 |
+| 8 | 是否无头 | 是否启动无头进程。 |
+| 9 | 是否净室 | 是否使用空上下文隔离。 |
+| 10 | 访问模式、写入范围与验收命令 | 只读或可写、写入白名单及验证命令。 |
+| 11 | 内联与超时 | 只读内容是否内联及本路超时。 |
+| 12 | 当前是否可用 | 本机判断与不可用原因。 |
+| 13 | 本机配置额度类型与当前状态 | 额度来源、可读状态及冷却情况。 |
+| 14 | 回执或子代理日志位置 | 结构化回执或原生轨迹位置。 |
+
+矩阵后附性能记录的联网刷新和本机实测更新时间，并给出批准当前计划、微调引擎或挡位或超时后批准、暂缓并交接三个选项。主会话结合证据说明推荐，用户明确选择前不执行重负载。`--session-id` 关联当前会话；轻计划如需保存，加 `--save-ticket`。`--plan-dir` 可指定票据目录，所有票据、回执、日志和临时制品均受当前授权边界约束。
+
+## 批准、执行与跨中断恢复
+
+用户批准后运行 `plan --approve-ticket` 登记。`--override-json` 按 `stream_id` 提供微调，只允许 `engine`、`tier`、`timeout`；调整须符合用户选择，批准前脚本重新离线解析并核查可用性。执行通过 `--ticket` 绑定内容一致且有效的 `APPROVED` 票据，不能借用其他任务的票据。
+
+`status_guard.py` 在工具执行前核验获批票据，拦截未经确认的重负载和裸 CLI 旁路。不要直接启动原始客户端命令绕过窗口、快照、额度或确认检查。`batch` 只执行 `cae_harness_headless`；含原生通道的计划由对应客户端按获批内容调用，不能整份交给 `batch`。在工作流中声明 `kind: gate` 时仍须提供范围与验收命令，不把批处理标签本身当作已完成验证。
+
+等待弹卡期间发生自动压缩，钩子从磁盘未决票据独立加载背景、要做什么、预计后果、完整矩阵和选项卡。恢复时分成两块：常规用户原话及子代理摘要；未决重负载工作流与完整确认单。票据缺失时报告缺口，不凭印象补写，也不把压缩或超时当作批准。
+
+进入 `drain` 或 `freeze` 强制交接时，`handoff_gate.py` 放行 `check-grounding --strict`，并在 `Stop` 硬门禁要求把完整工作流、全字段矩阵、性能更新时间、选项卡和票据写入【新对话提示词】。Codex 与 Claude Code 默认是 `advisory` 提醒，强制行为以实际模式为准。
+
+新会话先用 `plan --resume-ticket` 读取并重新核对完整确认内容。该接口保留原票据的 `session_id`，不会因传入新会话标识自动改绑；跨会话接力应据原流内容和当前会话标识重新生成确认票据，再按用户选择登记批准。内容变化、过期或校验失败时重新形成确认单，恢复本身不代表批准。
+
+`reply_repeat_guard.py` 在完工 `Stop` 检查回复中是否含有成败词，以及 Token 用量或无法统计说明。外部任务还须覆盖各流标识和账单中的实际回执文件名；单路 `task` 或 `gate` 可用模型名或任务状态代替默认流号。原生任务须覆盖完成数量、各流标识或各角色名中的一项，并提供日志或轨迹说明。流标识和外部回执文件名按完整词项匹配。漏报时同一回合单次阻断并附上磁盘账单。主会话仍须自行逐路核对具体状态、Token 明细与汇总算术，静态检查不核实这些内容的语义和计算结果。
+
+## 命令示例
+
+以下从技能目录运行。Windows 使用 `python -B -X utf8`，WSL2 与 Linux 改用 `python3 -B -X utf8`。占位符须替换为实际值，输入文件须已获授权准备，所有输出均须落在本轮允许范围。示例参数仅作覆盖演示，角色、挡位、窗口、超时、并发和轻重阈值默认由 `fleet_profile.json` 驱动，不应抄成固定策略。
+
+```powershell
 python -B -X utf8 scripts/cae_harness.py probe --caller auto
-
-# 2. 查看本机已就绪客户端及全部五个动态角色槽位（orchestrator/math/code/review/fast）的解析结果
 python -B -X utf8 scripts/cae_harness.py assess --caller auto
-
-# 3. 零黑名单文档事实锚定核验（重写或润色终审必跑；加 --base-ref HEAD 可额外拦截相对基线新增的陌生短语）
-python -B -X utf8 scripts/cae_harness.py check-grounding --target . --strict
-
-# 4. 目录级只读代码审查（大目录按 runtime_tunables 分片安全系数自动分片送审）
-python -B -X utf8 scripts/cae_harness.py audit --caller auto --target src --single --left role:review \
-  --focus "检查离散通量守恒性、奇异网格退化保护与数组越界风险"
-
-# 5. 派发专项无头任务（--kind 可选 math | review | direction | polish | code；新读者盲读加 --clean-room）
-python -B -X utf8 scripts/cae_harness.py task --caller auto --kind math --engine role:math --tier max --timeout 900 \
-  --target . --task-file "<任务单.md>"
-
-# 6. 限定白名单修改源码并强制运行定量验证脚本闭环（严禁放宽 rtol/atol 或删改断言）
-python -B -X utf8 scripts/cae_harness.py gate --caller auto --worker role:code --tier max \
-  --target . --write-scope "src/**" --verify-cmd "pytest -q tests/test_core.py" \
-  --task-file "<任务单.md>"
+python -B -X utf8 scripts/cae_harness.py check-grounding --target "<项目根目录>" --strict
 ```
 
-## 三、主会话复核要求（`R6` 与 `R3.6`）
+多路只读检查的 `--spec-file` 可使用以下对象列表。每路目标互不依赖，子任务边界清楚；两个 `role:review` 并不保证来自不同客户端，需要双源独立审查时另用 `audit` 明确两路来源。
 
-- 所有后台无头调用返回的结构化 JSON 默认标记 `handoff_to_caller: true`，主会话必须亲自打开原文件核对精确行号、符号约定与上下文后再决定是否采纳。
-- 汇报时严格按实际验证深度区分“源码或配置已就位（`verification_executed: false`）”“编译与离线单测已通过”以及“本机实际环境或算例守恒与收敛阶实测已通过”；涉及宿主机全局目录写入与远端仓库推送一律先征得用户明确批准。
+```json
+[
+  {"stream_id":"S1","channel":"cae_harness_headless","kind":"review","engine":"role:review","target":"<第一份文件路径>","subtask":"核对接口文档与实现是否一致"},
+  {"stream_id":"S2","channel":"cae_harness_headless","kind":"review","engine":"role:review","target":"<第二份文件路径>","subtask":"核对命令参数与配置依据"}
+]
+```
+
+先生成确认单。`--tier high` 只演示显式覆盖，实际挡位应与用户意图及批准计划一致：
+
+```powershell
+python -B -X utf8 scripts/cae_harness.py plan --spec-file "<工作流文件路径>" --tier high --session-id "<当前会话标识>" --workflow-bg "核心文档已重写，需要核对实现" --workflow-goal "分路检查指定文件" --workflow-impact "只读核查并生成回执，不修改源文件"
+```
+
+完整展示矩阵及选项，待用户明确批准后登记，再执行外部批处理：
+
+```powershell
+python -B -X utf8 scripts/cae_harness.py plan --approve-ticket "<票据标识>" --session-id "<当前会话标识>"
+python -B -X utf8 scripts/cae_harness.py batch --ticket "<票据标识>" --session-id "<当前会话标识>" --output "<授权回执路径>" --redact
+```
+
+如用户有点名要求，在形成计划和执行任务时通过 `--user-prompt "<用户点名原话>"` 保留同一约束。不要在执行时增加会改变已批准模型或挡位的参数。
+
+原生只读代理可先用以下入口形成计划，`plan` 不会启动代理。多路时通过同一 `--spec-file` 列全所有流，并按实际客户端设置 `--caller`：
+
+```powershell
+python -B -X utf8 scripts/cae_harness.py plan --channel native_subagent --caller codex --agent-type readonly-auditor --model inherit --kind review --target "<目标文件路径>" --session-id "<当前会话标识>" --save-ticket --workflow-bg "需要原文行号复核" --workflow-goal "读取目标并返回原文行号" --workflow-impact "只读，不运行构建或测试"
+```
+
+跨会话先读取旧票据；此命令不转移会话归属：
+
+```powershell
+python -B -X utf8 scripts/cae_harness.py plan --resume-ticket "<票据标识>"
+```
+
+单流可写任务需要强制验收时使用 `gate`，执行内容、目标、模型、挡位和超时须与确认票据一致。`--task-file` 中的任务也应与票据子任务一致：
+
+```powershell
+python -B -X utf8 scripts/cae_harness.py gate --worker role:code --target "<项目根目录>" --write-scope "<授权相对路径>" --verify-cmd "<实际验收命令>" --task-file "<任务文件路径>" --ticket "<票据标识>" --session-id "<当前会话标识>"
+```
+
+## 只读隔离与结果验收
+
+`task --clean-room` 只支持 Codex、Claude Code 和 DeepSeek Harness 的只读任务，剥离全局规则、钩子、技能及项目自动说明，用于新读者可读性检查。净室所需配置和暂存目录也须服从本轮授权，不因默认使用临时目录就获得额外写入许可。
+
+审查任务禁止修改文件或运行构建测试，前后以文件哈希快照核验零改动。可写任务通过 `--write-scope` 限定白名单；发生 `scope_violation` 时保留现场并报告，不扩大范围掩盖越界。无头子进程设置 `CAE_HARNESS_DEPTH=1` 防止嵌套派工，不得再次调用编排器；只读探测及 `check-grounding` 按脚本规定放行。
+
+重要文档依次做可读性检查、主会话整篇重写、源码事实与公开脱敏校核。`check-grounding --strict` 从源码和配置构建词法锚点，检查参数、文件标识符、大写缩写、定量数字和领域举例；`--base-ref HEAD` 可检查相对基线的新表述。词法检查不能替代数学证明、实际运行或人工复核。
+
+主会话采纳后台建议前亲自打开原文件，核对精确行号。公开材料不得含真实用户名、内网 IP、具体硬件型号、密钥或精确账单指纹。验收严禁放宽 `rtol`、`atol`、守恒与收敛阶判据，或删改测试断言。最终分别说明源码或配置完成、离线检查通过、本机实际环境或算例实测通过，未验证项只列本轮核心验证链路的缺口。

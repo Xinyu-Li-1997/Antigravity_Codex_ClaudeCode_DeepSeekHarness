@@ -323,6 +323,188 @@ def valid_session_id(value: str) -> bool:
     return isinstance(value, str) and bool(re.fullmatch(r"[A-Za-z0-9_-]{1,160}", value))
 
 
+def get_plugin_data_state_dir() -> Path:
+    """定位插件持久状态；隔离环境不读取真实宿主状态。"""
+    if os.environ.get("USER_GUARD_STATE_DIR"):
+        return Path(os.environ["USER_GUARD_STATE_DIR"]).expanduser()
+    if os.environ.get("PLUGIN_DATA"):
+        return Path(os.environ["PLUGIN_DATA"]).expanduser() / "state"
+    return Path.home() / ".gemini/antigravity/plugin_data/user-guard/state"
+
+
+def candidate_dispatch_plan_dirs(state_dir=None) -> List[Path]:
+    candidates = []
+    if os.environ.get("CAE_PLAN_STATE_DIR"):
+        candidates.append(Path(os.environ["CAE_PLAN_STATE_DIR"]).expanduser())
+    if state_dir is not None:
+        root = Path(state_dir).expanduser()
+        candidates.append(root / "dispatch_plans")
+        if root.name in ("handoff", "session-context"):
+            candidates.append(root.parent / "dispatch_plans")
+    candidates.append(get_plugin_data_state_dir() / "dispatch_plans")
+    return list(dict.fromkeys(path.resolve() for path in candidates))
+
+
+def _read_state_json(path: Path) -> Any:
+    try:
+        if _is_reparse_or_link(path) or _is_reparse_or_link(path.parent):
+            return None
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError):
+        return None
+
+
+def _session_tickets(session_id, state_dir=None, statuses=("PENDING",)):
+    if not valid_session_id(session_id):
+        return
+    seen = set()
+    for directory in candidate_dispatch_plan_dirs(state_dir):
+        pointer = _read_state_json(directory / f"session_{session_id}_pending.json")
+        preferred = pointer.get("ticket_id") if isinstance(pointer, dict) else None
+        paths = ([directory / (preferred + ".json")] if valid_session_id(preferred) else [])
+        paths += sorted(directory.glob("*.json"))
+        for path in paths:
+            key = str(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            ticket = _read_state_json(path)
+            if not isinstance(ticket, dict):
+                continue
+            tid = ticket.get("ticket_id")
+            if (not valid_session_id(tid) or path.name != tid + ".json"
+                    or ticket.get("session_id") != session_id or ticket.get("status") not in statuses):
+                continue
+            try:
+                if not float(ticket["expires_at"]) > time.time():
+                    continue
+            except (KeyError, ValueError, TypeError, OverflowError):
+                continue
+            yield path, ticket
+
+
+def find_session_pending_ticket(session_id, state_dir=None):
+    return next((ticket for _, ticket in _session_tickets(session_id, state_dir)), None)
+
+
+def find_session_approved_tickets(session_id, state_dir=None, *, ticket_id=None, channel=None):
+    return [ticket for _, ticket in _session_tickets(session_id, state_dir, ("APPROVED",))
+            if (ticket_id is None or ticket.get("ticket_id") == ticket_id)
+            and (channel is None or any(isinstance(row, dict) and row.get("channel") == channel
+                                        for row in ticket.get("streams", [])))]
+
+
+def handoff_session_pending_tickets(session_id, state_dir=None):
+    """保留票据全部绑定字段，只转换状态；回执仍供新会话恢复。"""
+    tickets = []
+    for path, _ in _session_tickets(session_id, state_dir, ("PENDING", "HANDED_OFF")):
+        with session_state_lock(path.parent, path.stem):
+            ticket = _read_state_json(path)
+            if (not isinstance(ticket, dict) or ticket.get("status") not in ("PENDING", "HANDED_OFF")
+                    or ticket.get("session_id") != session_id or ticket.get("ticket_id") != path.stem):
+                continue
+            try:
+                if not float(ticket["expires_at"]) > time.time():
+                    continue
+            except (KeyError, ValueError, TypeError, OverflowError):
+                continue
+            if ticket["status"] == "PENDING":
+                ticket["status"] = "HANDED_OFF"
+                atomic_write_json(path, ticket)
+                pointer_path = path.parent / f"session_{session_id}_pending.json"
+                pointer = _read_state_json(pointer_path)
+                if isinstance(pointer, dict) and pointer.get("ticket_id") == ticket["ticket_id"]:
+                    pointer["status"] = "HANDED_OFF"
+                    atomic_write_json(pointer_path, pointer)
+            tickets.append(ticket)
+    return tickets
+
+
+def _heavy_completion_paths(session_id, state_dir=None):
+    if valid_session_id(session_id):
+        for directory in dict.fromkeys(path.parent for path in candidate_dispatch_plan_dirs(state_dir)):
+            yield directory / "heavy_completions" / (session_id + ".json")
+
+
+def load_unreported_heavy_completions(session_id, state_dir=None):
+    entries, seen = [], set()
+    for path in _heavy_completion_paths(session_id, state_dir):
+        rows = _read_state_json(path)
+        for entry in rows if isinstance(rows, list) else []:
+            if not isinstance(entry, dict) or entry.get("reported_to_user") is not False:
+                continue
+            key = entry.get("run_id") or json.dumps(entry, sort_keys=True)
+            if key not in seen:
+                seen.add(key)
+                entries.append(entry)
+    return entries
+
+
+def mark_heavy_completions_reported(session_id, state_dir=None):
+    for path in _heavy_completion_paths(session_id, state_dir):
+        if not path.is_file():
+            continue
+        with session_state_lock(path.parent, session_id):
+            rows = _read_state_json(path)
+            if not isinstance(rows, list):
+                continue
+            changed = False
+            for entry in rows:
+                if isinstance(entry, dict) and entry.get("reported_to_user") is False:
+                    entry["reported_to_user"] = True
+                    changed = True
+            if changed:
+                atomic_write_json(path, rows)
+
+
+def render_pending_workflow_block(ticket, for_handoff=False) -> str:
+    """只渲染磁盘字段；缺失信息明确标注，不重新推断模型或额度。"""
+    def value(raw):
+        if raw is None or raw == "":
+            return "未记录"
+        if isinstance(raw, bool):
+            return "是" if raw else "否"
+        if isinstance(raw, (dict, list)):
+            return json.dumps(raw, ensure_ascii=False, sort_keys=True)
+        return str(raw)
+
+    def cell(raw):
+        return value(raw).replace("|", r"\|").replace("\r", " ").replace("\n", " ")
+
+    title = ("【新对话待选重负载工作流详述与选项卡块】" if for_handoff else
+             "【未决重负载工作流专项计划（压缩前待拍板弹框，非回读摘要——请向用户完整详述工作流背景、要做的事、预计后果、14列全字段矩阵及选项卡）】")
+    lines = [title, "票据：" + value(ticket.get("ticket_id")), "状态：" + value(ticket.get("status"))]
+    stored = ticket.get("handoff_prompt_block" if for_handoff else "human_popup_markdown")
+    if stored:
+        lines += [str(stored)]
+    lines += ["工作流背景：" + value(ticket.get("workflow_bg") or ticket.get("workflow_background")),
+              "要做什么与后续计划：" + value(ticket.get("workflow_goal")),
+              "预计后果与边界影响：" + value(ticket.get("workflow_impact"))]
+    columns = ["流号", "子任务与范围", "通道", "客户端及子代理类型", "模型名字", "挡位", "上下文窗口",
+               "是否无头", "是否净室", "访问模式、写入范围与验收命令", "内联与超时", "当前是否可用",
+               "本机配置额度类型与当前状态", "回执或子代理日志位置"]
+    lines += ["| " + " | ".join(columns) + " |", "|" + "---|" * len(columns)]
+    for stream in ticket.get("streams", []):
+        if not isinstance(stream, dict):
+            continue
+        fields = [stream.get("stream_id"), value(stream.get("subtask")) + "；范围：" + value(stream.get("target")),
+                  stream.get("channel"), value(stream.get("client")) + "；" + value(stream.get("agent_type")),
+                  stream.get("model_display") or stream.get("model"), stream.get("tier"), stream.get("context_window"),
+                  stream.get("headless"), stream.get("clean_room"),
+                  value(stream.get("access_mode")) + "；写入范围：" + value(stream.get("write_scope"))
+                  + "；验收命令：" + value(stream.get("verify_cmd")),
+                  "内联：" + value(stream.get("inline_readonly")) + "；超时：" + value(stream.get("timeout")),
+                  value(stream.get("currently_available")) + "；" + value(stream.get("unavailable_reason")),
+                  value(stream.get("quota_scheme")) + "；" + value(stream.get("quota_summary")), stream.get("receipt_location")]
+        lines.append("| " + " | ".join(cell(field) for field in fields) + " |")
+    ledger = ticket.get("capability_ledger") or {}
+    lines += ["离线性能记录更新时间：在线刷新 " + value(ledger.get("last_online_refresh_at"))
+              + "；本机实测 " + value(ledger.get("local_bench_verified_at")),
+              "选项卡：① 批准当前计划（推荐）；② 微调引擎、挡位或超时后批准；③ 暂缓并交接。",
+              "恢复命令：plan --resume-ticket " + value(ticket.get("ticket_id"))]
+    return "\n".join(lines)
+
+
 def _is_reparse_or_link(path: Path) -> bool:
     try:
         st = path.lstat()
@@ -627,7 +809,7 @@ def clean_user_content(raw_content: str, step_type: str = "USER_INPUT") -> str:
         msg_match = re.search(r"\[Message\][^\n]*?\bsender=([^\s]+)[^\n]*?\bcontent=", text)
         if msg_match:
             sender = msg_match.group(1).strip().lower()
-            if sender == "system":
+            if sender == "system" or re.search(r"(?:^|/)task-[A-Za-z0-9_-]+", sender):
                 return ""
             content_start = msg_match.end()
             close_idx = text.rfind("</SYSTEM_MESSAGE>", content_start)
@@ -687,6 +869,177 @@ def summarize_subagent_return(
     head_len = max(int(usable * ratio), 60)
     tail_len = max(usable - head_len, 50)
     return f"{cleaned[:head_len].rstrip()}{marker}{cleaned[-tail_len:].lstrip()}"
+
+
+class _HarnessArchiveCollector:
+    """把关联命令的完成输出与异步回执转换成原生归档条目。"""
+
+    def __init__(self, transcript_path: Path, policy: Dict[str, Any]):
+        self.path = transcript_path
+        self.policy = policy
+        self.cwd = ""
+        self.calls: Dict[str, Dict[str, Any]] = {}
+        self.tasks: Dict[str, Dict[str, Any]] = {}
+        self.unidentified: List[Dict[str, Any]] = []
+        self.items: List[Dict[str, Any]] = []
+        self.seen: Set[str] = set()
+
+    @staticmethod
+    def _objects(raw, parse_text=True):
+        if isinstance(raw, dict):
+            yield raw
+            for val in raw.values():
+                yield from _HarnessArchiveCollector._objects(val, parse_text)
+        elif isinstance(raw, list):
+            for val in raw:
+                yield from _HarnessArchiveCollector._objects(val, parse_text)
+        elif parse_text and isinstance(raw, str):
+            decoder = json.JSONDecoder()
+            pos = 0
+            while pos < len(raw):
+                start = raw.find("{", pos)
+                if start < 0:
+                    break
+                try:
+                    obj, used = decoder.raw_decode(raw[start:])
+                except (ValueError, RecursionError):
+                    pos = start + 1
+                    continue
+                yield from _HarnessArchiveCollector._objects(obj)
+                pos = start + used
+
+    def _file(self, raw_path, cwd=""):
+        if not isinstance(raw_path, str) or not raw_path:
+            return None
+        path = Path(raw_path).expanduser()
+        if not path.is_absolute():
+            path = (Path(cwd) if cwd else self.path.parent) / path
+        try:
+            if path.is_file() and path.stat().st_size <= MAX_HOOK_INPUT_CHARS:
+                return path, path.read_text(encoding="utf-8")
+        except (OSError, ValueError):
+            pass
+        return None
+
+    def _complete(self, meta, raw, index, timestamp):
+        text = raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False)
+        objects = list(self._objects(raw))
+        if not text.strip() or re.search(
+                r"Script running|Process running|running with (?:cell|session|id)|running in (?:the )?background|background task.*started", text, re.I):
+            return
+        if any(obj.get("session_id") and obj.get("exit_code") is None for obj in objects):
+            return
+        receipt = next((obj.get("receipt_file") for obj in objects if obj.get("receipt_file")), "")
+        file_data = self._file(receipt or meta.get("output"), meta.get("cwd", ""))
+        if file_data:
+            receipt, text = str(file_data[0]), file_data[1]
+            objects = list(self._objects(text))
+        models = list(dict.fromkeys(str(obj["model"]) for obj in objects if obj.get("model")))
+        summaries = []
+        for obj in objects:
+            for key in ("summary", "content", "evidence", "unverified", "error"):
+                val = obj.get(key)
+                if isinstance(val, str) and val.strip():
+                    summaries.append(val)
+                elif isinstance(val, list) and all(isinstance(item, str) for item in val):
+                    summaries.extend(val)
+        if not summaries:
+            outputs = [obj.get("output") or obj.get("stdout") for obj in objects]
+            summaries = [val for val in outputs if isinstance(val, str) and val.strip()] or [text]
+        body = "\n".join(dict.fromkeys(summaries))
+        if models:
+            body = "模型：" + "、".join(models) + "\n" + body
+        if receipt:
+            body += "\n回执：" + str(receipt)
+        fingerprint = hashlib.sha256((meta["command"] + str(receipt) + body).encode("utf-8")).hexdigest()
+        if fingerprint in self.seen:
+            return
+        self.seen.add(fingerprint)
+        self.items.append({"step_index": index, "created_at": timestamp,
+                           "agent_id": "cae-harness-" + fingerprint[:12],
+                           "label": "cae-harness " + meta["kind"] + (" " + ", ".join(models) if models else ""),
+                           "model": ", ".join(models), "receipt_file": str(receipt),
+                           "log_path": str(receipt or meta.get("log_path") or self.path), "raw_body": body,
+                           "content": summarize_subagent_return(body, self.policy["archive_subagent_item_chars"],
+                                                                 self.policy["subagent_head_ratio"]), "truncated": False})
+
+    def feed(self, entry, index):
+        timestamp = str(entry.get("timestamp") or entry.get("created_at") or "")
+        context = entry.get("payload") if entry.get("type") in ("session_meta", "turn_context") else entry
+        if isinstance(context, dict) and isinstance(context.get("cwd"), str):
+            self.cwd = context["cwd"]
+        # 协议结构只遍历对象，不将人类消息或工具正文中的 JSON 示例解释成调用。
+        objects = list(self._objects(entry, parse_text=False))
+        for obj in objects:
+            kind = obj.get("type")
+            is_call = kind in ("function_call", "custom_tool_call", "tool_use") or (
+                obj.get("name") and any(key in obj for key in ("args", "arguments", "input")))
+            if not is_call:
+                continue
+            args = obj.get("arguments", obj.get("args", obj.get("input", {})))
+            text = args if isinstance(args, str) else json.dumps(args, ensure_ascii=False)
+            parsed = _parse_codex_json_maybe(args)
+            parsed = parsed if isinstance(parsed, dict) else {}
+            call_id = _tool_call_id(obj, is_call=True)
+            task_id = str(parsed.get("session_id") or parsed.get("cell_id") or parsed.get("CommandId")
+                          or parsed.get("command_id") or parsed.get("task_id") or "")
+            if call_id and task_id in self.tasks:
+                self.calls[call_id] = self.tasks[task_id]
+                continue
+            match = re.search(r"cae_harness\.py[\"']?\s+(task|gate|audit|batch)\b", text)
+            if not match:
+                continue
+            command = str(parsed.get("command") or parsed.get("cmd") or parsed.get("CommandLine") or text)
+            output = re.search(r"--output(?:=|\s+)(?:\"([^\"]+)\"|'([^']+)'|([^\s;]+))", command)
+            meta = {"command": command, "kind": match[1],
+                    "tool": obj.get("name"),
+                    "cwd": str(parsed.get("cwd") or parsed.get("workdir") or parsed.get("Cwd") or self.cwd),
+                    "output": next((v for v in output.groups() if v), "") if output else ""}
+            if call_id:
+                self.calls[call_id] = meta
+            else:
+                self.unidentified.append(meta)
+        for obj in objects:
+            call_id = _tool_call_id(obj) or str(obj.get("tool_use_id") or "")
+            meta = self.calls.get(call_id)
+            if not meta and obj is entry and entry.get("type") in ("GENERIC", "TOOL_RESULT", "TOOL_RESPONSE"):
+                tool_result = entry.get("tool_result")
+                name = entry.get("tool_name") or (tool_result.get("name") if isinstance(tool_result, dict) else None)
+                matching = [candidate for candidate in self.unidentified if not name or candidate["tool"] == name]
+                if len(matching) == 1:
+                    meta = matching[0]
+                    self.unidentified.remove(meta)
+            if not meta:
+                continue
+            raw = obj.get("output", obj.get("content", obj.get("stdout")))
+            if raw is None and obj is entry.get("tool_result"):
+                raw = entry.get("content")
+            if raw is None:
+                continue
+            text = raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False)
+            for task in re.findall(r"\btask-[A-Za-z0-9_-]+", text):
+                self.tasks[task] = meta
+            for task in re.findall(r'(?:session_id|cell ID)[\s":]+([A-Za-z0-9_-]+)', text):
+                self.tasks[task] = meta
+            self._complete(meta, raw, index, timestamp)
+        if entry.get("type") == "SYSTEM_MESSAGE":
+            text = str(entry.get("content") or "")
+            for task in re.findall(r"\btask-[A-Za-z0-9_-]+", text):
+                meta = self.tasks.get(task)
+                if not meta:
+                    continue
+                roots = [self.path.parent, self.path.parent.parent]
+                log = next((data for root in roots
+                            if (data := self._file(str(root / "tasks" / (task + ".log"))))), None)
+                if log:
+                    meta = dict(meta, log_path=str(log[0]))
+                self._complete(meta, log[1] if log else text, index, timestamp)
+
+
+def _merge_harness_returns(native, collector, policy):
+    return select_recent_subagent_returns(
+        sorted(native + collector.items, key=lambda item: item["step_index"]), policy,
+        body_getter=lambda item: item.get("raw_body") or item.get("content") or "")
 
 
 def _unquote_proto_scalar(raw: Any) -> str:
@@ -936,6 +1289,7 @@ def extract_agy_archive(
     pending_questions: Dict[str, Tuple[int, str]] = {}
     unidentified_questions: Set[int] = set()
     ambiguous_outputs: Dict[int, Set[int]] = {}
+    harness = _HarnessArchiveCollector(transcript_path, get_compaction_tunables("antigravity"))
 
     try:
         with open(transcript_path, "rb") as f:
@@ -958,6 +1312,7 @@ def extract_agy_archive(
                 if not isinstance(step_index, int):
                     step_index = line_num
                 created_at = step.get("created_at", "")
+                harness.feed(step, step_index)
                 truncated_fields = step.get("truncated_fields") or []
                 is_content_truncated = isinstance(truncated_fields, list) and "content" in truncated_fields
 
@@ -1205,7 +1560,7 @@ def extract_agy_archive(
 
     result.update(
         words=results,
-        subagent_returns=subagent_returns,
+        subagent_returns=_merge_harness_returns(subagent_returns, harness, agy_policy),
         unresolved_steps=unresolved_steps,
         unverified_answers=sorted(index for index, questions in ambiguous_outputs.items() if questions),
     )
@@ -1732,9 +2087,11 @@ def extract_codex_session_words(
     codex_policy = get_compaction_tunables("codex")
     codex_archive_cap = int(codex_policy["archive_subagent_item_chars"])
     codex_head_ratio = float(codex_policy["subagent_head_ratio"])
+    harness = _HarnessArchiveCollector(segments[0], codex_policy)
     global_step_counter = 0
 
     for seg_path in segments:
+        harness.path = seg_path
         digest = hashlib.sha256()
         offset = 0
         bad_lines = 0
@@ -1766,6 +2123,7 @@ def extract_codex_session_words(
                     if not isinstance(entry, dict) or not isinstance(entry.get("type"), str):
                         bad_lines += 1
                         continue
+                    harness.feed(entry, global_step_counter)
                     item_obj = (
                         entry.get("payload")
                         if entry.get("type") == "response_item"
@@ -1893,7 +2251,8 @@ def extract_codex_session_words(
         "session_id": resolved_sid or session_id or "unknown",
         "words": words,
         "subagent_returns": select_recent_subagent_returns(
-            raw_subagent_returns, codex_policy, body_getter=lambda item: item.get("raw_body") or item.get("content") or ""
+            sorted(raw_subagent_returns + harness.items, key=lambda item: item["step_index"]),
+            codex_policy, body_getter=lambda item: item.get("raw_body") or item.get("content") or ""
         ),
         "segments": [str(p) for p in segments],
         "sources": sources,
@@ -2400,6 +2759,7 @@ def extract_claude_user_words(transcript_path: Path) -> Dict[str, Any]:
     question_ids: Set[str] = set()
     pending_subagents: Dict[str, Dict[str, str]] = {}
     claude_policy = get_compaction_tunables("claude")
+    harness = _HarnessArchiveCollector(transcript_path, claude_policy)
     try:
         with transcript_path.open("rb") as stream:
             before = os.fstat(stream.fileno())
@@ -2416,6 +2776,7 @@ def extract_claude_user_words(transcript_path: Path) -> Dict[str, Any]:
                     issues.append(f"Claude 轨迹第 {line_index} 行无法解析（{exc}）")
                     queued_index = None
                     continue
+                harness.feed(entry, line_index)
                 if entry.get("type") == "assistant" and not entry.get("isSidechain"):
                     question_ids.update(_claude_question_ids_from_assistant(entry))
                     pending_subagents.update(_claude_subagent_calls_from_assistant(entry))
@@ -2454,7 +2815,8 @@ def extract_claude_user_words(transcript_path: Path) -> Dict[str, Any]:
     return {
         "words": words,
         "subagent_returns": select_recent_subagent_returns(
-            subagent_returns, claude_policy, body_getter=lambda item: item.get("raw_body") or item.get("content") or ""
+            sorted(subagent_returns + harness.items, key=lambda item: item["step_index"]),
+            claude_policy, body_getter=lambda item: item.get("raw_body") or item.get("content") or ""
         ),
         "issues": issues,
         "sources": sources,

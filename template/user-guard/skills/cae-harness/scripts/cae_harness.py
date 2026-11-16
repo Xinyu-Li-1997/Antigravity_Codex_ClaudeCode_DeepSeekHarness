@@ -8,6 +8,7 @@ import argparse
 import base64
 import collections
 import concurrent.futures
+import contextlib
 import datetime
 import fnmatch
 import hashlib
@@ -231,6 +232,8 @@ def detect_workspace_mode(target_dir=None):
     for candidate in (base, *base.parents):
         if (candidate / 'install.py').is_file() and (candidate / 'template' / 'user-guard' / 'plugin.json').is_file():
             matched_root = candidate
+            break
+        if candidate == Path.home().resolve():
             break
     is_upstream = matched_root is not None
     return {
@@ -773,12 +776,231 @@ def _engine_parts(spec):
     return prefix, model if model and model != 'default' else ''
 
 
-def _peer_auto_ready(backends, name):
+def _confirmation_tunables():
+    return _fleet_profile().get('runtime_tunables', {}).get('dispatch_confirmation', {})
+
+
+def _subscription_model(model_slug):
+    key = re.sub(r'\[1m\]$', '', str(model_slug or ''), flags=re.I)
+    for slug, record in _fleet_profile().get('subscription_matrix', {}).get('models', {}).items():
+        if re.sub(r'\[1m\]$', '', slug, flags=re.I) == key:
+            return record
+    return {}
+
+
+def _is_subscription_enabled(prefix, model_slug=None):
+    matrix = _fleet_profile().get('subscription_matrix', {})
+    return (matrix.get('agents', {}).get(prefix, {}).get('enabled') is not False
+            and _subscription_model(model_slug).get('enabled') is not False)
+
+
+def _require_subscription(prefix, model_slug=None):
+    if not _is_subscription_enabled(prefix, model_slug):
+        raise HarnessError(f'{prefix}:{model_slug or "default"} 已在 fleet_profile.json 中停用',
+                           'subscription_disabled')
+
+
+def _is_lightweight(prefix, slug):
+    return bool(_subscription_model(slug).get('lightweight')
+                or _tokens_lower(slug) & _fast_model_tags(prefix))
+
+
+def _recent_rollout_events(info):
+    home = info.get('config_home')
+    if not home:
+        return
+    count = _positive_int(_confirmation_tunables().get('codex_rollout_scan_files')) or 5
+    try:
+        paths = sorted((Path(home) / 'sessions').rglob('rollout-*.jsonl'),
+                       key=lambda path: path.stat().st_mtime, reverse=True)[:count]
+        events = []
+        for path in paths:
+            with path.open('rb') as stream:
+                stream.seek(0, 2)
+                start = max(0, stream.tell() - 256 * 1024)
+                stream.seek(start)
+                if start:
+                    stream.readline()
+                lines = stream.read().decode('utf-8', errors='replace').splitlines()
+            for line in reversed(lines):
+                try:
+                    event = json.loads(line)
+                    if isinstance(event, dict):
+                        try:
+                            stamp = datetime.datetime.fromisoformat(event['timestamp'].replace('Z', '+00:00'))
+                            if stamp.tzinfo is None:
+                                stamp = stamp.replace(tzinfo=datetime.timezone.utc)
+                            stamp = stamp.timestamp()
+                        except (KeyError, AttributeError, TypeError, ValueError):
+                            stamp = path.stat().st_mtime
+                        events.append((stamp, event))
+                except ValueError:
+                    continue
+        for _, event in sorted(events, key=lambda item: item[0], reverse=True):
+            yield event
+    except OSError:
+        return
+
+
+def _loopback_router_alive(base_url):
+    try:
+        url = urlsplit(base_url)
+        if url.hostname not in ('127.0.0.1', 'localhost', '::1') or not url.port:
+            return False
+        # The health request must never follow an external redirect.
+        import http.client
+        connection = http.client.HTTPConnection(url.hostname, url.port, timeout=1.5)
+        try:
+            connection.request('GET', '/__router/health')
+            response = connection.getresponse()
+            return response.status == 200 and json.loads(response.read()).get('ok') is True
+        finally:
+            connection.close()
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def _claude_card_quota(info, model_slug):
+    cfg = _read_json(Path(info.get('config_home') or Path.home() / '.claude') / 'router/router.json') or {}
+    db = Path(os.environ.get('CAE_CCSWITCH_DB') or cfg.get('ccswitch_db')
+              or Path.home() / '.cc-switch' / 'cc-switch.db').expanduser()
+    if not db.is_file():
+        return {}
+    card = None
+    if info.get('uses_local_router') or info.get('llm_source') == 'local_router':
+        card = cfg.get('default_key_from_card')
+        slug = model_slug or info.get('model') or ''
+        for route in cfg.get('routes', []):
+            if route.get('prefix') and slug.lower().startswith(route['prefix'].lower()):
+                card = route.get('key_from_card') or card
+                break
+    try:
+        with contextlib.closing(sqlite3.connect(db.absolute().as_uri() + '?mode=ro', uri=True, timeout=2)) as con:
+            con.row_factory = sqlite3.Row
+            rows = con.execute("SELECT * FROM providers WHERE app_type='claude'").fetchall()
+            row = next((dict(row) for row in rows if (row['name'] == card if card else row['is_current'] == 1)), None)
+            if not row:
+                return {}
+            meta = json.loads(row.get('meta') or '{}')
+            usage = meta.get('usage_script') or meta.get('usageScript') or {}
+            result = {'quota_scheme': usage.get('templateType') or 'ccswitch_card_dependent', 'quota_exceeded': False}
+            tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if 'usage_daily_rollups' in tables:
+                # Select only known cost/date columns; never evaluate metadata as SQL.
+                columns = {r[1] for r in con.execute('PRAGMA table_info(usage_daily_rollups)')}
+                date_col = next((c for c in ('date', 'day', 'usage_date') if c in columns), None)
+                cost_col = next((c for c in ('total_cost_usd', 'cost_usd', 'total_cost') if c in columns), None)
+                if date_col and cost_col and 'provider_id' in columns:
+                    today = datetime.date.today().isoformat()
+                    for period, prefix in (('daily', today), ('monthly', today[:7])):
+                        limit = meta.get(f'limit_{period}_usd', row.get(f'limit_{period}_usd'))
+                        try:
+                            limit = float(limit or 0)
+                        except (TypeError, ValueError):
+                            continue
+                        if limit > 0:
+                            amount = con.execute(f'SELECT SUM("{cost_col}") FROM usage_daily_rollups '
+                                                 f'WHERE provider_id=? AND "{date_col}" LIKE ?',
+                                                 (row['id'], prefix + '%')).fetchone()[0] or 0
+                            result['quota_exceeded'] |= float(amount) >= limit
+                            result['quantitative_quota_known'] = True
+            return result
+    except (OSError, sqlite3.Error, ValueError, TypeError, KeyError):
+        return {}
+
+
+def inspect_backend_quota_and_availability(prefix, info, model_slug=None, redact_usage=False, *, ignore_cooldown=False):
+    matrix = _fleet_profile().get('subscription_matrix', {})
+    scheme = (_subscription_model(model_slug).get('quota_scheme')
+              or matrix.get('agents', {}).get(prefix, {}).get('quota_scheme') or 'unknown')
+    enabled = _is_subscription_enabled(prefix, model_slug)
+    reason = None if enabled else 'subscription_disabled'
+    exceeded, reset, percentages = False, None, []
+    plan_type = None
+    quantitative_known = False
+    if prefix == 'codex':
+        for event in _recent_rollout_events(info):
+            payload = event.get('payload') or event
+            rate = payload.get('rate_limits') or event.get('rate_limits')
+            if not isinstance(rate, dict):
+                continue
+            plan_type = rate.get('plan_type')
+            block = float(_confirmation_tunables().get('quota_block_percent', 100))
+            for name in ('primary', 'secondary'):
+                window = rate.get(name)
+                if not isinstance(window, dict):
+                    continue
+                try:
+                    resets = float(window['resets_at']) if window.get('resets_at') is not None else None
+                    if resets is not None and not math.isfinite(resets):
+                        resets = None
+                except (ValueError, TypeError):
+                    resets = None
+                expired = resets is not None and time.time() >= resets
+                if not expired and resets is not None:
+                    reset = min(reset or resets, resets)
+                exceeded |= not expired and bool(window.get('rate_limit_reached_type')
+                             or window.get('spend_control_reached') or rate.get('rate_limit_reached_type')
+                             or rate.get('spend_control_reached'))
+                try:
+                    used = float(window['used_percent'])
+                    if not math.isfinite(used) or used < 0:
+                        continue
+                    if expired:
+                        used = 0.0
+                except (KeyError, ValueError, TypeError):
+                    continue
+                label = {300: '5h_window', 10080: 'weekly_window'}.get(window.get('window_minutes'), name)
+                percentages.append(f'{label}:{used:g}%')
+                blocked = not expired and used >= block
+                exceeded |= blocked
+            if not percentages and (rate.get('rate_limit_reached_type') or rate.get('spend_control_reached')):
+                exceeded = True
+            break
+        quantitative_known = bool(percentages)
+    elif prefix == 'claude':
+        card = _claude_card_quota(info, model_slug)
+        scheme = card.get('quota_scheme') or scheme
+        exceeded = card.get('quota_exceeded', False)
+        quantitative_known = card.get('quantitative_quota_known', False)
+        if info.get('uses_local_router') or info.get('llm_source') == 'local_router':
+            if not _loopback_router_alive(info.get('base_url', '')):
+                reason = reason or 'local_router_unavailable'
+    cooldown = None if ignore_cooldown else _active_quota_record(prefix, info)
+    if cooldown:
+        exceeded = True
+        reset = cooldown.get('cooldown_until') or cooldown.get('cooldown_until_epoch') or cooldown.get('resets_at') or reset
+    if exceeded:
+        reason = reason or 'quota_exhausted'
+    if not info.get('available'):
+        reason = reason or 'backend_unavailable'
+    if prefix in ('claude', 'dsh') and not info.get('llm_configured'):
+        reason = reason or 'credentials_unconfigured'
+    label = ('quota_exceeded' if exceeded else 'within_quota' if quantitative_known
+             else 'no_local_cooldown (remaining_unknown)')
+    summary = f'{scheme}:{label}'
+    if percentages and not redact_usage:
+        summary += ' ' + ', '.join(percentages)
+    if reset is not None:
+        summary += f' resets_at={reset}'
+    result = {'currently_available': reason is None, 'unavailable_reason': reason,
+              'subscription_enabled': enabled, 'quota_scheme': scheme, 'quota_exceeded': bool(exceeded),
+              'quota_summary': summary, 'resets_at': reset}
+    if plan_type is not None and not redact_usage:
+        result['plan_type'] = plan_type
+    if cooldown:
+        result['cooldown_until'] = reset
+    return result
+
+
+def _peer_auto_ready(backends, name, *, ignore_cooldown=False):
     info = backends.get(name, {})
-    return bool(info.get('available') and (name not in ('claude', 'dsh') or info.get('llm_configured')))
+    return bool(_is_subscription_enabled(name, info.get('model'))
+                and (ignore_cooldown or not _active_quota_record(name, info))
+                and info.get('available') and (name not in ('claude', 'dsh') or info.get('llm_configured')))
 
 
-def _resolve_role_engine(backends, caller, role_spec, prompt_text=''):
+def _resolve_role_engine(backends, caller, role_spec, prompt_text='', *, ignore_cooldown=False):
     role_name = role_spec.split(':', 1)[1].strip().lower()
     roles = _fleet_profile().get('roles')
     role_cfg = roles.get(role_name) if isinstance(roles, dict) else None
@@ -792,31 +1014,52 @@ def _resolve_role_engine(backends, caller, role_spec, prompt_text=''):
         if not isinstance(raw_cand, str) or ':' not in raw_cand:
             continue
         cand_prefix, _ = _engine_parts(raw_cand)
-        if cand_prefix not in negated:
+        if cand_prefix not in negated and _is_subscription_enabled(cand_prefix):
+            try:
+                candidate_profile = resolve_execution_profile(backends, raw_cand)
+                if (cand_prefix == 'claude' and _per_backend_role_target(cand_prefix, _engine_parts(raw_cand)[1]) != 'fast'
+                        and (_is_lightweight('claude', candidate_profile.get('model'))
+                             or not _is_subscription_enabled(cand_prefix, candidate_profile.get('model')))):
+                    continue
+            except HarnessError:
+                continue
             parsed.append((cand_prefix, raw_cand))
     if not parsed:
         raise HarnessError(f'提示词已排除角色 {role_name} 的全部候选后端，请显式指定 --engine/--worker')
-    ready_peers = [spec for prefix, spec in parsed if prefix != caller_backend and _peer_auto_ready(backends, prefix)
-                   and not _active_quota_record(prefix, backends[prefix])]
+    ready_peers = [spec for prefix, spec in parsed if prefix != caller_backend
+                   and _peer_auto_ready(backends, prefix, ignore_cooldown=ignore_cooldown)]
     if ready_peers:
         return ready_peers[0]
-    ready_any = [spec for prefix, spec in parsed if _peer_auto_ready(backends, prefix)
-                 and not _active_quota_record(prefix, backends[prefix])]
+    ready_any = [spec for prefix, spec in parsed if _peer_auto_ready(backends, prefix, ignore_cooldown=ignore_cooldown)]
     if ready_any:
         return ready_any[0]
-    avail_any = [spec for prefix, spec in parsed if backends.get(prefix, {}).get('available')]
+    avail_any = [spec for prefix, spec in parsed if backends.get(prefix, {}).get('available')
+                 and (ignore_cooldown or not _active_quota_record(prefix, backends[prefix]))]
     if avail_any:
         return avail_any[0]
+    if not ignore_cooldown and any(_active_quota_record(p, backends.get(p, {})) for p, _ in parsed):
+        raise HarnessError('角色候选均不可用或处于配额冷却', 'quota_exhausted')
     raise HarnessError(f'未发现角色 {role_name} 可用的已安装后端，请先配置对应客户端')
 
 
-def choose_engine(backends, caller, explicit='', prompt_text=''):
+def choose_engine(backends, caller, explicit='', prompt_text='', user_prompt='', *, ignore_cooldown=False):
+    if user_prompt:
+        hinted = _prompt_engine_spec(backends, user_prompt)
+        if hinted:
+            original = (explicit or '').strip().lower()
+            slot = (original.split(':', 1)[1] if original.startswith('role:')
+                    else _per_backend_role_target(*_engine_parts(original)) if original else '')
+            backend = _extract_prompt_backend_hint(user_prompt)
+            if slot and backend and not _extract_prompt_model_hint(user_prompt):
+                hinted = f'{backend}:@{slot}'
+            explicit = hinted
+        prompt_text = user_prompt
     if explicit and explicit.strip().lower().startswith('role:'):
-        explicit = _resolve_role_engine(backends, caller, explicit.strip(), prompt_text)
+        explicit = _resolve_role_engine(backends, caller, explicit.strip(), prompt_text, ignore_cooldown=ignore_cooldown)
         name, _ = _engine_parts(explicit)
     elif explicit:
-        name, _ = _engine_parts(explicit)
-        explicit = name + ':' + (explicit.partition(':')[2] or 'default')
+        name, model = _engine_parts(explicit)
+        explicit = name + ':' + (model or 'default')
     elif hinted := _extract_prompt_backend_hint(prompt_text):
         name, explicit = hinted, hinted + ':default'
     else:
@@ -831,11 +1074,26 @@ def choose_engine(backends, caller, explicit='', prompt_text=''):
         if not order:
             raise HarnessError('请指定 --caller，或指定 --engine/--worker/--left（或 role:<math|code|review|fast>）')
         negated = _extract_negated_backends(prompt_text)
-        allowed = [peer for peer in order if peer not in negated]
+        allowed = [peer for peer in order if peer not in negated and _is_subscription_enabled(peer, backends.get(peer, {}).get('model'))
+                   and (ignore_cooldown or not _active_quota_record(peer, backends.get(peer, {})))]
         if not allowed:
-            raise HarnessError('提示词已排除全部候选后端，请显式指定 --engine/--worker')
-        name = next((peer for peer in allowed if _peer_auto_ready(backends, peer)), allowed[0])
+            cooled = next((peer for peer in order if peer not in negated and _is_subscription_enabled(peer)
+                           and _active_quota_record(peer, backends.get(peer, {}))), None)
+            if cooled:
+                raise HarnessError('候选客户端处于配额冷却', 'quota_exhausted', preflight_blocked=True,
+                                   **_quota_user_choices(cooled, _active_quota_record(cooled, backends[cooled])))
+            raise HarnessError('提示词已排除或停用全部候选后端，请显式指定 --engine/--worker')
+        ready = next((peer for peer in allowed if _peer_auto_ready(backends, peer, ignore_cooldown=ignore_cooldown)), None)
+        if not ready and not ignore_cooldown:
+            cooled = next((peer for peer in order if peer not in negated and _is_subscription_enabled(peer)
+                           and backends.get(peer, {}).get('available') and _active_quota_record(peer, backends[peer])), None)
+            if cooled:
+                cooldown = _active_quota_record(cooled, backends[cooled])
+                raise HarnessError('候选客户端处于配额冷却', 'quota_exhausted', preflight_blocked=True,
+                                   **_quota_user_choices(cooled, cooldown))
+        name = ready or allowed[0]
         explicit = name + ':default'
+    _require_subscription(name, _engine_parts(explicit)[1])
     if not backends.get(name, {}).get('available'):
         raise HarnessError(f'未发现所选后端 {name}，请配置对应运行环境')
     return explicit
@@ -866,6 +1124,8 @@ def _stage_wsl_readonly_workspace(target_dir, stage_root, rel_files=None, *, exc
     else:
         records = []
         for rel in rel_files:
+            if exclude_agent_instructions and Path(rel).name.upper() in ('AGENTS.MD', 'CLAUDE.MD'):
+                continue
             rel = _scope_patterns([rel])[0]
             src = target_dir / rel
             try:
@@ -1253,9 +1513,29 @@ def _resolve_explicit_agy_record(models, query, tier):
 
 
 def _semantic_text(text):
-    return re.sub(r'(?m)^\s*>[^\n]*|\x60{3}[\s\S]*?\x60{3}|\x60[^\x60\n]*\x60|'
-                  r'“[^”]*”|‘[^’]*’|"[^"\n]*"|(?<![A-Za-z0-9_])\x27[^\x27\n]*\x27(?![A-Za-z0-9_])',
-                  ' ', str(text or ''))
+    text = re.sub(r'(?m)^\s*>[^\n]*|\x60{3}[\s\S]*?\x60{3}', ' ', str(text or ''))
+    quoted = re.compile(r'`([^`\n]*)`|“([^”\n]*)”|‘([^’\n]*)’|"([^"\n]*)"|(?<![A-Za-z0-9_])\x27([^\x27\n]*)\x27(?![A-Za-z0-9_])')
+    def replace(match):
+        value = next((v for v in match.groups() if v is not None), '')
+        action = re.search(r'(?:使用|调用|采用|切到|指定|选用|改用|交给|让|用|\buse|\binvoke|\bvia)\s*$', text[:match.start()], re.I)
+        return value if action and re.fullmatch(r'[\w.:[\]@+/-]{1,48}', value) else ' '
+    return quoted.sub(replace, text)
+
+
+def _prompt_engine_spec(backends, text):
+    hint = _extract_prompt_model_hint(text)
+    backend = _extract_prompt_backend_hint(text)
+    if hint:
+        for prefix, info in ([(backend, backends.get(backend, {}))] if backend else backends.items()):
+            aliases = _catalog_rules(prefix).get('alias_map') or {}
+            slug = aliases.get(hint.lower(), hint)
+            if (_exact_model_record(info.get('models', []), slug)
+                    or hint.lower() in aliases
+                    or _subscription_model(slug).get('agent') == prefix):
+                return prefix + ':' + slug
+        if backend:
+            return backend + ':' + hint
+    return backend + ':default' if backend else ''
 
 
 def _cue_is_negated(prefix):
@@ -1329,6 +1609,25 @@ def _extract_prompt_model_hint(prompt_text):
     text = _semantic_text(prompt_text).strip()
     if not text:
         return ''
+    action = r'(?:使用|调用|采用|切到|指定|选用|改用|交给|让|用|\buse|\binvoke|\bvia)\s*'
+    aliases = {str(key).lower() for prefix in ('codex', 'agy', 'claude', 'dsh')
+               for key in (_catalog_rules(prefix).get('alias_map') or {})}
+    known = {slug.lower() for slug in _fleet_profile().get('subscription_matrix', {}).get('models', {})}
+
+    def is_client_name(candidate, tail):
+        return bool(re.fullmatch(r'(?:claude\s*(?:code|cli)|deepseek\s*harness|cc(?:\s+cli)?|dsh(?:\s+cli)?)', candidate, re.I)
+                    or (candidate.lower() == 'deepseek' and re.match(r'\s*harness\b', tail, re.I))
+                    or (candidate.lower() == 'claude' and re.match(r'\s*(?:code|cli)\b', tail, re.I)))
+
+    for match in re.finditer(action + r'([A-Za-z][A-Za-z0-9._\[\]@+-]{0,47})(?![A-Za-z0-9_.=-])', text, re.I):
+        name = match.group(1)
+        if is_client_name(name, text[match.end(1):]):
+            continue
+        if _cue_is_negated(_CUE_BOUNDARIES.split(text[:match.start()])[-1]):
+            continue
+        if (name.lower() in aliases or name.lower() in known
+                or re.fullmatch(r'(?:gpt|gemini|deepseek|kimi|k\d)[-\w.\[\]]*', name, re.I)):
+            return name
     stop_words = NON_AI_MODEL_STOPWORDS - ROUTER_MODEL_TAGS
     for pattern in PROMPT_MODEL_HINT_PATTERNS:
         for match in pattern.finditer(text):
@@ -1338,7 +1637,7 @@ def _extract_prompt_model_hint(prompt_text):
             cand = re.sub(r'\s+', ' ', match.group(1)).strip()
             if not cand:
                 continue
-            if re.fullmatch(r'(?:claude\s*(?:code|cli)|deepseek\s*harness|cc(?:\s+cli)?|dsh(?:\s+cli)?)', cand, re.I):
+            if is_client_name(cand, text[match.end(1):]):
                 continue
             tokens = [tok for tok in re.findall(r'[a-z0-9]+', cand.lower()) if tok]
             collapsed = re.sub(r'[^a-z0-9]+', '', cand.lower())
@@ -1365,9 +1664,8 @@ def _is_fast_engine_spec(engine):
     if raw == 'role:fast':
         return True
     if ':' in raw:
-        _, _, suffix = raw.partition(':')
-        if suffix in ('fast', '@fast'):
-            return True
+        prefix, _, suffix = raw.partition(':')
+        return suffix == '@fast' or (prefix in ('dsh', 'claude') and suffix == 'fast')
     return False
 
 
@@ -1398,8 +1696,11 @@ def select_task_tier(requested_tier='auto', kind='review', text='', file_count=1
         'low': ('用低挡', '用低档', '选低挡', '选低档', '低挡快速', '低档快速', '降到低挡', '降到低档',
                 '最低挡', '最低档', '使用 low 挡', 'use low effort'),
         'medium': ('用中挡', '用中档', '选中挡', '选中档', '降到中挡', '降到中档', '使用 medium 挡', 'use medium effort'),
-        'high': ('用高挡', '用高档', '选高挡', '选高档', '降到高挡', '降到高档', '使用 high 挡', 'use high effort'),
+        'high': ('高挡位', '高档位', '挂 high 挡', '用高挡', '用高档', '选高挡', '选高档', '降到高挡', '降到高档', '使用 high 挡', 'use high effort'),
     }
+    for level in ('max', 'xhigh', 'low', 'medium', 'high'):
+        if _has_positive_cue(sample, (level + ' 挡位', level + ' 档位', level + ' 挡', level + ' 档')):
+            return level, 'user_description_' + level
     for level, cues in prose_requests.items():
         if _has_positive_cue(sample, cues):
             return level, 'user_description_' + level
@@ -1436,6 +1737,14 @@ def select_task_tier(requested_tier='auto', kind='review', text='', file_count=1
     if _has_positive_cue(sample, HIGH_COMPLEXITY_CUES):
         return 'max', 'complexity_high_domain_max'
     return 'max', 'default_flagship_max'
+
+
+def _resolve_effective_tier(explicit_tier, kind, user_prompt, fallback_text, engine=''):
+    if user_prompt:
+        tier, reason = select_task_tier('auto', kind, user_prompt, engine=engine)
+        if reason.startswith(('user_description_', 'economy_')):
+            return tier, reason
+    return select_task_tier(explicit_tier, kind, user_prompt or fallback_text, engine=engine)
 
 
 def _execution_side(info):
@@ -1571,8 +1880,10 @@ def _select_codex_frontier_record(models):
     return min(native, key=_catalog_order) if native else {}
 
 
-def _select_codex_specialty_record(info, kind, tier, prompt_text, estimated_tokens, *, prefer_fast=False, allow_tier_fast=True):
-    models = [item for item in info.get('models', []) if _model_category('codex', item) == 'native']
+def _select_codex_specialty_record(info, kind, tier, prompt_text, estimated_tokens, *, prefer_fast=False, allow_tier_fast=True,
+                                  enforce_subscription=True):
+    models = [item for item in info.get('models', []) if _model_category('codex', item) == 'native'
+              and (not enforce_subscription or _is_subscription_enabled('codex', item['slug']))]
     eligible = sorted((item for item in models if not _only_delegating_efforts(item, tier)), key=_catalog_order)
     # 同一产品线只自动采用最新一代；目录优先级仍用于不同产品线之间的选择。
     latest = {}
@@ -1628,10 +1939,16 @@ def _per_backend_role_target(prefix, raw_model):
     return ''
 
 
-def resolve_execution_profile(backends, spec, tier='max', prompt_text='', kind='review', estimated_tokens=0):
+def resolve_execution_profile(backends, spec, tier='max', prompt_text='', kind='review', estimated_tokens=0, *,
+                              enforce_subscription=True):
     prefix, explicit_model = _engine_parts(spec)
     info = backends.get(prefix, {})
-    models = info.get('models', [])
+    if enforce_subscription:
+        _require_subscription(prefix, explicit_model)
+    models = [m for m in info.get('models', []) if _is_subscription_enabled(prefix, m['slug'])]
+    if not models and not enforce_subscription:
+        models = info.get('models', [])
+    info = {**info, 'models': models}
     role_target = _per_backend_role_target(prefix, explicit_model)
     if role_target:
         explicit_model = ''
@@ -1644,7 +1961,7 @@ def resolve_execution_profile(backends, spec, tier='max', prompt_text='', kind='
             kind = 'review'
         else:
             kind = role_target
-    hint = _extract_prompt_model_hint(prompt_text) if not explicit_model and not role_target and models else ''
+    hint = _extract_prompt_model_hint(prompt_text) if not explicit_model else ''
     if prefix in ('claude', 'dsh'):
         claude_rules = _catalog_rules('claude')
         dsh_rules = _catalog_rules('dsh')
@@ -1696,8 +2013,13 @@ def resolve_execution_profile(backends, spec, tier='max', prompt_text='', kind='
         effort = ({'ultra': 'max', 'max': 'max', 'xhigh': 'max', 'high': 'high',
                    'medium': 'low', 'low': 'low', 'minimal': 'low', 'off': 'off', 'none': 'off'}[tier]
                   if prefix == 'dsh' else 'max' if tier == 'ultra' else 'low' if tier == 'minimal' else tier)
+        if enforce_subscription:
+            _require_subscription(prefix, slug)
+        conflict = None
+        if prefix == 'claude' and role_target in ('math', 'code', 'review', 'orchestrator') and not query and _is_lightweight(prefix, slug):
+            conflict = '当前 Claude 配置卡片为轻量模型，不满足非 fast 专长角色要求；请切换主力卡片、启用本地路由或显式指定轻量模型/role:fast'
         return _profile(prefix, info, spec, slug, record, tier, source, effort, effort,
-                        'catalog_declared' if record.get('supported_efforts') else 'unverified_request')
+                        'catalog_declared' if record.get('supported_efforts') else 'unverified_request', error=conflict)
     if prefix == 'codex':
         if explicit_model or hint:
             try:
@@ -1714,6 +2036,7 @@ def resolve_execution_profile(backends, spec, tier='max', prompt_text='', kind='
         record, source = _select_codex_specialty_record(
             info, kind, tier, prompt_text, estimated_tokens,
             prefer_fast=(role_target == 'fast'), allow_tier_fast=(not role_target),
+            enforce_subscription=enforce_subscription,
         )
         if record:
             return _codex_profile(info, spec, record, record['slug'], tier,
@@ -2081,7 +2404,8 @@ def _claude_info(binary, requested=None):
                   for i, alias in enumerate(('opus', 'sonnet', 'haiku'))]
     return {'available': bool(binary), 'detected': bool(binary), 'binary': binary, 'family': 'claude',
             'config_home': str(root), 'windows_interop': interop, 'model': configured, 'models': models,
-            'base_url': _sanitize_endpoint_url(base_url), 'router_configured': bool(router_cfg),
+            'base_url': _sanitize_endpoint_url(base_url), 'router_configured': bool(router_cfg) and local_router,
+            'uses_local_router': local_router, 'router_alive': _loopback_router_alive(base_url) if local_router else False,
             'llm_source': source, 'llm_configured': source in ('local_router', 'settings_env', 'credentials_file'),
             'configured_window_tokens': configured_window, 'effective_compaction_tokens': compact_window,
             'verified_status': 'unverified', 'authentication_status': 'not_checked',
@@ -2092,14 +2416,16 @@ def _claude_info(binary, requested=None):
 
 def _dsh_info(binary, requested=None):
     root, interop = _dsh_home(binary)
-    api_key = _usable_credential(os.environ.get('DEEPSEEK_API_KEY'))
+    env_api_key = _usable_credential(os.environ.get('DEEPSEEK_API_KEY'))
+    dotenv_api_key = False
+    yaml_api_key = False
     for line in _optional_text(root / '.env').splitlines():
         if line.strip().startswith('#'):
             continue
         key, equal, value = line.partition('=')
         clean_key = re.sub(r'^export\s+', '', key.strip())
         if equal and clean_key == 'DEEPSEEK_API_KEY':
-            api_key = api_key or _usable_credential(_credential_scalar(value))
+            dotenv_api_key = dotenv_api_key or _usable_credential(_credential_scalar(value))
     account = False
     # 仅识别凭据文件中两种官方提供方及其密钥字段，不实现通用 YAML 解析器。
     scopes = []
@@ -2117,10 +2443,11 @@ def _dsh_info(binary, requested=None):
         platform = any(name.startswith('deepseek-account-platform/') for name in path)
         credential_key = key in ('DEEPSEEK_API_KEY', 'deepseek-official/DEEPSEEK_API_KEY', 'token', 'secret', 'access_token', 'api_key', 'value')
         if _usable_credential(value) and (credential_key or key == 'deepseek-official' or key.startswith('deepseek-account-platform/')):
-            api_key = api_key or official
+            yaml_api_key = yaml_api_key or official
             account = account or platform
         if not value:
             scopes.append((len(indent), key))
+    api_key = yaml_api_key or dotenv_api_key or (env_api_key and not account)
     source = 'api_key' if api_key else 'deepseek_account' if account else 'unconfigured'
     dsh_rules = _catalog_rules('dsh')
     raw_builtin = dsh_rules.get('builtin_models') or []
@@ -2133,6 +2460,8 @@ def _dsh_info(binary, requested=None):
     default_dsh_model = str(dsh_rules.get('default_model') or (models[0]['slug'] if models else 'default'))
     return {'available': bool(binary), 'detected': bool(binary), 'binary': binary, 'family': 'dsh',
             'config_home': str(root), 'windows_interop': interop, 'model': default_dsh_model, 'models': models,
+            'credential_source': ('yaml_api_key' if yaml_api_key else 'dotenv_api_key' if dotenv_api_key
+                                  else 'account' if account else 'env_api_key' if env_api_key else 'unconfigured'),
             'llm_source': source, 'dsh_provider': 'deepseek-official' if api_key else 'deepseek-account' if account else None,
             'llm_configured': source != 'unconfigured', 'verified_status': 'unverified', 'authentication_status': 'not_checked',
             'requested_input_budget_tokens': requested, 'capability_source': 'dsh_builtin_models',
@@ -2335,12 +2664,15 @@ def probe_backends(codex_input_budget=None, agy_input_budget=None, discover_mode
     result_map = {'codex': codex, 'agy': agy, 'claude': claude, 'dsh': dsh}
     for name, info in result_map.items():
         info['execution_side'] = _execution_side(info)
-        prof = resolve_execution_profile(result_map, name + ':default', 'max', kind='code')
-        deep_prof = resolve_execution_profile(result_map, name + ':default', 'max', kind='math')
-        fast_prof = resolve_execution_profile(result_map, name + ':default', 'low', kind='review')
+        info['subscription_enabled'] = _is_subscription_enabled(name)
+        prof = resolve_execution_profile(result_map, name + ':default', 'max', kind='code', enforce_subscription=False)
+        deep_prof = resolve_execution_profile(result_map, name + ':default', 'max', kind='math', enforce_subscription=False)
+        fast_prof = resolve_execution_profile(result_map, name + ':default', 'low', kind='review', enforce_subscription=False)
         info['frontier_model'] = prof['model']
         info['max_reasoning_effort'] = prof['reasoning_effort']
-        info['auto_selectable'] = bool(_peer_auto_ready(result_map, name) and not prof['execution_blocked_reason'])
+        info['auto_selectable'] = bool(_peer_auto_ready(result_map, name)
+                                       and _is_subscription_enabled(name, prof['model'])
+                                       and not prof['execution_blocked_reason'])
         info['specialty_routing'] = {
             'engineering_workhorse': {'model': prof['model'], 'reasoning_effort': prof['reasoning_effort']},
             'deep_reasoning': {'model': deep_prof['model'], 'reasoning_effort': deep_prof['reasoning_effort']},
@@ -2623,7 +2955,8 @@ def _enforce_preflight_quota(backends, specs, retry_quota=False, *, batch=None, 
     for spec in specs:
         if not spec:
             continue
-        prefix, _ = _engine_parts(spec)
+        prefix, requested_model = _engine_parts(spec)
+        _require_subscription(prefix, requested_model)
         info = backends.get(prefix, {})
         key = _quota_scope(prefix, info)
         with QUOTA_LOCK:
@@ -2685,16 +3018,13 @@ def _quota_can_replay(details, invocation):
 
 
 class _WindowsJob:
-    """为本次子进程单独创建 Windows Job 对象；以挂起状态创建子进程，先绑定至 Job 再恢复执行，防止派生子进程逃逸。"""
+    """单独创建带 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE 的 Windows Job 对象，
+    在 Popen 启动后立即绑定进程句柄，异常或不可用时回退 taskkill /T /F。
+    """
 
     def __init__(self):
         import ctypes
         from ctypes import wintypes
-
-        class ThreadEntry(ctypes.Structure):
-            _fields_ = [('dwSize', wintypes.DWORD), ('cntUsage', wintypes.DWORD),
-                        ('th32ThreadID', wintypes.DWORD), ('th32OwnerProcessID', wintypes.DWORD),
-                        ('tpBasePri', wintypes.LONG), ('tpDeltaPri', wintypes.LONG), ('dwFlags', wintypes.DWORD)]
 
         class IoCounters(ctypes.Structure):
             _fields_ = [
@@ -2730,7 +3060,6 @@ class _WindowsJob:
             ]
 
         self.ctypes = ctypes
-        self.entry_type = ThreadEntry
         self.api = ctypes.WinDLL('kernel32', use_last_error=True)
         signatures = (
             ('CreateJobObjectW', wintypes.HANDLE, (ctypes.c_void_p, wintypes.LPCWSTR)),
@@ -2738,11 +3067,6 @@ class _WindowsJob:
             ('AssignProcessToJobObject', wintypes.BOOL, (wintypes.HANDLE, wintypes.HANDLE)),
             ('TerminateJobObject', wintypes.BOOL, (wintypes.HANDLE, wintypes.UINT)),
             ('CloseHandle', wintypes.BOOL, (wintypes.HANDLE,)),
-            ('CreateToolhelp32Snapshot', wintypes.HANDLE, (wintypes.DWORD, wintypes.DWORD)),
-            ('Thread32First', wintypes.BOOL, (wintypes.HANDLE, ctypes.POINTER(ThreadEntry))),
-            ('Thread32Next', wintypes.BOOL, (wintypes.HANDLE, ctypes.POINTER(ThreadEntry))),
-            ('OpenThread', wintypes.HANDLE, (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)),
-            ('ResumeThread', wintypes.DWORD, (wintypes.HANDLE,)),
         )
         for name, result, arguments in signatures:
             function = getattr(self.api, name)
@@ -2752,34 +3076,14 @@ class _WindowsJob:
             raise ctypes.WinError(ctypes.get_last_error())
         ext_info = ExtendedLimitInfo()
         ext_info.BasicLimitInformation.LimitFlags = 0x00002000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-        self.api.SetInformationJobObject(self.handle, 9, ctypes.byref(ext_info), ctypes.sizeof(ext_info))
+        if not self.api.SetInformationJobObject(self.handle, 9, ctypes.byref(ext_info), ctypes.sizeof(ext_info)):
+            self.close()
+            raise ctypes.WinError(ctypes.get_last_error())
 
     def attach(self, proc):
         # Popen 保留的句柄具有创建时的权限，受限令牌重新 OpenProcess 可能被拒绝。
         if not self.api.AssignProcessToJobObject(self.handle, int(proc._handle)):
             raise self.ctypes.WinError(self.ctypes.get_last_error())
-        snapshot = self.api.CreateToolhelp32Snapshot(0x00000004, 0)  # TH32CS_SNAPTHREAD
-        if snapshot == self.ctypes.c_void_p(-1).value:
-            raise self.ctypes.WinError(self.ctypes.get_last_error())
-        try:
-            entry = self.entry_type()
-            entry.dwSize = self.ctypes.sizeof(entry)
-            available = self.api.Thread32First(snapshot, self.ctypes.byref(entry))
-            while available:
-                if entry.th32OwnerProcessID == proc.pid:
-                    thread = self.api.OpenThread(0x0002, False, entry.th32ThreadID)  # THREAD_SUSPEND_RESUME
-                    if not thread:
-                        raise self.ctypes.WinError(self.ctypes.get_last_error())
-                    try:
-                        if self.api.ResumeThread(thread) == 0xFFFFFFFF:
-                            raise self.ctypes.WinError(self.ctypes.get_last_error())
-                    finally:
-                        self.api.CloseHandle(thread)
-                    return
-                available = self.api.Thread32Next(snapshot, self.ctypes.byref(entry))
-            raise OSError('未找到挂起子进程的主线程')
-        finally:
-            self.api.CloseHandle(snapshot)
 
     def terminate(self):
         if self.handle and not self.api.TerminateJobObject(self.handle, 1):
@@ -2793,7 +3097,7 @@ class _WindowsJob:
 
 def _process_options():
     if os.name == 'nt':
-        return {'creationflags': subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW | 0x00000004}
+        return {'creationflags': subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW}
     return {'start_new_session': True}
 
 
@@ -2820,18 +3124,28 @@ def _close_process_streams(proc):
 
 
 def _start_process(command, cwd=None, env=None, shell=False):
-    job = _WindowsJob() if os.name == 'nt' else None
+    job = None
+    if os.name == 'nt':
+        try:
+            job = _WindowsJob()
+        except OSError as exc:
+            emit_event('windows_job_unavailable', error=str(exc), cleanup='taskkill /T /F')
     proc = None
     try:
         proc = subprocess.Popen(command, cwd=str(cwd) if cwd is not None else None, env=env, shell=shell,
                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True, encoding='utf-8', errors='replace', **_process_options())
         if job is not None:
-            proc._cae_job = job
-            job.attach(proc)
+            try:
+                job.attach(proc)
+                proc._cae_job = job
+            except OSError as exc:
+                job.close()
+                job = None
+                emit_event('windows_job_attach_failed', error=str(exc), cleanup='taskkill /T /F')
         return proc
     except BaseException as exc:
-        # 即使事件输出、入 Job 或恢复线程失败，也不能遗留一个挂起进程。
+        # 即使事件输出或绑定 Job 失败，也必须清理已启动的进程。
         cleanup_errors = []
         try:
             if proc is not None:
@@ -3510,9 +3824,178 @@ def _backend_diagnostics(result, *, structured_only=False):
     return '\n'.join(part for part in parts if part).strip()
 
 
+def _dsh_dotenv_key(home):
+    for line in _optional_text(Path(home) / '.env').splitlines():
+        if line.lstrip().startswith('#'):
+            continue
+        key, eq, value = line.partition('=')
+        if eq and re.sub(r'^export\s+', '', key.strip()) == 'DEEPSEEK_API_KEY':
+            value = _credential_scalar(value)
+            return value if _usable_credential(value) else None
+    return None
+
+
+_DSH_PERMISSION_CACHE = {}
+
+
+def _dsh_supports_cli_permission_flags(binary, env=None):
+    try:
+        stamp = Path(binary).stat().st_mtime_ns
+    except OSError:
+        return False
+    key = (str(binary), stamp)
+    if key not in _DSH_PERMISSION_CACHE:
+        try:
+            result = run_process([binary, '--profile', 'headless', '--help'], Path.cwd(),
+                                 timeout_sec=1.5, env=env)
+            output = (result.stdout or '') + (result.stderr or '')
+            is_help = bool(re.search(r'(?im)(?:usage:|options:|--help|--profile)', output))
+            if result.returncode != 0 or not is_help:
+                return False
+            supported = '--permission-mode' in output
+        except (OSError, HarnessError, subprocess.TimeoutExpired):
+            return False
+        _DSH_PERMISSION_CACHE[key] = supported
+    return _DSH_PERMISSION_CACHE[key]
+
+
+def _inline_readonly_prompt(prompt, root, rel_files=None, *, exclude_agent_instructions=False):
+    root = Path(root).resolve()
+    records = collect_target_files(root) if rel_files is None else [
+        {'rel_path': rel, 'path': root / rel} for rel in rel_files]
+    cap = (_positive_int(_headless_tunables().get('inline_readonly_max_kib')) or 256) * 1024
+    header = '\n\n所需目标文件原文已附带精确行号内联在下方，请勿再重复调用文件读取工具遍历工作区。\n'
+    blocks, omitted = [], []
+    size = len(header.encode('utf-8'))
+    for item in records:
+        path, rel = Path(item['path']), item['rel_path']
+        if exclude_agent_instructions and path.name.upper() in ('AGENTS.MD', 'CLAUDE.MD'):
+            continue
+        if (path.name.startswith('.env') or re.search(r'(?i)(credential|secret|auth\.json|private.?key|\.pem$|\.key$)', path.name)):
+            omitted.append(rel)
+            continue
+        try:
+            path.resolve().relative_to(root)
+            if _is_link(path) or any(_is_link(parent) for parent in path.parents if parent != root and root in parent.parents):
+                raise ValueError('linked source')
+            if path.stat().st_size > cap:
+                omitted.append(rel)
+                continue
+            text = path.read_text(encoding='utf-8')
+            if '\0' in text:
+                raise ValueError('binary source')
+            numbered = '\n'.join(f'{index}: {line}' for index, line in enumerate(text.splitlines(), 1))
+            block = f'=== FILE: {rel} ===\n{numbered}\n\n'
+            block_size = len(block.encode('utf-8'))
+            if size + block_size > cap:
+                omitted.append(rel)
+                continue
+            size += block_size
+            blocks.append(block)
+        except (OSError, ValueError):
+            omitted.append(rel)
+    suffix = ('\n未内联清单：' + ', '.join(omitted)) if omitted else ''
+    return prompt + (header + ''.join(blocks) if blocks else '') + suffix
+
+
+def extract_cli_token_usage(prefix, raw_stdout, raw_stderr=''):
+    unknown = {'input_tokens': None, 'cached_input_tokens': None, 'output_tokens': None,
+               'total_tokens': None, 'usage_source': 'unreported_by_cli'}
+    reports = []
+    def visit(value, terminal=False):
+        if not isinstance(value, dict):
+            return
+        terminal = terminal or value.get('type') in ('final', 'result', 'turn.completed') or value.get('event') == 'final'
+        for key in ('usage', 'tokenUsage', 'tokens'):
+            usage = value.get(key)
+            if isinstance(usage, dict):
+                reports.append((usage, terminal))
+        if prefix == 'claude' and isinstance(value.get('modelUsage'), dict) and not any(
+                isinstance(value.get(key), dict) and any(v is not None for v in normalize(value[key]).values())
+                for key in ('usage', 'tokenUsage', 'tokens')):
+            aggregate = {}
+            for source, target in (('inputTokens', 'input_tokens'), ('outputTokens', 'output_tokens'),
+                                   ('cacheReadInputTokens', 'cache_read_input_tokens'),
+                                   ('cacheCreationInputTokens', 'cache_creation_input_tokens')):
+                counts = [integer(usage.get(source)) for usage in value['modelUsage'].values() if isinstance(usage, dict)]
+                if any(count is not None for count in counts):
+                    aggregate[target] = sum(count for count in counts if count is not None)
+            reports.append((aggregate, terminal))
+        # Only structured envelopes are examined; generated result text is never treated as telemetry.
+        for key in ('payload', 'data', 'message', 'info'):
+            if isinstance(value.get(key), dict):
+                visit(value[key], terminal)
+    def integer(value):
+        return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+    def normalize(usage):
+        def first(*names):
+            return next((integer(usage[name]) for name in names if integer(usage.get(name)) is not None), None)
+        inp = first('input_tokens', 'prompt_tokens', 'inputTokens', 'promptTokens')
+        out = first('output_tokens', 'completion_tokens', 'outputTokens', 'completionTokens')
+        cached = first('cached_input_tokens', 'cache_hit_tokens', 'cached_tokens', 'cache_read_input_tokens', 'cachedInputTokens')
+        details = usage.get('prompt_tokens_details') or usage.get('input_tokens_details') or {}
+        if cached is None and isinstance(details, dict):
+            cached = integer(details.get('cached_tokens'))
+        if prefix == 'claude':
+            creation = integer(usage.get('cache_creation_input_tokens'))
+            # Claude's input_tokens excludes both cache categories.
+            if inp is not None:
+                inp += (cached or 0) + (creation or 0)
+        total = first('total_tokens', 'totalTokens')
+        if total is None and inp is not None and out is not None:
+            total = inp + out
+        return {'input_tokens': inp, 'cached_input_tokens': cached, 'output_tokens': out, 'total_tokens': total}
+    for raw in (raw_stdout, raw_stderr):
+        try:
+            visit(json.loads(raw))
+        except (TypeError, ValueError):
+            for line in (raw or '').splitlines():
+                try:
+                    visit(json.loads(line))
+                except ValueError:
+                    continue
+    usable = [(normalize(usage), terminal) for usage, terminal in reports]
+    usable = [(usage, terminal) for usage, terminal in usable if any(v is not None for v in usage.values())]
+    if not usable:
+        return unknown
+    finals = [usage for usage, terminal in usable if terminal]
+    if finals:
+        result = finals[-1]
+    elif prefix in ('codex', 'claude'):
+        result = usable[-1][0]
+    else:
+        result = {key: (sum(usage[key] for usage, _ in usable if usage[key] is not None)
+                        if any(usage[key] is not None for usage, _ in usable) else None) for key in unknown if key != 'usage_source'}
+    return {**result, 'usage_source': 'cli_reported'}
+
+
+def _codex_invocation_token_usage(info, started, ended):
+    unknown = extract_cli_token_usage('codex', '')
+    # Concurrent invocations share sessions: accept only an explicitly correlated process record.
+    for event in _recent_rollout_events(info):
+        payload = event.get('payload') or {}
+        if payload.get('type') != 'token_count':
+            continue
+        try:
+            stamp = datetime.datetime.fromisoformat(event['timestamp'].replace('Z', '+00:00')).timestamp()
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not started <= stamp <= ended or not info.get('invocation_session_id'):
+            continue
+        if event.get('session_id') != info['invocation_session_id']:
+            continue
+        usage = (payload.get('info') or {}).get('total_token_usage')
+        if isinstance(usage, dict):
+            return extract_cli_token_usage('codex', json.dumps({'usage': usage}))
+    return unknown
+
+
 def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, timeout_sec=600,
                   agent='readonly-collaborator', stage_files=None, effort=None, retry_quota=False,
-                  *, profile=None, batch=None, receipt=None, clean_room=False):
+                  *, profile=None, batch=None, receipt=None, clean_room=False, inline_readonly=None):
+    wall_start = time.monotonic()
+    invoke_start_epoch = time.time()
+    wall_deadline = wall_start + timeout_sec
     batch = batch or _QuotaBatch(retry_quota)
     prefix, _ = _engine_parts(spec)
     if clean_room:
@@ -3528,6 +4011,7 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
         info = backends[prefix]
         profile = resolve_execution_profile(backends, spec, effort or 'max')
     _require_execution_profile(profile)
+    _require_subscription(prefix, profile.get('model'))
     _, model = _engine_parts(profile['spec'])
     effort = profile['cli_effort']
     if receipt is None:
@@ -3603,6 +4087,13 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
         if prefix == 'claude' and not interop and (os.environ.get('CAE_CLAUDE_HOME') or os.environ.get('CLAUDE_CONFIG_DIR')):
             env['CLAUDE_CONFIG_DIR'] = info['config_home']
         if prefix == 'dsh':
+            src_home = Path(info.get('config_home') or Path.home() / '.dsh')
+            if not _usable_credential(env.get('DEEPSEEK_API_KEY')):
+                key_value = _dsh_dotenv_key(src_home)
+                if key_value:
+                    env['DEEPSEEK_API_KEY'] = key_value
+            if info.get('credential_source') == 'account':
+                env.pop('DEEPSEEK_API_KEY', None)
             env['DSH_TELEMETRY_DISABLED'] = '1'
             if effective_dsh_home and not interop:
                 env['DSH_HOME'] = effective_dsh_home
@@ -3627,23 +4118,13 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
                 exec_dir = stage_dir
                 win_target = translate(stage_dir)
                 exec_prompt = prompt + STAGED_PROMPT_SUFFIX
-                if clean_room and prefix == 'codex':
-                    staged_records = collect_target_files(stage_dir)
-                    total_bytes = sum(item['bytes'] for item in staged_records)
-                    inline_cap = (_positive_int(_headless_tunables().get('clean_room_inline_snapshot_kib')) or 256) * 1024
-                    if staged_records and total_bytes <= inline_cap:
-                        blocks = []
-                        for item in staged_records:
-                            try:
-                                lines = item['path'].read_text(encoding='utf-8').splitlines()
-                            except (OSError, UnicodeDecodeError):
-                                continue
-                            numbered = '\n'.join(f'{idx}: {line}' for idx, line in enumerate(lines, 1))
-                            blocks.append(f"=== FILE: {item['rel_path']} ===\n{numbered}")
-                        if blocks:
-                            exec_prompt += '\n\n【只读目标文件带行号原文快照（可直接阅读，无需调用外部命令）】\n' + '\n\n'.join(blocks)
+            if readonly and (inline_readonly is True or (inline_readonly is None and clean_room)):
+                exec_prompt = _inline_readonly_prompt(exec_prompt, stage_dir or target_dir, stage_files,
+                                                      exclude_agent_instructions=clean_room)
+            if time.monotonic() >= wall_deadline:
+                raise HarnessError('前置暂存或快照已耗尽墙钟超时预算', 'timeout')
             if prefix == 'codex':
-                command = [binary, 'exec', '-s', 'read-only' if readonly else 'workspace-write',
+                command = [binary, 'exec', '--json', '-s', 'read-only' if readonly else 'workspace-write',
                            '-c', 'approval_policy="never"', '--ephemeral',
                            '--skip-git-repo-check', '-C', win_target, '--output-schema', translate(schema_file), '-o', translate(output_file)]
                 if model:
@@ -3689,13 +4170,20 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
                 provider = 'deepseek-official' if info.get('dsh_provider') == 'deepseek-official' else 'deepseek-account'
                 dsh_default_slug = str(_catalog_rules('dsh').get('default_model') or info.get('model') or 'default')
                 patch_file.write_text(
+                    '- id: sandbox-policy\n  config:\n    mode: ' + ('read-only' if readonly else 'workspace-write') + '\n'
+                    '- id: approval\n  config:\n    policy: never\n- id: permission\n  config:\n    mode: ' + ('read-only' if readonly else 'workspace-write') + '\n'
                     '- id: credentials\n  disabled: false\n- id: authorization\n  disabled: false\n'
                     '- id: deepseek-account\n  disabled: false\n- id: agent-default-model\n'
                     "  name: '@deepseek-ai/dsh-agent-default-model'\n  config:\n"
                     f'    provider: {provider}\n    model: {json.dumps(model or dsh_default_slug)}\n'
                     f'    reasoningEffort: {effort or "high"}\n', encoding='utf-8')
-                command = [binary, '--profile', 'headless', '--patch', translate(patch_file), '--json', '--permission-mode',
-                           'read-only' if readonly else 'workspace-write', '--approval-policy', 'never', '-']
+                mode_str = 'read-only' if readonly else 'workspace-write'
+                command = [binary, '--profile', 'headless', '--patch', translate(patch_file), '--json']
+                if _dsh_supports_cli_permission_flags(binary, env):
+                    command.extend(['--permission-mode', mode_str, '--approval-policy', 'never'])
+                else:
+                    env['DSH_PERMISSION_MODE'] = mode_str
+                command.append('-')
                 req_keys = ', '.join(schema.get('required', ()))
                 exec_prompt = (f'{exec_prompt}\n\n请仅输出一个以 {{ 开头、以 }} 结尾且严格符合以下 JSON Schema 的单行或多行 JSON 对象'
                                f'（必含顶层键：{req_keys}；JSON 字符串内的反斜杠如 Windows 路径与 LaTeX 公式必须转义为双反斜杠 \\\\），'
@@ -3719,14 +4207,25 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
             # cannot clear a failure recorded by another unit in this same batch.
             _enforce_preflight_quota(backends, (spec,), batch=batch)
             receipt['launch_attempted'] = True
-            agy_grace = _positive_int(_headless_tunables().get('agy_timeout_grace_sec')) or 15
-            proc_timeout = timeout_sec + agy_grace if prefix == 'agy' else timeout_sec
+            preparation_sec = time.monotonic() - wall_start
+            if preparation_sec >= timeout_sec:
+                raise HarnessError('前置处理已耗尽墙钟超时预算', 'timeout')
+            if prefix == 'agy':
+                agy_grace = int(_headless_tunables().get('agy_timeout_grace_sec', 15))
+                proc_timeout = int(timeout_sec) + agy_grace
+            else:
+                proc_timeout = max(1, int(timeout_sec) - int(preparation_sec))
             try:
                 result = run_process(command, exec_dir, input_text, proc_timeout, env=env, native_pid_file=native_pid_file)
             except HarnessError as exc:
+                receipt['elapsed_sec'] = round(time.monotonic() - wall_start, 6)
                 receipt['invocation_started'] = bool(exc.details.get('process_started'))
                 raise
             receipt['invocation_started'] = True
+            receipt['elapsed_sec'] = round(time.monotonic() - wall_start, 6)
+            receipt['token_usage'] = extract_cli_token_usage(prefix, result.stdout, result.stderr)
+            if prefix == 'codex' and receipt['token_usage']['usage_source'] == 'unreported_by_cli':
+                receipt['token_usage'] = _codex_invocation_token_usage(info, invoke_start_epoch, time.time())
             receipt['returncode'] = result.returncode
             startup_stderr = all(not line.strip() or _is_quota_exhausted(line)
                                  for line in (result.stderr or '').splitlines())
@@ -3781,6 +4280,11 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
             if prefix == 'claude':
                 envelope = _decode_output_json(raw)
                 model_usage = envelope.get('modelUsage') if isinstance(envelope, dict) else None
+                if isinstance(envelope, dict):
+                    if isinstance(envelope.get('total_cost_usd'), (int, float)):
+                        receipt['total_cost_usd'] = envelope['total_cost_usd']
+                    if isinstance(model_usage, dict):
+                        receipt['modelUsage'] = model_usage
                 if isinstance(model_usage, dict) and model_usage:
                     receipt['actual_model'] = next(iter(model_usage))
                     receipt['actual_model_source'] = 'claude_result_model_usage'
@@ -3802,9 +4306,9 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
 
 
 def invoke_readonly_engine(spec, target_dir, prompt, backends, timeout_sec=600, stage_files=None, effort=None, retry_quota=False,
-                           *, profile=None, batch=None, receipt=None):
+                           *, profile=None, batch=None, receipt=None, inline_readonly=True):
     return invoke_engine(spec, target_dir, prompt, backends, AUDIT_JSON_SCHEMA, True, timeout_sec,
-                         'readonly-auditor', stage_files, effort, retry_quota, profile=profile, batch=batch, receipt=receipt)
+                         'readonly-auditor', stage_files, effort, retry_quota, profile=profile, batch=batch, receipt=receipt, inline_readonly=inline_readonly)
 
 
 def invoke_edit_worker(spec, target_dir, prompt, backends, timeout_sec=600, effort=None, retry_quota=False,
@@ -3819,9 +4323,22 @@ def invoke_edit_worker(spec, target_dir, prompt, backends, timeout_sec=600, effo
 # ════════════════════════════════════════════════════════════════════════════
 
 
-def snapshot_files(root):
+def _snapshot_ignored_dirs():
+    return set(_headless_tunables().get('snapshot_ignored_dirs',
+               ['.git', '.venv', 'venv', 'build', 'dist', 'runs', '__pycache__', 'node_modules', '.cache']))
+
+
+def snapshot_files(root, ignore_dirs=None):
     """对独立任务目录作事后核对，排除 Git 元数据，不撤销文件。"""
     root = Path(root)
+    ignored = set(ignore_dirs) if ignore_dirs is not None else _snapshot_ignored_dirs()
+    ignore_file = root / '.agentignore'
+    ignore_text = _optional_text(ignore_file) if ignore_file.is_file() and not _is_link(ignore_file) else ''
+    patterns = [line.strip().rstrip('/') for line in ignore_text.splitlines()
+                if line.strip() and not line.lstrip().startswith('#')]
+    def excluded(path):
+        rel = path.relative_to(root).as_posix()
+        return any(fnmatch.fnmatchcase(rel, pattern) or rel.split('/')[0] == pattern for pattern in patterns)
 
     def traversal_failed(exc):
         directory = Path(exc.filename) if exc.filename else root
@@ -3836,7 +4353,7 @@ def snapshot_files(root):
     except OSError as exc:
         raise HarnessError(f'无法核对目标目录: {exc}', snapshot_path='.') from exc
     for directory, dirs, files in os.walk(root, followlinks=False, onerror=traversal_failed):
-        dirs[:] = sorted(d for d in dirs if d != '.git')
+        dirs[:] = sorted(d for d in dirs if d not in ignored and not excluded(Path(directory) / d))
         for name in list(dirs):
             link = Path(directory) / name
             rel = link.relative_to(root).as_posix()
@@ -3850,7 +4367,7 @@ def snapshot_files(root):
                 raise HarnessError(f'无法核对目录 {rel}: {exc}', snapshot_path=rel) from exc
         for name in files:
             path = Path(directory) / name
-            if path == root / '.git':
+            if path == root / '.git' or excluded(path):
                 continue
             rel = path.relative_to(root).as_posix()
             try:
@@ -3872,14 +4389,16 @@ def snapshot_files(root):
 
 def _scope_patterns(patterns):
     result = []
-    for pattern in patterns:
-        normalized = pattern.replace('\\', '/')
-        if not normalized or normalized.startswith('/') or ':' in normalized or '..' in normalized.split('/'):
-            raise HarnessError('--write-scope 必须使用目标目录内的相对路径或通配符')
-        normalized = posixpath.normpath(normalized)
-        if normalized == '.':
-            raise HarnessError('--write-scope 不可为空路径')
-        result.append(normalized)
+    for raw in patterns:
+        items = [part.strip() for part in raw.split(',')] if isinstance(raw, str) and ',' in raw else [raw]
+        for pattern in items:
+            normalized = str(pattern).strip().replace('\\', '/')
+            if not normalized or normalized.startswith('/') or ':' in normalized or '..' in normalized.split('/'):
+                raise HarnessError('--write-scope 必须使用目标目录内的相对路径或通配符')
+            normalized = posixpath.normpath(normalized)
+            if normalized == '.':
+                raise HarnessError('--write-scope 不可为空路径')
+            result.append(normalized)
     return result
 
 
@@ -4181,6 +4700,9 @@ def run_physics_gate_loop(target_dir, task_desc, verify_cmd, worker_fn, verify_f
 
     verifier = verify_fn or default_verify
     scopes = _scope_patterns(write_scope or [])
+    # Gate 必须记录验收生成的 build 产物，并检查工作代理是否越界修改它们。
+    # 其余缓存目录沿用默认排除配置；显式授权的顶层目录重新纳入快照。
+    ignored = _snapshot_ignored_dirs() - {'build'} - {scope.split('/')[0] for scope in scopes}
     worker_changes = set()
     verification_changes = set()
     violations = set()
@@ -4191,7 +4713,7 @@ def run_physics_gate_loop(target_dir, task_desc, verify_cmd, worker_fn, verify_f
 
     def checked_snapshot(phase, round_number=None):
         try:
-            return snapshot_files(target_dir)
+            return snapshot_files(target_dir, ignore_dirs=ignored)
         except (HarnessError, OSError) as exc:
             scope_failure.update(scope_error_phase=phase, scope_error=str(exc))
             if round_number is not None:
@@ -4303,7 +4825,7 @@ def _task_text(args):
     text = Path(args.task_file).expanduser().resolve().read_text(encoding='utf-8-sig') if getattr(args, 'task_file', None) else args.task
     if not text or not text.strip():
         raise HarnessError('任务内容为空')
-    return text
+    return (getattr(args, 'user_prompt', '') + '\n' + text).strip()
 
 
 def _git_head(root):
@@ -4335,6 +4857,10 @@ def _prepare_execution(backends, specs, batch, *, dry_run=False):
         if not spec:
             continue
         prefix, model = _engine_parts(spec)
+        _require_subscription(prefix, model)
+        local_quota = inspect_backend_quota_and_availability(prefix, backends[prefix], model)
+        if local_quota['quota_exceeded'] and not batch.retry:
+            raise HarnessError('本地额度检查拒绝执行', 'quota_exhausted', quota_backend=prefix, preflight_blocked=True)
         try:
             if prefix == 'claude':
                 _verify_claude_llm_ready(backends[prefix], model, batch)
@@ -4370,7 +4896,12 @@ def _prepare_execution(backends, specs, batch, *, dry_run=False):
 
 
 def _planned_profile(args, backends, engine, tier, reason, text, kind, estimated_tokens):
-    profile = resolve_execution_profile(backends, engine, tier, text, kind, estimated_tokens)
+    user_prompt = getattr(args, 'user_prompt', '')
+    if user_prompt:
+        selected, selected_reason = _resolve_effective_tier(args.tier, kind, user_prompt, text, engine)
+        if selected_reason.startswith(('user_description_', 'economy_')):
+            tier, reason = selected, selected_reason
+    profile = resolve_execution_profile(backends, engine, tier, user_prompt or text, kind, estimated_tokens)
     prefix, _ = _engine_parts(engine)
     profile.update(requested_tier=args.tier, tier_reason=reason,
                    quota_status=backends.get(prefix, {}).get('quota_status', 'unknown_until_called'))
@@ -4846,10 +5377,15 @@ def cmd_check_grounding(args):
 
 def cmd_probe(args):
     refresh = bool(getattr(args, 'discover_models', False))
+    backends = _args_backends(args, refresh_model_cache=refresh)
+    for prefix, info in backends.items():
+        info['subscription_status'] = inspect_backend_quota_and_availability(prefix, info, info.get('model'), redact_usage=True)
     return _print({'status': 'ok', 'caller': resolve_caller(args.caller),
                    'workspace_mode': detect_workspace_mode(),
                    'fleet_profile': _fleet_profile_summary(),
-                   'backends': _args_backends(args, refresh_model_cache=refresh)})
+                   'capability_ledger': _fleet_profile().get('capability_ledger', {}),
+                   'subscription_status': _fleet_profile().get('subscription_matrix', {}),
+                   'backends': backends})
 
 
 def cmd_assess(args):
@@ -4863,6 +5399,7 @@ def cmd_assess(args):
     recommendations = {}
     for name, info in backends.items():
         detected = bool(info.get('detected', info.get('available')))
+        info['subscription_status'] = inspect_backend_quota_and_availability(name, info, info.get('model'), redact_usage=True)
         info['caller_relation'] = ('local' if name == local_backend else 'counterpart') if local_backend else 'unspecified'
         info['program_origin'] = ('windows_interop' if info.get('windows_interop') else 'native') if detected else None
         info['execution_environment'] = _execution_environment(info)
@@ -4881,7 +5418,10 @@ def cmd_assess(args):
         recommendations[name] = {}
         for scenario, (kind, prompt) in scenarios.items():
             tier, reason = select_task_tier(kind=kind, text=prompt)
-            profile = resolve_execution_profile(backends, name + ':default', tier, prompt, kind=kind)
+            try:
+                profile = resolve_execution_profile(backends, name + ':default', tier, prompt, kind=kind)
+            except HarnessError as exc:
+                profile = {'execution_blocked_reason': str(exc), 'status': exc.status}
             recommendations[name][scenario] = {**profile, 'requested_tier': 'auto', 'tier_reason': reason,
                                                 'backend_detected': detected}
     resolved_roles = {}
@@ -4906,6 +5446,8 @@ def cmd_assess(args):
             resolved_roles[role_name] = {'selected_engine': None, 'blocked_reason': str(exc), 'dynamic_slot': True}
     return _print({'status': 'ok', 'caller': caller, 'workspace_mode': detect_workspace_mode(),
                    'fleet_profile': _fleet_profile_summary(),
+                   'capability_ledger': _fleet_profile().get('capability_ledger', {}),
+                   'subscription_status': _fleet_profile().get('subscription_matrix', {}),
                    'resolved_roles': resolved_roles,
                    'backends': backends,
                    'recommendations': recommendations,
@@ -4915,19 +5457,43 @@ def cmd_assess(args):
 
 
 def cmd_audit(args):
+    _begin_dispatch(args)
     target, root = _target(args)
     caller = resolve_caller(args.caller)
     backends = _args_backends(args)
+    if getattr(args, 'user_prompt', ''):
+        args.focus = args.user_prompt + '\n' + args.focus
+        user_engine = _prompt_engine_spec(backends, args.user_prompt)
+        if user_engine:
+            original = (args.left or 'role:review').strip().lower()
+            slot = (original.split(':', 1)[1] if original.startswith('role:')
+                    else _per_backend_role_target(*_engine_parts(original)))
+            backend = _extract_prompt_backend_hint(args.user_prompt)
+            args.left = (f'{backend}:@{slot}' if slot and backend and not _extract_prompt_model_hint(args.user_prompt)
+                         else user_engine)
     skipped = []
     records = collect_target_files(target, skipped)
     if not records:
         raise HarnessError('目标范围没有可审查文件', skipped_files=skipped)
     total_tokens = sum(item['tokens'] for item in records)
-    engines = _audit_engines(backends, not args.single, args.left, args.right, args.dry_run, caller, args.focus)
+    try:
+        engines = _audit_engines(backends, not args.single, args.left, args.right, args.dry_run, caller, args.focus)
+    except HarnessError as exc:
+        if exc.status != 'quota_exhausted' or not getattr(args, 'fallback_on_quota', False):
+            return _dispatch_print(args, {'status': exc.status, 'error': str(exc), **exc.details})
+        prefix = exc.details.get('quota_backend')
+        fallback = _local_fallback_engine(caller, (prefix or 'codex') + ':default', backends, args.focus)
+        if not fallback:
+            return _dispatch_print(args, {'status': exc.status, 'error': str(exc), **exc.details})
+        engines = (fallback, None)
+        args._selection_fallback = _quota_fallback_record(prefix + ':default', fallback, exc.details)
+
     audit_engine_hint = (args.left or (engines[0] or '')) if args.single else ''
-    tier, tier_reason = select_task_tier(args.tier, 'audit', args.focus, len(records), total_tokens, engine=audit_engine_hint)
+    tier, tier_reason = _resolve_effective_tier(args.tier, 'audit', getattr(args, 'user_prompt', ''), args.focus, audit_engine_hint)
     meta = {'caller': caller, 'handoff_to_caller': True, 'requested_tier': args.tier,
             'selected_tier': tier, 'tier_reason': tier_reason, 'target': str(root)}
+    if getattr(args, '_selection_fallback', None):
+        meta['quota_fallback'] = args._selection_fallback
     batch = _QuotaBatch(args.retry_quota)
     fallback_before = snapshot_files(root) if getattr(args, 'fallback_on_quota', False) and not args.dry_run else None
     try:
@@ -4939,7 +5505,7 @@ def cmd_audit(args):
             and _workspace_unchanged(fallback_before, root)
         ) else None
         if not fb_engine:
-            return _print({'status': exc.status, **meta, 'error': str(exc), 'requested_engines': list(engines), **exc.details})
+            return _dispatch_print(args, {'status': exc.status, **meta, 'error': str(exc), 'requested_engines': list(engines), **exc.details})
         tripped_spec = next((e for e in engines if e and _engine_parts(e)[0] == q_backend), f'{q_backend}:default')
         kept = [e for e in engines if e and _engine_parts(e)[0] != q_backend]
         if kept and not args.single:
@@ -4962,7 +5528,7 @@ def cmd_audit(args):
             if not _workspace_unchanged(fallback_before, root):
                 raise HarnessError('回退预检后工作区发生变化或无法核对，已停止执行')
         except HarnessError as fb_exc:
-            return _print({'status': fb_exc.status, **meta, 'error': str(fb_exc), 'requested_engines': list(engines), **fb_exc.details})
+            return _dispatch_print(args, {'status': fb_exc.status, **meta, 'error': str(fb_exc), 'requested_engines': list(engines), **fb_exc.details})
     profiles = {}
     for side, engine in zip(('left', 'right'), engines):
         if engine:
@@ -4970,12 +5536,14 @@ def cmd_audit(args):
             estimate = _audit_estimate([record['rel_path'] for record in records], total_tokens, args.focus,
                                        backends[prefix].get('windows_interop', False))
             profiles[side] = _planned_profile(args, backends, engine, tier, tier_reason, args.focus, 'audit', estimate['estimated_tokens'])
+    for profile in profiles.values():
+        _check_ticket_execution(args, profile, target, 'review')
     plan = select_audit_plan(total_tokens, records, backends, args.strategy, not args.single, args.left, args.right,
                              args.shard_tokens, args.dry_run, caller, focus=args.focus, profiles=profiles, engines=engines)
     plan['skipped_files'].extend(skipped)
     plan.update(requested_tier=args.tier, selected_tier=tier, tier_reason=tier_reason)
     if args.dry_run:
-        return _print({'status': 'ok', 'dry_run': True, 'plan': plan})
+        return _dispatch_print(args, {'status': 'ok', 'dry_run': True, 'plan': plan})
     for profile in profiles.values():
         _require_execution_profile(profile)
     base = _git_head(root)
@@ -4991,7 +5559,7 @@ def cmd_audit(args):
             receipt = {}
             future = pool.submit(invoke_readonly_engine, profile['spec'], root, _build_audit_prompt(unit, args.focus),
                                  backends, args.timeout, unit['files'], profile['cli_effort'], args.retry_quota,
-                                 profile=profile, batch=batch, receipt=receipt)
+                                 profile=profile, batch=batch, receipt=receipt, inline_readonly=getattr(args, 'inline_readonly', True))
             futures[future] = side, unit, receipt
         for future in concurrent.futures.as_completed(futures):
             side, unit, receipt = futures[future]
@@ -5051,7 +5619,7 @@ def cmd_audit(args):
     completed.sort(key=lambda unit: (unit['side'], unit['shard_id']))
     errors.sort(key=lambda unit: (unit['side'], unit['shard_id']))
     merged = merge_blind_findings(findings['left'], findings['right'], plan['left_engine'], plan['right_engine'], root)
-    return _print({'status': status, **meta, 'plan': plan, 'base_commit': base,
+    return _dispatch_print(args, {'status': status, **meta, 'plan': plan, 'base_commit': base,
                    'completed_units': completed, 'completed_count': sum(unit['status'] == 'ok' for unit in completed),
                    'received_count': len(completed), 'total_units': len(tasks), 'errors': errors,
                    'reading_coverage_verified': False,
@@ -5061,13 +5629,17 @@ def cmd_audit(args):
 
 
 def cmd_gate(args):
+    _begin_dispatch(args)
     if not str(args.verify_cmd).strip():
         raise HarnessError('--verify-cmd 不能为空白命令')
     requested_target, root = _target(args)
     text = _task_text(args)
     backends = _args_backends(args)
     caller = resolve_caller(args.caller)
-    engine = choose_engine(backends, caller, args.worker, text)
+    try:
+        engine = _choose_dispatch_engine(args, backends, caller, args.worker, text)
+    except HarnessError as exc:
+        return _dispatch_print(args, {'status': exc.status, 'error': str(exc), **exc.details})
     scopes = _scope_patterns(args.write_scope)
     if requested_target.is_file() and not scopes:
         scopes = [requested_target.relative_to(root).as_posix()]
@@ -5086,7 +5658,7 @@ def cmd_gate(args):
             and _workspace_unchanged(fallback_before, root)
         ) else None
         if not fb_engine:
-            return _print({'status': exc.status, **meta, 'error': str(exc), **exc.details})
+            return _dispatch_print(args, {'status': exc.status, **meta, 'error': str(exc), **exc.details})
         meta['quota_fallback'] = _quota_fallback_record(engine, fb_engine, exc.details)
         engine = fb_engine
         meta.update(engine=engine, worker_engine=engine)
@@ -5095,11 +5667,12 @@ def cmd_gate(args):
             if not _workspace_unchanged(fallback_before, root):
                 raise HarnessError('回退预检后工作区发生变化或无法核对，已停止执行')
         except HarnessError as fb_exc:
-            return _print({'status': fb_exc.status, **meta, 'error': str(fb_exc), **fb_exc.details})
+            return _dispatch_print(args, {'status': fb_exc.status, **meta, 'error': str(fb_exc), **fb_exc.details})
     profile = _planned_profile(args, backends, engine, tier, tier_reason, text, 'gate', est_tokens)
+    _check_ticket_execution(args, profile, requested_target, 'gate', text)
     if args.dry_run:
         prefix, _ = _engine_parts(engine)
-        return _print({'status': 'ok', 'dry_run': True, **meta, **_profile_payload(profile),
+        return _dispatch_print(args, {'status': 'ok', 'dry_run': True, **meta, **_profile_payload(profile),
                        'quota_cooldown': backends.get(prefix, {}).get('quota_cooldown'),
                        'work_dir': str(root), 'verify_cmd': args.verify_cmd, 'write_scope': scopes, 'max_rounds': args.max_rounds})
     _require_execution_profile(profile)
@@ -5108,18 +5681,22 @@ def cmd_gate(args):
         result = _run_gate_with_fallback(args, root, requested_target, text, caller, engine, backends,
                                          scopes, profile, 'gate', est_tokens, batch, meta, fallback_before)
     except HarnessError as exc:
-        return _print({'status': exc.status, **meta, 'base_commit': base, 'error': str(exc), **exc.details})
-    return _print({**meta, **result, 'base_commit': base})
+        return _dispatch_print(args, {'status': exc.status, **meta, 'base_commit': base, 'error': str(exc), **exc.details})
+    return _dispatch_print(args, {**meta, **result, 'base_commit': base})
 
 
 def cmd_task(args):
+    _begin_dispatch(args)
     if args.kind == 'code' and args.verify_cmd is not None and not str(args.verify_cmd).strip():
         raise HarnessError('--verify-cmd 不能为空白命令')
     requested_target, root = _target(args)
     text = _task_text(args)
     caller = resolve_caller(args.caller)
     backends = _args_backends(args)
-    engine = choose_engine(backends, caller, args.engine, text)
+    try:
+        engine = _choose_dispatch_engine(args, backends, caller, args.engine, text)
+    except HarnessError as exc:
+        return _dispatch_print(args, {'status': exc.status, 'error': str(exc), **exc.details})
     scopes = _scope_patterns(args.write_scope)
     readonly = args.kind != 'code'
     if readonly and (scopes or args.verify_cmd):
@@ -5155,7 +5732,7 @@ def cmd_task(args):
             and _workspace_unchanged(fallback_before, root)
         ) else None
         if not fb_engine:
-            return _print({'status': exc.status, **payload, 'result': {}, 'changed_files': [], 'scope_violations': [],
+            return _dispatch_print(args, {'status': exc.status, **payload, 'result': {}, 'changed_files': [], 'scope_violations': [],
                            'error': str(exc), **exc.details})
         payload['quota_fallback'] = _quota_fallback_record(engine, fb_engine, exc.details)
         engine = fb_engine
@@ -5165,22 +5742,23 @@ def cmd_task(args):
             if not _workspace_unchanged(fallback_before, root):
                 raise HarnessError('回退预检后工作区发生变化或无法核对，已停止执行')
         except HarnessError as fb_exc:
-            return _print({'status': fb_exc.status, **payload, 'result': {}, 'changed_files': [], 'scope_violations': [],
+            return _dispatch_print(args, {'status': fb_exc.status, **payload, 'result': {}, 'changed_files': [], 'scope_violations': [],
                            'error': str(fb_exc), **fb_exc.details})
     profile = _planned_profile(args, backends, engine, tier, tier_reason, text, args.kind, est_tokens)
+    _check_ticket_execution(args, profile, requested_target, args.kind, text)
     prefix, _ = _engine_parts(engine)
     payload.update(_profile_payload(profile))
     if args.dry_run:
-        return _print({'status': 'ok', 'dry_run': True, 'quota_cooldown': backends.get(prefix, {}).get('quota_cooldown'), **payload})
+        return _dispatch_print(args, {'status': 'ok', 'dry_run': True, 'quota_cooldown': backends.get(prefix, {}).get('quota_cooldown'), **payload})
     _require_execution_profile(profile)
     if args.kind == 'code' and args.verify_cmd:
         try:
             result = _run_gate_with_fallback(args, root, requested_target, text, caller, engine, backends,
                                              scopes, profile, args.kind, est_tokens, batch, payload, fallback_before)
         except HarnessError as exc:
-            return _print({'status': exc.status, **payload, 'result': {}, 'changed_files': [],
+            return _dispatch_print(args, {'status': exc.status, **payload, 'result': {}, 'changed_files': [],
                            'scope_violations': [], 'error': str(exc), **exc.details})
-        return _print({**payload, **result})
+        return _dispatch_print(args, {**payload, **result})
     if not readonly:
         payload['verification_notice'] = '未提供 --verify-cmd，本次代码修改未经宿主机命令实测验证，请总控运行验证后再验收。'
     before = snapshot_files(root)
@@ -5201,7 +5779,8 @@ def cmd_task(args):
         try:
             result = invoke_engine(profile['spec'], root, prompt, backends, TASK_JSON_SCHEMA,
                                    readonly, args.timeout, 'readonly-collaborator', stage_files, profile['cli_effort'], args.retry_quota,
-                                   profile=profile, batch=batch, receipt=invocation, clean_room=clean_room)
+                                   profile=profile, batch=batch, receipt=invocation, clean_room=clean_room,
+                                   inline_readonly=getattr(args, 'inline_readonly', True))
         except HarnessError as exc:
             fb_engine = _local_fallback_engine(caller, engine, backends, text, clean_room=clean_room) if (
                 getattr(exc, 'status', None) == 'quota_exhausted'
@@ -5227,7 +5806,8 @@ def cmd_task(args):
             invocation = {}
             result = invoke_engine(fb_profile['spec'], root, prompt, backends, TASK_JSON_SCHEMA,
                                    readonly, args.timeout, 'readonly-collaborator', stage_files, fb_profile['cli_effort'], args.retry_quota,
-                                   profile=fb_profile, batch=batch, receipt=invocation, clean_room=clean_room)
+                                   profile=fb_profile, batch=batch, receipt=invocation, clean_room=clean_room,
+                                   inline_readonly=getattr(args, 'inline_readonly', True))
     except Exception as exc:
         status = getattr(exc, 'status', 'failed')
         error = {'error': str(exc), **getattr(exc, 'details', {})}
@@ -5251,7 +5831,645 @@ def cmd_task(args):
             'finding_count': len(drift_hits),
             'findings': drift_hits,
         }
-    return _print({'status': status, **payload, 'invocation': invocation, 'result': result, **error, **scope})
+    return _dispatch_print(args, {'status': status, **payload, 'invocation': invocation, 'result': result, **error, **scope})
+
+
+def _atomic_json(path, value):
+    path = Path(path).expanduser().resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + '.' + uuid.uuid4().hex + '.tmp')
+    try:
+        with temporary.open('x', encoding='utf-8', newline='\n') as stream:
+            json.dump(value, stream, ensure_ascii=False, indent=2)
+            stream.write('\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def resolve_dispatch_plan_dir(state_dir=None):
+    return Path(state_dir or os.environ.get('CAE_PLAN_STATE_DIR') or
+                Path.home() / '.gemini' / 'antigravity' / 'plugin_data' / 'user-guard' / 'state' / 'dispatch_plans').expanduser().resolve()
+
+
+def _safe_state_id(value):
+    value = str(value)
+    if not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', value):
+        raise HarnessError('票据或会话标识符只能含字母、数字、下划线与连字符', 'ticket_invalid')
+    return value
+
+
+def _session_id(args):
+    return (getattr(args, 'session_id', '') or getattr(args, '_approved_ticket', {}).get('session_id', '') or next((os.environ[k] for k in
+            ('AGY_CONVERSATION_ID', 'CLAUDE_SESSION_ID', 'CODEX_THREAD_ID', 'CAE_SESSION_ID') if os.environ.get(k)), ''))
+
+
+def _plan_hash(ticket):
+    binding = {key: ticket.get(key) for key in ('streams', 'workflow_bg', 'workflow_goal', 'workflow_impact')}
+    return hashlib.sha256(json.dumps(binding, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode('utf-8')).hexdigest()
+
+
+def _load_ticket(ticket_id, plan_dir=None, approved=False):
+    path = resolve_dispatch_plan_dir(plan_dir) / (_safe_state_id(ticket_id) + '.json')
+    ticket = _read_json(path)
+    if not isinstance(ticket, dict) or ticket.get('ticket_id') != ticket_id:
+        raise HarnessError('计划票据不存在或格式无效', 'ticket_invalid')
+    try:
+        expired = time.time() >= float(ticket['expires_at'])
+    except (ValueError, TypeError, KeyError):
+        expired = True
+    if expired or ticket.get('plan_hash') != _plan_hash(ticket):
+        raise HarnessError('计划票据已过期或内容校验失败', 'ticket_invalid')
+    if approved and ticket.get('status') != 'APPROVED':
+        raise HarnessError('计划票据尚未批准', 'ticket_invalid')
+    return ticket
+
+
+def _choose_dispatch_engine(args, backends, caller, explicit, text):
+    try:
+        return choose_engine(backends, caller, explicit, text, getattr(args, 'user_prompt', ''))
+    except HarnessError as exc:
+        if exc.status != 'quota_exhausted':
+            raise
+        prefix = exc.details.get('quota_backend')
+        if prefix and (getattr(args, 'dry_run', False) or getattr(args, 'retry_quota', False)):
+            return prefix + ':default'
+        if prefix and getattr(args, 'fallback_on_quota', False):
+            fallback = _local_fallback_engine(caller, prefix + ':default', backends, text)
+            if fallback:
+                args._selection_fallback = _quota_fallback_record(prefix + ':default', fallback, exc.details)
+                return fallback
+        raise
+
+
+def _check_ticket_execution(args, profile, target, kind, text=None):
+    ticket = getattr(args, '_approved_ticket', None)
+    if not ticket:
+        return
+    matches = [stream for stream in ticket['streams']
+               if stream.get('channel', 'cae_harness_headless') == 'cae_harness_headless'
+               and Path(stream['target']).resolve() == Path(target).resolve()
+               and stream['kind'] == kind and stream['execution_profile']['spec'] == profile['spec']
+               and stream['tier'] == profile['tier'] and args.timeout <= stream['timeout']]
+    if not matches:
+        raise HarnessError('执行目标、模型、挡位或超时与获批票据不一致', 'ticket_invalid')
+    if text is not None and not any(stream.get('subtask', '').strip() == text.strip() for stream in matches):
+        raise HarnessError('任务内容与获批票据不一致', 'ticket_invalid')
+
+
+def _begin_dispatch(args):
+    args._dispatch_started = time.monotonic()
+    ticket_id = getattr(args, 'ticket', '')
+    if ticket_id:
+        args._approved_ticket = _load_ticket(ticket_id, getattr(args, 'plan_dir', None), approved=True)
+
+
+def _redact_public(value):
+    if isinstance(value, dict):
+        return {k: _redact_public(v) for k, v in value.items()
+                if k not in ('total_cost_usd', 'cost_usd', 'modelUsage', 'plan_type')}
+    if isinstance(value, list):
+        return [_redact_public(v) for v in value]
+    if not isinstance(value, str):
+        return value
+    text = _redact_runtime_secret(value)
+    for path, replacement in ((str(Path.home()), '<HOME>'), (tempfile.gettempdir(), '<TEMP>')):
+        if len(path) > 3:
+            text = re.sub(re.escape(path), lambda _: replacement, text, flags=re.I)
+            text = re.sub(re.escape(path.replace('\\', '/')), lambda _: replacement, text, flags=re.I)
+    text = re.sub(r'(?i)(?:[A-Z]:[\\/]Users[\\/][^\\/\s"\n]+|/home/[^/\s"\n]+)', '<HOME>', text)
+    def mask_ip(match):
+        try:
+            address = ipaddress.IPv4Address(match.group())
+            return '<PRIVATE_IP>' if address.is_private else match.group()
+        except ValueError:
+            return match.group()
+    text = re.sub(r'(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])', mask_ip, text)
+    text = re.sub(r'cae-harness-[A-Za-z0-9_-]+', '<STAGING>', text)
+    if 'quota_summary' not in text:
+        text = re.sub(r'\b\d+(?:\.\d+)?%', '<USAGE>', text)
+    return text
+
+
+def _result_streams(payload):
+    if isinstance(payload.get('streams'), list):
+        return payload['streams']
+    if 'completed_units' in payload or 'errors' in payload:
+        return list(payload.get('completed_units', [])) + list(payload.get('errors', []))
+    if isinstance(payload.get('history'), list):
+        return payload['history']
+    return [payload]
+
+
+def _usage_summary(streams):
+    keys = ('input_tokens', 'cached_input_tokens', 'output_tokens', 'total_tokens')
+    usages = [item.get('token_usage') or item.get('invocation', {}).get('token_usage')
+              or extract_cli_token_usage('', '') for item in streams]
+    reported = sum(usage.get('usage_source') == 'cli_reported' for usage in usages)
+    return {**{key: (sum(u[key] for u in usages if isinstance(u.get(key), int))
+                      if any(isinstance(u.get(key), int) for u in usages) else None) for key in keys},
+            'reported_streams': reported, 'unreported_streams': len(usages) - reported}
+
+
+def _is_heavy_streams(streams, switched=False):
+    cfg = _confirmation_tunables()
+    return bool(switched or len(streams) >= cfg.get('heavy_min_streams', 2) or any(
+        stream.get('kind') in ('code', 'gate')
+        or stream.get('file_count', 0) > cfg.get('heavy_max_light_files', 2)
+        or stream.get('estimated_tokens', 0) > cfg.get('heavy_max_light_tokens', 24000)
+        or stream.get('timeout', 0) > cfg.get('heavy_max_light_timeout_sec', 600) for stream in streams))
+
+
+def record_heavy_completion_for_stop_hook(args, payload):
+    if (getattr(args, 'dry_run', False) or os.environ.get('CAE_HARNESS_DEPTH')
+            or os.environ.get('CAE_DISABLE_HEAVY_COMPLETIONS') == '1'):
+        return
+    command = getattr(args, 'subcommand', '')
+    heavy = command in ('audit', 'gate', 'batch') or getattr(args, 'ticket', '') or getattr(args, 'kind', '') == 'code'
+    if not heavy and getattr(args, 'target', None):
+        count, tokens = _target_metrics(Path(args.target).expanduser().resolve(), getattr(args, 'user_prompt', ''))
+        heavy = _is_heavy_streams([{'file_count': count, 'estimated_tokens': tokens, 'timeout': args.timeout}])
+    if not heavy:
+        return
+    run_id = uuid.uuid4().hex
+    plan_dir = resolve_dispatch_plan_dir(getattr(args, 'plan_dir', None))
+    receipt_path = Path(getattr(args, 'output', '') or plan_dir / 'receipts' / f'{run_id}_receipt.json').expanduser().resolve()
+    payload['receipt_file'] = str(receipt_path)
+    # Explicit --output is written by _dispatch_print after all metadata is attached.
+    if not getattr(args, 'output', ''):
+        _atomic_json(receipt_path, _redact_public(payload))
+    session_id = _session_id(args)
+    if session_id:
+        state_dir = plan_dir.parent
+        path = state_dir / 'heavy_completions' / (_safe_state_id(session_id) + '.json')
+        entry = {'run_id': run_id, 'ticket_id': getattr(args, 'ticket', '') or None,
+                 'completed_at': datetime.datetime.now(datetime.timezone.utc).isoformat(), 'subcommand': command,
+                 'receipt_file': str(receipt_path), 'all_succeeded': payload.get('status') == 'ok',
+                 'streams': [{'stream_id': stream.get('stream_id') or stream.get('shard_id') or f'S{i}',
+                              'engine': stream.get('engine') or payload.get('engine'),
+                              'model': stream.get('model') or payload.get('model'),
+                              'succeeded': stream.get('succeeded', stream.get('status') == 'ok'),
+                              'status': stream.get('status', 'failed'), 'elapsed_sec': stream.get('elapsed_sec'),
+                              'token_usage': stream.get('token_usage') or stream.get('invocation', {}).get('token_usage')
+                                             or extract_cli_token_usage('', '')}
+                             for i, stream in enumerate(_result_streams(payload), 1)],
+                 'token_usage_summary': payload['token_usage_summary'], 'reported_to_user': False}
+        with _COMPLETION_LOCK:
+            entries = _read_json(path) or []
+            if not isinstance(entries, list):
+                raise HarnessError('重负载报账状态格式无效')
+            entries.append(entry)
+            _atomic_json(path, entries)
+
+
+_COMPLETION_LOCK = threading.Lock()
+
+
+def _dispatch_print(args, payload):
+    streams = _result_streams(payload)
+    for stream in streams:
+        stream.setdefault('succeeded', stream.get('status', payload.get('status')) == 'ok')
+        stream.setdefault('elapsed_sec', stream.get('invocation', {}).get('elapsed_sec'))
+    payload.setdefault('elapsed_sec', round(time.monotonic() - getattr(args, '_dispatch_started', time.monotonic()), 6))
+    payload['succeeded'] = payload.get('status') == 'ok'
+    payload['token_usage_summary'] = _usage_summary(streams)
+    record_heavy_completion_for_stop_hook(args, payload)
+    if getattr(args, 'output', ''):
+        public = dict(payload)
+        public['sanitized_invocation'] = _redact_public([stream.get('invocation', {}) for stream in streams])
+        _atomic_json(args.output, public if getattr(args, 'no_redact_output', False) else _redact_public(public))
+    return _print(_redact_public(payload) if getattr(args, 'redact', False) else payload)
+
+
+def _read_stream_spec(path):
+    value = _read_json(Path(path))
+    if not isinstance(value, list) or not value or any(not isinstance(item, dict) for item in value):
+        raise HarnessError('--spec-file 必须包含非空工作流对象列表')
+    return value
+
+
+_PLAN_CHANNEL_LABELS = {
+    'cae_harness_headless': 'cae-harness 跨端无头调用',
+    'native_subagent': '同端内部子代理',
+    'native_workflow': '同端内部工作流',
+    'native_swarm': '同端内部并行代理组',
+}
+
+
+def _native_plan_model(prefix, info, requested_model):
+    """只读解析前端继承模型，不经无头后端重新选模。"""
+    home = info.get('config_home')
+    if not home:
+        home_fn = {'codex': _codex_home, 'agy': _agy_home, 'claude': _claude_home, 'dsh': _dsh_home}[prefix]
+        home, _ = home_fn(info.get('binary'))
+    home = Path(home).expanduser()
+    config = _top_level_toml(home / 'config.toml') if prefix == 'codex' else {}
+    if requested_model and requested_model != 'inherit':
+        return requested_model, requested_model, home, config
+    sub_model = os.environ.get('CLAUDE_CODE_SUBAGENT_MODEL', '').strip() if prefix == 'claude' else ''
+    if prefix == 'claude' and not sub_model:
+        settings = _read_json(home / 'settings.json') or {}
+        sub_model = str((settings.get('env') or {}).get('CLAUDE_CODE_SUBAGENT_MODEL') or '').strip()
+    if sub_model.lower() == 'inherit':
+        sub_model = ''
+    if prefix == 'claude':
+        model = sub_model or os.environ.get('ANTHROPIC_MODEL', '').strip() or info.get('model')
+    elif prefix == 'codex':
+        model = config.get('model') or info.get('model')
+    elif prefix == 'agy':
+        model = _agy_config(home).get('model') or info.get('model')
+    else:
+        model = info.get('model')
+    if not model or model == 'inherit':
+        model = None
+    display = ('inherit -> ' + model if sub_model else 'inherit (' + model + ')') if model else 'inherit (跟随当前前端所选模型)'
+    return model, display, home, config
+
+
+def _plan_stream_details(args, stream, profile, prefix, channel):
+    native = channel != 'cae_harness_headless'
+    readonly = stream['kind'] not in ('code', 'gate')
+    scopes = _scope_patterns(stream.get('write_scope', getattr(args, 'write_scope', [])))
+    verify_cmd = stream.get('verify_cmd', getattr(args, 'verify_cmd', '')) or ''
+    access = '只读' if readonly else '写入范围：' + (', '.join(scopes) or '未声明') + '；验收命令：' + (verify_cmd or '未声明')
+    clean_room = False if native else bool(stream.get('clean_room', getattr(args, 'clean_room', False)))
+    if clean_room and (not readonly or prefix == 'agy'):
+        raise HarnessError('净室仅支持 codex、claude、dsh 的只读无头任务')
+    capacity = profile.get('capacity', {})
+    return {**stream, 'channel': channel, 'client': prefix,
+            'subtask': stream.get('subtask') or getattr(args, 'workflow_goal', '')
+                       or getattr(args, 'user_prompt', '') or '检查目标',
+            'agent_type': stream.get('agent_type') or getattr(args, 'agent_type', '') or ('self' if native else 'readonly-collaborator'),
+            'model': profile.get('model'), 'model_display': stream.get('model_display') if native else str(profile.get('model') or '未声明'),
+            'context_window': capacity.get('selected_window_tokens'),
+            'headless': not native, 'clean_room': clean_room, 'access_mode': access,
+            'write_scope': scopes, 'verify_cmd': verify_cmd,
+            'inline_readonly': False if native or not readonly else bool(stream.get('inline_readonly', getattr(args, 'inline_readonly', True))),
+            'receipt_location': stream.get('receipt_location') or getattr(args, 'receipt_location', '')
+                                or f'执行回执 streams[{stream["stream_id"]}].invocation（执行后生成）'}
+
+
+def _resolve_plan_streams(args, streams, backends):
+    resolved, switched = [], False
+    ids = set()
+    for index, original in enumerate(streams, 1):
+        stream = dict(original)
+        sid = str(stream.get('stream_id') or f'S{index}')
+        if sid in ids:
+            raise HarnessError('工作流 stream_id 不可重复')
+        ids.add(sid)
+        target = Path(stream.get('target') or args.target).expanduser().resolve()
+        if not target.exists():
+            raise HarnessError(f'工作流目标不存在: {target}')
+        kind = stream.get('kind') or args.kind
+        if kind not in ('review', 'math', 'code', 'gate', 'polish', 'direction'):
+            raise HarnessError('工作流 kind 无效')
+        if _positive_int(stream.get('timeout', args.timeout)) is None:
+            raise HarnessError('工作流 timeout 必须为正整数')
+        channel = stream.get('channel') or getattr(args, 'channel', 'cae_harness_headless')
+        if channel not in _PLAN_CHANNEL_LABELS:
+            raise HarnessError('工作流 channel 无效')
+        user_text = getattr(args, 'user_prompt', '')
+        text = user_text or stream.get('subtask', '')
+        requested = stream.get('requested_engine', stream.get('engine')) or args.engine
+        requested_model = stream.get('requested_model', stream.get('model', getattr(args, 'model', ''))) or ''
+        count, tokens = _target_metrics(target, stream.get('subtask', ''))
+        if channel != 'cae_harness_headless':
+            caller = resolve_caller(stream.get('caller') or args.caller)
+            prefix = 'agy' if caller == 'antigravity' else caller
+            if prefix not in ('codex', 'agy', 'claude', 'dsh'):
+                raise HarnessError('原生通道必须指定或识别 caller 客户端')
+            info = backends.get(prefix, {})
+            requested_model = requested_model or 'inherit'
+            model, display, home, config = _native_plan_model(prefix, info, requested_model)
+            tier, reason = _resolve_effective_tier(stream.get('tier', args.tier), kind, user_text, text)
+            record = _exact_model_record(info.get('models', []), model) if model else {}
+            capacity = _execution_budget(prefix, info, record or {})
+            if prefix == 'codex' and (requested_model == 'inherit' or requested_model == config.get('model')):
+                capacity['selected_window_tokens'] = (_positive_int(config.get('model_context_window'))
+                                                     or capacity['selected_window_tokens'])
+            engine = prefix + ':' + (model or 'default')
+            profile = {'spec': engine, 'model': model, 'tier': tier, 'capacity': capacity,
+                       'profile_source': 'native_frontend_config'}
+            quota = inspect_backend_quota_and_availability(prefix, info, model,
+                                                            redact_usage=getattr(args, 'redact', False),
+                                                            ignore_cooldown=getattr(args, 'retry_quota', False))
+            log_dir = home / ('sessions' if prefix == 'codex' else 'projects' if prefix == 'claude' else 'antigravity' if prefix == 'agy' else 'sessions')
+            chosen = {**stream, 'stream_id': sid, 'target': str(target), 'kind': kind, 'caller': caller,
+                      'requested_engine': requested, 'engine': engine, 'tier': tier, 'requested_model': requested_model,
+                      'model_display': display, 'timeout': int(stream.get('timeout', args.timeout)),
+                      'execution_profile': profile, 'file_count': count, 'estimated_tokens': tokens, **quota}
+            chosen['receipt_location'] = (stream.get('receipt_location') or getattr(args, 'receipt_location', '')
+                                          or str(log_dir) + '（具体子代理日志由原生客户端分配）')
+            resolved.append(_plan_stream_details(args, chosen, profile, prefix, channel))
+            continue
+        excluded = set()
+        last_error = None
+        chosen = None
+        stream_switched = False
+        auto_route = (not _extract_prompt_backend_hint(user_text) and not _extract_prompt_model_hint(user_text)
+                      and (not requested or requested.startswith('role:')) and not requested_model)
+        while len(excluded) < len(backends):
+            available = {key: info for key, info in backends.items() if key not in excluded}
+            engine = ''
+            try:
+                engine = choose_engine(available, args.caller, requested, text, user_text,
+                                       ignore_cooldown=getattr(args, 'retry_quota', False))
+                model = requested_model
+                if model and model != 'inherit' and not _extract_prompt_model_hint(user_text) and not excluded:
+                    engine = _engine_parts(engine)[0] + ':' + model
+                tier, reason = _resolve_effective_tier(stream.get('tier', args.tier), kind, user_text, text, engine)
+                profile = resolve_execution_profile(available, engine, tier, text, kind, tokens)
+                _require_execution_profile(profile)
+                prefix, _ = _engine_parts(engine)
+                quota = inspect_backend_quota_and_availability(prefix, backends[prefix], profile['model'],
+                                                                redact_usage=getattr(args, 'redact', False),
+                                                                ignore_cooldown=getattr(args, 'retry_quota', False))
+                if not quota['currently_available']:
+                    last_error = quota['unavailable_reason']
+                    if not auto_route:
+                        raise HarnessError('指定通道不可用：' + str(last_error), last_error, stream_id=sid)
+                    excluded.add(prefix)
+                    stream_switched = True
+                    continue
+                chosen = {**stream, 'stream_id': sid, 'target': str(target), 'kind': kind,
+                          'requested_engine': requested, 'requested_model': requested_model, 'engine': engine, 'tier': tier,
+                          'timeout': int(stream.get('timeout') or args.timeout), 'execution_profile': profile,
+                          'file_count': count, 'estimated_tokens': tokens, **quota}
+                break
+            except HarnessError as exc:
+                last_error = exc.status
+                if not auto_route:
+                    raise
+                if engine:
+                    prefix, _ = _engine_parts(engine)
+                    if prefix not in excluded:
+                        excluded.add(prefix)
+                        stream_switched = True
+                        continue
+                break
+        if chosen is None:
+            raise HarnessError('二次检查门未找到可用通道', last_error or 'failed', stream_id=sid)
+        switched |= stream_switched and (not original.get('execution_profile')
+                                        or engine != original.get('engine')
+                                        or profile['model'] != original.get('model'))
+        resolved.append(_plan_stream_details(args, chosen, profile, prefix, channel))
+    return resolved, switched
+
+
+def _render_plan(ticket):
+    columns = ['流号', '子任务与范围', '通道', '客户端及子代理类型', '模型名字', '挡位', '上下文窗口',
+               '是否无头', '是否净室', '访问模式、写入范围与验收命令', '内联与超时', '当前是否可用',
+               '本机配置额度类型与当前状态', '回执或子代理日志位置']
+    rows = ['| ' + ' | '.join(columns) + ' |', '|' + '---|' * len(columns)]
+    yes_no = lambda value: '是' if value else '否'
+    for stream in ticket['streams']:
+        available = yes_no(stream['currently_available'])
+        if stream.get('unavailable_reason'):
+            available += '（' + stream['unavailable_reason'] + '）'
+        values = [stream['stream_id'], stream.get('subtask', '') + '；范围：' + stream['target'],
+                  _PLAN_CHANNEL_LABELS[stream['channel']] + ' (' + stream['channel'] + ')',
+                  stream['client'] + '；' + stream['agent_type'], stream['model_display'], stream['tier'],
+                  str(stream['context_window']) + ' tokens' if stream['context_window'] else '未声明',
+                  yes_no(stream['headless']), yes_no(stream['clean_room']), stream['access_mode'],
+                  '内联：' + yes_no(stream['inline_readonly']) + '；超时：' + str(stream['timeout']) + ' 秒',
+                  available, stream['quota_scheme'] + '；' + stream['quota_summary'], stream['receipt_location']]
+        rows.append('| ' + ' | '.join(str(value).replace('|', r'\|').replace('\n', ' ') for value in values) + ' |')
+    ledger = ticket.get('capability_ledger', {})
+    markdown = ('工作流背景：' + ticket['workflow_bg'] + '\n\n要做什么：' + ticket['workflow_goal']
+                + '\n\n预计后果：' + ticket['workflow_impact'] + '\n\n' + '\n'.join(rows)
+                + '\n\ncapability_ledger 离线性能记录更新时间：在线刷新 ' + str(ledger.get('last_online_refresh_at'))
+                + '；本机实测 ' + str(ledger.get('local_bench_verified_at'))
+                + '\n\n选项：① 批准当前计划（推荐）；② 微调引擎、挡位或超时后批准；③ 暂缓并交接。'
+                + '\n\n票据：' + ticket['ticket_id'] + '；状态：' + ticket['status'])
+    ticket['human_popup_markdown'] = markdown
+    ticket['handoff_prompt_block'] = ('【新对话提示词】\n请接力以下完整工作流，先读取并复核票据，不要推测缺失内容。\n'
+                                      + markdown + '\n恢复命令：plan --resume-ticket ' + ticket['ticket_id'])
+
+
+def _save_plan(ticket, plan_dir):
+    ticket['plan_hash'] = _plan_hash(ticket)
+    _render_plan(ticket)
+    _atomic_json(plan_dir / (ticket['ticket_id'] + '.json'), ticket)
+    session_id = ticket.get('session_id')
+    if session_id:
+        pointer = plan_dir / ('session_' + _safe_state_id(session_id) + '_pending.json')
+        if ticket['status'] == 'APPROVED':
+            pointer.unlink(missing_ok=True)
+        else:
+            _atomic_json(pointer, {'ticket_id': ticket['ticket_id'], 'status': ticket['status'],
+                                   'ticket_file': str(plan_dir / (ticket['ticket_id'] + '.json'))})
+
+
+def cmd_plan(args):
+    plan_dir = resolve_dispatch_plan_dir(args.plan_dir)
+    ticket_id = args.approve_ticket or args.resume_ticket or args.mark_handed_off
+    if ticket_id:
+        ticket = _load_ticket(ticket_id, plan_dir)
+        args.user_prompt = args.user_prompt or ticket.get('user_prompt', '')
+        ticket['user_prompt'] = args.user_prompt
+        if args.mark_handed_off:
+            ticket['status'] = 'HANDED_OFF'
+        else:
+            if args.approve_ticket and args.override_json:
+                overrides = json.loads(args.override_json)
+                if not isinstance(overrides, dict):
+                    raise HarnessError('--override-json 须按 stream_id 提供对象')
+                for stream in ticket['streams']:
+                    override = overrides.get(stream['stream_id'], {})
+                    if set(override) - {'engine', 'tier', 'timeout'}:
+                        raise HarnessError('只可微调 engine、tier、timeout')
+                    stream.update(override)
+                    if 'engine' in override:
+                        stream['requested_engine'] = override['engine']
+                        stream['requested_model'] = ''
+            backends = _args_backends(args, refresh_model_cache=False)
+            core_fields = ('engine', 'model', 'tier', 'timeout', 'channel', 'context_window',
+                           'currently_available', 'unavailable_reason', 'quota_exceeded')
+            expected = [{key: stream.get(key) for key in core_fields} for stream in ticket['streams']]
+            profile_fields = ('spec', 'model', 'reasoning_effort', 'cli_effort')
+            expected_profiles = [{key: stream.get('execution_profile', {}).get(key) for key in profile_fields}
+                                 for stream in ticket['streams']]
+            # 微调的预期值先按用户指定引擎和挡位计算；第二道门仍负责检查可用性和漂移。
+            if args.approve_ticket and args.override_json:
+                for stream, core, profile_core in zip(ticket['streams'], expected, expected_profiles):
+                    override = overrides.get(stream['stream_id'], {})
+                    if (set(override) & {'engine', 'tier'} and stream['channel'] == 'cae_harness_headless'):
+                        if 'engine' in override:
+                            engine = choose_engine(backends, args.caller, stream['requested_engine'], stream.get('subtask', ''), args.user_prompt)
+                        else:
+                            # 只改挡位时用原票据的具体模型计算强度，不重新解释 default 或角色别名。
+                            engine = _engine_parts(stream['engine'])[0] + ':' + stream['model']
+                        tier, _ = _resolve_effective_tier(stream['tier'], stream['kind'], args.user_prompt, stream.get('subtask', ''), engine)
+                        profile = resolve_execution_profile(backends, engine, tier, args.user_prompt or stream.get('subtask', ''), stream['kind'])
+                        if 'engine' in override:
+                            core.update(engine=engine, model=profile['model'], tier=tier,
+                                        context_window=profile['capacity']['selected_window_tokens'])
+                            profile_core.update({key: profile.get(key) for key in profile_fields})
+                        else:
+                            core['tier'] = tier
+                            profile_core.update({key: profile.get(key) for key in ('reasoning_effort', 'cli_effort')})
+            try:
+                streams, switched = _resolve_plan_streams(args, ticket['streams'], backends)
+            except HarnessError:
+                if not args.approve_ticket:
+                    raise
+                streams = [dict(stream) for stream in ticket['streams']]
+                for stream in streams:
+                    prefix, _ = _engine_parts(stream['engine'])
+                    stream.update(inspect_backend_quota_and_availability(prefix, backends[prefix], stream.get('model')))
+                if all(all(stream.get(key) == value for key, value in core.items())
+                       for stream, core in zip(streams, expected)):
+                    raise
+                switched = True
+            drift = switched or any(any(stream.get(key) != value for key, value in core.items())
+                                    for stream, core in zip(streams, expected)) or any(
+                any(stream.get('execution_profile', {}).get(key) != value for key, value in core.items())
+                for stream, core in zip(streams, expected_profiles))
+            if args.approve_ticket and drift:
+                ticket.update(streams=streams, status='PENDING', is_heavy=_is_heavy_streams(streams, switched))
+                _save_plan(ticket, plan_dir)
+                raise HarnessError('确认期间通道可用性或选路发生变化，已更新确认单，请重新向用户展示确认', 'ticket_changed')
+            if args.approve_ticket and any(not stream['currently_available'] for stream in streams):
+                raise HarnessError('二次检查门拒绝批准不可用的原生通道', 'quota_exhausted' if any(
+                    stream['quota_exceeded'] for stream in streams) else 'failed')
+            changed = ticket['streams'] != streams
+            ticket['streams'] = streams
+            ticket['is_heavy'] = _is_heavy_streams(streams, switched)
+            ticket['status'] = 'APPROVED' if args.approve_ticket else ('PENDING' if changed else ticket['status'])
+        _save_plan(ticket, plan_dir)
+    else:
+        streams = _read_stream_spec(args.spec_file) if args.spec_file else [{
+            'stream_id': 'S1', 'subtask': args.workflow_goal or args.user_prompt or '检查目标',
+            'target': args.target, 'kind': args.kind, 'engine': args.engine, 'tier': args.tier, 'timeout': args.timeout,
+            'channel': args.channel, 'agent_type': args.agent_type, 'model': args.model}]
+        streams, switched = _resolve_plan_streams(args, streams, _args_backends(args, refresh_model_cache=False))
+        ticket = {'ticket_id': uuid.uuid4().hex, 'status': 'PENDING', 'created_at': time.time(),
+                  'expires_at': time.time() + _confirmation_tunables().get('ticket_ttl_sec', 86400),
+                  'session_id': _session_id(args), 'workflow_bg': args.workflow_bg,
+                  'user_prompt': args.user_prompt,
+                  'workflow_goal': args.workflow_goal, 'workflow_impact': args.workflow_impact,
+                  'streams': streams, 'is_heavy': _is_heavy_streams(streams, switched),
+                  'capability_ledger': _fleet_profile().get('capability_ledger', {})}
+        ticket['plan_hash'] = _plan_hash(ticket)
+        _render_plan(ticket)
+        if ticket['is_heavy'] or args.save_ticket:
+            _save_plan(ticket, plan_dir)
+    if args.output:
+        _atomic_json(args.output, ticket if args.no_redact_output else _redact_public(ticket))
+    _print(_redact_public(ticket) if args.redact else ticket)
+    return 0
+
+
+def cmd_batch(args):
+    _begin_dispatch(args)
+    backends = _args_backends(args, refresh_model_cache=False)
+    if getattr(args, '_approved_ticket', None):
+        streams = args._approved_ticket['streams']
+        args.user_prompt = args.user_prompt or args._approved_ticket.get('user_prompt', '')
+    elif args.spec_file:
+        streams, _ = _resolve_plan_streams(args, _read_stream_spec(args.spec_file), backends)
+    else:
+        raise HarnessError('batch 需要 --spec-file 或已批准的 --ticket')
+    if any(stream.get('channel', 'cae_harness_headless') != 'cae_harness_headless' for stream in streams):
+        raise HarnessError('原生通道请在 caller 客户端内部执行，batch 仅执行 cae_harness_headless 通道')
+    limits = _headless_tunables().get('batch_max_workers_per_backend', {})
+    blocked, lock = set(), threading.Lock()
+    quota_batch = _QuotaBatch(args.retry_quota)
+    def run(stream):
+        started = time.monotonic()
+        engine = stream['engine']
+        prefix, _ = _engine_parts(engine)
+        invocation = {}
+        result = {'stream_id': stream['stream_id'], 'engine': engine, 'invocation': invocation, 'status': 'failed'}
+        try:
+            if stream['kind'] == 'gate' and not (stream.get('verify_cmd') or '').strip():
+                raise HarnessError('批处理 gate 任务必须声明非空 verify_cmd')
+            with lock:
+                if prefix in blocked:
+                    raise HarnessError('同后端前序任务已触发额度熔断，停止排队流', 'quota_exhausted')
+            quota = inspect_backend_quota_and_availability(prefix, backends[prefix], stream['execution_profile']['model'],
+                                                           ignore_cooldown=args.retry_quota)
+            if not quota['currently_available']:
+                if quota['quota_exceeded']:
+                    with lock:
+                        blocked.add(prefix)
+                raise HarnessError('批处理二次检查门拒绝执行', quota['unavailable_reason'])
+            text = args.user_prompt or stream.get('subtask', '')
+            tier, _ = _resolve_effective_tier(stream['tier'], stream['kind'], args.user_prompt, text, engine)
+            profile = resolve_execution_profile(backends, engine, tier, text, stream['kind'])
+            _require_execution_profile(profile)
+            if getattr(args, '_approved_ticket', None) and profile['spec'] != stream['execution_profile']['spec']:
+                raise HarnessError('实际模型与获批计划不一致，请重新确认票据', 'ticket_invalid')
+            result['model'] = profile['model']
+            if args.dry_run:
+                result.update(status='ok', dry_run=True)
+                return result
+            target = Path(stream['target'])
+            root = target if target.is_dir() else target.parent
+            readonly = stream['kind'] not in ('code', 'gate')
+            scopes = _scope_patterns(stream.get('write_scope', []))
+            if not readonly and not scopes:
+                raise HarnessError('批处理编码任务必须声明 write_scope')
+            before = snapshot_files(root)
+            try:
+                result['result'] = invoke_engine(profile['spec'], root, stream.get('subtask', ''), backends,
+                                                 TASK_JSON_SCHEMA, readonly, stream['timeout'],
+                                                 agent=stream.get('agent_type') or 'readonly-collaborator',
+                                                 stage_files=[target.name] if target.is_file() else None,
+                                                 profile=profile, receipt=invocation, batch=quota_batch,
+                                                 clean_room=stream.get('clean_room', False),
+                                                 inline_readonly=stream.get('inline_readonly', args.inline_readonly))
+                result['status'] = 'ok'
+            finally:
+                scope = _safe_changes_report(before, root, scopes, readonly)
+                staged_scope = invocation.get('staged_scope')
+                if isinstance(staged_scope, dict):
+                    # 暂存副本与原目录都要检查；任一快照违规或核对失败均不得通过。
+                    scope = {**scope, **staged_scope,
+                             'scope_verified': bool(scope.get('scope_verified') and staged_scope.get('scope_verified')),
+                             'scope_violations': sorted(set(scope.get('scope_violations', []))
+                                                        | set(staged_scope.get('scope_violations', [])))}
+                result.update(scope)
+                if scope.get('scope_violations'):
+                    result['status'] = 'scope_violation'
+                elif not scope.get('scope_verified'):
+                    result['status'] = 'failed'
+            if result['status'] == 'ok' and not readonly and stream.get('verify_cmd'):
+                verification = run_process(stream['verify_cmd'], root, timeout_sec=stream['timeout'], shell=True)
+                result['verification_executed'] = True
+                if verification.returncode:
+                    result['status'] = 'verification_failed'
+        except Exception as exc:
+            status = getattr(exc, 'status', 'failed')
+            if result['status'] != 'scope_violation':
+                result['status'] = status
+            result.update(error=str(exc), **getattr(exc, 'details', {}))
+            if status == 'quota_exhausted':
+                with lock:
+                    blocked.add(prefix)
+                if not args.dry_run:
+                    _record_quota_exhausted(prefix, backends[prefix], str(exc), batch=quota_batch)
+        finally:
+            result['succeeded'] = result['status'] == 'ok'
+            result['elapsed_sec'] = round(time.monotonic() - started, 6)
+            result['token_usage'] = invocation.get('token_usage') or extract_cli_token_usage(prefix, '')
+        return result
+    groups = {}
+    for index, stream in enumerate(streams):
+        groups.setdefault(_engine_parts(stream['engine'])[0], []).append((index, stream))
+    def run_backend(item):
+        prefix, group = item
+        with concurrent.futures.ThreadPoolExecutor(max_workers=_positive_int(limits.get(prefix)) or 2) as pool:
+            return list(zip((index for index, _ in group), pool.map(run, (stream for _, stream in group))))
+    results = [None] * len(streams)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(groups))) as pool:
+        for group in pool.map(run_backend, groups.items()):
+            for index, result in group:
+                results[index] = result
+    return _dispatch_print(args, {'status': 'ok' if all(s['succeeded'] for s in results) else 'partial', 'streams': results})
 
 
 def _positive_arg(raw):
@@ -5278,6 +6496,32 @@ def build_arg_parser():
     grounding.add_argument('--base-ref', default='', help='可选 Git 基线引用（如 HEAD），额外拦截改写期间新增的无依据领域短语')
     grounding.add_argument('--allow-from-file', action='append', default=[], help='额外纳入允许锚点语料的说明或需求文件路径')
     grounding.add_argument('--strict', action='store_true', help='检出任何无依据标识符、缩写、定量数字或举例词干时返回非零退出码')
+    plan = sub.add_parser('plan', help='纯离线生成工作流确认票据与交接提示')
+    plan.add_argument('--target', default='.')
+    plan.add_argument('--kind', default='review', choices=['review', 'math', 'code', 'gate', 'direction', 'polish'])
+    plan.add_argument('--engine', default='')
+    plan.add_argument('--channel', choices=list(_PLAN_CHANNEL_LABELS), default='cae_harness_headless')
+    plan.add_argument('--agent-type', default='')
+    plan.add_argument('--model', default='')
+    plan.add_argument('--clean-room', action='store_true')
+    plan.add_argument('--write-scope', action='append', default=[])
+    plan.add_argument('--verify-cmd', default='')
+    plan.add_argument('--receipt-location', default='')
+    plan.add_argument('--spec-file', default='')
+    plan.add_argument('--workflow-bg', default='')
+    plan.add_argument('--workflow-goal', default='')
+    plan.add_argument('--workflow-impact', default='')
+    plan.add_argument('--save-ticket', action='store_true')
+    actions = plan.add_mutually_exclusive_group()
+    actions.add_argument('--approve-ticket', default='')
+    actions.add_argument('--resume-ticket', default='')
+    actions.add_argument('--mark-handed-off', default='')
+    plan.add_argument('--override-json', default='')
+    batch = sub.add_parser('batch', help='按后端限流执行独立工作流')
+    batch.add_argument('--spec-file', default='')
+    batch.add_argument('--target', default='.')
+    batch.add_argument('--kind', default='review')
+    batch.add_argument('--engine', default='')
     audit = sub.add_parser('audit', help='单路或双路文件审计')
     audit.add_argument('--target', required=True)
     audit.add_argument('--focus', default='')
@@ -5304,14 +6548,14 @@ def build_arg_parser():
         group.add_argument('--task-file')
         command.add_argument('--write-scope', action='append', default=[])
         command.add_argument('--max-rounds', type=_positive_arg, default=default_rounds)
-    for command in (probe, assess, grounding, audit, gate, task):
+    for command in (probe, assess, grounding, audit, gate, task, plan, batch):
         command.add_argument('--caller', choices=['auto', 'codex', 'antigravity', 'claude', 'cc', 'dsh'], default='auto')
         if command is not grounding:
             command.add_argument('--codex-input-budget', type=_positive_arg)
             command.add_argument('--agy-input-budget', type=_positive_arg)
             command.add_argument('--claude-input-budget', type=_positive_arg)
             command.add_argument('--dsh-input-budget', type=_positive_arg)
-    for command in (audit, gate, task):
+    for command in (audit, gate, task, plan, batch):
         command.add_argument('--tier', choices=list(TIER_CHOICES), default='auto',
                              help='挡位策略：auto 默认按角色槽位或单模型非委派最高挡选路（短润色用 medium、长润色用 high）；仅当用户要求降挡／省额度时切换分级自适应')
         command.add_argument('--retry-quota', action='store_true',
@@ -5320,6 +6564,15 @@ def build_arg_parser():
                               help='目标触发额度熔断且未修改工作区时，优先回退发起方，再选择其他已就绪且未冷却的端')
         command.add_argument('--timeout', type=_positive_arg, default=default_timeout)
         command.add_argument('--dry-run', action='store_true')
+    for command in (audit, gate, task, plan, batch):
+        command.add_argument('--user-prompt', default='')
+        command.add_argument('--output', default='')
+        command.add_argument('--no-redact-output', action='store_true')
+        command.add_argument('--redact', action='store_true')
+        command.add_argument('--session-id', default='')
+        command.add_argument('--plan-dir', default='')
+        command.add_argument('--ticket', default='')
+        command.add_argument('--inline-readonly', action=argparse.BooleanOptionalAction, default=True)
     return parser
 
 
@@ -5345,6 +6598,8 @@ def main():
             'audit': cmd_audit,
             'gate': cmd_gate,
             'task': cmd_task,
+            'plan': cmd_plan,
+            'batch': cmd_batch,
         }[args.subcommand]
         code = handler(args)
     except HarnessError as exc:

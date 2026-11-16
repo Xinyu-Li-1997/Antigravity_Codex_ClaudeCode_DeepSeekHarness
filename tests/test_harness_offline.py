@@ -407,7 +407,8 @@ class HarnessTests(unittest.TestCase):
                     stream = json.dumps({'type': 'init'}) + '\n' + json.dumps({'type': 'final',
                         'reason': {'kind': 'completed'}, 'text': json.dumps(TASK)})
                     return subprocess.CompletedProcess(command, 0, stream, '')
-                with self.subTest(provider=provider, readonly=readonly), patch.object(harness, 'run_process', side_effect=run):
+                with self.subTest(provider=provider, readonly=readonly), patch.object(harness, 'run_process', side_effect=run), \
+                     patch.object(harness, '_dsh_supports_cli_permission_flags', return_value=True):
                     result = harness.invoke_engine('dsh:default', self.root, '执行输入', engines, harness.TASK_JSON_SCHEMA,
                                                    readonly=readonly, effort='medium')
                 self.assertEqual(result, TASK)
@@ -2618,7 +2619,7 @@ else:
     def test_negated_backend_cues_dsh_non_lightweight_and_router_alias_preflight(self):
         engines = self.four_backends()
         engines['claude'].update(llm_source='local_router', config_home=str(self.root / 'claude-cfg'),
-                                 base_url='http://127.0.0.1:8240', model='k3.1-pro[1m]', models=[])
+                                 base_url='http://127.0.0.1:8240', model='claude-custom-pro', models=[])
         engines['dsh'].update(llm_source='deepseek-account', config_home=str(self.root / 'dsh-cfg'),
                               model='deepseek-v4-pro',
                               models=[{'slug': 'deepseek-v4-pro', 'supported_efforts': ['low', 'high', 'max']},
@@ -3318,6 +3319,1034 @@ else:
             detected = inst_mod.detect_installed_apps()
             self.assertFalse(detected['codex']['interop_available'])
             self.assertIsNone(detected['codex']['interop_evidence'][0]['binary'])
+
+    def test_wp1_subscription_gates_and_explicit_disabled_alias(self):
+        engines = self.four_backends()
+        profile = json.loads(json.dumps(harness._fleet_profile()))
+        profile['roles']['review']['candidates'] = ['claude:@review', 'codex:review']
+        engines['claude'].update(model='k3.1-pro[1m]', models=[{'slug': 'k3.1-pro[1m]'}])
+        profile['subscription_matrix']['models']['k3.1-pro[1m]']['enabled'] = False
+        with patch.object(harness, '_fleet_profile', return_value=profile):
+            self.assertFalse(harness._is_subscription_enabled('claude', 'k3.1-pro[1M]'))
+            self.assertEqual(harness.choose_engine(engines, 'agy', 'role:review'), 'codex:review')
+            for spec in ('claude:k3.1-pro', 'claude:k3.1-pro[1m]'):
+                with self.assertRaises(harness.HarnessError) as caught:
+                    harness.choose_engine(engines, 'agy', spec)
+                self.assertEqual(caught.exception.status, 'subscription_disabled')
+            profile['subscription_matrix']['agents']['codex']['enabled'] = False
+            self.assertFalse(harness._peer_auto_ready(engines, 'codex'))
+            self.assertTrue(harness.choose_engine(engines, 'agy').startswith('dsh:'))
+            with self.assertRaises(harness.HarnessError) as caught:
+                harness.resolve_execution_profile(engines, 'codex:default')
+            self.assertEqual(caught.exception.status, 'subscription_disabled')
+
+    def test_wp1_codex_local_rate_limits_reset_redaction_and_plan_switch(self):
+        engines = self.four_backends()
+        sessions = Path(engines['codex']['config_home']) / 'sessions' / 'day'
+        sessions.mkdir(parents=True)
+        rollout = sessions / 'rollout-test.jsonl'
+        (self.root / 'a.py').write_text('x = 1\n', encoding='utf-8')
+        for percent, reset, expected in ((46.0, time.time() + 3600, False),
+                                         (100.0, time.time() + 3600, True),
+                                         (100.0, time.time() - 1, False)):
+            rollout.write_text(json.dumps({'payload': {'rate_limits': {'plan_type': 'test',
+                'primary': {'used_percent': percent, 'window_minutes': 300, 'resets_at': reset}}}}), encoding='utf-8')
+            info = harness.inspect_backend_quota_and_availability('codex', engines['codex'])
+            self.assertEqual(info['quota_exceeded'], expected)
+            self.assertEqual(info['currently_available'], not expected)
+            self.assertIn('5h_window:', info['quota_summary'])
+            redacted = harness.inspect_backend_quota_and_availability('codex', engines['codex'], redact_usage=True)
+            self.assertNotIn('%', redacted['quota_summary'])
+            if expected:
+                args = self.args('plan', '--caller', 'antigravity', '--target', str(self.root / 'a.py'),
+                                 '--engine', 'role:review', '--timeout', '60', '--plan-dir', str(self.root / 'plans'))
+                profile = json.loads(json.dumps(harness._fleet_profile()))
+                profile['roles']['review']['candidates'] = ['codex:review', 'dsh:review']
+                with patch.object(harness, '_args_backends', return_value=engines), \
+                     patch.object(harness, '_fleet_profile', return_value=profile):
+                    code, plan = self.capture(harness.cmd_plan, args)
+                self.assertEqual(code, 0)
+                self.assertTrue(plan['is_heavy'])
+                self.assertFalse(plan['streams'][0]['engine'].startswith('codex:'))
+                self.assertTrue(plan['streams'][0]['currently_available'])
+                for engine, prompt in (('codex:review', ''), ('claude:default', '请用 Codex 审查')):
+                    args.engine, args.user_prompt = engine, prompt
+                    with self.assertRaises(harness.HarnessError) as caught:
+                        harness._resolve_plan_streams(args, [{}], engines)
+                    self.assertEqual(caught.exception.status, 'quota_exhausted')
+
+    def test_wp1_ccswitch_readonly_card_limits_and_dead_router(self):
+        engines = self.four_backends()
+        info = engines['claude']
+        db = self.root / 'cc-switch.db'
+        with sqlite3.connect(db) as con:
+            con.execute('CREATE TABLE providers (id TEXT, app_type TEXT, name TEXT, is_current INTEGER, meta TEXT)')
+            con.execute('CREATE TABLE usage_daily_rollups (provider_id TEXT, date TEXT, total_cost_usd REAL)')
+            con.executemany('INSERT INTO providers VALUES (?, ?, ?, ?, ?)', [
+                ('p', 'claude', 'Kimi', 1, json.dumps({'usage_script': {'templateType': 'token_plan'}, 'limit_daily_usd': 2})),
+                ('f', 'claude', 'DeepSeek', 0, json.dumps({'usage_script': {'templateType': 'balance'}}))])
+            con.execute('INSERT INTO usage_daily_rollups VALUES (?, ?, ?)', ('p', datetime.date.today().isoformat(), 2))
+        con.close()
+        before = db.read_bytes()
+        with patch.dict(os.environ, {'CAE_CCSWITCH_DB': str(db)}):
+            quota = harness.inspect_backend_quota_and_availability('claude', info)
+            self.assertEqual(quota['quota_scheme'], 'token_plan')
+            self.assertTrue(quota['quota_exceeded'])
+            cfg = Path(info['config_home']) / 'router'
+            cfg.mkdir(parents=True)
+            (cfg / 'router.json').write_text(json.dumps({'default_key_from_card': 'Kimi',
+                'routes': [{'prefix': 'deepseek', 'key_from_card': 'DeepSeek'}]}), encoding='utf-8')
+            info.update(llm_source='local_router', uses_local_router=True, base_url='http://127.0.0.1:1')
+            with patch.object(harness, '_loopback_router_alive', return_value=False):
+                quota = harness.inspect_backend_quota_and_availability('claude', info, 'deepseek-flash[1M]')
+            self.assertEqual(quota['quota_scheme'], 'balance')
+            self.assertFalse(quota['currently_available'])
+            self.assertEqual(quota['unavailable_reason'], 'local_router_unavailable')
+        self.assertEqual(db.read_bytes(), before)
+
+    def test_wp1_lightweight_specialty_conflict_and_cooled_role_fallback(self):
+        engines = self.four_backends()
+        engines['claude'].update(model='deepseek-flash[1M]', models=[{'slug': 'deepseek-flash[1M]'}])
+        profile = json.loads(json.dumps(harness._fleet_profile()))
+        profile['roles']['review']['candidates'] = ['claude:@review', 'codex:review', 'dsh:review']
+        with patch.object(harness, '_fleet_profile', return_value=profile):
+            resolved = harness.resolve_execution_profile(engines, 'claude:@review')
+            self.assertIn('轻量模型', resolved['execution_blocked_reason'])
+            self.assertIsNone(harness.resolve_execution_profile(engines, 'claude:deepseek-flash[1M]').get('execution_blocked_reason'))
+            self.assertEqual(harness.choose_engine(engines, 'agy', 'role:review'), 'codex:review')
+            harness._record_quota_exhausted('codex', engines['codex'], 'quota exceeded')
+            self.assertEqual(harness.choose_engine(engines, 'agy', 'role:review'), 'dsh:review')
+            harness._record_quota_exhausted('dsh', engines['dsh'], 'quota exceeded')
+            with self.assertRaises(harness.HarnessError) as caught:
+                harness.choose_engine(engines, 'agy', 'role:review')
+            self.assertEqual(caught.exception.status, 'quota_exhausted')
+
+    def test_wp1_user_prompt_p0_quoted_identifiers_tiers_and_fast_symmetry(self):
+        engines = self.four_backends()
+        engines['codex']['models'].append({'slug': 'gpt-6.1-sol', 'provider': 'openai',
+            'max_context_window': 1000000, 'supported_efforts': ['low', 'high', 'max']})
+        self.assertEqual(harness._extract_prompt_model_hint('请用 `gpt-6.1-sol` 审查'), 'gpt-6.1-sol')
+        self.assertEqual(harness.choose_engine(engines, 'agy', 'role:review', user_prompt='请用 `gpt-6.1-sol` 审查'), 'codex:gpt-6.1-sol')
+        with self.assertRaises(harness.HarnessError) as disabled_prompt_k3:
+            harness.choose_engine(engines, 'agy', 'role:review', user_prompt='让 Kimi 高挡位看看')
+        self.assertEqual(disabled_prompt_k3.exception.status, 'subscription_disabled')
+        enabled_profile_head = json.loads(json.dumps(harness._fleet_profile()))
+        enabled_profile_head['subscription_matrix']['models']['k3.1-pro[1m]']['enabled'] = True
+        with patch.object(harness, '_fleet_profile', return_value=enabled_profile_head):
+            kimi = harness.choose_engine(engines, 'agy', 'role:review', user_prompt='让 Kimi 高挡位看看')
+        self.assertTrue(kimi.startswith('claude:'))
+        self.assertEqual(harness.choose_engine(engines, 'agy', 'role:review', user_prompt='用 DSH 审'), 'dsh:@review')
+        for text in ('`use cc`', '> 请用 `gpt-6.1-sol`', '```\n请用 `gpt-6.1-sol`\n```'):
+            self.assertEqual(harness._extract_prompt_backend_hint(text), '')
+            self.assertEqual(harness._extract_prompt_model_hint(text), '')
+        for level in ('low', 'medium', 'high', 'xhigh', 'max'):
+            self.assertEqual(harness.select_task_tier(text=f'挂 {level} 挡位看看')[0], level)
+        for prefix in ('agy', 'codex', 'claude', 'dsh'):
+            suffixes = ('fast', '@fast') if prefix in ('claude', 'dsh') else ('@fast',)
+            for suffix in suffixes:
+                self.assertTrue(harness._is_fast_engine_spec(prefix + ':' + suffix))
+                self.assertEqual(harness._per_backend_role_target(prefix, suffix), 'fast')
+        for prefix in ('agy', 'codex'):
+            self.assertFalse(harness._is_fast_engine_spec(prefix + ':fast'))
+            self.assertEqual(harness._per_backend_role_target(prefix, 'fast'), '')
+        self.assertEqual(harness.choose_engine(engines, 'agy', 'claude:1m'), 'claude:default')
+        self.assertFalse(harness._is_subscription_enabled('claude', 'k3.1-pro[1m]'))
+        with self.assertRaises(harness.HarnessError) as disabled_k3:
+            harness.resolve_execution_profile(engines, 'claude:k3.1-pro[1m]')
+        self.assertEqual(disabled_k3.exception.status, 'subscription_disabled')
+        enabled_profile = json.loads(json.dumps(harness._fleet_profile()))
+        enabled_profile['subscription_matrix']['models']['k3.1-pro[1m]']['enabled'] = True
+        (self.root / 'a.py').write_text('x = 1', encoding='utf-8')
+        args = self.args('task', '--caller', 'antigravity', '--engine', 'role:review',
+                         '--kind', 'review', '--target', str(self.root / 'a.py'), '--task', '检查代码',
+                         '--user-prompt', '让 Kimi 高挡位看看', '--dry-run')
+        with patch.object(harness, '_fleet_profile', return_value=enabled_profile), \
+                patch.object(harness, '_args_backends', return_value=engines):
+            code, result = self.capture(harness.cmd_task, args)
+        self.assertEqual(code, 0)
+        self.assertTrue(result['engine'].startswith('claude:'))
+        self.assertEqual(result['reasoning_effort'], 'high')
+
+    def test_wp1_inline_all_backends_budget_binary_secrets_and_staging_filter(self):
+        engines = self.four_backends()
+        target = self.root / 'target'
+        target.mkdir()
+        (target / 'a.py').write_text('one\ntwo', encoding='utf-8')
+        (target / '.env').write_text('SECRET=value', encoding='utf-8')
+        (target / 'auth.json').write_text('{"token":"private"}', encoding='utf-8')
+        (target / 'blob.txt').write_bytes(b'\x00binary')
+        for prefix in ('codex', 'agy', 'claude', 'dsh'):
+            def runner(command, cwd, input_text, timeout_sec, **kwargs):
+                self.assertIn('=== FILE: a.py ===', input_text)
+                self.assertIn('1: one', input_text)
+                self.assertNotIn('SECRET=value', input_text)
+                self.assertNotIn('private', input_text)
+                self.assertIn('请勿再重复调用', input_text)
+                if prefix == 'codex':
+                    Path(command[command.index('-o') + 1]).write_text(json.dumps(TASK), encoding='utf-8')
+                return subprocess.CompletedProcess(command, 0, json.dumps(TASK), '')
+            with patch.object(harness, 'run_process', side_effect=runner):
+                self.assertEqual(harness.invoke_engine(prefix + ':default', target, '读文件', engines,
+                                 harness.TASK_JSON_SCHEMA, inline_readonly=True), TASK)
+        (target / 'large.py').write_text('z' * 1024, encoding='utf-8')
+        with patch.object(harness, '_headless_tunables', return_value={'inline_readonly_max_kib': 1}):
+            inline = harness._inline_readonly_prompt('', target, ['large.py', 'a.py', 'blob.txt', '.env'])
+        self.assertIn('=== FILE: a.py ===', inline)
+        self.assertNotIn('=== FILE: large.py ===', inline)
+        self.assertIn('未内联清单', inline)
+        (target / 'AGENTS.md').write_text('rules', encoding='utf-8')
+        staged = harness._stage_wsl_readonly_workspace(target, self.root / 'stage', ['AGENTS.md', 'a.py'], exclude_agent_instructions=True)
+        self.assertFalse((staged / 'AGENTS.md').exists())
+        self.assertTrue((staged / 'a.py').is_file())
+
+    def test_wp1_snapshot_derived_dirs_agentignore_and_explicit_full_verification(self):
+        for directory in ('.venv', 'runs', 'build', 'raw-data', 'src'):
+            (self.root / directory).mkdir()
+            (self.root / directory / 'a.py').write_text('x = 1', encoding='utf-8')
+        (self.root / 'src' / 'skip.txt').write_text('ignored', encoding='utf-8')
+        (self.root / '.agentignore').write_text('# data\n\nraw-data/\nsrc/*.txt\n', encoding='utf-8')
+        snap = harness.snapshot_files(self.root)
+        self.assertIn('src/a.py', snap)
+        for name in ('.venv/a.py', 'runs/a.py', 'build/a.py', 'raw-data/a.py', 'src/skip.txt'):
+            self.assertNotIn(name, snap)
+        self.assertIn('build/a.py', harness.snapshot_files(self.root, ignore_dirs=['.git']))
+
+    def test_wp1_dsh_dual_cli_versions_dotenv_and_oauth_clean_room(self):
+        engines = self.four_backends()
+        home = Path(engines['dsh']['config_home'])
+        home.mkdir()
+        key = 'fixture_deepseek_key_0123456789'
+        (home / '.env').write_text('DEEPSEEK_API_KEY=' + key, encoding='utf-8')
+        with patch.object(harness, '_dsh_home', return_value=(home, False)), patch.dict(os.environ, {}, clear=True):
+            info = harness._dsh_info('dsh')
+        self.assertEqual(info['credential_source'], 'dotenv_api_key')
+        self.assertNotIn(key, json.dumps(info))
+        binary = self.root / 'dsh-fixture.exe'
+        binary.write_bytes(b'not executable')
+        for help_text, supported in (('Usage: dsh --profile --help', False), ('Usage: dsh --permission-mode --help', True)):
+            harness._DSH_PERMISSION_CACHE.clear()
+            with patch.object(harness, 'run_process', return_value=subprocess.CompletedProcess([], 0, help_text, '')) as run:
+                self.assertEqual(harness._dsh_supports_cli_permission_flags(str(binary)), supported)
+                self.assertEqual(harness._dsh_supports_cli_permission_flags(str(binary)), supported)
+            self.assertEqual(run.call_count, 1)
+        target = self.root / 'target'
+        target.mkdir()
+        (target / 'a.py').write_text('x=1', encoding='utf-8')
+        for supported in (False, True):
+            def runner(command, cwd, input_text, timeout_sec, env, **kwargs):
+                self.assertEqual('--permission-mode' in command, supported)
+                self.assertEqual(env['DEEPSEEK_API_KEY'], key)
+                if not supported:
+                    self.assertEqual(env['DSH_PERMISSION_MODE'], 'read-only')
+                patch_text = Path(command[command.index('--patch') + 1]).read_text(encoding='utf-8')
+                for plugin in ('sandbox-policy', 'approval', 'permission', 'agent-default-model', 'credentials', 'authorization', 'deepseek-account'):
+                    self.assertIn('- id: ' + plugin, patch_text)
+                return subprocess.CompletedProcess(command, 0, json.dumps(TASK), '')
+            with patch.object(harness, '_dsh_supports_cli_permission_flags', return_value=supported), \
+                 patch.object(harness, 'run_process', side_effect=runner), patch.dict(os.environ, {}, clear=True):
+                self.assertEqual(harness.invoke_engine('dsh:default', target, '读', engines,
+                    harness.TASK_JSON_SCHEMA, clean_room=True), TASK)
+        (home / '.credentials.yaml').write_text('deepseek-account-platform/main:\n  token: account_fixture_valid_0123456789\n', encoding='utf-8')
+        (home / '.env').unlink()
+        with patch.object(harness, '_dsh_home', return_value=(home, False)), \
+             patch.dict(os.environ, {'DEEPSEEK_API_KEY': 'stale_key_0123456789'}, clear=True):
+            engines['dsh'] = harness._dsh_info('dsh')
+        self.assertEqual(engines['dsh']['credential_source'], 'account')
+        def account_runner(command, cwd, input_text, timeout_sec, env, **kwargs):
+            self.assertNotIn('DEEPSEEK_API_KEY', env)
+            self.assertTrue((Path(env['DSH_HOME']) / '.credentials.yaml').is_file())
+            text = Path(command[command.index('--patch') + 1]).read_text(encoding='utf-8')
+            self.assertIn('provider: deepseek-account', text)
+            self.assertNotIn('disabled: true', text)
+            return subprocess.CompletedProcess(command, 0, json.dumps(TASK), '')
+        with patch.object(harness, 'run_process', side_effect=account_runner), \
+             patch.dict(os.environ, {'DEEPSEEK_API_KEY': 'stale_key_0123456789'}, clear=True):
+            harness.invoke_engine('dsh:default', target, '读', engines, harness.TASK_JSON_SCHEMA, clean_room=True)
+
+    @patch.dict(os.environ, {'CAE_HARNESS_DEPTH': '', 'CAE_DISABLE_HEAVY_COMPLETIONS': ''})
+    def test_wp1_plan_lifecycle_batch_receipt_and_pending_accounts(self):
+        engines = self.four_backends()
+        target = self.root / 'target'
+        target.mkdir()
+        (target / 'a.py').write_text('x=1', encoding='utf-8')
+        plans = self.root / 'state' / 'dispatch_plans'
+        common = ['--caller', 'antigravity', '--plan-dir', str(plans), '--target', str(target), '--timeout', '60']
+        with patch.object(harness, '_args_backends', return_value=engines):
+            _, light = self.capture(harness.cmd_plan, self.args('plan', *common, '--engine', 'codex:review'))
+            self.assertFalse(light['is_heavy'])
+            self.assertFalse(plans.exists())
+            spec = self.root / 'spec.json'
+            spec.write_text(json.dumps([{'stream_id': sid, 'subtask': '审查', 'target': str(target),
+                                         'engine': engine, 'timeout': 60} for sid, engine in
+                                        [('S1', 'codex:review'), ('S2', 'dsh:review')]]), encoding='utf-8')
+            _, ticket = self.capture(harness.cmd_plan, self.args('plan', *common, '--spec-file', str(spec),
+                '--session-id', 'session1', '--workflow-bg', '接口变更', '--workflow-goal', '先审查再核对', '--workflow-impact', '只读并返回证据'))
+            self.assertTrue(ticket['is_heavy'])
+            tid = ticket['ticket_id']
+            self.assertTrue((plans / 'session_session1_pending.json').is_file())
+            self.capture(harness.cmd_plan, self.args('plan', *common, '--mark-handed-off', tid))
+            _, resumed = self.capture(harness.cmd_plan, self.args('plan', *common, '--resume-ticket', tid))
+            self.assertEqual(resumed['status'], 'HANDED_OFF')
+            for key in ('workflow_bg', 'workflow_goal', 'workflow_impact'):
+                self.assertEqual(resumed[key], ticket[key])
+                self.assertIn(ticket[key], resumed['handoff_prompt_block'])
+            _, approved = self.capture(harness.cmd_plan, self.args('plan', *common, '--approve-ticket', tid,
+                '--override-json', json.dumps({'S1': {'tier': 'high'}})))
+            self.assertEqual(approved['status'], 'APPROVED')
+            self.assertNotEqual(approved['plan_hash'], ticket['plan_hash'])
+            self.assertFalse((plans / 'session_session1_pending.json').exists())
+            output = self.root / 'receipt.json'
+            def invoke(*args, receipt, **kwargs):
+                receipt['token_usage'] = harness.extract_cli_token_usage('codex', '{"usage":{"input_tokens":10,"output_tokens":2}}')
+                return dict(TASK)
+            with patch.object(harness, 'invoke_engine', side_effect=invoke):
+                code, result = self.capture(harness.cmd_batch, self.args('batch', '--caller', 'antigravity',
+                    '--plan-dir', str(plans), '--ticket', tid, '--output', str(output), '--session-id', 'session1'))
+            self.assertEqual(code, 0)
+            self.assertTrue(all(s['succeeded'] for s in result['streams']))
+            self.assertEqual(result['token_usage_summary']['total_tokens'], 24)
+            self.assertTrue(output.is_file())
+            public = json.loads(output.read_text(encoding='utf-8'))
+            self.assertIn('sanitized_invocation', public)
+            self.assertNotIn(str(self.root), output.read_text(encoding='utf-8'))
+            pending = json.loads((plans.parent / 'heavy_completions' / 'session1.json').read_text(encoding='utf-8'))
+            self.assertFalse(pending[0]['reported_to_user'])
+            self.assertTrue(pending[0]['all_succeeded'])
+            self.assertEqual(pending[0]['receipt_file'], str(output))
+
+    def test_wp1b_plan_mixed_channels_full_matrix_and_handoff(self):
+        engines = self.four_backends()
+        home = Path(engines['codex']['config_home'])
+        home.mkdir()
+        (home / 'config.toml').write_text('model = "fixture-code"\nmodel_context_window = 65536\n', encoding='utf-8')
+        target = self.root / 'a.py'
+        target.write_text('x=1\n', encoding='utf-8')
+        spec = self.root / 'matrix.json'
+        spec.write_text(json.dumps([
+            {'stream_id': 'N1', 'subtask': '核对原文', 'channel': 'native_subagent',
+             'agent_type': 'readonly-reader', 'model': 'inherit', 'target': str(target),
+             'clean_room': True, 'inline_readonly': True, 'receipt_location': 'native-log.jsonl'},
+            {'stream_id': 'H1', 'subtask': '独立审查', 'channel': 'cae_harness_headless',
+             'engine': 'dsh:review', 'agent_type': 'readonly-auditor', 'target': str(target),
+             'clean_room': True, 'receipt_location': 'headless-receipt.json'}]), encoding='utf-8')
+        args = self.args('plan', '--caller', 'codex', '--spec-file', str(spec), '--target', str(target),
+                         '--plan-dir', str(self.root / 'plans'), '--timeout', '60',
+                         '--workflow-bg', '接口调整', '--workflow-goal', '核对实现', '--workflow-impact', '返回只读证据')
+        with patch.object(harness, '_args_backends', return_value=engines), \
+             patch.object(harness, 'inspect_backend_quota_and_availability', wraps=harness.inspect_backend_quota_and_availability) as inspect:
+            _, ticket = self.capture(harness.cmd_plan, args)
+        self.assertEqual([call.args[0] for call in inspect.call_args_list], ['codex', 'dsh'])
+        native, headless = ticket['streams']
+        required = ('stream_id', 'subtask', 'target', 'channel', 'client', 'agent_type', 'model_display',
+                    'tier', 'context_window', 'headless', 'clean_room', 'access_mode', 'inline_readonly',
+                    'timeout', 'currently_available', 'quota_scheme', 'quota_summary', 'receipt_location')
+        persisted = json.loads((self.root / 'plans' / (ticket['ticket_id'] + '.json')).read_text(encoding='utf-8'))
+        for stream in persisted['streams']:
+            self.assertTrue(all(key in stream for key in required))
+        self.assertEqual(native['model'], 'fixture-code')
+        self.assertEqual(native['model_display'], 'inherit (fixture-code)')
+        self.assertEqual(native['context_window'], 65536)
+        self.assertFalse(native['headless'])
+        self.assertFalse(native['clean_room'])
+        self.assertFalse(native['inline_readonly'])
+        self.assertTrue(headless['headless'])
+        self.assertTrue(headless['clean_room'])
+        self.assertTrue(headless['inline_readonly'])
+        for key in ('human_popup_markdown', 'handoff_prompt_block'):
+            text = ticket[key]
+            rows = [line for line in text.splitlines() if line.startswith('|')]
+            self.assertEqual(len(rows), 4)
+            self.assertTrue(all(len(line.split('|')[1:-1]) == 14 for line in rows))
+            for label in ('是否无头', '是否净室', '当前是否可用', '本机配置额度类型与当前状态', '上下文窗口'):
+                self.assertIn(label, rows[0])
+            for stream, row in zip(ticket['streams'], rows[2:]):
+                cells = [cell.strip() for cell in row.split('|')[1:-1]]
+                self.assertEqual(cells[7:9], ['是' if stream['headless'] else '否', '是' if stream['clean_room'] else '否'])
+                self.assertEqual(cells[11], '是')
+                for field in ('stream_id', 'subtask', 'target', 'channel', 'client', 'agent_type', 'model_display',
+                              'tier', 'access_mode', 'quota_scheme', 'quota_summary', 'receipt_location'):
+                    self.assertIn(str(stream[field]), row)
+                self.assertIn(str(stream['timeout']), cells[10])
+            for field in ('workflow_bg', 'workflow_goal', 'workflow_impact'):
+                self.assertIn(ticket[field], text)
+            for date in ticket['capability_ledger'].values():
+                if isinstance(date, str) and date[:4].isdigit():
+                    self.assertIn(date, text)
+            self.assertIn('①', text)
+            self.assertIn('②', text)
+            self.assertIn('③', text)
+        with patch.object(harness, '_args_backends', return_value=engines):
+            _, resumed = self.capture(harness.cmd_plan, self.args('plan', '--caller', 'codex', '--resume-ticket',
+                ticket['ticket_id'], '--plan-dir', str(self.root / 'plans')))
+        self.assertEqual(resumed['streams'][0]['model_display'], native['model_display'])
+        (home / 'config.toml').write_text('model = "fixture-next"\nmodel_context_window = 32768\n', encoding='utf-8')
+        with patch.object(harness, '_args_backends', return_value=engines):
+            _, refreshed = self.capture(harness.cmd_plan, self.args('plan', '--caller', 'codex', '--resume-ticket',
+                ticket['ticket_id'], '--plan-dir', str(self.root / 'plans')))
+        self.assertEqual(refreshed['streams'][0]['model_display'], 'inherit (fixture-next)')
+        self.assertEqual(refreshed['streams'][0]['context_window'], 32768)
+
+    def test_wp1b_plan_implicit_subtasks_preserve_complete_streams(self):
+        engines = self.four_backends()
+        target = self.root / 'a.py'
+        target.write_text('x=1\n', encoding='utf-8')
+        args = self.args('plan', '--caller', 'codex', '--target', str(target), '--timeout', '60')
+        streams, _ = harness._resolve_plan_streams(args, [
+            {'channel': 'native_subagent', 'agent_type': 'readonly-reader'},
+            {'channel': 'cae_harness_headless', 'engine': 'dsh:review'}], engines)
+        for stream in streams:
+            self.assertEqual(stream['subtask'], '检查目标')
+            self.assertIn('quota_summary', stream)
+            self.assertIn('receipt_location', stream)
+        self.assertEqual([stream['headless'] for stream in streams], [False, True])
+        args.workflow_goal = '核对接口定义'
+        streams, _ = harness._resolve_plan_streams(args, [{'channel': 'native_workflow'}], engines)
+        self.assertEqual(streams[0]['subtask'], '核对接口定义')
+
+    def test_wp1b_native_models_environment_local_config_and_explicit_model(self):
+        engines = self.four_backends()
+        target = self.root / 'a.py'
+        target.write_text('x=1', encoding='utf-8')
+        def plan(caller, channel='native_subagent', *extra):
+            return self.capture(harness.cmd_plan, self.args('plan', '--caller', caller, '--channel', channel,
+                '--agent-type', 'Explore', '--target', str(target), '--timeout', '60', *extra))[1]['streams'][0]
+        with patch.object(harness, '_args_backends', return_value=engines), patch.dict(os.environ, {}, clear=True):
+            with patch.dict(os.environ, {'CLAUDE_CODE_SUBAGENT_MODEL': 'fixture-sub', 'ANTHROPIC_MODEL': 'fixture-parent'}):
+                stream = plan('cc')
+                self.assertEqual(stream['model_display'], 'inherit -> fixture-sub')
+                self.assertEqual(stream['model'], 'fixture-sub')
+                self.assertEqual(plan('cc', 'native_workflow', '--model', 'fixture-explicit')['model_display'], 'fixture-explicit')
+            with patch.dict(os.environ, {'ANTHROPIC_MODEL': 'fixture-parent'}):
+                self.assertEqual(plan('claude')['model_display'], 'inherit (fixture-parent)')
+            agy_home = Path(engines['agy']['config_home'])
+            (agy_home / 'config').mkdir(parents=True)
+            (agy_home / 'config' / 'config.json').write_text(json.dumps({'userSettings': {'model': 'fixture-agy'}}), encoding='utf-8')
+            for channel in ('native_subagent', 'native_workflow', 'native_swarm'):
+                stream = plan('antigravity', channel, '--clean-room')
+                self.assertEqual(stream['model_display'], 'inherit (fixture-agy)')
+                self.assertEqual(stream['agent_type'], 'Explore')
+                self.assertFalse(stream['headless'])
+                self.assertFalse(stream['clean_room'])
+            (agy_home / 'config' / 'config.json').unlink()
+            self.assertEqual(plan('antigravity')['model_display'], 'inherit (跟随当前前端所选模型)')
+
+    def test_wp1b_native_availability_quota_recheck_and_batch_refusal(self):
+        engines = self.four_backends()
+        target = self.root / 'a.py'
+        target.write_text('x=1', encoding='utf-8')
+        plans = self.root / 'plans'
+        common = ['--caller', 'codex', '--plan-dir', str(plans)]
+        with patch.object(harness, '_args_backends', return_value=engines):
+            _, ticket = self.capture(harness.cmd_plan, self.args('plan', *common, '--channel', 'native_subagent',
+                '--target', str(target), '--timeout', '60', '--save-ticket'))
+            self.capture(harness.cmd_plan, self.args('plan', *common, '--approve-ticket', ticket['ticket_id']))
+            with patch.object(harness, 'invoke_engine') as never:
+                with self.assertRaisesRegex(harness.HarnessError, '原生通道'):
+                    harness.cmd_batch(self.args('batch', *common, '--ticket', ticket['ticket_id']))
+                never.assert_not_called()
+            harness._record_quota_exhausted('codex', engines['codex'], 'quota exceeded')
+            _, resumed = self.capture(harness.cmd_plan, self.args('plan', *common, '--resume-ticket', ticket['ticket_id']))
+            self.assertFalse(resumed['streams'][0]['currently_available'])
+            self.assertTrue(resumed['streams'][0]['quota_exceeded'])
+            self.assertEqual(resumed['streams'][0]['client'], 'codex')
+            for key in ('human_popup_markdown', 'handoff_prompt_block'):
+                self.assertIn('quota_exhausted', resumed[key])
+                self.assertIn(resumed['streams'][0]['quota_summary'], resumed[key])
+            with self.assertRaises(harness.HarnessError) as caught:
+                harness.cmd_plan(self.args('plan', *common, '--approve-ticket', ticket['ticket_id']))
+            self.assertEqual(caught.exception.status, 'quota_exhausted')
+            engines['codex']['available'] = False
+            with patch.object(harness, '_active_quota_record', return_value=None):
+                _, unavailable = self.capture(harness.cmd_plan, self.args('plan', *common, '--channel', 'native_swarm',
+                    '--target', str(target), '--timeout', '60'))
+            self.assertFalse(unavailable['streams'][0]['currently_available'])
+            self.assertEqual(unavailable['streams'][0]['unavailable_reason'], 'backend_unavailable')
+
+    def test_wp1b_plan_single_headless_write_access_and_lf_files(self):
+        engines = self.four_backends()
+        target = self.root / 'a.py'
+        target.write_text('x=1', encoding='utf-8')
+        args = self.args('plan', '--caller', 'antigravity', '--engine', 'codex:default', '--model', 'fixture-code',
+            '--channel', 'cae_harness_headless', '--agent-type', 'self', '--kind', 'code', '--target', str(target),
+            '--write-scope', 'a.py', '--verify-cmd', 'python -B a.py', '--receipt-location', 'result.json',
+            '--plan-dir', str(self.root / 'plans'))
+        with patch.object(harness, '_args_backends', return_value=engines):
+            _, ticket = self.capture(harness.cmd_plan, args)
+        stream = ticket['streams'][0]
+        self.assertTrue(stream['headless'])
+        self.assertFalse(stream['clean_room'])
+        self.assertFalse(stream['inline_readonly'])
+        self.assertEqual(stream['model_display'], 'fixture-code')
+        self.assertEqual(stream['write_scope'], ['a.py'])
+        self.assertIn('a.py', stream['access_mode'])
+        self.assertIn('python -B a.py', stream['access_mode'])
+        for key in ('human_popup_markdown', 'handoff_prompt_block'):
+            self.assertIn(stream['access_mode'], ticket[key])
+            self.assertIn('result.json', ticket[key])
+        for path in (SCRIPT, ROOT / 'template/user-guard/skills/cae-harness/fleet_profile.json', Path(__file__)):
+            data = path.read_bytes()
+            self.assertFalse(data.startswith(b'\xef\xbb\xbf'), str(path))
+            self.assertNotIn(b'\r', data, str(path))
+            data.decode('utf-8')
+
+    def test_wp1b_gate_ignored_dirs_and_explicit_scope(self):
+        for name in ('.pytest_cache', '.venv', 'runs'):
+            (self.root / name).mkdir()
+            (self.root / name / 'a.py').write_text('old', encoding='utf-8')
+        traversed = []
+        walk = os.walk
+        def observed_walk(*args, **kwargs):
+            for entry in walk(*args, **kwargs):
+                traversed.append(Path(entry[0]).relative_to(self.root).as_posix())
+                yield entry
+        def worker(prompt, number):
+            (self.root / 'allowed.py').write_text('x=1', encoding='utf-8')
+            return 'done'
+        with patch.object(harness.os, 'walk', side_effect=observed_walk):
+            result = harness.run_physics_gate_loop(self.root, '改代码', 'verify', worker,
+                lambda *_: (0, 'ok'), write_scope=['allowed.py'])
+        self.assertTrue(result['gate_passed'])
+        self.assertEqual(set(traversed), {'.'})
+        def scoped_worker(prompt, number):
+            (self.root / 'runs' / 'a.py').write_text('new', encoding='utf-8')
+            return 'done'
+        result = harness.run_physics_gate_loop(self.root, '改产物', 'verify', scoped_worker,
+            lambda *_: (0, 'ok'), write_scope=['runs/a.py'])
+        self.assertTrue(result['gate_passed'])
+        self.assertEqual(result['worker_changed_files'], ['runs/a.py'])
+
+    def test_wp1b_fast_engine_syntax_matches_role_targets(self):
+        self.assertTrue(harness._is_fast_engine_spec('role:fast'))
+        for prefix in ('agy', 'codex', 'claude', 'dsh'):
+            for suffix in ('fast', '@fast'):
+                expected = suffix == '@fast' or prefix in ('claude', 'dsh')
+                with self.subTest(engine=prefix + ':' + suffix):
+                    self.assertEqual(harness._is_fast_engine_spec(prefix + ':' + suffix), expected)
+                    self.assertEqual(harness._per_backend_role_target(prefix, suffix), 'fast' if expected else '')
+
+    def test_wp1b_integer_process_timeout_and_client_name_model_exclusion(self):
+        engines = backends()
+        for elapsed, expected in ((0.01, 30), (0.99, 30), (1.01, 29), (7.8, 23), (29.9, 1)):
+            def runner(command, cwd, input_text, timeout_sec, **kwargs):
+                self.assertEqual(timeout_sec, expected)
+                self.assertIsInstance(timeout_sec, int)
+                Path(command[command.index('-o') + 1]).write_text(json.dumps(TASK), encoding='utf-8')
+                return subprocess.CompletedProcess(command, 0, '', '')
+            with patch.object(harness.time, 'monotonic', side_effect=[0, elapsed, elapsed, elapsed]), \
+                 patch.object(harness, 'run_process', side_effect=runner):
+                self.assertEqual(harness.invoke_engine('codex:default', self.root, '审查', engines,
+                    harness.TASK_JSON_SCHEMA, timeout_sec=30), TASK)
+        for name in ('CC', 'DSH', 'Claude Code', 'Claude CLI', 'DeepSeek Harness'):
+            for quote in ('', '`', '"'):
+                self.assertEqual(harness._extract_prompt_model_hint(f'用 {quote}{name}{quote} 模型'), '')
+        self.assertEqual(harness._extract_prompt_model_hint('用 `DeepSeek` Harness 模型'), '')
+        self.assertEqual(harness._extract_prompt_model_hint('用 DeepSeek 模型'), 'DeepSeek')
+
+    @patch.dict(os.environ, {'CAE_HARNESS_DEPTH': '', 'CAE_DISABLE_HEAVY_COMPLETIONS': ''})
+    def test_wp1_batch_quota_fuse_queue_and_other_backend_timeout_isolation(self):
+        engines = self.four_backends()
+        target = self.root / 'target'
+        target.mkdir()
+        (target / 'a.py').write_text('x=1', encoding='utf-8')
+        spec = self.root / 'spec.json'
+        spec.write_text(json.dumps([{'stream_id': str(i), 'target': str(target), 'subtask': '审查',
+            'engine': engine, 'timeout': 60} for i, engine in enumerate(['codex:review'] * 3 + ['dsh:review', 'agy:review'])]), encoding='utf-8')
+        calls = []
+        hd = {**harness._headless_tunables(), 'batch_max_workers_per_backend': {p: 1 for p in engines}}
+        def invoke(spec, *args, **kwargs):
+            prefix = harness._engine_parts(spec)[0]
+            calls.append(prefix)
+            if prefix == 'codex':
+                raise harness.HarnessError('quota exceeded', 'quota_exhausted')
+            if prefix == 'dsh':
+                raise harness.HarnessError('deadline', 'timeout')
+            return dict(TASK)
+        with patch.object(harness, '_args_backends', return_value=engines), \
+             patch.object(harness, '_headless_tunables', return_value=hd), patch.object(harness, 'invoke_engine', side_effect=invoke):
+            code, result = self.capture(harness.cmd_batch, self.args('batch', '--caller', 'antigravity', '--spec-file', str(spec),
+                '--plan-dir', str(self.root / 'state' / 'plans')))
+        self.assertEqual(code, 3)
+        self.assertEqual(calls.count('codex'), 1)
+        self.assertEqual([s['status'] for s in result['streams']], ['quota_exhausted'] * 3 + ['timeout', 'ok'])
+        self.assertIsNotNone(harness._active_quota_record('codex', engines['codex']))
+        self.assertTrue(Path(result['receipt_file']).is_file())
+
+    def test_wp1_ticket_invalid_expired_tampered_and_pending_rejected(self):
+        plans = self.root / 'plans'
+        plans.mkdir()
+        base = {'ticket_id': 'fixture', 'expires_at': time.time() + 60, 'status': 'PENDING', 'streams': []}
+        base['plan_hash'] = harness._plan_hash(base)
+        path = plans / 'fixture.json'
+        for change in ({}, {'status': 'APPROVED', 'expires_at': 0}, {'status': 'APPROVED', 'plan_hash': 'changed'}):
+            path.write_text(json.dumps({**base, **change}), encoding='utf-8')
+            with patch.object(harness, '_args_backends') as never, self.assertRaises(harness.HarnessError) as caught:
+                harness.cmd_batch(self.args('batch', '--ticket', 'fixture', '--plan-dir', str(plans)))
+            self.assertEqual(caught.exception.status, 'ticket_invalid')
+            never.assert_not_called()
+        with self.assertRaises(harness.HarnessError):
+            harness._load_ticket('../escape', plans)
+
+    def test_wp1_token_usage_extraction_and_no_fabricated_totals(self):
+        claude = harness.extract_cli_token_usage('claude', json.dumps({'type': 'result', 'usage': {
+            'input_tokens': 10, 'cache_creation_input_tokens': 3, 'cache_read_input_tokens': 5, 'output_tokens': 2},
+            'total_cost_usd': 0.1, 'modelUsage': {'model': {}}}))
+        self.assertEqual((claude['input_tokens'], claude['cached_input_tokens'], claude['output_tokens'], claude['total_tokens']), (18, 5, 2, 20))
+        events = '\n'.join(json.dumps(event) for event in [
+            {'usage': {'prompt_tokens': 2, 'completion_tokens': 1}},
+            {'type': 'final', 'tokenUsage': {'prompt_tokens': 9, 'completion_tokens': 4, 'cache_hit_tokens': 3, 'total_tokens': 13}}])
+        dsh = harness.extract_cli_token_usage('dsh', events)
+        self.assertEqual((dsh['input_tokens'], dsh['total_tokens']), (9, 13))
+        codex = harness.extract_cli_token_usage('codex', '{"type":"turn.completed","usage":{"input_tokens":8,"cached_input_tokens":2,"output_tokens":3}}')
+        self.assertEqual(codex['total_tokens'], 11)
+        for prefix in ('codex', 'agy', 'dsh', 'claude'):
+            unknown = harness.extract_cli_token_usage(prefix, 'plain text')
+            self.assertEqual(unknown['usage_source'], 'unreported_by_cli')
+            self.assertIsNone(unknown['total_tokens'])
+        partial = harness.extract_cli_token_usage('agy', '{"usage":{"input_tokens":3}}')
+        self.assertIsNone(partial['output_tokens'])
+        self.assertIsNone(partial['total_tokens'])
+
+    def test_wp1_wall_clock_staging_timeout_prevents_launch_and_flags_not_suspended(self):
+        engines = self.four_backends()
+        (self.root / 'a.py').write_text('x=1', encoding='utf-8')
+        with patch.object(harness.time, 'monotonic', side_effect=[0, 11]), \
+             patch.object(harness, 'run_process') as never, self.assertRaises(harness.HarnessError) as caught:
+            harness.invoke_engine('codex:default', self.root, '读', engines, harness.TASK_JSON_SCHEMA, timeout_sec=10)
+        self.assertEqual(caught.exception.status, 'timeout')
+        never.assert_not_called()
+        if os.name == 'nt':
+            self.assertFalse(harness._process_options()['creationflags'] & 0x00000004)
+
+    @patch.dict(os.environ, {'CAE_HARNESS_DEPTH': '', 'CAE_DISABLE_HEAVY_COMPLETIONS': ''})
+    def test_wp1_heavy_receipt_disable_dryrun_redaction_and_atomic_output(self):
+        args = self.args('batch', '--session-id', 'session1', '--plan-dir', str(self.root / 'state' / 'plans'))
+        harness._begin_dispatch(args)
+        sample_lan_ip = '192.' + '168.1.2'
+        payload = {'status': 'ok', 'streams': [{'stream_id': 'S1', 'engine': 'codex:test', 'status': 'ok',
+            'invocation': {'argv': [str(self.root / 'cae-harness-staging'), 'http://' + sample_lan_ip], 'total_cost_usd': 1.234}}]}
+        _, result = self.capture(lambda unused: harness._dispatch_print(args, payload), args)
+        self.assertTrue(Path(result['receipt_file']).is_file())
+        public = Path(result['receipt_file']).read_text(encoding='utf-8')
+        self.assertNotIn(sample_lan_ip, public)
+        self.assertNotIn('1.234', public)
+        self.assertNotIn(str(self.root), public)
+        self.assertEqual(result['token_usage_summary']['unreported_streams'], 1)
+        dry = self.args('batch', '--dry-run', '--plan-dir', str(self.root / 'never'))
+        _, result = self.capture(lambda unused: harness._dispatch_print(dry, {'status': 'ok', 'streams': []}), dry)
+        self.assertNotIn('receipt_file', result)
+        self.assertFalse((self.root / 'never').exists())
+
+
+    def test_wp6a_probe_disabled_agents_and_all_models_keeps_static_budgets(self):
+        engines = self.four_backends()
+        engines['codex']['models'][0]['context_window'] = 64000
+        for info in engines.values():
+            info['models'][0]['context_window'] = 64000
+        base = json.loads(json.dumps(harness._fleet_profile()))
+        for name in engines:
+            for disable_agent in (True, False):
+                profile = json.loads(json.dumps(base))
+                if disable_agent:
+                    profile['subscription_matrix']['agents'].setdefault(name, {})['enabled'] = False
+                else:
+                    for record in engines[name]['models']:
+                        profile['subscription_matrix']['models'].setdefault(record['slug'], {})['enabled'] = False
+                with self.subTest(backend=name, agent=disable_agent), \
+                     patch.object(harness, '_fleet_profile', return_value=profile), \
+                     patch.object(harness, '_find_binary', side_effect=lambda name: name), \
+                     patch.object(harness, '_codex_home', return_value=(self.root / 'codex', False)), \
+                     patch.object(harness, '_read_codex_catalog', return_value=(engines['codex']['models'], {})), \
+                     patch.object(harness, '_agy_info', return_value=dict(engines['agy'])), \
+                     patch.object(harness, '_claude_info', return_value=dict(engines['claude'])), \
+                     patch.object(harness, '_dsh_info', return_value=dict(engines['dsh'])):
+                    actual = harness.probe_backends(refresh_model_cache=False)
+                    self.assertEqual(set(actual), set(engines))
+                    self.assertFalse(actual[name]['auto_selectable'])
+                    self.assertEqual(actual[name]['subscription_enabled'], not disable_agent)
+                    self.assertIsNotNone(actual[name]['frontier_model'])
+                    self.assertGreater(actual[name]['safe_input_budget_tokens'], 0)
+                    with self.assertRaises(harness.HarnessError):
+                        harness.resolve_execution_profile(actual, name + ':' + engines[name]['models'][0]['slug'])
+
+    def test_wp6a_p0_client_model_and_role_constraints(self):
+        engines = self.four_backends()
+        # 同一个模型也在其他端出现，必须遵守原话指定的客户端。
+        engines['codex']['models'].append({'slug': 'gpt-fixture', 'provider': 'openai'})
+        engines['claude']['models'].append({'slug': 'gpt-fixture', 'provider': 'claude_configured'})
+        self.assertEqual(harness._prompt_engine_spec(engines, '请用 CC，使用 gpt-fixture 模型审查'), 'claude:gpt-fixture')
+        self.assertEqual(harness._prompt_engine_spec(engines, '请用 DSH，使用 gpt-fixture 模型审查'), 'dsh:gpt-fixture')
+        engines['claude'].update(model='deepseek-flash[1M]', models=[{'slug': 'deepseek-flash[1M]'}])
+        for role in ('review', 'math', 'code', 'orchestrator'):
+            engine = harness.choose_engine(engines, 'codex', 'role:' + role, user_prompt='请用 CC 审查')
+            self.assertEqual(engine, 'claude:@' + role)
+            profile = harness.resolve_execution_profile(engines, engine, tier='low')
+            with self.assertRaisesRegex(harness.HarnessError, '轻量模型'):
+                harness._require_execution_profile(profile)
+
+    def test_wp8_backend_prompt_preserves_explicit_role_and_audit_rejects_light_card(self):
+        engines = self.four_backends()
+        engines['claude'].update(model='deepseek-flash[1M]', models=[{'slug': 'deepseek-flash[1M]'}])
+        for explicit in ('claude:@review', 'codex:math', 'claude:code'):
+            with self.subTest(explicit=explicit):
+                engine = harness.choose_engine(engines, 'codex', explicit, user_prompt='请用 CC 审查')
+                slot = harness._per_backend_role_target(*harness._engine_parts(explicit))
+                self.assertEqual(engine, 'claude:@' + slot)
+                with self.assertRaisesRegex(harness.HarnessError, '轻量模型'):
+                    harness._require_execution_profile(harness.resolve_execution_profile(engines, engine, tier='low'))
+        target = self.root / 'a.py'
+        target.write_text('x=1', encoding='utf-8')
+        for left in ('', 'role:review', 'claude:@review'):
+            with self.subTest(left=left), patch.object(harness, '_args_backends', return_value=engines), \
+                 patch.object(harness, '_prepare_execution'), patch.object(harness, 'invoke_readonly_engine') as invoke:
+                args = self.args('audit', '--target', str(target), '--caller', 'codex', '--single', '--left', left,
+                                 '--user-prompt', '请用 CC 审查')
+                with self.assertRaisesRegex(harness.HarnessError, '轻量模型'):
+                    harness.cmd_audit(args)
+                invoke.assert_not_called()
+
+    def test_wp8_plan_explicit_model_survives_tier_or_economy_prompt(self):
+        engines = self.four_backends()
+        target = self.root / 'a.py'
+        target.write_text('x=1', encoding='utf-8')
+        for prompt in ('使用 low 挡', '省额度，只看拼写'):
+            with self.subTest(prompt=prompt), patch.object(harness, '_args_backends', return_value=engines):
+                _, result = self.capture(harness.cmd_plan, self.args('plan', '--caller', 'codex', '--target', str(target),
+                    '--engine', 'claude:default', '--model', 'deepseek-v4-pro', '--user-prompt', prompt, '--timeout', '60'))
+                self.assertEqual(result['streams'][0]['model'], 'deepseek-v4-pro')
+                self.assertEqual(result['streams'][0]['tier'], 'low')
+
+    def test_wp6a_effective_tier_all_entry_points_and_ticket_prompt_recovery(self):
+        engines = self.four_backends()
+        target = self.root / 'a.py'
+        target.write_text('x=1\n', encoding='utf-8')
+        for prompt, expected in (('请用 CC 审查', 'medium'), ('请用 CC，使用 low 挡', 'low'),
+                                 ('请用 CC，省额度，只看拼写', 'low')):
+            tier, _ = harness._resolve_effective_tier('medium', 'review', prompt, '检查')
+            self.assertEqual(tier, expected)
+            for command in ('plan', 'task', 'gate', 'audit'):
+                tokens = [command, '--caller', 'codex', '--target', str(target), '--tier', 'medium',
+                          '--user-prompt', prompt, '--dry-run', '--plan-dir', str(self.root / 'plans')]
+                if command == 'audit':
+                    tokens += ['--single', '--left', 'role:review']
+                if command == 'task':
+                    tokens += ['--kind', 'review', '--engine', 'claude:default']
+                if command == 'gate':
+                    tokens += ['--verify-cmd', 'verify', '--worker', 'claude:default']
+                if command in ('task', 'gate'):
+                    tokens += ['--task', '检查目标']
+                with self.subTest(command=command, prompt=prompt), \
+                     patch.object(harness, '_args_backends', return_value=engines):
+                    _, result = self.capture(getattr(harness, 'cmd_' + command), self.args(*tokens))
+                    # gate 的省额度常规任务按自适应规则选 high。
+                    expected_tier = 'high' if command == 'gate' and '省额度' in prompt else expected
+                    if command == 'audit':
+                        self.assertEqual(result['plan']['selected_tier'], expected_tier)
+                        self.assertEqual(result['plan']['execution_profiles']['left']['tier'], expected_tier)
+                    else:
+                        self.assertEqual(result['streams'][0]['tier'] if command == 'plan' else result['selected_tier'], expected_tier)
+        plans = self.root / 'saved-plans'
+        common = ['--caller', 'codex', '--target', str(target), '--plan-dir', str(plans), '--timeout', '60']
+        with patch.object(harness, '_args_backends', return_value=engines):
+            _, ticket = self.capture(harness.cmd_plan, self.args('plan', *common, '--save-ticket', '--tier', 'max',
+                '--user-prompt', '请用 CC，使用 low 挡'))
+            self.assertEqual(ticket['user_prompt'], '请用 CC，使用 low 挡')
+            _, resumed = self.capture(harness.cmd_plan, self.args('plan', *common, '--resume-ticket', ticket['ticket_id']))
+            _, approved = self.capture(harness.cmd_plan, self.args('plan', *common, '--approve-ticket', ticket['ticket_id']))
+        self.assertEqual(resumed['streams'][0]['tier'], 'low')
+        self.assertEqual(approved['status'], 'APPROVED')
+        self.assertEqual(approved['streams'][0]['tier'], 'low')
+
+    def test_wp6a_approval_routing_drift_stays_pending_then_can_be_reapproved(self):
+        engines = self.four_backends()
+        target = self.root / 'a.py'
+        target.write_text('x=1', encoding='utf-8')
+        profile = json.loads(json.dumps(harness._fleet_profile()))
+        profile['roles']['review']['candidates'] = ['codex:review', 'dsh:review']
+        plans = self.root / 'plans'
+        common = ['--caller', 'antigravity', '--target', str(target), '--plan-dir', str(plans), '--timeout', '60']
+        with patch.object(harness, '_fleet_profile', return_value=profile), \
+             patch.object(harness, '_args_backends', return_value=engines):
+            _, ticket = self.capture(harness.cmd_plan, self.args('plan', *common, '--engine', 'role:review', '--save-ticket'))
+            sessions = Path(engines['codex']['config_home']) / 'sessions'
+            sessions.mkdir(parents=True)
+            (sessions / 'rollout-limit.jsonl').write_text(json.dumps({'payload': {'rate_limits': {
+                'primary': {'used_percent': 100, 'resets_at': time.time() + 3600}}}}), encoding='utf-8')
+            for extra in ([], ['--override-json', json.dumps({'S1': {'timeout': 90}})]):
+                if extra:
+                    # 恢复原待批选路，确认 override 也不能掩盖随后发生的漂移。
+                    harness._save_plan(ticket, plans)
+                with self.assertRaises(harness.HarnessError) as caught:
+                    harness.cmd_plan(self.args('plan', *common, '--approve-ticket', ticket['ticket_id'], *extra))
+                self.assertEqual(caught.exception.status, 'ticket_changed')
+                pending = harness._load_ticket(ticket['ticket_id'], plans)
+                self.assertEqual(pending['status'], 'PENDING')
+                self.assertEqual(pending['streams'][0]['engine'], 'dsh:review')
+                _, approved = self.capture(harness.cmd_plan, self.args('plan', *common, '--approve-ticket', ticket['ticket_id']))
+                self.assertEqual(approved['status'], 'APPROVED')
+
+    def test_wp6a_approval_explicit_channel_availability_drift(self):
+        engines = self.four_backends()
+        target = self.root / 'a.py'
+        target.write_text('x=1', encoding='utf-8')
+        plans = self.root / 'plans'
+        common = ['--caller', 'codex', '--target', str(target), '--plan-dir', str(plans), '--timeout', '60']
+        with patch.object(harness, '_args_backends', return_value=engines):
+            _, ticket = self.capture(harness.cmd_plan, self.args('plan', *common, '--engine', 'claude:default', '--save-ticket'))
+            engines['claude']['available'] = False
+            with self.assertRaises(harness.HarnessError) as caught:
+                harness.cmd_plan(self.args('plan', *common, '--approve-ticket', ticket['ticket_id']))
+            self.assertEqual(caught.exception.status, 'ticket_changed')
+            pending = harness._load_ticket(ticket['ticket_id'], plans)
+            self.assertEqual(pending['status'], 'PENDING')
+            self.assertEqual(pending['streams'][0]['engine'], 'claude:default')
+            self.assertFalse(pending['streams'][0]['currently_available'])
+
+    def test_wp6a_latest_rate_event_across_rollouts_and_unknown_quota(self):
+        engines = self.four_backends()
+        for prefix in engines:
+            quota = harness.inspect_backend_quota_and_availability(prefix, engines[prefix])
+            self.assertTrue(quota['currently_available'])
+            self.assertFalse(quota['quota_exceeded'])
+            self.assertIn('no_local_cooldown (remaining_unknown)', quota['quota_summary'])
+        sessions = Path(engines['codex']['config_home']) / 'sessions'
+        sessions.mkdir(parents=True)
+        reset = int(time.time()) + 3600
+        def event(stamp, percent):
+            return {'timestamp': stamp, 'payload': {'rate_limits': {'primary': {
+                'used_percent': percent, 'window_minutes': 300, 'resets_at': reset}}}}
+        newer = sessions / 'rollout-newer-event.jsonl'
+        older = sessions / 'rollout-older-event.jsonl'
+        newer.write_text(json.dumps(event('2020-01-02T00:00:00Z', 25)), encoding='utf-8')
+        older.write_text(json.dumps(event('2020-01-01T00:00:00Z', 100)), encoding='utf-8')
+        os.utime(newer, (10, 10))
+        os.utime(older, (20, 20))
+        quota = harness.inspect_backend_quota_and_availability('codex', engines['codex'])
+        self.assertFalse(quota['quota_exceeded'])
+        self.assertEqual(quota['resets_at'], reset)
+        self.assertIn('within_quota', quota['quota_summary'])
+        self.assertIn('5h_window:25%', quota['quota_summary'])
+        self.assertIn('resets_at=' + str(reset), quota['quota_summary'])
+        newer.write_text(json.dumps({'payload': {'rate_limits': {'primary': {'used_percent': 30, 'resets_at': reset}}}}), encoding='utf-8')
+        os.utime(older, (1, 1))
+        self.assertIn('primary:30%', harness.inspect_backend_quota_and_availability('codex', engines['codex'])['quota_summary'])
+        for window, expected in (({'resets_at': reset}, False),
+                                 ({'resets_at': reset, 'spend_control_reached': True}, True),
+                                 ({'resets_at': reset, 'used_percent': 101}, True)):
+            newer.write_text(json.dumps({'payload': {'rate_limits': {'primary': window}}}), encoding='utf-8')
+            quota = harness.inspect_backend_quota_and_availability('codex', engines['codex'])
+            self.assertEqual(quota['quota_exceeded'], expected)
+            self.assertEqual(quota['resets_at'], reset)
+            self.assertIn('resets_at=' + str(reset), quota['quota_summary'])
+            if not expected:
+                self.assertIn('remaining_unknown', quota['quota_summary'])
+
+    def test_wp6a_approval_explicit_engine_override_and_unrequested_model_drift(self):
+        engines = self.four_backends()
+        target = self.root / 'a.py'
+        target.write_text('x=1', encoding='utf-8')
+        plans = self.root / 'plans'
+        common = ['--caller', 'codex', '--target', str(target), '--plan-dir', str(plans), '--timeout', '60']
+        with patch.object(harness, '_args_backends', return_value=engines):
+            _, ticket = self.capture(harness.cmd_plan, self.args('plan', *common, '--engine', 'claude:default', '--save-ticket'))
+            _, approved = self.capture(harness.cmd_plan, self.args('plan', *common, '--approve-ticket', ticket['ticket_id'],
+                '--override-json', json.dumps({'S1': {'engine': 'dsh:@review'}})))
+            self.assertEqual(approved['status'], 'APPROVED')
+            self.assertEqual(approved['streams'][0]['engine'], 'dsh:@review')
+            _, ticket = self.capture(harness.cmd_plan, self.args('plan', *common, '--engine', 'claude:default', '--save-ticket'))
+            engines['claude'].update(model='fixture-changed', models=[{'slug': 'fixture-changed'}])
+            for override in ({}, {'tier': 'high'}):
+                harness._save_plan(ticket, plans)
+                extra = ['--override-json', json.dumps({'S1': override})] if override else []
+                with self.subTest(override=override), self.assertRaises(harness.HarnessError) as caught:
+                    harness.cmd_plan(self.args('plan', *common, '--approve-ticket', ticket['ticket_id'], *extra))
+                self.assertEqual(caught.exception.status, 'ticket_changed')
+                pending = harness._load_ticket(ticket['ticket_id'], plans)
+                self.assertEqual(pending['status'], 'PENDING')
+                self.assertEqual(pending['streams'][0]['model'], 'fixture-changed')
+
+    def test_wp6a_ccswitch_configured_db_and_quantitative_evidence(self):
+        info = self.four_backends()['claude']
+        cfg = Path(info['config_home']) / 'router'
+        cfg.mkdir(parents=True)
+        db = self.root / 'configured.db'
+        other = self.root / 'override.db'
+        (cfg / 'router.json').write_text(json.dumps({'ccswitch_db': str(db)}), encoding='utf-8')
+        for path, scheme in ((db, 'token_plan'), (other, 'balance')):
+            with contextlib.closing(sqlite3.connect(path)) as con, con:
+                con.execute('CREATE TABLE providers (id TEXT, app_type TEXT, name TEXT, is_current INTEGER, meta TEXT)')
+                con.execute('INSERT INTO providers VALUES (?, ?, ?, ?, ?)',
+                            ('card', 'claude', 'Fixture', 1, json.dumps({'usage_script': {'templateType': scheme}})))
+        with patch.dict(os.environ, {}, clear=True):
+            quota = harness.inspect_backend_quota_and_availability('claude', info)
+            self.assertIn('token_plan:no_local_cooldown (remaining_unknown)', quota['quota_summary'])
+            with patch.dict(os.environ, {'CAE_CCSWITCH_DB': str(other)}):
+                self.assertEqual(harness._claude_card_quota(info, '')['quota_scheme'], 'balance')
+            with contextlib.closing(sqlite3.connect(db)) as con, con:
+                con.execute('UPDATE providers SET meta=?', (json.dumps({'limit_daily_usd': 5}),))
+            self.assertIn('remaining_unknown', harness.inspect_backend_quota_and_availability('claude', info)['quota_summary'])
+            with contextlib.closing(sqlite3.connect(db)) as con, con:
+                con.execute('CREATE TABLE usage_daily_rollups (provider_id TEXT, date TEXT, total_cost_usd REAL)')
+                con.execute('INSERT INTO usage_daily_rollups VALUES (?, ?, ?)', ('card', datetime.date.today().isoformat(), 2))
+            quota = harness.inspect_backend_quota_and_availability('claude', info)
+            self.assertIn('within_quota', quota['quota_summary'])
+            self.assertFalse(quota['quota_exceeded'])
+
+    def test_wp6a_native_settings_subagent_and_model_specific_window(self):
+        engines = self.four_backends()
+        home = Path(engines['claude']['config_home'])
+        home.mkdir(parents=True)
+        (home / 'settings.json').write_text(json.dumps({'env': {'CLAUDE_CODE_SUBAGENT_MODEL': 'fixture-sub'}}), encoding='utf-8')
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(harness._native_plan_model('claude', engines['claude'], 'inherit')[0], 'fixture-sub')
+            with patch.dict(os.environ, {'CLAUDE_CODE_SUBAGENT_MODEL': 'fixture-env'}):
+                self.assertEqual(harness._native_plan_model('claude', engines['claude'], 'inherit')[0], 'fixture-env')
+        home = Path(engines['codex']['config_home'])
+        home.mkdir(parents=True)
+        (home / 'config.toml').write_text('model = "fixture-code"\nmodel_context_window = 80000\n', encoding='utf-8')
+        engines['codex']['models'] += [{'slug': 'fixture-other', 'context_window': 32000}]
+        args = self.args('plan', '--caller', 'codex', '--target', str(self.root), '--channel', 'native_subagent')
+        for model, expected in (('inherit', 80000), ('fixture-code', 80000), ('fixture-other', 32000)):
+            streams, _ = harness._resolve_plan_streams(args, [{'model': model}], engines)
+            self.assertEqual(streams[0]['context_window'], expected)
+
+    def test_wp6a_dsh_failed_help_is_uncached_and_conservative(self):
+        binary = self.root / 'dsh'
+        binary.write_bytes(b'fixture')
+        for outcome in (OSError('unavailable'), subprocess.TimeoutExpired('dsh', 1),
+                        subprocess.CompletedProcess([], 1, 'Usage: --permission-mode', ''),
+                        subprocess.CompletedProcess([], 0, 'unrecognized response', '')):
+            with self.subTest(outcome=outcome), patch.object(harness, '_DSH_PERMISSION_CACHE', {}), \
+                 patch.object(harness, 'run_process') as run:
+                if isinstance(outcome, Exception):
+                    run.side_effect = outcome
+                else:
+                    run.return_value = outcome
+                self.assertFalse(harness._dsh_supports_cli_permission_flags(binary))
+                self.assertEqual(harness._DSH_PERMISSION_CACHE, {})
+                run.side_effect = None
+                run.return_value = subprocess.CompletedProcess([], 0, 'Usage: dsh --permission-mode', '')
+                self.assertTrue(harness._dsh_supports_cli_permission_flags(binary))
+                self.assertTrue(harness._dsh_supports_cli_permission_flags(binary))
+                self.assertEqual(run.call_count, 2)
+        with patch.object(harness, '_DSH_PERMISSION_CACHE', {}), patch.object(harness, 'run_process',
+                return_value=subprocess.CompletedProcess([], 0, 'Usage: dsh --patch', '')) as run:
+            self.assertFalse(harness._dsh_supports_cli_permission_flags(binary))
+            self.assertFalse(harness._dsh_supports_cli_permission_flags(binary))
+            self.assertEqual(run.call_count, 1)
+
+    def test_wp6a_claude_model_usage_fallback_and_no_double_count(self):
+        models = {'first': {'inputTokens': 10, 'outputTokens': 2, 'cacheReadInputTokens': 5, 'cacheCreationInputTokens': 3},
+                  'second': {'inputTokens': 20, 'outputTokens': 4, 'cacheReadInputTokens': 7, 'cacheCreationInputTokens': 1}}
+        for usage in ({}, {'input_tokens': 'unknown', 'output_tokens': None}):
+            result = harness.extract_cli_token_usage('claude', json.dumps({'type': 'result', 'usage': usage, 'modelUsage': models}))
+            self.assertEqual(result, {'input_tokens': 46, 'output_tokens': 6, 'cached_input_tokens': 12,
+                                      'total_tokens': 52, 'usage_source': 'cli_reported'})
+        result = harness.extract_cli_token_usage('claude', json.dumps({'type': 'result', 'usage': {
+            'input_tokens': 1, 'output_tokens': 2}, 'modelUsage': models}))
+        self.assertEqual(result['total_tokens'], 3)
+
+    def test_wp6a_batch_gate_requires_verification_and_staged_scope_is_checked(self):
+        engines = self.four_backends()
+        target = self.root / 'target'
+        target.mkdir()
+        (target / 'a.py').write_text('x=1', encoding='utf-8')
+        spec = self.root / 'spec.json'
+        common = ['--caller', 'antigravity', '--spec-file', str(spec), '--plan-dir', str(self.root / 'plans')]
+        base = {'target': str(target), 'engine': 'codex:review', 'timeout': 60}
+        with patch.object(harness, '_args_backends', return_value=engines), \
+             patch.dict(os.environ, {'CAE_DISABLE_HEAVY_COMPLETIONS': '1'}):
+            for command in ('', '   '):
+                spec.write_text(json.dumps([{**base, 'kind': 'gate', 'write_scope': ['a.py'], 'verify_cmd': command}]), encoding='utf-8')
+                with patch.object(harness, 'invoke_engine') as invoke, patch.object(harness, 'run_process') as verify:
+                    code, result = self.capture(harness.cmd_batch, self.args('batch', *common))
+                self.assertEqual(code, 3)
+                self.assertEqual(result['streams'][0]['status'], 'failed')
+                self.assertIn('批处理 gate 任务必须声明非空 verify_cmd', result['streams'][0]['error'])
+                invoke.assert_not_called()
+                verify.assert_not_called()
+            for clean_room in (False, True):
+                spec.write_text(json.dumps([{**base, 'kind': 'review', 'clean_room': clean_room}]), encoding='utf-8')
+                def staged_edit(*args, receipt, **kwargs):
+                    receipt['staged_readonly_workspace'] = True
+                    receipt['staged_scope'] = {'scope_verified': True, 'scope_violations': ['a.py'], 'changed_files': ['a.py']}
+                    return dict(TASK)
+                with patch.object(harness, 'invoke_engine', side_effect=staged_edit):
+                    code, result = self.capture(harness.cmd_batch, self.args('batch', *common))
+                self.assertEqual(code, 3)
+                self.assertEqual(result['streams'][0]['status'], 'scope_violation')
+                self.assertEqual(result['streams'][0]['scope_violations'], ['a.py'])
+                self.assertEqual((target / 'a.py').read_text(encoding='utf-8'), 'x=1')
+            spec.write_text(json.dumps([{**base, 'kind': 'gate', 'write_scope': ['a.py'], 'verify_cmd': 'verify'}]), encoding='utf-8')
+            with patch.object(harness, 'invoke_engine', return_value=dict(TASK)), \
+                 patch.object(harness, 'run_process', return_value=subprocess.CompletedProcess([], 1, '', '')) as verify:
+                _, result = self.capture(harness.cmd_batch, self.args('batch', *common))
+            self.assertEqual(result['streams'][0]['status'], 'verification_failed')
+            self.assertTrue(result['streams'][0]['verification_executed'])
+            verify.assert_called_once()
+
+    def test_wp6a_batch_dry_run_no_cooldown_writes_and_retry_ignores_cached_cooldown(self):
+        engines = self.four_backends()
+        target = self.root / 'a.py'
+        target.write_text('x=1', encoding='utf-8')
+        args = self.args('batch', '--caller', 'antigravity', '--plan-dir', str(self.root / 'plans'))
+        streams, _ = harness._resolve_plan_streams(args, [{'target': str(target), 'engine': 'codex:review'}], engines)
+        ticket = {'streams': streams, 'user_prompt': '省额度，只看拼写'}
+        harness._record_quota_exhausted('codex', engines['codex'], 'quota exceeded')
+        with patch.object(harness, '_begin_dispatch', side_effect=lambda args: setattr(args, '_approved_ticket', ticket)), \
+             patch.object(harness, '_args_backends', return_value=engines), \
+             patch.object(harness, '_record_quota_exhausted') as record, \
+             patch.dict(os.environ, {'CAE_DISABLE_HEAVY_COMPLETIONS': '1'}):
+            with patch.object(harness, 'invoke_engine') as invoke:
+                _, result = self.capture(harness.cmd_batch, self.args('batch', '--dry-run'))
+                self.assertEqual(result['streams'][0]['status'], 'quota_exhausted')
+                record.assert_not_called()
+                invoke.assert_not_called()
+            def run(*args, profile, batch, **kwargs):
+                self.assertTrue(batch.retry)
+                self.assertEqual(profile['tier'], 'low')
+                return dict(TASK)
+            with patch.object(harness, 'invoke_engine', side_effect=run):
+                _, result = self.capture(harness.cmd_batch, self.args('batch', '--retry-quota'))
+            self.assertEqual(result['streams'][0]['status'], 'ok')
+            record.assert_not_called()
+        retry_args = self.args('batch', '--caller', 'antigravity', '--target', str(target), '--retry-quota')
+        role_profile = json.loads(json.dumps(harness._fleet_profile()))
+        role_profile['roles']['review']['candidates'] = ['codex:review']
+        with patch.object(harness, '_fleet_profile', return_value=role_profile):
+            streams, _ = harness._resolve_plan_streams(retry_args, [{'engine': 'role:review'}], engines)
+        self.assertEqual(streams[0]['engine'], 'codex:review')
+
+    def test_wp6a_batch_backend_pools_cannot_starve_other_backend(self):
+        engines = self.four_backends()
+        target = self.root / 'target'
+        target.mkdir()
+        (target / 'a.py').write_text('x=1', encoding='utf-8')
+        spec = self.root / 'spec.json'
+        specs = ['codex:review'] * 8 + ['dsh:review']
+        spec.write_text(json.dumps([{'stream_id': str(index), 'target': str(target), 'engine': engine,
+                                    'subtask': '核对', 'timeout': 60} for index, engine in enumerate(specs)]), encoding='utf-8')
+        other_started = threading.Event()
+        counts, lock = {}, threading.Lock()
+        def invoke(engine, *args, **kwargs):
+            prefix, _ = harness._engine_parts(engine)
+            with lock:
+                counts[prefix] = counts.get(prefix, 0) + 1
+            if prefix == 'codex':
+                self.assertTrue(other_started.wait(3), '其他后端被同端排队流阻塞')
+            else:
+                other_started.set()
+            with lock:
+                counts[prefix] -= 1
+            return dict(TASK)
+        hd = {**harness._headless_tunables(), 'batch_max_workers_per_backend': {prefix: 1 for prefix in engines}}
+        with patch.object(harness, '_args_backends', return_value=engines), \
+             patch.object(harness, '_headless_tunables', return_value=hd), \
+             patch.object(harness, 'invoke_engine', side_effect=invoke), \
+             patch.dict(os.environ, {'CAE_DISABLE_HEAVY_COMPLETIONS': '1'}):
+            _, result = self.capture(harness.cmd_batch, self.args('batch', '--caller', 'antigravity',
+                '--spec-file', str(spec), '--plan-dir', str(self.root / 'plans')))
+        self.assertTrue(all(stream['succeeded'] for stream in result['streams']))
+        self.assertEqual([stream['stream_id'] for stream in result['streams']], [str(i) for i in range(len(specs))])
 
 
 if __name__ == '__main__':

@@ -18,7 +18,12 @@
   },
   "roles": {
     "orchestrator": {
-      "candidates": ["agy:@orchestrator", "codex:@orchestrator", "claude:@orchestrator", "dsh:@orchestrator"],
+      "candidates": [
+        "agy:@orchestrator",
+        "codex:@orchestrator",
+        "claude:@orchestrator",
+        "dsh:@orchestrator"
+      ],
       "recommended_client": "antigravity",
       "recommended_model_family": "carbon",
       "recommended_tier": "high",
@@ -26,7 +31,13 @@
       "defects_and_mitigations": "交互式会话在约 20 万至 26 万 token 附近会触发自动检查点压缩，且 agy models 命令不输出整数窗口字段；通过 R9 钩子按 runtime_tunables.compaction_recovery.per_client.antigravity 动态恢复历轮用户原话与实质子代理返回摘要，在 cae_harness.py 中按保守单分片预算规划审查，并通过 blocked_auto_tokens 与 agy_retiring_patterns 跳过共享窗口复合模式及待退役第三方模型。"
     },
     "math": {
-      "candidates": ["codex:math", "codex:code", "agy:@math", "dsh:math", "claude:math"],
+      "candidates": [
+        "codex:math",
+        "codex:code",
+        "agy:@math",
+        "dsh:math",
+        "claude:math"
+      ],
       "recommended_client": "codex",
       "recommended_model_family": "astra",
       "recommended_tier": "max",
@@ -34,7 +45,13 @@
       "defects_and_mitigations": "客户端缓存默认推理强度为 medium、默认窗口为 272,000 token，不显式传参无法用满窗口与推理深度；开启 ultra 委派挡位会自动派生多层子代理引发轮询超时。由 install.py 与 cae_harness.py 显式声明最大窗口与单模型非委派最高挡 max，并在只读任务前后比对工作区文件哈希快照。"
     },
     "code": {
-      "candidates": ["codex:code", "codex:math", "claude:code", "agy:@code", "dsh:code"],
+      "candidates": [
+        "codex:code",
+        "codex:math",
+        "claude:code",
+        "agy:@code",
+        "dsh:code"
+      ],
       "recommended_client": "codex",
       "recommended_model_family": "sol",
       "recommended_tier": "max",
@@ -42,15 +59,25 @@
       "defects_and_mitigations": "客户端缓存默认推理强度为 low、默认窗口为 500,000 token，且在 Windows 下无范围遍历大型目录时易因进程调用开销触发超时；脚本显式传入 max 挡位与最大窗口，派发任务须配合 --write-scope 与精确行号限定范围。"
     },
     "review": {
-      "candidates": ["claude:default", "codex:review", "agy:@review", "dsh:review"],
-      "recommended_client": "claude",
-      "recommended_model_family": "k3.1-pro[1m]+deepseek-flash",
+      "candidates": [
+        "codex:review",
+        "dsh:review",
+        "agy:@review",
+        "claude:default"
+      ],
+      "recommended_client": "codex",
+      "recommended_model_family": "sol",
       "recommended_tier": "max",
-      "strengths": "现阶段 Claude Code 客户端具备完整的五类生命周期钩子与原生 --json-schema 结构化输出校验；经本地 router.py（Windows 默认端口 8240、WSL2 默认端口 8241）或 CC Switch 直连卡片接入原生兼容 Anthropic Messages API（/v1/messages）的 Kimi 与 DeepSeek 官方接口（均支持 1M 上下文窗口，单分片安全预算 900,000 token），按 API 余额计费并自动复用前缀缓存折扣。",
-      "defects_and_mitigations": "严禁接入第三方 Responses API 协议转换反代（易因工具调用 ID 映射不一致触发 HTTP 422 或流式响应中断）；无头只读调用固定附加 --permission-mode dontAsk，避免触发 auto 权限模式的额外安全分类器限流报错。"
+      "strengths": "现阶段独立代码与文档审查优先跨客户端调用 Codex sol 系列（872,000 token 窗口）或 DeepSeek Harness 内置 DeepSeek-V4-Pro（1,048,576 token 窗口）及 Antigravity carbon 系列；Claude Code 客户端保留完整的五类生命周期钩子、原生 --json-schema 结构化输出校验及本地 router.py 与 CC Switch 卡片通道，按 subscription_matrix 中已启用的卡片模型参与调度。",
+      "defects_and_mitigations": "Claude Code 当前启用的 DeepSeek 卡片为轻量模型 deepseek-flash[1M]，由脚本硬性拦截其冒充非 fast 审查角色主力；严禁接入第三方 Responses API 协议转换反代，无头只读调用固定附加 --permission-mode dontAsk 以规避 auto 分类器限流报错。"
     },
     "fast": {
-      "candidates": ["dsh:fast", "claude:fast", "agy:@fast", "codex:@fast"],
+      "candidates": [
+        "dsh:fast",
+        "claude:fast",
+        "agy:@fast",
+        "codex:@fast"
+      ],
       "recommended_client": "dsh",
       "recommended_model_family": "deepseek-flash",
       "recommended_tier": "low",
@@ -73,14 +100,45 @@
   },
   "client_catalog_rules": {
     "agy": {
-      "family_priority": ["carbon", "argon", "pro"],
-      "fast_tags": ["lite", "mini", "fast", "flash", "hydrogen"],
-      "blocked_auto_tokens": ["orchestrator", "router", "claude", "sonnet", "opus", "haiku", "gpt", "oss"]
+      "family_priority": [
+        "carbon",
+        "argon",
+        "pro"
+      ],
+      "fast_tags": [
+        "lite",
+        "mini",
+        "fast",
+        "flash",
+        "hydrogen"
+      ],
+      "blocked_auto_tokens": [
+        "orchestrator",
+        "router",
+        "claude",
+        "sonnet",
+        "opus",
+        "haiku",
+        "gpt",
+        "oss"
+      ]
     },
     "codex": {
-      "workhorse_families": ["sol", "astra", "terra"],
-      "deep_tags": ["astra"],
-      "fast_tags": ["lite", "mini", "fast", "flash", "luna"]
+      "workhorse_families": [
+        "sol",
+        "astra",
+        "terra"
+      ],
+      "deep_tags": [
+        "astra"
+      ],
+      "fast_tags": [
+        "lite",
+        "mini",
+        "fast",
+        "flash",
+        "luna"
+      ]
     },
     "claude": {
       "default_fallback_alias": "opus",
@@ -90,7 +148,11 @@
       "max_context_tokens": 1048576,
       "auto_compact_window": 1000000,
       "router_card_name": "K3.1主+DS子代理",
-      "managed_cards": ["Kimi", "DeepSeek", "K3.1主+DS子代理"],
+      "managed_cards": [
+        "Kimi",
+        "DeepSeek",
+        "K3.1主+DS子代理"
+      ],
       "alias_map": {
         "kimi": "k3.1-pro[1m]",
         "k3": "k3.1-pro[1m]",
@@ -107,14 +169,24 @@
           "display_name": "DeepSeek-V4-Pro",
           "context_window": 1048576,
           "max_context_window": 1048576,
-          "supported_efforts": ["off", "low", "high", "max"]
+          "supported_efforts": [
+            "off",
+            "low",
+            "high",
+            "max"
+          ]
         },
         {
           "slug": "deepseek-flash",
           "display_name": "DeepSeek-V4.1-Flash",
           "context_window": 1048576,
           "max_context_window": 1048576,
-          "supported_efforts": ["off", "low", "high", "max"]
+          "supported_efforts": [
+            "off",
+            "low",
+            "high",
+            "max"
+          ]
         }
       ],
       "alias_map": {
@@ -124,10 +196,27 @@
     }
   },
   "peer_fallback_order": {
-    "antigravity": ["codex", "claude", "dsh"],
-    "codex": ["agy", "claude", "dsh"],
-    "claude": ["codex", "agy", "dsh"],
-    "dsh": ["codex", "agy", "claude", "dsh"]
+    "antigravity": [
+      "codex",
+      "claude",
+      "dsh"
+    ],
+    "codex": [
+      "agy",
+      "claude",
+      "dsh"
+    ],
+    "claude": [
+      "codex",
+      "agy",
+      "dsh"
+    ],
+    "dsh": [
+      "codex",
+      "agy",
+      "claude",
+      "dsh"
+    ]
   },
   "runtime_tunables": {
     "compaction_recovery": {
@@ -139,7 +228,14 @@
         "recent_subagent_returns": 4,
         "recent_subagent_window": 12,
         "min_substantive_subagent_chars": 64,
-        "priority_subagent_keywords": ["auditor", "collaborator", "reader", "review", "math", "audit"],
+        "priority_subagent_keywords": [
+          "auditor",
+          "collaborator",
+          "reader",
+          "review",
+          "math",
+          "audit"
+        ],
         "subagent_head_ratio": 0.58,
         "inline_subagent_total_chars": 1400,
         "inline_subagent_item_chars": 280,
@@ -220,7 +316,7 @@
       "reply_repeat": {
         "max_short_reply_chars": 300,
         "tail_scan_kib": 256,
-        "similarity_threshold": 0.80,
+        "similarity_threshold": 0.8,
         "core_similarity_threshold": 0.75,
         "consecutive_wait_limit": 3
       },
@@ -239,7 +335,7 @@
       }
     },
     "headless_dispatch": {
-      "input_budget_safety_ratio": 0.90,
+      "input_budget_safety_ratio": 0.9,
       "unlisted_window_fallback_tokens": 120000,
       "default_shard_tokens": 120000,
       "default_timeout_sec": 600,
@@ -265,6 +361,104 @@
         "max_inflight": 64,
         "windows_proxy_ttl_sec": 5,
         "key_cache_ttl_sec": 60
+      },
+      "inline_readonly_max_kib": 256,
+      "snapshot_ignored_dirs": [
+        ".git",
+        ".venv",
+        "venv",
+        "build",
+        "dist",
+        "runs",
+        "__pycache__",
+        "node_modules",
+        ".cache",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+        "target"
+      ],
+      "batch_max_workers_per_backend": {
+        "codex": 2,
+        "claude": 2,
+        "dsh": 2,
+        "agy": 2
+      }
+    },
+    "dispatch_confirmation": {
+      "heavy_min_streams": 2,
+      "heavy_max_light_files": 2,
+      "heavy_max_light_tokens": 24000,
+      "heavy_max_light_timeout_sec": 600,
+      "ticket_ttl_sec": 86400,
+      "codex_rollout_scan_files": 5,
+      "quota_warn_percent": 85.0,
+      "quota_block_percent": 100.0
+    }
+  },
+  "capability_ledger": {
+    "last_online_refresh_at": "2026-11-11",
+    "local_bench_verified_at": "2026-11-16",
+    "online_refresh_module": "fleet-evolve",
+    "dispatch_online_lookup": false
+  },
+  "subscription_matrix": {
+    "decided_at": "2026-11-16",
+    "agents": {
+      "agy": {
+        "enabled": true,
+        "quota_scheme": "rolling_window_5h_7d",
+        "quota_label": "5 小时与 7 天滚动订阅配额"
+      },
+      "codex": {
+        "enabled": true,
+        "quota_scheme": "rolling_window_5h_weekly",
+        "quota_label": "5 小时与周度滚动窗口配额（读取本地 rollout rate_limits）"
+      },
+      "claude": {
+        "enabled": true,
+        "quota_scheme": "ccswitch_card_dependent",
+        "quota_label": "按 CC Switch 卡片计费类型（token_plan、balance 或日月限额）"
+      },
+      "dsh": {
+        "enabled": true,
+        "quota_scheme": "api_balance_or_account",
+        "quota_label": "官方 API 余额按量或账号配额"
+      }
+    },
+    "models": {
+      "gpt-6.1-sol": {
+        "agent": "codex",
+        "enabled": true,
+        "quota_scheme": "rolling_window_5h_weekly",
+        "offline_perf_note": "工程编码、多文件实现与边界审查主力，high 挡单轮吞吐稳健"
+      },
+      "gpt-6-astra": {
+        "agent": "codex",
+        "enabled": true,
+        "quota_scheme": "rolling_window_5h_weekly",
+        "offline_perf_note": "长链数理推导强，max 挡单轮耗时长，常规分片宜用 high 挡"
+      },
+      "k3.1-pro[1m]": {
+        "agent": "claude",
+        "enabled": false,
+        "quota_scheme": "token_plan",
+        "card": "Kimi",
+        "offline_perf_note": "当前在配置中设为停用（enabled: false），全局选路自动跳过；按需开启后可用于 1M 窗口跨文件审查"
+      },
+      "deepseek-v4-pro": {
+        "agent": "dsh",
+        "enabled": true,
+        "quota_scheme": "api_balance",
+        "offline_perf_note": "数理推导与中文工程书面语校核扎实"
+      },
+      "deepseek-flash[1M]": {
+        "agent": "claude",
+        "enabled": true,
+        "quota_scheme": "balance",
+        "card": "DeepSeek",
+        "lightweight": true,
+        "offline_perf_note": "轻量快速低成本初筛，不可冒充非 fast 专长角色主力"
       }
     }
   }

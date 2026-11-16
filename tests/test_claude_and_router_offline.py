@@ -43,6 +43,7 @@ def _load_module(name, path):
 router = _load_module("claude_router_offline", REPO_ROOT / "template/claude/router/router.py")
 admin = _load_module("ccswitch_admin_offline", REPO_ROOT / "template/claude/router/ccswitch_admin.py")
 installer = _load_module("claude_installer_offline", REPO_ROOT / "install.py")
+fleet_state = _load_module("fleet_state_offline", REPO_ROOT / "template/user-guard/skills/fleet-evolve/scripts/fleet_state.py")
 
 
 def _append_jsonl(path, entry):
@@ -818,7 +819,7 @@ class TestClaudeRouter(OfflineSandbox):
         self.assertEqual(json.loads(log)["bytes"], len(handler.wfile.getvalue()))
 
     def test_deepseek_prefix_strips_context_suffix_and_forces_max(self):
-        handler = self.handler({"model": "deepseek-flash[1M]", "output_config": {"effort": "low", "format": "json"}})
+        handler = self.handler({"model": "deepseek-flash[1M]", "output_config": {"effort": "high", "format": "json"}})
         connection = self.upstream()
         with mock.patch.object(router.http.client, "HTTPSConnection", return_value=connection) as opened, \
                 mock.patch.object(router, "card_key", return_value="tok_ds_unit_test") as key:
@@ -828,6 +829,76 @@ class TestClaudeRouter(OfflineSandbox):
         data = json.loads(connection.request.call_args.kwargs["body"])
         self.assertEqual(data["model"], "deepseek-flash")
         self.assertEqual(data["output_config"], {"effort": "max", "format": "json"})
+
+    def test_force_effort_preserves_low_tiers_and_defaults_to_max(self):
+        for effort in (None, "low", "LoW", "medium", "MEDIUM", "high", "XHIGH", "max", "unknown"):
+            with self.subTest(effort=effort):
+                output_config = {"format": "json"}
+                if effort is not None:
+                    output_config["effort"] = effort
+                handler = self.handler({"model": "deepseek-flash", "output_config": output_config})
+                connection = self.upstream()
+                with mock.patch.object(router.http.client, "HTTPSConnection", return_value=connection), \
+                        mock.patch.object(router, "card_key", return_value="tok_fixture"):
+                    handler.do_POST()
+                config = json.loads(connection.request.call_args.kwargs["body"])["output_config"]
+                expected = "max" if effort is None or effort.lower() in ("high", "xhigh", "max") else effort
+                self.assertEqual(config, {"format": "json", "effort": expected})
+
+    def test_busy_router_rejects_before_any_body_read(self):
+        for chunked in (False, True):
+            with self.subTest(chunked=chunked):
+                handler = self.handler({"model": "deepseek-flash"})
+                if chunked:
+                    handler.headers["Transfer-Encoding"] = "chunked"
+                handler.rfile = mock.Mock()
+                handler.server.inflight_sem = mock.Mock()
+                handler.server.inflight_sem.acquire.return_value = False
+                handler.do_POST()
+                handler.send_error.assert_called_once_with(503, "router max_inflight reached")
+                handler.rfile.read.assert_not_called()
+                handler.rfile.readline.assert_not_called()
+                handler.server.inflight_sem.acquire.assert_called_once_with(blocking=False)
+                handler.server.inflight_sem.release.assert_not_called()
+
+    def test_post_slot_released_once_on_body_and_forward_paths(self):
+        for case in ("success", "oversize", "invalid_length", "read_error", "chunked", "bad_chunk", "forward_error"):
+            with self.subTest(case=case):
+                handler = self.handler({"model": "deepseek-flash"})
+                handler.server.inflight_sem = mock.Mock()
+                handler.server.inflight_sem.acquire.return_value = True
+                handler._forward_locked = mock.Mock()
+                if case == "oversize":
+                    handler.server.cfg["max_body_bytes"] = 1
+                elif case == "invalid_length":
+                    handler.headers.replace_header("Content-Length", "invalid")
+                elif case == "read_error":
+                    handler.rfile = mock.Mock()
+                    handler.rfile.read.side_effect = OSError("fixture")
+                elif case in ("chunked", "bad_chunk"):
+                    handler.headers["Transfer-Encoding"] = "chunked"
+                    handler.rfile = io.BytesIO(b"2\r\n{}\r\n0\r\n\r\n" if case == "chunked" else b"invalid\r\n")
+                elif case == "forward_error":
+                    handler._forward_locked.side_effect = RuntimeError("fixture")
+                if case == "forward_error":
+                    with self.assertRaisesRegex(RuntimeError, "fixture"):
+                        handler.do_POST()
+                else:
+                    handler.do_POST()
+                handler.server.inflight_sem.acquire.assert_called_once_with(blocking=False)
+                handler.server.inflight_sem.release.assert_called_once_with()
+                if case in ("success", "chunked", "forward_error"):
+                    handler._forward_locked.assert_called_once()
+                else:
+                    handler._forward_locked.assert_not_called()
+
+    def test_platform_router_port_comes_from_profile(self):
+        tunables = {"port": 18240, "wsl_port": 18241}
+        with mock.patch.dict(router.DEFAULTS), mock.patch.object(router, "_load_fleet_router_tunables", return_value=tunables):
+            for platform, expected in (("nt", 18240), ("posix", 18241)):
+                with mock.patch.object(router.os, "name", platform):
+                    router._apply_fleet_router_defaults()
+                self.assertEqual(router.DEFAULTS["port"], expected)
 
     def test_proxy_tunnel_and_lookup_failure_direct_fallback(self):
         handler = self.handler({"model": "kimi"})
@@ -920,6 +991,82 @@ class TestClaudeRouter(OfflineSandbox):
 
 
 class TestCCSwitchAdmin(OfflineSandbox):
+    def test_status_quota_types_and_caps_never_disclose_amounts(self):
+        db = self.database()
+        with closing(sqlite3.connect(db)) as con:
+            con.execute("UPDATE providers SET meta=?, limit_daily_usd=?, limit_monthly_usd=? WHERE app_type='claude'",
+                        (json.dumps({"usage_script": {"templateType": "token_plan", "secret": "tok_private"}}), 12.34, 56.78))
+            con.execute("UPDATE providers SET meta=? WHERE app_type='codex'",
+                        (json.dumps({"usage_script": {"templateType": "balance"}}),))
+            con.commit()
+        report = admin.inspect_status(db)
+        cards = {card["app_type"]: card for card in report["cards"]}
+        self.assertEqual(cards["claude"]["quota_scheme"], "token_plan")
+        self.assertEqual(cards["codex"]["quota_scheme"], "balance")
+        self.assertEqual(cards["claude"]["quota_caps"], ["daily_cap", "monthly_cap"])
+        self.assertEqual(cards["codex"]["quota_caps"], [])
+        serialized = json.dumps(report)
+        for secret in ("12.34", "56.78", "tok_private"):
+            self.assertNotIn(secret, serialized)
+        with closing(sqlite3.connect(db)) as con:
+            con.execute("UPDATE providers SET meta='[]'")
+            con.commit()
+        self.assertTrue(all(card["quota_scheme"] is None for card in admin.inspect_status(db)["cards"]))
+
+    def test_switch_dead_loopback_warns_or_blocks_before_writes(self):
+        db, settings = self.database(), self.settings()
+        admin.prepare_cards(db, 8240)
+        for host in ("127.0.0.1", "localhost", "[::1]"):
+            with self.subTest(host=host):
+                self.replace_card(db, "Kimi", {"env": {"ANTHROPIC_BASE_URL": f"http://{host}:8240"}})
+                original = (db.read_bytes(), settings.read_bytes())
+                backups = set(self.root.rglob("*.bak-before-live-switch-*"))
+                opener = mock.Mock()
+                opener.open.side_effect = OSError("fixture dead router")
+                with mock.patch.object(admin.urllib.request, "build_opener", return_value=opener):
+                    with self.assertRaisesRegex(RuntimeError, "Local router"):
+                        admin.switch_card(db, settings, "Kimi", require_router_alive=True)
+                    with self.assertRaisesRegex(RuntimeError, "Local router"):
+                        admin.main(["--db", str(db), "--settings", str(settings),
+                                    "switch-card", "Kimi", "--require-router-alive"])
+                    self.assertEqual((db.read_bytes(), settings.read_bytes()), original)
+                    self.assertEqual(set(self.root.rglob("*.bak-before-live-switch-*")), backups)
+                    result = admin.switch_card(db, settings, "Kimi")
+                self.assertTrue(any("/__router/health" in warning for warning in result["warnings"]))
+                opener.open.assert_called_with(f"http://{host}:8240/__router/health", timeout=2.0)
+
+    def test_switch_live_router_and_direct_card_with_required_health(self):
+        db, settings = self.database(), self.settings()
+        admin.prepare_cards(db, 8240)
+        self.replace_card(db, "Kimi", {"env": {"ANTHROPIC_BASE_URL": "http://localhost:8240"}})
+        response = mock.MagicMock(status=200)
+        response.__enter__.return_value = response
+        response.read.return_value = b'{"ok": true}'
+        opener = mock.Mock()
+        opener.open.return_value = response
+        with mock.patch.object(admin.urllib.request, "build_opener", return_value=opener):
+            result = admin.switch_card(db, settings, "Kimi", require_router_alive=True)
+        self.assertFalse(result["warnings"])
+        with mock.patch.object(admin.urllib.request, "build_opener") as probe:
+            admin.switch_card(db, settings, "DeepSeek", require_router_alive=True)
+        probe.assert_not_called()
+
+    def test_card_defaults_are_dynamic_and_incomplete_profile_is_rejected(self):
+        profile = self.root / "profile.json"
+        rules = {"router_primary_model": "fixture-primary", "router_subagent_model": "fixture-subagent",
+                 "max_context_tokens": 123456, "auto_compact_window": 120000, "router_card_name": "fixture"}
+        user_words.atomic_write_json(profile, {"client_catalog_rules": {"claude": rules}})
+        with mock.patch.dict(os.environ, {"CAE_FLEET_PROFILE": str(profile)}):
+            cards = admin._build_card_templates(8240)
+            env = cards["fixture"][0]()
+            self.assertEqual(env["ANTHROPIC_MODEL"], "fixture-primary")
+            self.assertEqual(env["CLAUDE_CODE_SUBAGENT_MODEL"], "fixture-subagent")
+            self.assertEqual(env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "123456")
+            self.assertEqual(env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "120000")
+            user_words.atomic_write_json(profile, {"client_catalog_rules": {"claude": {}}})
+            with self.assertRaisesRegex(ValueError, "missing Claude defaults"):
+                admin._claude_profile_defaults()
+
     def test_schema_supported_newer_warns_and_older_rejected(self):
         db = self.database()
         for version, warns in ((26, False), (27, True)):
@@ -951,6 +1098,18 @@ class TestCCSwitchAdmin(OfflineSandbox):
         for name in ("Kimi", "DeepSeek", "K3.1主+DS子代理"):
             self.assertNotIn("CLAUDE_CODE_EFFORT_LEVEL", cards[name]["env"])
         self.assertNotIn("tok_kimi_unit_test", json.dumps(second))
+
+    def test_prepare_cards_preserves_valid_meta_and_normalizes_invalid_meta(self):
+        db = self.database()
+        admin.prepare_cards(db, 8240)
+        metadata = '{ "usage_script": {"templateType":"fixture"}, "dailyLimit": 8, "monthlyLimit": 40 }'
+        for value in (metadata, "", "[]", "broken", None):
+            with self.subTest(meta=value), closing(sqlite3.connect(db)) as con:
+                con.execute("UPDATE providers SET meta=? WHERE name='Kimi'", (value,))
+                con.commit()
+                admin.prepare_cards(db, 8241)
+                saved = con.execute("SELECT meta FROM providers WHERE name='Kimi'").fetchone()[0]
+                self.assertEqual(saved, metadata if value == metadata else "{}")
 
     def test_prepare_dry_run_and_duplicate_failure_do_not_modify_database(self):
         db = self.database()
@@ -1154,6 +1313,288 @@ class TestClaudeInstallerAndUpgradeAudit(OfflineSandbox):
                 ("codex_old", "codex", "Old Codex", 2, "old codex rules"),
             ])
             con.commit()
+
+    def test_legacy_custom_rules_migrate_and_audit_detects_missing_standard_section(self):
+        self.codex.mkdir(parents=True)
+        rules = self.codex / "AGENTS.md"
+        tail = "## 工具与本机\nR10. 本地编译器。\n- **R11. 本地编辑器。**\n原样保留 R10. 内文。\n"
+        template = (self.source / "template/user-guard/rules/AGENTS.md").read_text(encoding="utf-8").rstrip()
+        core = template.split("## 工具与运行环境", 1)[0].rstrip()
+        rules.write_bytes((core + "\n\n" + tail).encode())
+        args = ["--app", "codex", "--codex-home", self.codex]
+        report = json.loads(self.install(*args, "--audit-upgrade").stdout)
+        self.assertIn("AGENTS.md", report["codex"]["drift_files"])
+        self.install(*args)
+        expected_tail = tail.replace("\nR10.", "\nL1.").replace("- **R11.", "- **L2.")
+        self.assertEqual(rules.read_text(encoding="utf-8"), template + "\n\n" + expected_tail)
+        before = self.snapshot()
+        report = json.loads(self.install(*args, "--audit-upgrade").stdout)
+        self.assertEqual(report["codex"]["drift_files"], [])
+        self.assertTrue(report["codex"]["hooks_aligned"])
+        self.assertEqual(self.snapshot(), before)
+        self.install(*args)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_custom_rule_collision_markdown_variants_and_rules_equal(self):
+        template = self.source / "template/user-guard/rules/AGENTS.md"
+        target = self.codex / "AGENTS.md"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        prefixes = ("", "- ", "* ", "+ ", "1. ", "**", "*", "- **", "### ", "  2. **")
+        for prefix in prefixes:
+            with self.subTest(prefix=prefix):
+                tail = "## 工具与本机\n" + prefix + "R10. 编译器\n" + prefix + "R11. 编辑器\n"
+                target.write_text(template.read_text(encoding="utf-8") + "\n" + tail, encoding="utf-8")
+                self.assertFalse(installer._rules_equal(target.read_bytes(), template.read_bytes()))
+                installer._sync_global_rules(template, target, "fixture", False)
+                text = target.read_text(encoding="utf-8")
+                self.assertTrue(text.endswith(tail.replace("R10.", "L1.").replace("R11.", "L2.")))
+                self.assertTrue(installer._rules_equal(target.read_bytes(), template.read_bytes()))
+
+    def test_codex_all_hook_scripts_run_and_off_removes_gate(self):
+        args = ["--app", "codex", "--codex-home", self.codex]
+        self.install(*args)
+        names = {"session_context_loader.py", "status_guard.py", "reply_repeat_guard.py", "handoff_gate.py", "user_words.py"}
+        for name in names:
+            path = self.codex / "hooks" / name
+            self.assertEqual(path.read_bytes(), (HOOKS_DIR / name).read_bytes())
+            result = subprocess.run([sys.executable, "-B", "-X", "utf8", "-I", str(path), "--help"],
+                                    cwd=self.project, capture_output=True, text=True, encoding="utf-8", timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        doc = json.loads((self.codex / "hooks.json").read_bytes())
+        for event, name in (("PreToolUse", "status_guard.py"), ("Stop", "reply_repeat_guard.py")):
+            handlers = [h for g in doc["hooks"][event] for h in g["hooks"] if name in h["command"]]
+            self.assertEqual(len(handlers), 1)
+            self.assertEqual(handlers[0]["timeout"], 15)
+            self.assertIn("--client codex", handlers[0]["command"])
+            payload = {"session_id": "codex_fixture", "cwd": str(self.project), "hook_event_name": event,
+                       "stop_hook_active": True, "tool_name": "Read",
+                       "tool_input": {"file_path": str(self.project / "solver.py")}}
+            result = subprocess.run(installer._codex_hook_tokens(handlers[0]), input=json.dumps(payload),
+                                    cwd=self.project, capture_output=True, text=True, encoding="utf-8", timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stderr, "")
+            self.assertIsInstance(json.loads(result.stdout), dict)
+        gate = self.codex / "hooks/handoff_gate.py"
+        before = self.snapshot()
+        self.install(*args, "--codex-handoff-mode", "off", "--dry-run")
+        self.assertEqual(self.snapshot(), before)
+        self.install(*args, "--codex-handoff-mode", "off")
+        self.assertEqual(gate.read_bytes(), (HOOKS_DIR / "handoff_gate.py").read_bytes())
+        self.assertTrue(all((self.codex / "hooks" / name).is_file() for name in names))
+        doc = json.loads((self.codex / "hooks.json").read_bytes())
+        self.assertNotIn("handoff_gate.py", json.dumps(doc["hooks"]))
+        for event, name in (("PreToolUse", "status_guard.py"), ("Stop", "reply_repeat_guard.py")):
+            handler = next(h for g in doc["hooks"][event] for h in g["hooks"] if name in h["command"])
+            payload = {"session_id": "codex_off_fixture", "cwd": str(self.project), "hook_event_name": event,
+                       "stop_hook_active": True, "tool_name": "Read",
+                       "tool_input": {"file_path": str(self.project / "solver.py")}}
+            result = subprocess.run(installer._codex_hook_tokens(handler), input=json.dumps(payload),
+                                    cwd=self.project, capture_output=True, text=True, encoding="utf-8", timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stderr, "")
+            self.assertIsInstance(json.loads(result.stdout), dict)
+        report = json.loads(self.install(*args, "--audit-upgrade").stdout)
+        self.assertEqual(report["codex"]["drift_files"], [])
+        self.assertTrue(report["codex"]["hooks_aligned"])
+        gate.write_bytes(b"# stale gate\n")
+        report = json.loads(self.install(*args, "--audit-upgrade").stdout)
+        self.assertIn("hooks/handoff_gate.py", report["codex"]["drift_files"])
+        self.install(*args)
+        self.assertEqual(gate.read_bytes(), (HOOKS_DIR / "handoff_gate.py").read_bytes())
+
+    def test_codex_audit_detects_missing_guard_registration_and_script(self):
+        args = ["--app", "codex", "--codex-home", self.codex]
+        self.install(*args)
+        registry = self.codex / "hooks.json"
+        original = registry.read_bytes()
+        for event, name in (("PreToolUse", "status_guard.py"), ("Stop", "reply_repeat_guard.py")):
+            with self.subTest(event=event):
+                doc = json.loads(original)
+                expected_doc = copy.deepcopy(doc)
+                for group in doc["hooks"][event]:
+                    group["hooks"] = [handler for handler in group["hooks"] if name not in handler["command"]]
+                for group in expected_doc["hooks"][event]:
+                    restored = [handler for handler in group["hooks"] if name in handler["command"]]
+                    group["hooks"] = [handler for handler in group["hooks"] if name not in handler["command"]] + restored
+                registry.write_bytes((json.dumps(doc) + "\n").encode("utf-8"))
+                before = self.snapshot()
+                report = json.loads(self.install(*args, "--audit-upgrade").stdout)
+                self.assertFalse(report["codex"]["hooks_aligned"])
+                self.assertIn("hooks.json", report["codex"]["drift_files"])
+                self.assertEqual(self.snapshot(), before)
+                self.install(*args)
+                self.assertEqual(json.loads(registry.read_bytes()), expected_doc)
+                script = self.codex / "hooks" / name
+                script.unlink()
+                before = self.snapshot()
+                report = json.loads(self.install(*args, "--audit-upgrade").stdout)
+                self.assertIn("hooks/" + name, report["codex"]["drift_files"])
+                self.assertEqual(self.snapshot(), before)
+                self.install(*args)
+                self.assertEqual(script.read_bytes(), (HOOKS_DIR / name).read_bytes())
+                report = json.loads(self.install(*args, "--audit-upgrade").stdout)
+                self.assertTrue(report["codex"]["hooks_aligned"])
+                self.assertEqual(report["codex"]["drift_files"], [])
+
+    def test_claude_admin_is_installed_without_router_and_audited(self):
+        args = ["--app", "claude", "--claude-home", self.claude_home]
+        self.install(*args, "--no-claude-hooks")
+        self.assertFalse((self.claude_home / "hooks").exists())
+        self.install(*args)
+        target = self.claude_home / "hooks/ccswitch_admin.py"
+        self.assertEqual(target.read_bytes(), (self.source / "template/claude/router/ccswitch_admin.py").read_bytes())
+        self.assertFalse((self.claude_home / "router").exists())
+        result = subprocess.run([sys.executable, "-B", "-X", "utf8", str(target), "--help"],
+                                capture_output=True, text=True, encoding="utf-8", timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(self.install(*args, "--audit-upgrade").stdout)
+        self.assertEqual(report["claude"]["drift_files"], [])
+        target.write_bytes(b"# drift\n")
+        report = json.loads(self.install(*args, "--audit-upgrade").stdout)
+        self.assertIn("hooks/ccswitch_admin.py", report["claude"]["drift_files"])
+
+    def test_audit_cli_isolates_only_ccswitch_configuration(self):
+        before = dict(os.environ)
+        isolated = []
+
+        def probe(command, **kwargs):
+            if "cc-switch" in command[-2]:
+                env = kwargs["env"]
+                paths = {env[key] for key in ("HOME", "XDG_CONFIG_HOME", "APPDATA", "LOCALAPPDATA")}
+                self.assertEqual(len(paths), 1)
+                root = Path(paths.pop())
+                self.assertTrue(root.is_dir())
+                self.assertNotEqual(root, self.home)
+                self.assertEqual(env["USERPROFILE"], before["USERPROFILE"])
+                (root / "cc-switch.db").write_bytes(b"isolated defaults")
+                isolated.append(root)
+            else:
+                self.assertNotIn("env", kwargs)
+                self.assertEqual(os.environ["USERPROFILE"], before["USERPROFILE"])
+            return subprocess.CompletedProcess(command, 0, "fixture 1.2.3\n", "")
+
+        with mock.patch.object(installer.subprocess, "run", side_effect=probe):
+            for binary in ("cc-switch", "cc-switch.exe", "codex", "claude", "agy", "dsh"):
+                self.assertEqual(installer._audit_cli({"native_binary": binary})["version"], "1.2.3")
+        self.assertEqual(dict(os.environ), before)
+        self.assertEqual(len(isolated), 2)
+        self.assertTrue(all(not root.exists() for root in isolated))
+
+    def test_audit_cli_cleans_isolated_configuration_when_probe_fails(self):
+        before = dict(os.environ)
+        for failure in (OSError("fixture executable unavailable"), subprocess.TimeoutExpired("cc-switch", 3)):
+            with self.subTest(failure=type(failure).__name__):
+                isolated = []
+
+                def probe(command, **kwargs):
+                    root = Path(kwargs["env"]["HOME"])
+                    self.assertTrue(root.is_dir())
+                    self.assertTrue(root.is_relative_to(REPO_ROOT))
+                    (root / "cc-switch.db").write_bytes(b"fixture defaults")
+                    isolated.append(root)
+                    raise failure
+
+                with mock.patch.object(installer.tempfile, "tempdir", str(self.root)), \
+                        mock.patch.object(installer.subprocess, "run", side_effect=probe):
+                    report = installer._audit_cli({"native_binary": "cc-switch", "native_installed": True})
+                self.assertIsNone(report["version"])
+                self.assertTrue(report["native_installed"])
+                self.assertEqual(len(isolated), 1)
+                self.assertFalse(isolated[0].exists())
+                self.assertEqual(dict(os.environ), before)
+
+    def test_subscription_candidates_separate_profile_enablement_and_availability(self):
+        db = self.database()
+        admin.prepare_cards(db, admin.default_router_port())
+        card = self.cards(db)["Kimi"]
+        card["env"]["ANTHROPIC_AUTH_TOKEN"] = "fixture-card-token"
+        with closing(sqlite3.connect(db)) as con:
+            con.execute("UPDATE providers SET settings_config=?, meta=? WHERE app_type='claude' AND name='Kimi'",
+                        (json.dumps(card), json.dumps({"usage_script": {"templateType": "balance"}})))
+            con.commit()
+        profile = {"subscription_matrix": {
+            "agents": {name: {"enabled": name != "dsh", "quota_scheme": "fixture_quota"}
+                       for name in ("agy", "codex", "claude", "dsh")},
+            "models": {
+                "fixture-model": {"agent": "codex", "enabled": False, "quota_scheme": "fixture_quota"},
+                "missing-model": {"agent": "codex", "enabled": True, "quota_scheme": "fixture_quota"},
+                "card-model": {"agent": "claude", "card": "Kimi", "enabled": True, "quota_scheme": "token_plan"},
+                "missing-card-model": {"agent": "claude", "card": "absent", "enabled": True, "quota_scheme": "balance"},
+                "placeholder-model": {"agent": "claude", "card": "DeepSeek", "enabled": True, "quota_scheme": "balance"},
+                "dsh-model": {"agent": "dsh", "enabled": False, "quota_scheme": "api_balance"},
+            },
+        }}
+        self.codex.mkdir(parents=True)
+        user_words.atomic_write_json(self.codex / "models_cache.json", {"models": [{"slug": "fixture-model"}]})
+        detected = {name: {"native_installed": name != "antigravity"} for name in ("antigravity", "codex", "claude", "dsh")}
+        with mock.patch.object(installer, "_load_fleet_profile", return_value=profile):
+            report = installer.audit_upgrade_status(
+                REPO_ROOT, self.plugin, self.codex, self.claude_home, db,
+                detection=detected, is_sandbox_run=True, dsh_home=self.home / ".dsh")
+        candidates = report["subscription_candidates"]
+        self.assertEqual(set(candidates["agents"]), {"agy", "codex", "claude", "dsh"})
+        self.assertFalse(candidates["agents"]["agy"]["currently_available"])
+        self.assertTrue(candidates["agents"]["dsh"]["currently_available"])
+        self.assertFalse(candidates["agents"]["dsh"]["enabled_in_profile"])
+        self.assertFalse(candidates["models"]["fixture-model"]["enabled_in_profile"])
+        self.assertTrue(candidates["models"]["fixture-model"]["currently_available"])
+        self.assertFalse(candidates["models"]["missing-model"]["currently_available"])
+        self.assertFalse(candidates["models"]["missing-card-model"]["currently_available"])
+        self.assertTrue(candidates["models"]["card-model"]["currently_available"])
+        self.assertFalse(candidates["models"]["placeholder-model"]["currently_available"])
+        self.assertEqual(candidates["models"]["card-model"]["quota_scheme"], "balance")
+        cli_report = json.loads(self.install("--audit-upgrade", "--app", "claude", "--claude-home", self.claude_home,
+                                             "--ccswitch-db", db).stdout)
+        self.assertIn("subscription_candidates", cli_report)
+
+    def test_router_chmod_failure_preserves_synced_scripts(self):
+        source = self.root / "router-template"
+        source.mkdir()
+        for name in ("router.py", "cc-router.sh", "router.windows.json", "router.wsl.json"):
+            (source / name).write_bytes(b"{}\n" if name.endswith(".json") else b"# fixture\n")
+        with mock.patch.object(Path, "chmod", side_effect=OSError("fixture permission denied")) as chmod:
+            installer._sync_cc_router(source, self.claude_home)
+        self.assertGreaterEqual(chmod.call_count, 2)
+        for name in ("router.py", "cc-router.sh"):
+            self.assertEqual((self.claude_home / "router" / name).read_bytes(), (source / name).read_bytes())
+
+    def test_initial_router_port_uses_profile_and_preserves_existing_config(self):
+        source = self.source / "template/claude/router"
+        platform_file = "router.windows.json" if os.name == "nt" else "router.wsl.json"
+        template = (source / platform_file).read_bytes()
+        default_port = json.loads(template)["port"]
+        port_key = "port" if os.name == "nt" else "wsl_port"
+        for port in (default_port, default_port + 17):
+            target_home = self.root / ("claude-port-" + str(port))
+            profile = {"runtime_tunables": {"headless_dispatch": {"router": {port_key: port}}}}
+            with mock.patch.object(installer, "_load_fleet_profile", return_value=profile):
+                installer._sync_cc_router(source, target_home, dry_run=True)
+                self.assertFalse((target_home / "router/router.json").exists())
+                installer._sync_cc_router(source, target_home)
+            primary = target_home / "router/router.json"
+            self.assertEqual(json.loads(primary.read_bytes())["port"], port)
+            if port == default_port:
+                self.assertEqual(primary.read_bytes(), template)
+            custom = b'{"port": 8456, "custom": true}\n'
+            primary.write_bytes(custom)
+            installer._sync_cc_router(source, target_home)
+            self.assertEqual(primary.read_bytes(), custom)
+
+    def test_new_claude_hooks_use_selected_interpreter_when_existing_prefix_is_invalid(self):
+        path = self.claude_home / "settings.json"
+        user_words.atomic_write_json(path, {"hooks": {"SessionStart": [{"matcher": "^(compact|resume)$", "hooks": [{
+            "type": "command", "command": sys.executable,
+            "args": ["-I", "-B", str(self.claude_home / "hooks/session_context_loader.py"), "--user-only"],
+        }]}]}})
+        prefix = "fixture-python -X utf8 -I -B"
+        with mock.patch.object(installer, "_is_working_python_cmd", return_value=False):
+            plan = installer._plan_claude_settings(path, REPO_ROOT / "template/claude/hooks.json", prefix)
+        doc = json.loads(plan.change.content)
+        for event, name in (("PreToolUse", "status_guard.py"), ("Stop", "reply_repeat_guard.py")):
+            handler = next(h for g in doc["hooks"][event] for h in g["hooks"] if name in h["command"])
+            self.assertTrue(handler["command"].startswith(prefix + " "))
+        loader = next(h for g in doc["hooks"]["SessionStart"] for h in g["hooks"] if "session_context_loader.py" in h["command"])
+        self.assertTrue(loader["command"].startswith(prefix + " "))
 
     def test_claude_upgrade_migrates_hooks_preserves_user_assets_and_is_idempotent(self):
         db = self.database()
@@ -1502,7 +1943,13 @@ class TestClaudeInstallerAndUpgradeAudit(OfflineSandbox):
         self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), initial)
         self.assertIn(b"--mode enforce --compact-limit 3", path.read_bytes())
         self.install(*args, "--claude-handoff-mode", "off")
-        self.assertFalse((self.claude_home / "hooks/handoff_gate.py").exists())
+        self.assertEqual((self.claude_home / "hooks/handoff_gate.py").read_bytes(), (HOOKS_DIR / "handoff_gate.py").read_bytes())
+        self.assertNotIn("handoff_gate.py", json.dumps(json.loads(path.read_bytes())["hooks"]))
+        for name in ("status_guard.py", "reply_repeat_guard.py"):
+            result = subprocess.run([sys.executable, "-B", "-X", "utf8", "-I", str(self.claude_home / "hooks" / name), "--help"],
+                                    cwd=self.project, capture_output=True, text=True, encoding="utf-8", timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stderr, "")
         initial = self.snapshot()
         self.install(*args)
         self.assertEqual(self.snapshot(), initial)
@@ -2225,6 +2672,157 @@ class TestClaudeInstallerAndUpgradeAudit(OfflineSandbox):
         probe_http.assert_not_called()
         self.assertNotIn("start_cc_router", report["summary"]["recommended_actions"])
         self.assertTrue(report["summary"]["all_aligned"], report["summary"])
+
+
+class TestFleetStateWP3A(OfflineSandbox):
+    def setUp(self):
+        super().setUp()
+        self.repo = self.project / "upstream"
+        self.repo.mkdir()
+        (self.repo / "install.py").write_text("", encoding="utf-8")
+        user_words.atomic_write_json(self.repo / "template/user-guard/plugin.json", {"version": "fixture"})
+        self.profile = self.repo / "template/user-guard/skills/cae-harness/fleet_profile.json"
+        user_words.atomic_write_json(self.profile, {"runtime_tunables": {"headless_dispatch": {"fleet_state_ttl_sec": 321}}})
+        patch = mock.patch.dict(os.environ, {"CAE_FLEET_STATE_DIR": str(self.root / "fleet-state")})
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.state_file = fleet_state._validated_state_file(self.repo)
+
+    def run_state(self, *args):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = fleet_state.main(["--repo", str(self.repo), *args])
+        return code, json.loads(out.getvalue())
+
+    def test_grounding_missing_spec_loader_and_execution_fail_closed(self):
+        result = fleet_state._run_repo_grounding_gate(self.repo)
+        self.assertIs(result["ok"], False)
+        self.assertIn("missing", result["error"])
+        harness = self.profile.parent / "scripts/cae_harness.py"
+        harness.parent.mkdir()
+        harness.write_text("raise RuntimeError('fixture import failure')\n", encoding="utf-8")
+        for spec in (None, SimpleNamespace(loader=None)):
+            with mock.patch.object(importlib.util, "spec_from_file_location", return_value=spec):
+                result = fleet_state._run_repo_grounding_gate(self.repo)
+            self.assertIs(result["ok"], False)
+            self.assertIn("ImportError", result["error"])
+        result = fleet_state._run_repo_grounding_gate(self.repo)
+        self.assertIs(result["ok"], False)
+        self.assertIn("fixture import failure", result["error"])
+        harness.write_text("def audit_doc_grounding(*args):\n    raise RuntimeError('fixture audit failure')\n", encoding="utf-8")
+        result = fleet_state._run_repo_grounding_gate(self.repo)
+        self.assertIs(result["ok"], False)
+        self.assertIn("fixture audit failure", result["error"])
+        harness.write_text("def audit_doc_grounding(*args):\n    return {}\n", encoding="utf-8")
+        self.assertIs(fleet_state._run_repo_grounding_gate(self.repo)["ok"], False)
+
+    def test_verified_clear_preserves_active_proposal_unless_forced(self):
+        code, _ = self.run_state("propose", "--session-id", "fixture", "--summary", "fixture approval")
+        self.assertEqual(code, 0)
+        original = self.state_file.read_bytes()
+        for extra in ([], ["--readback-done"]):
+            with mock.patch.object(fleet_state, "_run_repo_grounding_gate") as grounding:
+                code, result = self.run_state("clear", "--verified", *extra)
+            self.assertEqual(code, 1)
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["reason"], "active_user_approval")
+            self.assertEqual(self.state_file.read_bytes(), original)
+            grounding.assert_not_called()
+        code, result = self.run_state("clear", "--verified", "--force")
+        self.assertEqual(code, 0)
+        self.assertTrue(result["verified"])
+        self.assertEqual(json.loads(self.state_file.read_text(encoding="utf-8"))["phase"], "IDLE")
+
+    def test_record_pass1_preserves_active_proposal_unless_forced_or_expired(self):
+        self.run_state("propose", "--session-id", "fixture", "--summary", "fixture approval")
+        original = self.state_file.read_bytes()
+        code, result = self.run_state("record-pass1", "--session-id", "fixture", "--target-master", "codex")
+        self.assertEqual(code, 2)
+        self.assertEqual(result["reason"], "active_user_approval")
+        self.assertEqual(self.state_file.read_bytes(), original)
+        code, result = self.run_state("record-pass1", "--session-id", "fixture", "--target-master", "codex", "--force")
+        self.assertEqual(code, 0)
+        self.assertEqual(result["state"]["phase"], "AWAITING_MASTER_RELOAD")
+        self.state_file.unlink()
+        self.run_state("propose", "--session-id", "fixture", "--summary", "fixture approval")
+        saved = json.loads(self.state_file.read_text(encoding="utf-8"))
+        saved["updated_at_epoch"] = 1
+        user_words.atomic_write_json(self.state_file, saved)
+        code, result = self.run_state("record-pass1", "--session-id", "fixture", "--target-master", "codex")
+        self.assertEqual(code, 0)
+
+    def test_clear_grounding_runs_under_lock_and_failed_gate_keeps_state(self):
+        from contextlib import contextmanager
+
+        code, _ = self.run_state("propose", "--session-id", "fixture", "--summary", "fixture approval")
+        self.assertEqual(code, 0)
+        original = self.state_file.read_bytes()
+        lock_held = False
+        actual_lock = fleet_state._state_lock
+
+        @contextmanager
+        def tracked_lock(path):
+            nonlocal lock_held
+            with actual_lock(path):
+                lock_held = True
+                try:
+                    yield
+                finally:
+                    lock_held = False
+
+        def gate(repo):
+            self.assertTrue(lock_held)
+            self.assertEqual(repo, self.repo)
+            return {"ok": False, "error": "fixture grounding failure"}
+
+        with mock.patch.object(fleet_state, "_state_lock", tracked_lock), \
+                mock.patch.object(fleet_state, "_run_repo_grounding_gate", side_effect=gate):
+            code, result = self.run_state("clear", "--verified", "--readback-done", "--force")
+        self.assertEqual(code, 2)
+        self.assertEqual(result["reason"], "grounding_check_failed")
+        self.assertEqual(result["error"], "fixture grounding failure")
+        self.assertEqual(self.state_file.read_bytes(), original)
+        with mock.patch.object(fleet_state, "_run_repo_grounding_gate", return_value={"ok": True}):
+            code, result = self.run_state("clear", "--verified", "--readback-done", "--force")
+        self.assertEqual(code, 0)
+        self.assertTrue(result["readback_verified"])
+
+    def test_expired_approval_does_not_block_verified_clear(self):
+        self.run_state("propose", "--session-id", "fixture", "--summary", "fixture approval")
+        saved = json.loads(self.state_file.read_text(encoding="utf-8"))
+        saved["updated_at_epoch"] = 1
+        user_words.atomic_write_json(self.state_file, saved)
+        code, result = self.run_state("clear", "--verified")
+        self.assertEqual(code, 0)
+        self.assertTrue(result["verified"])
+
+    def test_ttl_uses_resolved_target_profile_and_explicit_override(self):
+        for command, extra in (("propose", ["--summary", "fixture"]), ("record-pass1", ["--target-master", "codex"])):
+            for override, expected in (([], 321), (["--ttl", "654"], 654)):
+                with self.subTest(command=command, override=override):
+                    self.state_file.unlink(missing_ok=True)
+                    code, result = self.run_state(command, "--session-id", "fixture", *extra, *override)
+                    self.assertEqual(code, 0)
+                    self.assertEqual(result["state"]["ttl_seconds"], expected)
+
+    def test_invalid_parameter_values_return_json_without_traceback(self):
+        cases = [
+            ["propose", "--session-id", " ", "--summary", "fixture"],
+            ["propose", "--session-id", "fixture", "--summary", " "],
+            ["propose", "--session-id", "fixture", "--summary", "fixture", "--ttl", "0"],
+            ["approve", "--session-id", " "],
+            ["record-pass1", "--session-id", " ", "--target-master", "codex"],
+            ["record-pass1", "--session-id", "fixture", "--target-master", "codex", "--ttl", "-1"],
+        ]
+        script = REPO_ROOT / "template/user-guard/skills/fleet-evolve/scripts/fleet_state.py"
+        for args in cases:
+            with self.subTest(args=args):
+                result = subprocess.run([sys.executable, "-B", "-X", "utf8", str(script), "--repo", str(self.repo), *args],
+                                        capture_output=True, text=True, encoding="utf-8", cwd=self.project, timeout=20)
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(json.loads(result.stdout)["reason"], "invalid_arguments")
+                self.assertEqual(result.stderr, "")
+        self.assertFalse(self.state_file.exists())
 
 
 if __name__ == "__main__":

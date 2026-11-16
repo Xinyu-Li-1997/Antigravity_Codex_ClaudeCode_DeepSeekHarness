@@ -59,11 +59,11 @@ FLOOR_TOP = {
     "apiKeyHelper", "apiBaseUrl", "primaryModel", "smallFastModel", "apiKey", "model", "fallbackModel",
     "modelOverrides", "modelPicker", "advisorModel", "awsAuthRefresh", "awsCredentialExport", "gcpAuthRefresh",
 }
-RESIDUE_ENV = {
-    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": ("262144", "372000", "983616", "1048576"),
-    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": ("262144", "372000", "1000000"),
-    "CLAUDE_CODE_MAX_OUTPUT_TOKENS": ("131072",),
-}
+RESIDUE_ENV = (
+    "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
+    "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
+)
 
 
 def default_router_port() -> int:
@@ -109,13 +109,17 @@ def _claude_profile_defaults() -> Dict[str, str]:
                         break
         except (OSError, UnicodeError, ValueError):
             continue
-    return {
-        "kimi_model": str(cl_rules.get("router_primary_model") or "kimi-primary"),
-        "deepseek_model": str(cl_rules.get("router_subagent_model") or "deepseek-subagent"),
-        "max_context": str(cl_rules.get("max_context_tokens") or 1048576),
-        "compact_window": str(cl_rules.get("auto_compact_window") or 1000000),
-        "router_card_name": str(cl_rules.get("router_card_name") or "Router_Hybrid"),
+    fields = {
+        "kimi_model": "router_primary_model",
+        "deepseek_model": "router_subagent_model",
+        "max_context": "max_context_tokens",
+        "compact_window": "auto_compact_window",
+        "router_card_name": "router_card_name",
     }
+    missing = [key for key in fields.values() if not cl_rules.get(key)]
+    if missing:
+        raise ValueError("fleet_profile.json missing Claude defaults: " + ", ".join(missing))
+    return {key: str(cl_rules[field]) for key, field in fields.items()}
 
 
 def floor_env(key: str) -> bool:
@@ -350,9 +354,8 @@ def project_claude_settings(
     for key, value in previous_env.items():
         if key in EXCLUSIVE and env.get(key) == value:
             env.pop(key, None)
-    for key, values in RESIDUE_ENV.items():
-        if env.get(key) in (*values, *(int(value) for value in values)):
-            env.pop(key, None)
+    for key in RESIDUE_ENV:
+        env.pop(key, None)
     for key, value in target.get("env", {}).items():
         if floor_env(key) or key in EXCLUSIVE:
             env[key] = copy.deepcopy(value)
@@ -391,10 +394,22 @@ def inspect_status(
             report["schema_version"] = schema_ver
             report["warnings"].extend(warnings)
             if _table_exists(con, "providers"):
+                columns = {r[1] for r in con.execute("PRAGMA table_info(providers)")}
+                quota_columns = ", ".join(
+                    f'"{key}"' if key in columns else "NULL"
+                    for key in ("meta", "limit_daily_usd", "limit_monthly_usd")
+                )
                 rows = con.execute(
-                    "SELECT id, app_type, name, settings_config, is_current FROM providers ORDER BY app_type, sort_index, name"
+                    "SELECT id, app_type, name, settings_config, is_current, " + quota_columns
+                    + " FROM providers ORDER BY app_type, sort_index, name"
                 ).fetchall()
-                for row_id, app_type, name, raw_cfg, is_current in rows:
+                for row_id, app_type, name, raw_cfg, is_current, raw_meta, daily_cap, monthly_cap in rows:
+                    try:
+                        meta = json.loads(raw_meta) if raw_meta else {}
+                    except (ValueError, TypeError):
+                        meta = {}
+                    usage = meta.get("usage_script") if isinstance(meta, dict) else None
+                    scheme = usage.get("templateType") if isinstance(usage, dict) else None
                     invalid_json = False
                     cfg_obj: Any = {}
                     try:
@@ -420,6 +435,10 @@ def inspect_status(
                         "app_type": app_type,
                         "name": name,
                         "current": bool(is_current),
+                        "quota_scheme": scheme if scheme in ("token_plan", "balance") else None,
+                        "quota_caps": [label for label, value in (
+                            ("daily_cap", daily_cap), ("monthly_cap", monthly_cap)
+                        ) if value is not None],
                         "base_url": _sanitize_url(env.get("ANTHROPIC_BASE_URL")),
                         "model": env.get("ANTHROPIC_MODEL"),
                         "subagent_model": env.get("CLAUDE_CODE_SUBAGENT_MODEL"),
@@ -600,11 +619,16 @@ def prepare_cards(
             )
             if not dry_run:
                 if current:
+                    meta = current.get("meta")
+                    try:
+                        valid_meta = isinstance(meta, str) and bool(meta.strip()) and isinstance(json.loads(meta), dict)
+                    except (ValueError, RecursionError):
+                        valid_meta = False
                     update_pairs = [
                         ("settings_config", record["settings_config"]),
                         ("notes", notes),
                         ("category", "third_party"),
-                        ("meta", "{}"),
+                        ("meta", meta if valid_meta else "{}"),
                         ("in_failover_queue", 0),
                     ]
                     valid_pairs = [(col, val) for col, val in update_pairs if col in columns]
@@ -662,6 +686,7 @@ def switch_card(
     settings_path: Path,
     card_name: str,
     dry_run: bool = False,
+    require_router_alive: bool = False,
 ) -> Dict[str, Any]:
     if not db_path.is_file():
         raise FileNotFoundError(f"Database not found: {db_path}")
@@ -699,6 +724,25 @@ def switch_card(
             previous,
             json.loads(raw_target),
         )
+        base_url = updated.get("env", {}).get("ANTHROPIC_BASE_URL")
+        endpoint = urlsplit(base_url) if isinstance(base_url, str) else None
+        if endpoint and endpoint.hostname and endpoint.hostname.lower() in ("127.0.0.1", "localhost", "::1"):
+            host = "[::1]" if endpoint.hostname == "::1" else endpoint.hostname
+            port = endpoint.port or (443 if endpoint.scheme == "https" else 80)
+            health_url = f"{endpoint.scheme}://{host}:{port}/__router/health"
+            try:
+                opener = urllib.request.build_opener(urllib.request.ProxyHandler({}),
+                                                     urllib.request.HTTPHandler(), urllib.request.HTTPSHandler())
+                with opener.open(health_url, timeout=2.0) as resp:
+                    health = json.loads(resp.read().decode("utf-8"))
+                    alive = resp.status == 200 and isinstance(health, dict) and health.get("ok") is True
+            except (OSError, ValueError, urllib.error.URLError):
+                alive = False
+            if not alive:
+                warning = "Local router /__router/health is unreachable or unhealthy; switching may leave Claude without a working route"
+                if require_router_alive:
+                    raise RuntimeError(warning)
+                warnings.append(warning)
         if dry_run:
             return {
                 "dry_run": True,
@@ -1002,6 +1046,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_switch = sub.add_parser("switch-card", help="Switch active Claude card and project into settings.json")
     p_switch.add_argument("card", help="Target Claude card name")
     p_switch.add_argument("--dry-run", action="store_true")
+    p_switch.add_argument("--require-router-alive", action="store_true")
 
     p_prompts = sub.add_parser("disable-prompts", help="Disable enabled prompts in cc-switch.db")
     p_prompts.add_argument(
@@ -1040,7 +1085,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(json.dumps(out, ensure_ascii=False, indent=2))
         return 0
     if args.cmd == "switch-card":
-        out = switch_card(db_path, settings_path, args.card, dry_run=args.dry_run)
+        out = switch_card(db_path, settings_path, args.card, dry_run=args.dry_run,
+                          require_router_alive=args.require_router_alive)
         print(json.dumps(out, ensure_ascii=False, indent=2))
         return 0
     if args.cmd == "disable-prompts":

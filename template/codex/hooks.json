@@ -49,6 +49,12 @@
         "hooks": [
           {
             "type": "command",
+            "command": "python3 -X utf8 -I -B \"~/.codex/hooks/status_guard.py\" --client codex --state-dir \"~/.codex/hooks/state\" --log-dir \"~/.codex/hooks/logs\"",
+            "timeout": 15,
+            "statusMessage": "检查工作区写边界与日志重复读取"
+          },
+          {
+            "type": "command",
             "command": "python3 -X utf8 -I -B \"~/.codex/hooks/handoff_gate.py\" --client codex --mode advisory --compact-limit 0 --state-dir \"~/.codex/hooks/state/handoff\"",
             "timeout": 10,
             "statusMessage": "检查长会话交接状态"
@@ -59,6 +65,12 @@
     "Stop": [
       {
         "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -X utf8 -I -B \"~/.codex/hooks/reply_repeat_guard.py\" --client codex --state-dir \"~/.codex/hooks/state\" --log-dir \"~/.codex/hooks/logs\"",
+            "timeout": 15,
+            "statusMessage": "检查重复状态回复"
+          },
           {
             "type": "command",
             "command": "python3 -X utf8 -I -B \"~/.codex/hooks/handoff_gate.py\" --client codex --mode advisory --compact-limit 0 --state-dir \"~/.codex/hooks/state/handoff\"",

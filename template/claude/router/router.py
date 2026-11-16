@@ -35,7 +35,7 @@ from urllib.parse import urlsplit
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULTS = {
     "listen": "127.0.0.1",
-    "port": 8240,
+    "port": 8240 if os.name == "nt" else 8241,
     "default_upstream": "https://api.kimi.com/coding",
     "routes": [
         {"prefix": "deepseek", "upstream": "https://api.deepseek.com/anthropic",
@@ -105,8 +105,9 @@ def _apply_fleet_router_defaults():
     rt = _load_fleet_router_tunables()
     if not rt:
         return
-    if isinstance(rt.get("port"), int) and rt["port"] > 0:
-        DEFAULTS["port"] = rt["port"]
+    port_key = "port" if os.name == "nt" else "wsl_port"
+    if isinstance(rt.get(port_key), int) and not isinstance(rt[port_key], bool) and 1 <= rt[port_key] <= 65535:
+        DEFAULTS["port"] = rt[port_key]
     if isinstance(rt.get("timeout_sec"), int) and rt["timeout_sec"] > 0:
         DEFAULTS["timeout_s"] = rt["timeout_sec"]
     if isinstance(rt.get("max_body_mib"), int) and rt["max_body_mib"] > 0:
@@ -429,6 +430,16 @@ class Handler(BaseHTTPRequestHandler):
         self.forward(b"")
 
     def do_POST(self):
+        sem = getattr(self.server, "inflight_sem", _INFLIGHT_SEM)
+        if not sem.acquire(blocking=False):
+            self.send_error(503, "router max_inflight reached")
+            return
+        try:
+            self._read_and_forward_locked()
+        finally:
+            sem.release()
+
+    def _read_and_forward_locked(self):
         max_bytes = int(self.server.cfg.get("max_body_bytes") or (64 * 1024 * 1024))
         te_hdr = (self.headers.get("Transfer-Encoding") or "").lower()
         if "chunked" in te_hdr:
@@ -442,7 +453,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             except OSError:
                 return
-            self.forward(body)
+            self._forward_locked(body)
             return
         try:
             n = int(self.headers.get("Content-Length") or 0)
@@ -458,7 +469,7 @@ class Handler(BaseHTTPRequestHandler):
             body = self.rfile.read(n) if n else b""
         except OSError:
             return
-        self.forward(body)
+        self._forward_locked(body)
 
     do_PUT = do_POST
     do_DELETE = do_GET
@@ -503,7 +514,11 @@ class Handler(BaseHTTPRequestHandler):
             rec["thinking"] = (data.get("thinking") or {}).get("type") if isinstance(data.get("thinking"), dict) else None
             if route:
                 data["model"] = model.replace("[1m]", "").replace("[1M]", "")
-                if route.get("force_effort"):
+                effort = oc.get("effort")
+                if route.get("force_effort") and (
+                    "effort" not in oc
+                    or (isinstance(effort, str) and effort.lower() in ("high", "xhigh", "max"))
+                ):
                     oc = dict(oc)
                     oc["effort"] = route["force_effort"]
                     data["output_config"] = oc

@@ -2228,6 +2228,369 @@ class TestCodexHandoffAdapter(unittest.TestCase):
         self.assertTrue(keep_json.exists())
 
 
+class TestHeavyWorkflowLifecycle(unittest.TestCase):
+    """磁盘票据、命令行回执与三端生命周期协议的离线集成验收。"""
+
+    def setUp(self):
+        self.tmp = _new_temp_dir(prefix="workflow-lifecycle-")
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.state = self.root / "state"
+        self.sid = "fixture-session"
+        environment = mock.patch.dict(os.environ, {
+            "CAE_PLAN_STATE_DIR": "", "USER_GUARD_STATE_DIR": str(self.state),
+            "PLUGIN_DATA": str(self.root / "plugin"), "USER_GUARD_LOGS_DIR": str(self.root / "logs"),
+            "CODEX_HOME": str(self.root / "codex"), "CLAUDE_CONFIG_DIR": str(self.root / "claude"),
+            "CAE_HARNESS_DEPTH": "",
+        })
+        environment.start()
+        self.addCleanup(environment.stop)
+
+    def ticket(self, status="PENDING", tid="fixture-ticket", directory=None):
+        import time
+        streams = []
+        for number, channel in enumerate(("native_subagent", "cae_harness_headless"), 1):
+            streams.append({"stream_id": f"S{number}", "subtask": f"核对接口第{number}路", "target": ".",
+                            "channel": channel, "client": "codex" if number == 1 else "claude",
+                            "agent_type": "readonly-auditor", "model": f"fixture-model-{number}",
+                            "model_display": f"fixture-model-{number}", "tier": "high", "context_window": 64000,
+                            "headless": number == 2, "clean_room": number == 2, "access_mode": "只读",
+                            "write_scope": [], "verify_cmd": "", "inline_readonly": number == 2,
+                            "timeout": 120, "currently_available": True, "unavailable_reason": "",
+                            "quota_scheme": "fixture", "quota_summary": "凭据就绪，额度未触发冷却",
+                            "receipt_location": f"receipts/fixture-{number}.json"})
+        ticket = {"ticket_id": tid, "session_id": self.sid, "status": status, "expires_at": time.time() + 3600,
+                  "workflow_bg": "压缩前需要交叉核对当前接口。", "workflow_goal": "逐路只读核对并汇总依据。",
+                  "workflow_impact": "只产生核查回执，工作区源码保持原状。", "streams": streams,
+                  "capability_ledger": {"last_online_refresh_at": "2026-11-15T01:00:00Z",
+                                        "local_bench_verified_at": "2026-11-15T02:00:00Z"}}
+        path = (directory or self.state / "dispatch_plans") / (tid + ".json")
+        user_words.atomic_write_json(path, ticket)
+        user_words.atomic_write_json(path.parent / f"session_{self.sid}_pending.json",
+                                     {"ticket_id": tid, "status": status, "ticket_file": str(path)})
+        return path, ticket
+
+    def native_payload(self, client):
+        transcript = self.root / client / "fixture.jsonl"
+        if client == "codex":
+            _append_jsonl(transcript, {"type": "session_meta", "payload": {"id": self.sid, "source": "cli"}})
+        else:
+            _append_jsonl(transcript, {"type": "user", "sessionId": self.sid,
+                                       "message": {"role": "user", "content": "继续核对接口。"}})
+        return {"session_id": self.sid, "transcript_path": str(transcript), "cwd": str(self.root)}
+
+    def test_ticket_discovery_priority_isolation_expiry_and_approved(self):
+        override = self.root / "override"
+        _, plugin = self.ticket(tid="plugin-ticket", directory=self.root / "plugin/state/dispatch_plans")
+        _, local = self.ticket(tid="local-ticket")
+        path, first = self.ticket(tid="override-ticket", directory=override)
+        with mock.patch.dict(os.environ, {"CAE_PLAN_STATE_DIR": str(override)}):
+            dirs = user_words.candidate_dispatch_plan_dirs(self.state)
+            self.assertEqual(dirs[:2], [override.resolve(), (self.state / "dispatch_plans").resolve()])
+            self.assertEqual(user_words.find_session_pending_ticket(self.sid, self.state), first)
+            first["expires_at"] = 0
+            user_words.atomic_write_json(path, first)
+            self.assertEqual(user_words.find_session_pending_ticket(self.sid, self.state), local)
+            self.assertIsNone(user_words.find_session_pending_ticket("../escape", self.state))
+        _, approved = self.ticket(status="APPROVED", tid="approved-ticket")
+        self.assertEqual(user_words.find_session_approved_tickets(self.sid, self.state), [approved])
+        # 移走本地票据后，插件目录仍受 USER_GUARD_STATE_DIR 隔离，不回读其他宿主。
+        (self.state / "dispatch_plans/local-ticket.json").unlink()
+        self.assertIsNone(user_words.find_session_pending_ticket(self.sid, self.state))
+        with mock.patch.dict(os.environ, {"USER_GUARD_STATE_DIR": ""}):
+            self.assertEqual(user_words.find_session_pending_ticket(self.sid, self.root / "unused"), plugin)
+
+    def test_completion_bills_use_exact_harness_schema_and_explicit_acknowledgement(self):
+        entries = [{"run_id": "fixture-run", "reported_to_user": False, "all_succeeded": False,
+                    "subcommand": "batch", "receipt_file": "receipts/fixture.json",
+                    "streams": [{"stream_id": "S1", "engine": "claude:fixture-model", "model": "fixture-model",
+                                 "succeeded": False, "status": "failed", "token_usage": {"total_tokens": 42}}],
+                    "token_usage_summary": {"total_tokens": 42}},
+                   {"run_id": "already-reported", "reported_to_user": True}]
+        path = self.state / "heavy_completions" / (self.sid + ".json")
+        user_words.atomic_write_json(path, entries)
+        self.assertEqual(user_words.load_unreported_heavy_completions(self.sid, self.state), entries[:1])
+        block = "\n".join(session_context_loader._workflow_recovery_blocks(self.sid, self.state))
+        for value in ("【待汇报重负载完工账单】", "S1", "failed", "42", "receipts/fixture.json"):
+            self.assertIn(value, block)
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8")), entries, "恢复注入不能代替向用户报账")
+        user_words.mark_heavy_completions_reported(self.sid, self.state)
+        self.assertEqual(user_words.load_unreported_heavy_completions(self.sid, self.state), [])
+        self.assertTrue(all(row["reported_to_user"] for row in json.loads(path.read_text(encoding="utf-8"))))
+
+    def test_three_clients_archive_completed_harness_commands(self):
+        for client in ("antigravity", "codex", "claude"):
+            for command in ("task", "gate", "audit", "batch"):
+                with self.subTest(client=client, command=command):
+                    receipt = self.root / f"{client}-{command}-receipt.json"
+                    result = {"status": "ok", "model": "fixture-model", "receipt_file": str(receipt),
+                              "result": {"summary": "已完成接口核对，回执中保留逐项依据。"}}
+                    user_words.atomic_write_json(receipt, result)
+                    transcript = self.root / f"{client}-{command}.jsonl"
+                    shell = f'python -B -X utf8 tools/cae_harness.py {command} --output "{receipt}"'
+                    if client == "antigravity":
+                        rows = [{"type": "PLANNER_RESPONSE", "tool_calls": [
+                            {"id": "call-fixture", "name": "run_command", "args": {"CommandLine": shell}}]},
+                            {"type": "GENERIC", "tool_call_id": "call-fixture", "content": json.dumps(result)}]
+                    elif client == "codex":
+                        rows = [{"type": "session_meta", "payload": {"id": self.sid, "source": "cli"}},
+                                {"type": "response_item", "payload": {"type": "function_call", "name": "exec_command",
+                                 "call_id": "call-fixture", "arguments": json.dumps({"cmd": shell})}},
+                                {"type": "response_item", "payload": {"type": "function_call_output",
+                                 "call_id": "call-fixture", "output": json.dumps(result)}}]
+                    else:
+                        rows = [{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "call-fixture",
+                                 "name": "Bash", "input": {"command": shell}}]}},
+                                {"type": "user", "message": {"content": [{"type": "tool_result",
+                                 "tool_use_id": "call-fixture", "content": json.dumps(result)}]}}]
+                    for row in rows:
+                        _append_jsonl(transcript, row)
+                    archive = (user_words.extract_agy_archive(str(transcript)) if client == "antigravity" else
+                               user_words.extract_codex_session_words(str(transcript), self.sid) if client == "codex" else
+                               user_words.extract_claude_user_words(transcript))
+                    returns = archive["subagent_returns"]
+                    self.assertEqual(len(returns), 1)
+                    self.assertIn("已完成接口核对", returns[0]["content"])
+                    self.assertIn("fixture-model", returns[0]["label"])
+                    self.assertEqual(returns[0]["log_path"], str(receipt))
+                    self.assertEqual(archive["words"], [])
+
+    def test_agy_background_notification_reads_task_log_without_new_user_boundary(self):
+        transcript = self.root / ".system_generated/logs/transcript.jsonl"
+        log = self.root / ".system_generated/tasks/task-fixture.log"
+        user_words.atomic_write_text(log, json.dumps({"model": "fixture-model", "status": "ok",
+                                                     "result": {"summary": "后台只读审查已结束，依据在回执。"}}))
+        rows = [{"type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "继续检查。"},
+                {"type": "PLANNER_RESPONSE", "tool_calls": [{"name": "run_command", "args": {
+                    "CommandLine": "python -B cae_harness.py audit"}}]},
+                {"type": "GENERIC", "content": "Command is running in background with ID: task-fixture"},
+                {"type": "SYSTEM_MESSAGE", "content": "<SYSTEM_MESSAGE>\n[Message] sender=fixture/task-fixture content=命令已完成\n</SYSTEM_MESSAGE>"}]
+        for index, row in enumerate(rows):
+            _append_jsonl(transcript, dict(row, step_index=index))
+        archive = user_words.extract_agy_archive(str(transcript))
+        self.assertEqual([item["content"] for item in archive["words"]], ["继续检查。"])
+        self.assertEqual(len(archive["subagent_returns"]), 1)
+        self.assertEqual(archive["subagent_returns"][0]["log_path"], str(log))
+        self.assertIn("后台只读审查已结束", archive["subagent_returns"][0]["content"])
+        self.assertEqual(user_words.clean_user_content(rows[-1]["content"], "SYSTEM_MESSAGE"), "")
+
+    def test_codex_async_poll_completion_is_correlated(self):
+        payload = self.native_payload("codex")
+        transcript = Path(payload["transcript_path"])
+        rows = [{"type": "function_call", "name": "exec_command", "call_id": "start",
+                 "arguments": json.dumps({"cmd": "python -B cae_harness.py task"})},
+                {"type": "function_call_output", "call_id": "start", "output": json.dumps({
+                    "session_id": 42, "output": "still running"})},
+                {"type": "function_call", "name": "write_stdin", "call_id": "poll",
+                 "arguments": json.dumps({"session_id": 42})},
+                {"type": "function_call_output", "call_id": "poll", "output": json.dumps({
+                    "exit_code": 0, "output": json.dumps({"status": "ok", "model": "fixture-model",
+                                                           "result": {"summary": "异步完成的接口审查。"}})})}]
+        for row in rows:
+            _append_jsonl(transcript, {"type": "response_item", "payload": row})
+        returns = user_words.extract_codex_session_words(str(transcript), self.sid)["subagent_returns"]
+        self.assertEqual(len(returns), 1)
+        self.assertIn("异步完成的接口审查", returns[0]["content"])
+
+    def test_three_clients_restore_workflow_outside_regular_summary_budget(self):
+        path, ticket = self.ticket()
+        ticket["workflow_bg"] += "保留票据记录中的完整接口核对依据。" * 800
+        user_words.atomic_write_json(path, ticket)
+        expected = user_words.render_pending_workflow_block(ticket)
+        self.assertGreater(len(expected), user_words.get_compaction_tunables("codex")["inline_total_chars"])
+        user_words.atomic_write_json(self.state / "heavy_completions" / (self.sid + ".json"), [{
+            "run_id": "unreported-fixture", "all_succeeded": True, "reported_to_user": False,
+            "receipt_file": "receipts/finished.json", "streams": [{"stream_id": "S1", "succeeded": True,
+                "status": "ok", "token_usage": {"total_tokens": 42}}], "token_usage_summary": {"total_tokens": 42}}])
+        self.assertEqual(len(next(line for line in expected.splitlines() if line.startswith("| 流号")).split("|")) - 2, 14)
+        for client in ("antigravity", "codex", "claude"):
+            with self.subTest(client=client):
+                if client == "antigravity":
+                    transcript = self.root / "agy/transcript.jsonl"
+                    _append_jsonl(transcript, {"type": "USER_INPUT", "source": "USER_EXPLICIT", "step_index": 0,
+                                               "content": "继续逐项核对。"})
+                    _append_jsonl(transcript, {"type": "CHECKPOINT", "step_index": 1, "content": "summary"})
+                    response = session_context_loader.handle_session_start({"conversationId": self.sid,
+                                                                           "transcriptPath": str(transcript)})
+                    context = response["injectSteps"][0]["systemMessage"]["systemMessage"]
+                else:
+                    payload = dict(self.native_payload(client), source="compact")
+                    handler = (session_context_loader.handle_codex_session_start if client == "codex" else
+                               session_context_loader.handle_claude_session_start)
+                    context = handler(payload, str(self.state), str(self.root / f"{client}.log"))["hookSpecificOutput"]["additionalContext"]
+                self.assertIn(expected, context)
+                self.assertIn("【待汇报重负载完工账单】", context)
+                self.assertIn("receipts/finished.json", context)
+                self.assertIn('"total_tokens": 42', context)
+                self.assertLess(context.index("【系统原话回溯】"), context.index(expected))
+                self.assertIn("\n\n---\n\n" + expected, context)
+                for stream in ticket["streams"]:
+                    self.assertIn(stream["channel"], context)
+                    self.assertIn(stream["receipt_location"], context)
+                self.assertNotIn("gpt-", expected)
+
+    def test_renderer_preserves_disk_popup_and_fills_missing_fields(self):
+        _, ticket = self.ticket()
+        ticket["human_popup_markdown"] = "原票据弹框的专门说明。"
+        ticket["handoff_prompt_block"] = "原票据接力要求。"
+        popup = user_words.render_pending_workflow_block(ticket)
+        handoff = user_words.render_pending_workflow_block(ticket, for_handoff=True)
+        self.assertIn(ticket["human_popup_markdown"], popup)
+        self.assertIn(ticket["handoff_prompt_block"], handoff)
+        for block in (popup, handoff):
+            for value in (ticket["workflow_bg"], ticket["workflow_goal"], ticket["workflow_impact"], "③ 暂缓并交接", "64000"):
+                self.assertIn(value, block)
+        missing = user_words.render_pending_workflow_block({"ticket_id": "missing", "workflow_background": "只有背景。"})
+        self.assertIn("只有背景。", missing)
+        self.assertIn("要做什么与后续计划：未记录", missing)
+
+    def test_readonly_harness_commands_are_allowed_in_both_phases_for_all_clients(self):
+        for phase in ("drain", "freeze"):
+            for command in ("check-grounding --target . --strict", "assess --target .", "probe", "plan --target ."):
+                shell = "python -B -X utf8 tools/cae_harness.py " + command
+                self.assertEqual(handoff_gate._classify_run_command(shell), "readonly_inspect")
+                self.assertEqual(handoff_gate._classify_run_command("tools/cae_harness.py " + command), "readonly_inspect")
+                agy_state = handoff_gate.default_gate_state(self.sid)
+                agy_state["phase"] = phase
+                handoff_gate.save_gate_state(self.state, self.sid, agy_state)
+                result = handoff_gate.check_pre_tool_use_locked({"conversationId": self.sid,
+                    "toolCall": {"name": "run_command", "args": {"CommandLine": shell}}}, self.state)
+                self.assertIsNone(result)
+                for client in ("codex", "claude"):
+                    payload = self.native_payload(client)
+                    directory = self.state / client
+                    handler = handoff_gate.handle_codex_handoff if client == "codex" else handoff_gate.handle_claude_handoff
+                    handler(dict(payload, hook_event_name="UserPromptSubmit", prompt="请整理交接并停机"), directory, "enforce")
+                    state = json.loads((directory / (self.sid + "_handoff_gate.json")).read_text(encoding="utf-8"))
+                    state["phase"] = phase
+                    handoff_gate.save_gate_state(directory, self.sid, state)
+                    result = handler(dict(payload, hook_event_name="PreToolUse", tool_name="Bash",
+                                          tool_input={"command": shell}), directory, "enforce")
+                    self.assertEqual(result, {})
+                    after = json.loads((directory / (self.sid + "_handoff_gate.json")).read_text(encoding="utf-8"))
+                    self.assertEqual(after["drainActionsRemaining"], state["drainActionsRemaining"])
+        self.assertEqual(handoff_gate._classify_run_command("python cae_harness.py task --prompt probe"), "blocked_always")
+        self.assertEqual(handoff_gate._classify_run_command("python cae_harness.py batch"), "blocked_always")
+
+    def test_agy_stop_requires_complete_pending_workflow_once_in_both_phases(self):
+        for phase in ("drain", "freeze"):
+            with self.subTest(phase=phase):
+                path, ticket = self.ticket()
+                state = handoff_gate.default_gate_state(self.sid)
+                state["phase"] = phase
+                handoff_gate.save_gate_state(self.state, self.sid, state)
+                reply = "已验证：接口已核对。Git 工作区待提交。未完成：独立审查。\n【新对话提示词】\n请核对当前工作区并继续完成独立审查和回执核验。"
+                result = handoff_gate.check_stop_handoff_locked({"conversationId": self.sid}, self.state, "fixture-turn", reply)
+                self.assertEqual(result["decision"], "continue")
+                handed = json.loads(path.read_text(encoding="utf-8"))
+                self.assertEqual(handed, dict(ticket, status="HANDED_OFF"))
+                block = user_words.render_pending_workflow_block(handed, for_handoff=True)
+                self.assertIn(block, result["reason"])
+                self.assertEqual(handoff_gate.check_stop_handoff_locked({"conversationId": self.sid}, self.state,
+                                  "fixture-turn", reply)["decision"], "allow", "同一回合只补正一次")
+                self.assertEqual(handoff_gate.check_stop_handoff_locked({"conversationId": self.sid}, self.state,
+                                  "fixture-corrected", reply + "\n" + block)["decision"], "allow")
+
+    def test_native_stop_requires_pending_workflow_once_and_accepts_corrected_reply(self):
+        for client in ("codex", "claude"):
+            for phase in ("drain", "freeze"):
+                with self.subTest(client=client, phase=phase):
+                    path, ticket = self.ticket()
+                    payload = self.native_payload(client)
+                    directory = self.state / f"{client}-{phase}"
+                    handler = handoff_gate.handle_codex_handoff if client == "codex" else handoff_gate.handle_claude_handoff
+                    notice = handler(dict(payload, hook_event_name="UserPromptSubmit", prompt="请整理交接并停机"), directory, "enforce")
+                    handed = json.loads(path.read_text(encoding="utf-8"))
+                    self.assertEqual(handed, dict(ticket, status="HANDED_OFF"))
+                    block = user_words.render_pending_workflow_block(handed, for_handoff=True)
+                    self.assertIn(block, json.dumps(notice, ensure_ascii=False).replace("\\n", "\n"))
+                    state_path = directory / (self.sid + "_handoff_gate.json")
+                    state = json.loads(state_path.read_text(encoding="utf-8"))
+                    state["phase"] = phase
+                    handoff_gate.save_gate_state(directory, self.sid, state)
+                    reply = "已验证：接口已核对。Git 工作区待提交。未完成：独立审查。\n【新对话提示词】\n请核对当前工作区并继续完成独立审查和回执核验。"
+                    first = handler(dict(payload, hook_event_name="Stop", last_assistant_message=reply), directory, "enforce")
+                    self.assertEqual(first["decision"], "block")
+                    self.assertIn(block, first["reason"])
+                    second = handler(dict(payload, hook_event_name="Stop", last_assistant_message=reply), directory, "enforce")
+                    self.assertNotEqual(second.get("decision"), "block")
+                    self.assertFalse(json.loads(state_path.read_text(encoding="utf-8"))["handoffRecorded"])
+                    corrected = handler(dict(payload, hook_event_name="Stop", last_assistant_message=reply + "\n" + block), directory, "enforce")
+                    self.assertNotEqual(corrected.get("decision"), "block")
+                    self.assertTrue(json.loads(state_path.read_text(encoding="utf-8"))["handoffRecorded"])
+
+    def test_workflow_must_be_inside_prompt_or_a_changed_handoff_document(self):
+        _, ticket = self.ticket()
+        block = user_words.render_pending_workflow_block(ticket, for_handoff=True)
+        reply = "已验证：接口已核对。Git 工作区待提交。未完成：独立审查。\n【新对话提示词】\n请核对当前工作区并继续完成独立审查和回执核验。"
+        self.assertFalse(handoff_gate._workflow_handoff_present(block + "\n" + reply, [ticket]))
+        self.assertFalse(handoff_gate._workflow_handoff_present(reply + "\n" + ticket["ticket_id"], [ticket]))
+        document = self.root / "handoff.md"
+        state = {}
+        handoff_gate._record_handoff_baseline(state, document)
+        document.write_text(reply, encoding="utf-8", newline="\n")
+        self.assertFalse(handoff_gate._has_valid_handoff_file(state, [ticket]))
+        document.write_text(reply + "\n" + block, encoding="utf-8", newline="\n")
+        self.assertTrue(handoff_gate._has_valid_handoff_file(state, [ticket]))
+        unchanged = {}
+        handoff_gate._record_handoff_baseline(unchanged, document)
+        self.assertFalse(handoff_gate._has_valid_handoff_file(unchanged, [ticket]))
+
+    def test_original_harness_popup_layout_is_accepted_without_canonical_labels(self):
+        _, ticket = self.ticket()
+        block = user_words.render_pending_workflow_block(ticket, for_handoff=True)
+        # 保留字段与 14 列数据，采用 cae_harness._render_plan 的原有标签与选项格式。
+        original = (block.replace("要做什么与后续计划：", "要做什么：").replace("预计后果与边界影响：", "预计后果：")
+                    .replace("离线性能记录更新时间：", "capability_ledger 离线性能记录更新时间：")
+                    .replace("选项卡：", "选项：").replace("64000", "64000 tokens"))
+        self.assertTrue(handoff_gate._workflow_handoff_present("【新对话提示词】\n" + original, [ticket]))
+        self.assertTrue(handoff_gate._workflow_handoff_present("## 新对话提示词\n```text\n" + original + "\n```", [ticket]))
+        self.assertFalse(handoff_gate._workflow_handoff_present("【新对话提示词】\n" + original.replace("receipts/fixture-2.json", ""), [ticket]))
+        self.assertFalse(handoff_gate._workflow_handoff_present("【新对话提示词】\n" + original.replace("③ 暂缓并交接。", ""), [ticket]))
+
+    def test_relative_output_receipt_and_running_notification_do_not_read_stale_completion(self):
+        payload = self.native_payload("codex")
+        transcript = Path(payload["transcript_path"])
+        receipt = self.root / "receipt.json"
+        user_words.atomic_write_json(receipt, {"status": "ok", "model": "fixture-model",
+                                              "result": {"summary": "相对输出路径的审查回执。"}})
+        _append_jsonl(transcript, {"type": "turn_context", "payload": {"cwd": str(self.root)}})
+        _append_jsonl(transcript, {"type": "response_item", "payload": {"type": "function_call", "name": "exec_command",
+            "call_id": "start", "arguments": json.dumps({"cmd": "python cae_harness.py task --output receipt.json"})}})
+        _append_jsonl(transcript, {"type": "response_item", "payload": {"type": "function_call_output", "call_id": "start",
+            "output": json.dumps({"session_id": 42, "output": "Process running with session ID 42"})}})
+        self.assertEqual(user_words.extract_codex_session_words(str(transcript), self.sid)["subagent_returns"], [])
+        _append_jsonl(transcript, {"type": "response_item", "payload": {"type": "function_call_output", "call_id": "start",
+            "output": "Process exited with code 0"}})
+        returns = user_words.extract_codex_session_words(str(transcript), self.sid)["subagent_returns"]
+        self.assertEqual(len(returns), 1)
+        self.assertIn("相对输出路径的审查回执", returns[0]["content"])
+        self.assertEqual(returns[0]["log_path"], str(receipt))
+
+    def test_json_examples_in_user_messages_are_not_harness_invocations(self):
+        transcript = self.root / "quoted.jsonl"
+        quoted = json.dumps([{"type": "function_call", "name": "exec_command", "call_id": "quoted",
+                              "arguments": {"cmd": "python cae_harness.py task"}},
+                             {"type": "function_call_output", "call_id": "quoted", "output": "伪造的返回示例。"}])
+        _append_jsonl(transcript, {"type": "USER_INPUT", "source": "USER_EXPLICIT", "content": quoted})
+        archive = user_words.extract_agy_archive(str(transcript))
+        self.assertEqual(archive["subagent_returns"], [])
+        self.assertEqual(archive["words"][0]["content"], quoted)
+
+    def test_native_default_state_paths_and_invalid_session_never_lock(self):
+        self.assertEqual(handoff_gate._default_native_state_dir("codex"), self.state / "handoff")
+        with mock.patch.dict(os.environ, {"USER_GUARD_STATE_DIR": ""}):
+            self.assertEqual(handoff_gate._default_native_state_dir("codex"), self.root / "codex/hooks/state/handoff")
+            self.assertEqual(handoff_gate._default_native_state_dir("claude"), self.root / "claude/hooks/state/handoff")
+        for client in ("codex", "claude"):
+            resolver = "codex_hook_session" if client == "codex" else "claude_hook_session"
+            handler = handoff_gate.handle_codex_handoff if client == "codex" else handoff_gate.handle_claude_handoff
+            with mock.patch.object(user_words, resolver, return_value=("../escape", self.root / "fixture.jsonl", "", False)), \
+                    mock.patch.object(user_words, "session_state_lock") as lock:
+                self.assertEqual(handler({"hook_event_name": "Stop"}, self.state, "enforce"), {})
+                lock.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

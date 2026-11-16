@@ -653,6 +653,28 @@ def build_compaction_system_message(
 
 # ⑤ Antigravity 恢复流程与兼容入口
 
+def _workflow_recovery_blocks(session_id: str, state_dir: Path, ticket=None) -> List[str]:
+    """专项计划与未报账单独立于有界原话摘要，不随摘要截断。"""
+    blocks = []
+    ticket = ticket or user_words.find_session_pending_ticket(session_id, state_dir)
+    if ticket:
+        blocks.append(user_words.render_pending_workflow_block(ticket))
+    completions = user_words.load_unreported_heavy_completions(session_id, state_dir)
+    if completions:
+        lines = ["【待汇报重负载完工账单】"]
+        for entry in completions:
+            lines.append("运行：" + str(entry.get("run_id")) + "；全部成功：" + str(entry.get("all_succeeded"))
+                         + "；回执：" + str(entry.get("receipt_file") or "未记录"))
+            for stream in entry.get("streams", []):
+                lines.append("流：" + str(stream.get("stream_id")) + "；引擎：" + str(stream.get("engine"))
+                             + "；模型：" + str(stream.get("model")) + "；成功：" + str(stream.get("succeeded"))
+                             + "；状态：" + str(stream.get("status")) + "；Token："
+                             + json.dumps(stream.get("token_usage"), ensure_ascii=False, sort_keys=True))
+            lines.append("Token 汇总：" + json.dumps(entry.get("token_usage_summary"), ensure_ascii=False, sort_keys=True))
+        blocks.append("\n".join(lines))
+    return blocks
+
+
 def _handle_context_locked(conversation_id: str, event_name: str, explicit_source: str,
                            transcript_path: Path, state_dir: Path) -> Dict[str, Any]:
     state_file = state_dir / f"{conversation_id}_compaction.json"
@@ -670,6 +692,7 @@ def _handle_context_locked(conversation_id: str, event_name: str, explicit_sourc
             user_words.atomic_write_json(state_file, state)
         return {"injectSteps": []}
 
+    pending_ticket = user_words.find_session_pending_ticket(conversation_id, state_dir)
     # Antigravity 专属长会话“原子收口 + 交接停机”硬门禁评估（懒加载以保持 --client codex 零依赖隔离）
     import handoff_gate  # noqa: E402
 
@@ -757,6 +780,7 @@ def _handle_context_locked(conversation_id: str, event_name: str, explicit_sourc
                 source_paths=[str(transcript_path), str(transcript_path.parent / "transcript_full.jsonl")],
                 subagent_returns=subagent_returns, client="antigravity", policy=agy_policy,
             ))
+            injected_blocks.extend(_workflow_recovery_blocks(conversation_id, state_dir, pending_ticket))
             state["lastInjectedAt"] = get_current_iso_time()
             state["lastInjectedWordCount"] = len(words)
         log_event(
@@ -862,7 +886,7 @@ def handle_codex_session_start(
     count = saved.get("count")
     words = result.get("words") or []
 
-    lines: List[str] = [f"恢复来源：{source}",
+    lines: List[str] = ["【系统原话回溯】", f"恢复来源：{source}",
                         "提取状态：成功（已合并可见的同 ID 主会话记录）" if complete else "提取状态：存在缺口"]
     if saved.get("available"):
         lines.append(f"本会话用户原话文件：{saved['file']}")
@@ -901,6 +925,9 @@ def handle_codex_session_start(
     if len(full_context) > codex_cap:
         suffix = "\n（内联内容已截断，请查阅原话档案。）"
         full_context = _close_unbalanced_fence(full_context, codex_cap - len(suffix)) + suffix
+    blocks = _workflow_recovery_blocks(session_id, state_dir)
+    if blocks:
+        full_context += "\n\n---\n\n" + "\n\n---\n\n".join(blocks)
 
     _append_codex_log(
         log_path,
@@ -940,7 +967,7 @@ def handle_claude_session_start(
     source = str(payload.get("source") or "unknown").strip()
     count = saved.get("count")
     scope = f"第 1～{count} 条" if isinstance(count, int) and count > 0 else "0 条" if count == 0 else "尚未核实"
-    lines = [f"恢复来源：Claude {source}",
+    lines = ["【系统原话回溯】", f"恢复来源：Claude {source}",
              "提取状态：成功（本次可见主轨迹中的原话已归档）" if result["complete"] else "提取状态：存在缺口",
              f"本会话用户原话文件：{saved['file']}" if saved.get("available") else "本会话用户原话文件：尚无已确认可读的归档文档",
              f"已保存记录范围：{scope}。最后一条时间：{saved.get('last_time') or '未记录'}。"]
@@ -963,6 +990,9 @@ def handle_claude_session_start(
     if len(full_context) > claude_cap:
         suffix = "\n（内联内容已截断，请查阅原话档案。）"
         full_context = _close_unbalanced_fence(full_context, claude_cap - len(suffix)) + suffix
+    blocks = _workflow_recovery_blocks(str(payload.get("session_id") or ""), state_dir)
+    if blocks:
+        full_context += "\n\n---\n\n" + "\n\n---\n\n".join(blocks)
     if log_path_str:
         user_words.append_jsonl_log(Path(log_path_str).expanduser(), {
             "ts": get_current_iso_time(), "event": "SessionStart", "client": "claude",

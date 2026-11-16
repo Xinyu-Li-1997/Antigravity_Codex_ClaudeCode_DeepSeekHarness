@@ -95,11 +95,27 @@ def _sensitive_findings(content, home_variants=(), user_name="", hostname=""):
                 and value.casefold() not in ALLOWED_PLACEHOLDERS | {"localhost", "root", "ubuntu", "docker"}
                 and re.search(rf"(?<![A-Za-z0-9_]){re.escape(value)}(?![A-Za-z0-9_])", token_text, re.I)):
             findings.append(label)
+    regex_spans = []
+    if "re." in content:
+        try:
+            tree = ast.parse(content)
+        except (SyntaxError, ValueError):
+            tree = None
+        lines = content.splitlines(keepends=True)
+        def offset(line, column):
+            return sum(map(len, lines[:line - 1])) + len(lines[line - 1].encode("utf-8")[:column].decode("utf-8"))
+        for node in ast.walk(tree) if tree is not None else ():
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name) and node.func.value.id == "re"
+                    and node.func.attr in ("compile", "search", "match", "fullmatch", "split", "findall", "finditer", "sub", "subn") and node.args
+                    and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str)):
+                literal = node.args[0]
+                regex_spans.append((offset(literal.lineno, literal.col_offset), offset(literal.end_lineno, literal.end_col_offset)))
     for pattern in HARDCODED_HOME_PATTERNS:
         for match in pattern.finditer(content):
             captured = match[1].strip().casefold()
-            if re.search(r"[\[\](){}+*?\\]", captured):
-                continue  # 只跳过正则定义自身，不豁免任何文件。
+            if any(start <= match.start() and match.end() <= end for start, end in regex_spans):
+                continue  # 仅豁免正则模式字面量中的匹配区间。
             if captured and captured not in ALLOWED_PLACEHOLDERS and not captured.startswith("$"):
                 findings.append("未脱敏主目录")
     if any(pattern.search(content) for pattern in SECRET_PATTERNS):
@@ -352,6 +368,18 @@ class TestEndToEndIntegration(unittest.TestCase):
         for text in homes + models + credentials:
             with self.subTest(text=text):
                 self.assertTrue(_sensitive_findings(text))
+        for name in ("private(name)", "private+name", "private{name}", "private[name]", "private[^name]", "private$name", "private.*name"):
+            with self.subTest(directory=name):
+                self.assertIn("未脱敏主目录", _sensitive_findings("/home/" + name + "/work"))
+        regex_literal = 're.compile(r"' + "/home/" + '([^name]+)")'
+        self.assertEqual(_sensitive_findings(regex_literal), [])
+        substitution = 're.sub(r"' + "/home/" + '([^name]+)", "replacement", value)'
+        self.assertEqual(_sensitive_findings(substitution), [])
+        private_replacement = 're.sub("pattern", "' + "/home/" + 'private[^name]/work", value)'
+        self.assertIn("未脱敏主目录", _sensitive_findings(private_replacement))
+        outside_literal = regex_literal + '; path = "' + "/home/" + 'private[^name]/work"'
+        self.assertIn("未脱敏主目录", _sensitive_findings(outside_literal))
+        self.assertIn("未脱敏主目录", _sensitive_findings('path = "' + "/home/" + 'private[^name]/work"'))
         for text in (
             "/home/alice/work", "C:/Users/bob/work", "/home/charlie/work", "/Users/<user>/work",
             "CPU GPU Intel Core AMD Ryzen Threadripper Xeon EPYC NVIDIA RTX GTX",
@@ -991,14 +1019,59 @@ class TestEndToEndIntegration(unittest.TestCase):
                 INSTALLER._sync_codex_workspace_boundary(codex_dir, dry_run=False)
             self.assertEqual(cfg.read_text(encoding="utf-8"), first_pass)
 
+    def test_wp3b_rules_preserve_full_template_and_only_rename_local_collisions(self):
+        template = TEMPLATE_DIR / "rules/AGENTS.md"
+        expected = template.read_text(encoding="utf-8").rstrip()
+        with tempfile.TemporaryDirectory(dir=REPO_ROOT / "tests") as tmp:
+            target = Path(tmp) / "AGENTS.md"
+            for newline in ("\n", "\r\n"):
+                with self.subTest(newline=repr(newline)):
+                    tail = newline.join(("## 工具与本机  ", "R10. 编译器。", "R11. 编辑器。",
+                                         "- **R10. 构建说明。**", "- **R11. 调试说明。**",
+                                         "R12. 其他编号不变。", "正文中的 R10. 与 R11. 不变。", ""))
+                    raw = ("# 旧规则" + newline * 2 + tail).encode("utf-8")
+                    target.write_bytes(raw)
+                    self.assertFalse(INSTALLER._rules_equal(raw, template.read_bytes()))
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        INSTALLER._sync_global_rules(template, target, "fixture", dry_run=False)
+                    local = tail.replace(newline + "R10.", newline + "L1.").replace(newline + "R11.", newline + "L2.")
+                    local = local.replace("- **R10.", "- **L1.").replace("- **R11.", "- **L2.")
+                    merged = (expected.replace("\n", newline) + newline * 2 + local).encode("utf-8")
+                    self.assertEqual(target.read_bytes(), merged)
+                    self.assertTrue(INSTALLER._rules_equal(merged, template.read_bytes()))
+                    collision = (expected + "\n\n## 工具与本机\n- **R11. 撞号。**\n").encode("utf-8")
+                    self.assertFalse(INSTALLER._rules_equal(collision, template.read_bytes()))
+                    before = target.stat().st_mtime_ns
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        INSTALLER._sync_global_rules(template, target, "fixture", dry_run=False)
+                    self.assertEqual(target.read_bytes(), merged)
+                    self.assertEqual(target.stat().st_mtime_ns, before)
+
+    def test_global_rules_custom_tail_does_not_hide_missing_standard_rules(self) -> None:
+        template = TEMPLATE_DIR / "rules/AGENTS.md"
+        expected = template.read_text(encoding="utf-8").rstrip()
+        core = expected.split("## 工具与运行环境", 1)[0].rstrip()
+        tail = "## 工具与本机\nL1. 本地编译器。\n\n逐字保留尾段。  \n\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "AGENTS.md"
+            for incomplete in (core, core + "\n\n## 工具与运行环境"):
+                with self.subTest(incomplete=incomplete[-30:]):
+                    raw = (incomplete + "\n\n" + tail).encode("utf-8")
+                    self.assertFalse(INSTALLER._rules_equal(raw, template.read_bytes()))
+                    target.write_bytes(raw)
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        INSTALLER._sync_global_rules(template, target, "fixture", dry_run=False)
+                    self.assertEqual(target.read_bytes(), (expected + "\n\n" + tail).encode("utf-8"))
+                    self.assertTrue(INSTALLER._rules_equal(target.read_bytes(), template.read_bytes()))
+
     def test_14_installer_codex_global_rules_sync_preserves_custom_env_section(self) -> None:
-        """验证安装器同步 R0-R9 全局核心总纲至 ~/.codex/AGENTS.md 时，原封不动保留用户末尾自定义的本机环境段。"""
+        """验证完整标准规则同步、自定义环境尾段的冲突编号迁移与重复同步幂等性。"""
         with tempfile.TemporaryDirectory() as tmp:
             codex_dir = Path(tmp) / ".codex"
             codex_dir.mkdir()
             codex_agents = codex_dir / "AGENTS.md"
             custom_env_tail = (
-                "## 工具与本机\n"
+                "## 工具与本机运行环境（自定义）\n"
                 "R10. 自定义子系统内存隔离上限配置说明。\n"
                 "R11. 自定义本地开发工作站环境与默认编辑器说明。"
             )
@@ -1015,8 +1088,15 @@ class TestEndToEndIntegration(unittest.TestCase):
             synced = codex_agents.read_text(encoding="utf-8")
             self.assertIn("R3.1. 四端对等层级与按专长协作编排", synced)
             self.assertIn("R3.6. 验收红线与诚实披露", synced)
-            self.assertTrue(synced.endswith("\n\n" + custom_env_tail + "\n"))
-            self.assertNotIn("## 工具与运行环境", synced)
+            migrated_env_tail = (
+                "## 工具与本机运行环境（自定义）\n"
+                "L1. 自定义子系统内存隔离上限配置说明。\n"
+                "L2. 自定义本地开发工作站环境与默认编辑器说明。"
+            )
+            self.assertTrue(synced.endswith("\n\n" + migrated_env_tail + "\n"))
+            self.assertIn("## 工具与运行环境", synced)
+            self.assertIn("R10.", synced)
+            self.assertIn("R11.", synced)
 
             # 二次调用严格幂等
             with contextlib.redirect_stdout(io.StringIO()):
@@ -1296,8 +1376,8 @@ class TestEndToEndIntegration(unittest.TestCase):
             self.assertEqual(proc_cx.returncode, 0, proc_cx.stderr)
             self.assertTrue((codex_only_home / "hooks" / "handoff_gate.py").is_file())
             self.assertTrue((codex_only_home / "hooks" / "session_context_loader.py").is_file())
-            self.assertFalse((codex_only_home / "hooks" / "status_guard.py").exists())
-            self.assertFalse((codex_only_home / "hooks" / "reply_repeat_guard.py").exists())
+            self.assertTrue((codex_only_home / "hooks" / "status_guard.py").is_file())
+            self.assertTrue((codex_only_home / "hooks" / "reply_repeat_guard.py").is_file())
             codex_hooks = json.loads((codex_only_home / "hooks.json").read_text(encoding="utf-8"))["hooks"]
             self.assertEqual(set(codex_hooks), {"SessionStart", "PostCompact", "UserPromptSubmit", "PreToolUse", "Stop"})
             sid = "isolated-codex-handoff"
@@ -1389,8 +1469,29 @@ class TestEndToEndIntegration(unittest.TestCase):
             result = install("--codex-handoff-mode", "off")
             self.assertEqual(result.returncode, 0, result.stderr)
             disabled_bytes = hooks_path.read_bytes()
+            py_prefix = INSTALLER.detect_hook_python_command()
+            guard_state = quote((loader_path.parent / "state").as_posix())
+            guard_logs = quote((loader_path.parent / "logs").as_posix())
+            expected_status = {
+                "type": "command",
+                "command": f'{py_prefix} {quote((loader_path.parent / "status_guard.py").as_posix())} '
+                           f'--client codex --state-dir {guard_state} --log-dir {guard_logs}',
+                "timeout": 15, "statusMessage": "检查工作区写边界与日志重复读取",
+            }
+            expected_reply = {
+                "type": "command",
+                "command": f'{py_prefix} {quote((loader_path.parent / "reply_repeat_guard.py").as_posix())} '
+                           f'--client codex --state-dir {guard_state} --log-dir {guard_logs}',
+                "timeout": 15, "statusMessage": "检查重复状态回复",
+            }
             self.assertEqual(json.loads(disabled_bytes), {
                 **expected_legacy, "description": legacy["description"] + "\n[user-guard codex-handoff v1 mode=off compact_limit=2]",
+                "hooks": {
+                    "SessionStart": [{"matcher": "^(compact|resume)$", "hooks": [expected_loader, sibling]}, other_group],
+                    "Notification": other_event,
+                    "PreToolUse": [{"matcher": ".*", "hooks": [expected_status]}],
+                    "Stop": [{"hooks": [other_gate, shared_path_gate, expected_reply]}],
+                },
             })
             result = install()
             self.assertEqual(result.returncode, 0, result.stderr)

@@ -1,119 +1,75 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 500" width="1080" height="500" role="img" aria-labelledby="flow-title flow-desc">
-  <title id="flow-title">会话生命周期防护管线与后台定量验证闭环</title>
-  <desc id="flow-desc">上半部分展示交互式主会话按 runtime_tunables 动态调节的压缩实质恢复、写边界拦截与长会话交接管线；下半部分展示 cae-harness 独立子进程的动态角色选路、读写快照、定量验证与 check-grounding 事实锚定闭环。</desc>
-  <defs>
-    <style>
-      .bg { fill: #f8fafc; stroke: #cbd5e1; stroke-width: 1.5; }
-      .title { font: 700 18px "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; fill: #0f172a; }
-      .subtitle { font: 400 12px "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; fill: #475569; }
-      .lane-hook { fill: #f0fdf4; stroke: #16a34a; stroke-width: 1.5; }
-      .lane-ver { fill: #eff6ff; stroke: #2563eb; stroke-width: 1.5; }
-      .card { fill: #ffffff; stroke: #94a3b8; stroke-width: 1.3; }
-      .lane-hdr-g { font: 700 13.5px "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; fill: #15803d; }
-      .lane-hdr-b { font: 700 13.5px "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; fill: #1d4ed8; }
-      .card-hdr { font: 700 12.5px "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; fill: #0f172a; }
-      .body { font: 400 11.2px "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; fill: #1e293b; }
-      .mono { font: 600 10.8px Consolas, "SFMono-Regular", Menlo, monospace; fill: #0f172a; }
-      .arrow-g { stroke: #16a34a; stroke-width: 1.7; fill: none; marker-end: url(#head-g); }
-      .arrow-b { stroke: #2563eb; stroke-width: 1.7; fill: none; marker-end: url(#head-b); }
-    </style>
-    <marker id="head-g" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
-      <path d="M 0 1 L 10 5 L 0 9 z" fill="#16a34a"/>
-    </marker>
-    <marker id="head-b" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
-      <path d="M 0 1 L 10 5 L 0 9 z" fill="#2563eb"/>
-    </marker>
-  </defs>
-
-  <rect x="8" y="8" width="1064" height="484" rx="12" class="bg"/>
-  <text x="540" y="35" text-anchor="middle" class="title">会话生命周期防护管线与后台定量验证闭环</text>
-  <text x="540" y="55" text-anchor="middle" class="subtitle">未压缩回合零字节注入（保护前缀缓存） · 按客户端动态预算恢复原话与实质子代理结论 · 改码强制验证与零黑名单事实锚定</text>
-
-  <!-- Upper Lane: Interactive Lifecycle Hooks -->
-  <rect x="24" y="70" width="1032" height="192" rx="10" class="lane-hook"/>
-  <text x="40" y="93" class="lane-hdr-g">A. 交互式主会话事件钩子管线（Antigravity / Codex / Claude Code 事件驱动 · 阈值读取 runtime_tunables）</text>
-
-  <!-- Hook Step 1 -->
-  <rect x="40" y="106" width="320" height="142" rx="7" class="card"/>
-  <text x="52" y="126" class="card-hdr">① 恢复与调用前：动态双路恢复</text>
-  <text x="52" y="143" class="mono">session_context_loader.py + user_words.py</text>
-  <text x="52" y="162" class="body">• 无新压缩检查点：返回空对象（0 B 注入）</text>
-  <text x="52" y="180" class="body">• 先还原截断全文，再按 per_client 恢复：</text>
-  <text x="64" y="198" class="body">- 全部人类原话与问答选择（保首轮总纲）</text>
-  <text x="64" y="216" class="body">- 保留最新及窗口内实质子代理摘要与指针</text>
-  <text x="64" y="234" class="body">- 自动闭合截断代码围栏并与人类指令分区</text>
-
-  <path d="M 360 177 L 380 177" class="arrow-g"/>
-
-  <!-- Hook Step 2 -->
-  <rect x="382" y="106" width="320" height="142" rx="7" class="card"/>
-  <text x="394" y="126" class="card-hdr">② 工具执行前：写边界与防轮询门禁</text>
-  <text x="394" y="143" class="mono">status_guard.py + handoff_gate.py</text>
-  <text x="394" y="162" class="body">• 拦截未获批项目外写删、重定向、worktree、</text>
-  <text x="406" y="180" class="body">编码子壳与 Python AST 越界写（无头直接 deny）</text>
-  <text x="394" y="198" class="body">• 阻止对大小与修改时间未变的日志同区间重读</text>
-  <text x="394" y="216" class="body">• 达 handoff_thresholds 进入 drain / freeze，</text>
-  <text x="406" y="234" class="body">阻断新开子代理与 git push，预留预算收尾</text>
-
-  <path d="M 702 177 L 722 177" class="arrow-g"/>
-
-  <!-- Hook Step 3 -->
-  <rect x="724" y="106" width="316" height="142" rx="7" class="card"/>
-  <text x="736" y="126" class="card-hdr">③ 回合结束时：防空等与交接校验</text>
-  <text x="736" y="143" class="mono">reply_repeat_guard.py + handoff_gate.py</text>
-  <text x="736" y="162" class="body">• 连续达 consecutive_wait_limit 输出无新数值</text>
-  <text x="748" y="180" class="body">进展的短句等待时单次拦截（保留迭代残差汇报）</text>
-  <text x="736" y="198" class="body">• 冻结交接期核验已验证进展、Git 状态、待办项</text>
-  <text x="748" y="216" class="body">及可复制的【新对话提示词】（含 GOAL_CANCELLED）</text>
-  <text x="736" y="234" class="body">• 日志按上限滚动裁剪，低频清理空闲过期锁文件</text>
-
-  <!-- Lower Lane: CAE Harness Closed-Loop Verification -->
-  <rect x="24" y="278" width="1032" height="198" rx="10" class="lane-ver"/>
-  <text x="40" y="301" class="lane-hdr-b">B. 后台独立子进程编排与事实锚定闭环（cae_harness.py：task / audit / gate / check-grounding）</text>
-
-  <!-- Ver Step 1 -->
-  <rect x="40" y="314" width="234" height="146" rx="7" class="card"/>
-  <text x="52" y="334" class="card-hdr">1. 动态选路与预检</text>
-  <text x="52" y="351" class="mono">probe / assess / role:*</text>
-  <text x="52" y="370" class="body">• 识别通用课题或上游仓库模式</text>
-  <text x="52" y="388" class="body">• 对称解析五个动态角色槽位候选</text>
-  <text x="52" y="406" class="body">• 预检凭据、路由健康与配额冷却</text>
-  <text x="52" y="424" class="body">• 按安全系数计算分片预算，跳过</text>
-  <text x="64" y="442" class="body">ultra 自动委派挡与退役模型</text>
-
-  <path d="M 274 387 L 292 387" class="arrow-b"/>
-
-  <!-- Ver Step 2 -->
-  <rect x="294" y="314" width="234" height="146" rx="7" class="card"/>
-  <text x="306" y="334" class="card-hdr">2. 独立上下文与读写边界</text>
-  <text x="306" y="351" class="mono">CAE_HARNESS_DEPTH=1</text>
-  <text x="306" y="370" class="body">• 全新进程运行，不挤占主会话窗口</text>
-  <text x="306" y="388" class="body">• 只读任务：前后全树文件哈希快照</text>
-  <text x="306" y="406" class="body">• 盲读模式：--clean-room 剥离规则</text>
-  <text x="306" y="424" class="body">• 改码任务：--write-scope 锁定白</text>
-  <text x="318" y="442" class="body">名单，越界立即报 scope_violation</text>
-
-  <path d="M 528 387 L 546 387" class="arrow-b"/>
-
-  <!-- Ver Step 3 -->
-  <rect x="548" y="314" width="234" height="146" rx="7" class="card"/>
-  <text x="560" y="334" class="card-hdr">3. 定量门禁闭环修正</text>
-  <text x="560" y="351" class="mono">gate --verify-cmd</text>
-  <text x="560" y="370" class="body">• 强制绑定非空定量验证脚本</text>
-  <text x="560" y="388" class="body">• 严禁放宽 rtol / atol 或删断言</text>
-  <text x="560" y="406" class="body">• 未通过时自动将真实报错回传子进</text>
-  <text x="572" y="424" class="body">程在 --max-rounds 内迭代修复</text>
-  <text x="560" y="442" class="body">• 回执实报 verification_executed</text>
-
-  <path d="M 782 387 L 800 387" class="arrow-b"/>
-
-  <!-- Ver Step 4 -->
-  <rect x="802" y="314" width="238" height="146" rx="7" class="card"/>
-  <text x="814" y="334" class="card-hdr">4. 事实锚定与 R6 终审</text>
-  <text x="814" y="351" class="mono">check-grounding / L1–L4</text>
-  <text x="814" y="370" class="body">• 零黑名单拦截陌生缩写与虚构术语</text>
-  <text x="814" y="388" class="body">• 主会话亲自打开原文件核对行号</text>
-  <text x="814" y="406" class="body">• L1 源码就位 · L2 编译单测通过</text>
-  <text x="814" y="424" class="body">• L3 离散守恒与不变量达机器零</text>
-  <text x="814" y="442" class="body">• L4 网格加密收敛阶 EOC 达标</text>
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="1090" viewBox="0 0 1440 1090" role="img" aria-labelledby="title desc">
+  <title id="title">会话确认、压缩接力与完成核验</title>
+  <desc id="desc">左侧为正常执行链，右侧为中断接力；恢复内容来自磁盘票据，批准必须由用户明确给出。</desc>
+  <defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M 0 1 L 8 5 L 0 9" fill="none" stroke="#64748b" stroke-width="1.5"/></marker></defs>
+  <style>text { font-family: "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; fill: #23354d; } .title { font-size: 28px; font-weight: 700; } .subtitle { font-size: 17px; fill: #52657b; } .heading { font-size: 21px; font-weight: 700; } .body { font-size: 16px; } .link { fill: none; stroke: #64748b; stroke-width: 2; marker-end: url(#arrow); }</style>
+  <rect width="1440" height="1090" fill="#f3f6fb"/>
+  <text x="32" y="49" class="title">会话确认、压缩接力与完成核验</text>
+  <text x="32" y="80" class="subtitle">左侧为正常执行链，右侧为中断接力；恢复内容来自磁盘票据，批准必须由用户明确给出。</text>
+  <path class="link" d="M 457 280 L 457 310"/>
+  <path class="link" d="M 457 440 L 457 470"/>
+  <path class="link" d="M 457 622 L 457 652"/>
+  <path class="link" d="M 457 802 L 457 842"/>
+  <path class="link" d="M 882 194 L 914 194"/>
+  <path class="link" d="M 1161 360 L 1161 390"/>
+  <path class="link" d="M 1161 622 L 1161 652"/>
+  <path class="link" d="M 1161 802 L 1161 842"/>
+  <g><rect x="32" y="112" width="850" height="168" rx="14" fill="#ffffff" stroke="#b5c8e5"/>
+    <text x="54" y="146" class="heading">准备与计划：先定义任务，再核对可用性</text>
+    <text x="54" y="177" class="body">明确数学或软件契约、目标路径、读取范围与验收判据。</text>
+    <text x="54" y="203" class="body">用户点名按 P0 锁定；role:* 补齐未指定维度。</text>
+    <text x="54" y="229" class="body">plan 复查启停、路由、可读额度与冷却；日常不联网刷新性能。</text>
+    <text x="54" y="255" class="body">轻重阈值读取 runtime_tunables.dispatch_confirmation。</text>
+  </g>
+  <g><rect x="32" y="310" width="850" height="130" rx="14" fill="#fff8e9" stroke="#d7b265"/>
+    <text x="54" y="344" class="heading">完整确认：内部原生与外部无头通道一并列全</text>
+    <text x="54" y="375" class="body">背景、要做什么、预计后果、14 列矩阵、性能更新时间和选项卡。</text>
+    <text x="54" y="401" class="body">用户批准后运行 plan --approve-ticket；执行绑定 --ticket。</text>
+    <text x="54" y="427" class="body">PreToolUse 检查有效票据，拦截裸调和未经确认的重负载。</text>
+  </g>
+  <g><rect x="32" y="470" width="850" height="152" rx="14" fill="#ffffff" stroke="#b5c8e5"/>
+    <text x="54" y="504" class="heading">按批准计划执行：权限与验证边界不混用</text>
+    <text x="54" y="535" class="body">batch 仅执行外部通道，原生代理由对应客户端调用。</text>
+    <text x="54" y="561" class="body">只读小文件默认精确行号内联，前后快照核验零改动。</text>
+    <text x="54" y="587" class="body">gate 锁定 --write-scope 并执行 --verify-cmd。</text>
+    <text x="54" y="613" class="body">额度耗尽停止重试；同后端排队流停止，保留实际结果。</text>
+  </g>
+  <g><rect x="32" y="652" width="850" height="150" rx="14" fill="#eefaf4" stroke="#81bfa0"/>
+    <text x="54" y="686" class="heading">完成与 Stop：按证据报清结果</text>
+    <text x="54" y="717" class="body">reply_repeat_guard.py 按外部或原生通道规则检查成败词、Token 说明及回执或轨迹标识。</text>
+    <text x="54" y="743" class="body">原生轨迹未提供 Token 整数时明确写无法统计。</text>
+    <text x="54" y="769" class="body">主会话核对行号与适用条件，区分配置完成、离线检查和实际实测。</text>
+  </g>
+  <g><rect x="914" y="112" width="494" height="248" rx="14" fill="#f3efff" stroke="#b8a7dc"/>
+    <text x="936" y="146" class="heading">压缩打断：独立加载专项确认单</text>
+    <text x="936" y="177" class="body">session_context_loader.py 分块恢复：</text>
+    <text x="936" y="203" class="body">常规用户原话与实质子代理摘要；</text>
+    <text x="936" y="229" class="body">磁盘未决工作流与完整确认内容。</text>
+    <text x="936" y="255" class="body">保留背景、目标、后果、矩阵和选项。</text>
+    <text x="936" y="281" class="body">缺项报告缺口，不凭摘要补猜。</text>
+    <text x="936" y="307" class="body">压缩与恢复不代表批准。</text>
+  </g>
+  <g><rect x="914" y="390" width="494" height="232" rx="14" fill="#f3efff" stroke="#b8a7dc"/>
+    <text x="936" y="424" class="heading">交接打断：保留完整接力内容</text>
+    <text x="936" y="455" class="body">drain 或 freeze 强制阶段由 Stop 检查。</text>
+    <text x="936" y="481" class="body">【新对话提示词】嵌入完整工作流、</text>
+    <text x="936" y="507" class="body">矩阵、性能更新时间、选项卡与票据。</text>
+    <text x="936" y="533" class="body">Codex 与 Claude Code 默认 advisory。</text>
+    <text x="936" y="559" class="body">强制行为以实际模式为准。</text>
+  </g>
+  <g><rect x="914" y="652" width="494" height="150" rx="14" fill="#f3efff" stroke="#b8a7dc"/>
+    <text x="936" y="686" class="heading">新会话：复核后重新形成当前计划</text>
+    <text x="936" y="717" class="body">plan --resume-ticket 读取旧票据。</text>
+    <text x="936" y="743" class="body">不自动改绑 session_id，不推测批准。</text>
+    <text x="936" y="769" class="body">跨会话重新生成确认票据再执行。</text>
+  </g>
+  <g><rect x="32" y="842" width="1376" height="220" rx="14" fill="#ffffff" stroke="#b5c8e5"/>
+    <text x="54" y="876" class="heading">Codex 五类事件的执行链</text>
+    <text x="54" y="907" class="body">SessionStart：compact 或 resume 入口恢复原话与未决工作流，再检查交接状态。</text>
+    <text x="54" y="933" class="body">PostCompact：更新压缩后交接判断；UserPromptSubmit：按用户新指令更新判断。</text>
+    <text x="54" y="959" class="body">PreToolUse：status_guard.py 检查写边界、重复日志读取、裸调与重负载票据，再检查交接。</text>
+    <text x="54" y="985" class="body">Stop：reply_repeat_guard.py 检查重复回复与完工报账，handoff_gate.py 检查交接提示词。</text>
+    <text x="54" y="1011" class="body">user_words.py 提供共享提取与状态能力；五事件与五脚本模块分别计数。</text>
+    <text x="54" y="1037" class="body">check-grounding --strict 核对文档词法依据；不替代数学证明、运行验证和人工复核。</text>
+  </g>
 </svg>

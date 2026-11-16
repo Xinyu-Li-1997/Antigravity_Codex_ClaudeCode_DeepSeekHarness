@@ -829,8 +829,7 @@ def _classify_run_command(cmd_str: str, is_daemon: bool = False, _depth: int = 0
             sub_tokens = [_strip_token_quotes(st) for st in tokens[1:]]
             if (
                 not has_redir
-                and any(st in ("probe", "--help", "-h", "status") for st in sub_tokens)
-                and not any(st in ("task", "audit", "gate") for st in sub_tokens)
+                and sub_tokens and sub_tokens[0] in ("check-grounding", "assess", "probe", "plan", "--help", "-h", "status")
             ):
                 continue
             return "blocked_always"
@@ -884,8 +883,7 @@ def _classify_run_command(cmd_str: str, is_daemon: bool = False, _depth: int = 0
                     sub_tokens = [_strip_token_quotes(st) for st in py_args[idx_arg + 1 :]]
                     if (
                         not has_redir
-                        and any(st in ("probe", "--help", "-h", "status") for st in sub_tokens)
-                        and not any(st in ("task", "audit", "gate") for st in sub_tokens)
+                        and sub_tokens and sub_tokens[0] in ("check-grounding", "assess", "probe", "plan", "--help", "-h", "status")
                     ):
                         continue
                     return "blocked_always"
@@ -970,14 +968,106 @@ def _record_handoff_baseline(state: Dict[str, Any], path: Path) -> None:
             baselines[key] = snapshot
 
 
-def _has_valid_handoff_file(gate_state: Dict[str, Any]) -> bool:
+def _has_valid_handoff_file(gate_state: Dict[str, Any], tickets=None) -> bool:
     for raw_path, baseline in gate_state.get("handoffFileBaselines", {}).items():
         current = _handoff_document_snapshot(Path(raw_path), include_text=True)
         if (isinstance(baseline, dict) and current and current.get("path") == baseline.get("path")
                 and current.get("sha256") != baseline.get("sha256")
-                and _handoff_structure_present(current.get("text") or "")):
+                and _handoff_structure_present(current.get("text") or "")
+                and _workflow_handoff_present(current.get("text") or "", tickets or [])):
             return True
     return False
+
+
+def _workflow_handoff_present(text: str, tickets) -> bool:
+    if not tickets:
+        return True
+    # 只核验提示词正文，正文之前提到票据或在其他章节列矩阵不能代替接力。
+    lines = text.splitlines()
+    start = None
+    inline = ""
+    for i, line in enumerate(user_words.markdown_unquoted_lines(text)):
+        heading, *tail = re.split(r"[:：]", line, maxsplit=1)
+        heading = heading.strip("#*【】[] \t")
+        heading = re.sub(r"^(?:[-*+]\s+|\(?[0-9一二三四五六七八九十]+[.)、．]\s*)", "", heading).strip("#*【】[] \t")
+        if PROMPT_MARKER_RE.fullmatch(heading):
+            start, inline = i, tail[0] if tail else ""
+            break
+    if start is None:
+        return False
+    body_lines = [inline]
+    fence = ""
+    for line in lines[start + 1:]:
+        match = user_words.MARKDOWN_FENCE_RE.match(line)
+        if match:
+            if not fence:
+                fence = match[1]
+            elif match[1][0] == fence[0] and len(match[1]) >= len(fence):
+                fence = ""
+        if not fence and re.match(r"^\s*#{1,6}\s+", line):
+            break
+        body_lines.append(line)
+    def normalize(value):
+        return re.sub(r"\s+", "", str(value).replace(r"\|", "|"))
+
+    body = "\n".join(body_lines)
+    normalized = normalize(body)
+    rows = []
+    for line in body_lines:
+        if line.strip().startswith("|") and line.strip().endswith("|"):
+            cells = re.split(r"(?<!\\)\|", line.strip())[1:-1]
+            if len(cells) == 14:
+                rows.append([normalize(cell) for cell in cells])
+
+    def contains(cell, value):
+        return value in (None, "", []) or normalize(value) in cell
+
+    def boolean(cell, value):
+        if not isinstance(value, bool):
+            return True
+        return ("是" if value else "否") in cell
+
+    for ticket in tickets:
+        for value in (ticket.get("ticket_id"), ticket.get("workflow_bg") or ticket.get("workflow_background"),
+                      ticket.get("workflow_goal"), ticket.get("workflow_impact")):
+            if not contains(normalized, value):
+                return False
+        if not all(option in normalized for option in ("①", "②", "③", "批准当前计划", "微调", "暂缓", "交接")):
+            return False
+        ledger = ticket.get("capability_ledger") or {}
+        if any(not contains(normalized, ledger.get(key)) for key in ("last_online_refresh_at", "local_bench_verified_at")):
+            return False
+        for stream in ticket.get("streams", []):
+            matched = False
+            for row in rows:
+                if row[0] != normalize(stream.get("stream_id")):
+                    continue
+                checks = [(1, "subtask"), (1, "target"), (2, "channel"), (3, "client"), (3, "agent_type"),
+                          (5, "tier"), (6, "context_window"), (9, "access_mode"), (9, "verify_cmd"),
+                          (10, "timeout"), (11, "unavailable_reason"), (12, "quota_scheme"),
+                          (12, "quota_summary"), (13, "receipt_location")]
+                if not all(contains(row[index], stream.get(key)) for index, key in checks):
+                    continue
+                if not contains(row[4], stream.get("model_display") or stream.get("model")):
+                    continue
+                if not all(boolean(row[index], stream.get(key)) for index, key in
+                           ((7, "headless"), (8, "clean_room"), (10, "inline_readonly"), (11, "currently_available"))):
+                    continue
+                if not all(contains(row[9], scope) for scope in stream.get("write_scope", [])):
+                    continue
+                matched = True
+                break
+            if not matched:
+                return False
+    return True
+
+
+def _workflow_handoff_notice(tickets) -> str:
+    if not tickets:
+        return ""
+    return ("\n必须将以下未决重负载工作流的背景、要做什么、预计后果、14列全字段矩阵、"
+            "离线性能更新时间及选项卡完整写入【新对话提示词】，由新对话读取磁盘票据再请用户拍板。\n"
+            + "\n\n".join(user_words.render_pending_workflow_block(ticket, for_handoff=True) for ticket in tickets))
 
 
 def _reply_has_handoff_prompt(reply_text: str) -> bool:
@@ -1432,6 +1522,10 @@ def evaluate_pre_invocation_locked(
     elif phase == "freeze":
         mandate_message = _build_freeze_message(gate_state, tel)
 
+    if phase in ("drain", "freeze"):
+        tickets = user_words.handoff_session_pending_tickets(conversation_id, state_dir)
+        mandate_message = (mandate_message or "") + _workflow_handoff_notice(tickets)
+
     if changed:
         save_gate_state(state_dir, conversation_id, gate_state)
 
@@ -1513,6 +1607,7 @@ def check_pre_tool_use_locked(payload: Dict[str, Any], state_dir: Path,
         return None
 
     # 以下为 Stage-2 (drain / freeze) 精确工具门禁
+    user_words.handoff_session_pending_tickets(conversation_id, state_dir)
     # 1. 绝不允许的派工与常驻/外推工具（drain 与 freeze 均阻断）
     if tool_name in DELEGATION_TOOLS or tool_name in MEDIA_TOOLS or tool_name.startswith("browser_"):
         save_gate_state(state_dir, conversation_id, gate_state)
@@ -1696,6 +1791,8 @@ def check_stop_handoff_locked(
     if phase not in ("drain", "freeze"):
         return None
 
+    tickets = user_words.handoff_session_pending_tickets(conversation_id, state_dir)
+
     if turn_key == "turn_0_initial":
         comp_file = state_dir / f"{conversation_id}_compaction.json"
         if comp_file.exists():
@@ -1714,12 +1811,15 @@ def check_stop_handoff_locked(
         return {"decision": "allow"}
 
     missing_parts: List[str] = []
-    has_file = _has_valid_handoff_file(gate_state)
-    has_prompt_inline = _handoff_structure_present(latest_reply)
+    has_file = _has_valid_handoff_file(gate_state, tickets)
+    has_prompt_inline = (_handoff_structure_present(latest_reply)
+                         and _workflow_handoff_present(latest_reply, tickets))
     if not has_file and not has_prompt_inline:
         missing_parts.append(
             "尚未落盘非空交接文档且最终回复中缺少可直接复制粘贴到新对话的完整【新对话提示词】（含已验证进度、Git 状态与未完成事项）"
         )
+        if tickets:
+            missing_parts.append("【新对话提示词】遗漏未决票据的完整工作流详述、矩阵或选项卡")
 
     requires_cancel = bool(gate_state.get("isGoalActive")) if goal_active is None else goal_active
     if requires_cancel and not user_words.has_goal_cancel_marker(latest_reply):
@@ -1750,6 +1850,7 @@ def check_stop_handoff_locked(
             "【user-guard 交接停机门禁验收未通过】"
             + "；".join(missing_parts)
             + "。请补全上述交接要素后直接输出停机回复。"
+            + _workflow_handoff_notice(tickets)
         ),
     }
 
@@ -2126,6 +2227,8 @@ def _handle_native_handoff(payload: Dict[str, Any], state_dir: Path, mode: str,
         return {}
     if transcript is None:
         return {"systemMessage": f"{label} 长会话门禁未更新。{identity_error}。"}
+    if not user_words.valid_session_id(sid):
+        return {}
     state_dir = Path(state_dir)
     with user_words.session_state_lock(state_dir, sid):
         state_path = _gate_state_path(state_dir, sid)
@@ -2189,6 +2292,9 @@ def _handle_native_handoff(payload: Dict[str, Any], state_dir: Path, mode: str,
         phase = state["phase"]
         client_label = "Claude" if client == "claude" else "Codex"
         notice = _codex_notice(phase, count, mode, client_label=client_label)
+        tickets = (user_words.handoff_session_pending_tickets(sid, state_dir)
+                   if phase in ("drain", "freeze") else [])
+        notice += _workflow_handoff_notice(tickets)
         if state["compactionIssues"]:
             notice += " 压缩轨迹对账存在缺口，次数按当前可见证据保守计算。"
         response: Dict[str, Any] = {}
@@ -2210,6 +2316,7 @@ def _handle_native_handoff(payload: Dict[str, Any], state_dir: Path, mode: str,
             elif kind == "mutating_other":
                 if consume_drain_action(state):
                     notice = _codex_notice(state["phase"], count, mode, client_label=client_label)
+                    notice += _workflow_handoff_notice(tickets)
                     if state["compactionIssues"]:
                         notice += " 压缩轨迹对账存在缺口，次数按当前可见证据保守计算。"
                 response = _codex_context(event, notice)
@@ -2221,7 +2328,8 @@ def _handle_native_handoff(payload: Dict[str, Any], state_dir: Path, mode: str,
                 state["toolDecisions"] = dict(list(previous.items())[-512:])
         elif event == "Stop" and mode == "enforce" and phase in ("drain", "freeze"):
             reply = str(payload.get("last_assistant_message") or "")
-            if _handoff_structure_present(reply) or _has_valid_handoff_file(state):
+            if ((_handoff_structure_present(reply) and _workflow_handoff_present(reply, tickets))
+                    or _has_valid_handoff_file(state, tickets)):
                 state.update(phase="freeze", handoffRecorded=True)
                 response = {} if client == "claude" else {"continue": False, "stopReason": "已记录交接结构，结束当前回合；目标与后台任务状态须由用户/总控另行核对。"}
             elif payload.get("stop_hook_active") or state["stopCorrectionRequested"]:
@@ -2238,12 +2346,20 @@ def _handle_native_handoff(payload: Dict[str, Any], state_dir: Path, mode: str,
 
 # ⑦ 命令行主入口
 
+def _default_native_state_dir(client: str) -> Path:
+    state = os.environ.get("USER_GUARD_STATE_DIR")
+    if state:
+        return Path(state).expanduser() / "handoff"
+    variable, dirname = (("CLAUDE_CONFIG_DIR", ".claude") if client == "claude" else ("CODEX_HOME", ".codex"))
+    return Path(os.environ.get(variable) or Path.home() / dirname).expanduser() / "hooks" / "state" / "handoff"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Codex & Claude Code 长会话交接事件适配；反重力使用既有模块接口")
     parser.add_argument("--client", choices=("codex", "claude"), required=True)
     parser.add_argument("--mode", choices=("advisory", "enforce", "off"), default=None)
     parser.add_argument("--compact-limit", type=int, default=None)
-    parser.add_argument("--state-dir", default=str(HOOKS_DIR / "state" / "handoff"))
+    parser.add_argument("--state-dir", default=None)
     args = parser.parse_args()
     ht = _sync_handoff_tunables()
     client_cfg = ht.get(args.client) if isinstance(ht.get(args.client), dict) else {}
@@ -2257,7 +2373,7 @@ def main() -> None:
     try:
         payload = user_words.read_hook_payload()
         handler = handle_claude_handoff if args.client == "claude" else handle_codex_handoff
-        state_dir = Path(args.state_dir).expanduser()
+        state_dir = Path(args.state_dir).expanduser() if args.state_dir else _default_native_state_dir(args.client)
         response = handler(payload, state_dir, mode, compact_limit)
     except Exception as exc:
         # 状态/协议异常时不伪装已受保护，不在失败的钩子中无限继续。

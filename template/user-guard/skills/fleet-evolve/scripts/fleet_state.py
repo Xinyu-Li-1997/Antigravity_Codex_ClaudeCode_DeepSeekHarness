@@ -84,16 +84,22 @@ def _resolve_repo_root(raw_repo: str | None) -> Path:
 
 
 def _run_repo_grounding_gate(repo_root: Path) -> Dict[str, Any]:
-    harness_py = repo_root / "template" / "user-guard" / "skills" / "cae-harness" / "scripts" / "cae_harness.py"
-    if not harness_py.is_file():
-        return {"ok": True, "skipped": True}
-    import importlib.util
-    spec = importlib.util.spec_from_file_location("_cae_harness_grounding", harness_py)
-    if spec is None or spec.loader is None:
-        return {"ok": True, "skipped": True}
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module.audit_doc_grounding(repo_root, repo_root)
+    try:
+        harness_py = repo_root / "template" / "user-guard" / "skills" / "cae-harness" / "scripts" / "cae_harness.py"
+        if not harness_py.is_file():
+            raise FileNotFoundError("cae_harness.py is missing")
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("_cae_harness_grounding", harness_py)
+        if spec is None or spec.loader is None:
+            raise ImportError("cae_harness.py has no import spec or loader")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        result = module.audit_doc_grounding(repo_root, repo_root)
+        if not isinstance(result, dict) or not isinstance(result.get("ok"), bool):
+            raise ValueError("grounding gate returned an invalid result")
+        return result
+    except Exception as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
 def _default_ttl_seconds(repo_root: Path | None = None) -> int:
@@ -259,11 +265,10 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("status", help="Read current bootstrap or approval phase without modifying disk")
 
-    default_ttl = _default_ttl_seconds()
     p_prop = sub.add_parser("propose", help="Record candidate client-model table and pause for user sign-off")
     p_prop.add_argument("--session-id", required=True)
     p_prop.add_argument("--summary", required=True, help="Brief summary of proposed role/model changes requiring user approval")
-    p_prop.add_argument("--ttl", type=int, default=default_ttl)
+    p_prop.add_argument("--ttl", type=int, default=None)
 
     p_app = sub.add_parser("approve", help="Record explicit user sign-off on the proposed client-model table")
     p_app.add_argument("--session-id", required=True)
@@ -271,7 +276,7 @@ def main(argv: list[str] | None = None) -> int:
     p_rec = sub.add_parser("record-pass1", help="Record Pass 1 completion awaiting Master reload")
     p_rec.add_argument("--session-id", required=True)
     p_rec.add_argument("--target-master", required=True)
-    p_rec.add_argument("--ttl", type=int, default=default_ttl)
+    p_rec.add_argument("--ttl", type=int, default=None)
     p_rec.add_argument("--force", action="store_true", help="Overwrite even if an active Pass 2 session has claimed the lock")
 
     p_ver = sub.add_parser("verify-pass2", help="Validate Pass 2 re-entry from a reloaded Master session")
@@ -279,6 +284,7 @@ def main(argv: list[str] | None = None) -> int:
 
     p_clr = sub.add_parser("clear", help="Reset bootstrap state lock to IDLE (optionally recording last_verified metadata)")
     p_clr.add_argument("--verified", action="store_true")
+    p_clr.add_argument("--force", action="store_true", help="Allow clearing an active user approval proposal")
     p_clr.add_argument("--readback-done", action="store_true", help="Confirm cold full-file readback pass completed")
 
     args = parser.parse_args(argv)
@@ -294,6 +300,8 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     try:
         default_ttl = _default_ttl_seconds(repo_root)
+        if args.cmd in ("propose", "record-pass1") and args.ttl is None:
+            args.ttl = default_ttl
         state_file = _validated_state_file(repo_root)
         meta = _repo_meta(repo_root)
     except (ValueError, OSError) as exc:
@@ -342,7 +350,8 @@ def main(argv: list[str] | None = None) -> int:
         sid = args.session_id.strip()
         summary = args.summary.strip()
         if not sid or not summary or args.ttl <= 0:
-            raise ValueError("session-id and summary must be non-empty and ttl must be positive")
+            print(json.dumps({"ok": False, "reason": "invalid_arguments", "error": "session-id and summary must be non-empty and ttl must be positive"}, ensure_ascii=False, indent=2))
+            return 2
         payload = {
             "schema_version": 1,
             "phase": "AWAITING_USER_APPROVAL",
@@ -361,7 +370,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "approve":
         sid = args.session_id.strip()
         if not sid:
-            raise ValueError("session-id must be non-empty")
+            print(json.dumps({"ok": False, "reason": "invalid_arguments", "error": "session-id must be non-empty"}, ensure_ascii=False, indent=2))
+            return 2
         with _state_lock(state_file):
             try:
                 saved = _load_state(state_file)
@@ -399,7 +409,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "record-pass1":
         sid = args.session_id.strip()
         if not sid or args.ttl <= 0:
-            raise ValueError("session-id must be non-empty and ttl must be positive")
+            print(json.dumps({"ok": False, "reason": "invalid_arguments", "error": "session-id must be non-empty and ttl must be positive"}, ensure_ascii=False, indent=2))
+            return 2
         payload = {
             "schema_version": 1,
             "phase": "AWAITING_MASTER_RELOAD",
@@ -417,6 +428,10 @@ def main(argv: list[str] | None = None) -> int:
                 except ValueError:
                     existing = {}
                 claimed_by = existing.get("claimed_by_session_id")
+                if (existing.get("phase") == "AWAITING_USER_APPROVAL"
+                        and now - _int_field(existing, "updated_at_epoch", 0) <= _int_field(existing, "ttl_seconds", 86400, positive=True)):
+                    print(json.dumps({"ok": False, "reason": "active_user_approval", "saved": existing}, ensure_ascii=False, indent=2))
+                    return 2
                 if (
                     existing.get("phase") == "AWAITING_MASTER_RELOAD"
                     and claimed_by
@@ -458,19 +473,32 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"ok": ok, "reason": reason or "ready_for_pass2", "saved": saved}, ensure_ascii=False, indent=2))
         return 0 if ok else 2
 
-    if args.verified and args.readback_done:
-        grounding = _run_repo_grounding_gate(repo_root)
-        if not grounding.get("ok", True):
-            print(json.dumps({
-                "ok": False,
-                "readback_verified": False,
-                "reason": "grounding_check_failed",
-                "finding_count": grounding.get("finding_count", 0),
-                "findings": grounding.get("findings", []),
-            }, ensure_ascii=False, indent=2))
-            return 2
-
     with _state_lock(state_file):
+        if args.verified and not args.force:
+            try:
+                saved = _load_state(state_file, default_ttl)
+            except (ValueError, OSError) as exc:
+                print(json.dumps({"ok": False, "reason": "invalid_state", "error": str(exc)}, ensure_ascii=False, indent=2))
+                return 1
+            if (
+                saved.get("phase") == "AWAITING_USER_APPROVAL"
+                and int(time.time()) - _int_field(saved, "updated_at_epoch", 0)
+                <= _int_field(saved, "ttl_seconds", default_ttl, positive=True)
+            ):
+                print(json.dumps({"ok": False, "reason": "active_user_approval", "error": "An active proposal requires user approval; use --force to explicitly override"}, ensure_ascii=False, indent=2))
+                return 1
+        if args.verified and args.readback_done:
+            grounding = _run_repo_grounding_gate(repo_root)
+            if grounding.get("ok") is not True:
+                print(json.dumps({
+                    "ok": False,
+                    "readback_verified": False,
+                    "reason": "grounding_check_failed",
+                    "error": grounding.get("error"),
+                    "finding_count": grounding.get("finding_count", 0),
+                    "findings": grounding.get("findings", []),
+                }, ensure_ascii=False, indent=2))
+                return 2
         if args.verified:
             payload = {
                 "schema_version": 1,

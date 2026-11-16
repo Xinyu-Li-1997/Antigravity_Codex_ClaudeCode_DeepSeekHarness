@@ -21,6 +21,7 @@ import base64
 import binascii
 import hashlib
 import itertools
+import importlib.util
 import json
 import os
 import posixpath
@@ -756,7 +757,7 @@ def _win_expand_short_path(win_path: str) -> str:
             cur_str = str(cur)
             buf = ctypes.create_unicode_buffer(max(len(cur_str) + 256, 512))
             length = _WIN_GET_LONG_PATH(cur_str, buf, len(buf))
-            if length > len(buf):
+            if length >= len(buf):
                 buf = ctypes.create_unicode_buffer(length)
                 length = _WIN_GET_LONG_PATH(cur_str, buf, length)
             if length:
@@ -811,15 +812,27 @@ def _normalize_cross_env_lexical(raw_str: str, base_dir: Optional[str] = None) -
         return _normalize_win_mount_key(m_mnt.group(1).lower(), m_mnt.group(2) or "")
 
     if is_unc:
-        norm = "//" + posixpath.normpath(slashes.lstrip("/"))
+        norm = _normalize_unc_key(slashes)
         if "~" in norm and os.name == "nt":
             win_unc = _win_expand_short_path(norm.replace("/", "\\"))
             if win_unc.startswith("\\\\"):
-                norm = "//" + posixpath.normpath(win_unc.replace("\\", "/").lstrip("/"))
+                norm = _normalize_unc_key(win_unc.replace("\\", "/"))
         return norm.casefold()
 
     norm = posixpath.normpath(slashes)
     return norm.casefold() if os.name == "nt" else norm
+
+
+def _normalize_unc_key(path: str) -> str:
+    parts = [part for part in path.split("/") if part]
+    root, tail = parts[:2], []
+    for part in parts[2:]:
+        if part == "..":
+            if tail:
+                tail.pop()
+        elif part != ".":
+            tail.append(part)
+    return "//" + "/".join(root + tail)
 
 
 def _is_under_norm_key(target_key: str, root_key: str) -> bool:
@@ -1007,13 +1020,15 @@ def _collect_boundary_context(
         if item in raw_projects:
             if rk:
                 allowed_resolved_keys.append(rk)
-        elif rk and rk == nk:
+        elif rk and (rk == nk or item in (str(state_dir), str(logs_dir), tempfile.gettempdir())):
             allowed_resolved_keys.append(rk)
         else:
             # 缓存、轨迹等目录只有物理位置与登记的标准目录一致时才适用例外。
             continue
         if nk and nk not in allowed_norm_keys:
             allowed_norm_keys.append(nk)
+        if (item in raw_projects or item in (str(state_dir), str(logs_dir), tempfile.gettempdir())) and rk:
+            allowed_norm_keys.append(rk)
 
     project_display = ", ".join(raw_projects)
     return project_norm_keys, allowed_norm_keys, allowed_resolved_keys, project_display, base_cwd
@@ -2138,6 +2153,9 @@ def _extract_clause_path_targets(tokens: List[str], copy_dest_only: bool = False
             explicit_paths.append(tokens[idx + 1])
             idx += 2
             continue
+        if head_low == "robocopy" and re.match(r"^/(?:MIR|E|S|PURGE|MOVE|MOV|R|W|COPY|DCOPY|MT|LOG|TEE|NFL|NDL)(?::|$)", tok, re.I):
+            idx += 1
+            continue
         if tok.startswith("-"):
             idx += 1
             continue
@@ -2424,7 +2442,7 @@ def _detect_command_external_mutation(
                             effective_cwd = _ast_resolve_cwd(_expand_host_vars(tokens[idx]), effective_cwd)
                         idx += 1
                 continue
-            if "=" in t and not t.startswith("-") and "/" not in t and "\\" not in t:
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", t):
                 idx += 1
                 continue
             break
@@ -2496,7 +2514,8 @@ def _detect_command_external_mutation(
             targets = _extract_clause_path_targets(cmd_tokens, copy_dest_only=True, head_low=head_low)
         elif head_low in ("sed", "perl"):
             has_inplace = any(
-                t == "-i" or t.startswith("-i") or (t.startswith("-") and not t.startswith("--") and "i" in t[1:])
+                t == "--in-place" or t.startswith("--in-place=") or t.startswith("-i")
+                or (t.startswith("-") and not t.startswith("--") and "i" in t[1:])
                 for t in cmd_tokens[1:]
             )
             if has_inplace:
@@ -2539,6 +2558,271 @@ def _detect_command_external_mutation(
                 return "Shell 输出重定向写入", red_tok, _compact_snippet(m_red.group(0))
 
     return None
+
+
+def _heavy_min_streams() -> int:
+    profile = user_words.load_fleet_profile(HOOKS_DIR)
+    config = profile.get("dispatch_confirmation", {})
+    if not config:
+        config = profile.get("runtime_tunables", {}).get("dispatch_confirmation", {})
+    try:
+        return max(1, int(config.get("heavy_min_streams", 2)))
+    except (TypeError, ValueError, OverflowError):
+        return 2
+
+
+def _native_tool_name(name: str) -> str:
+    return name.rsplit(".", 1)[-1].rsplit("__", 1)[-1]
+
+
+def _native_dispatch(name: str, args: Dict[str, Any]) -> bool:
+    return name in ("invoke_subagent", "spawn_agent", "Agent", "Task", "run_workflow") or (
+        name == "swarm" and str(args.get("action") or args.get("Action")).lower() == "add")
+
+
+def _dispatch_transcript(payload: Dict[str, Any]) -> Optional[Path]:
+    raw = payload.get("transcriptPath") or payload.get("transcript_path")
+    return user_words.resolve_compact_transcript_path(Path(raw).expanduser()) if raw else None
+
+
+def _native_turn_snapshot(payload: Dict[str, Any], *, all_turns=False) -> Tuple[str, List[Dict[str, Any]]]:
+    """读取原生调用；派工按当前回合计数，完工核验可保留全部可见回合。"""
+    path = _dispatch_transcript(payload)
+    turn, calls = "initial", []
+    if path is None:
+        return turn, calls
+    try:
+        with path.open("rb") as source:
+            for index, line in enumerate(source):
+                try:
+                    entry = json.loads(user_words.decode_jsonl_line(line))
+                except (ValueError, RecursionError):
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                typ = entry.get("type")
+                explicit = typ == "USER_INPUT" or entry.get("source") == "USER_EXPLICIT"
+                if typ == "user":
+                    text, kind = user_words.claude_user_content(entry)
+                    explicit = bool(text and kind in ("user_input", "queued_command"))
+                rec = entry.get("payload") if typ == "response_item" else None
+                if isinstance(rec, dict) and rec.get("type") == "message" and rec.get("role") == "user":
+                    _, word = user_words._extract_codex_record(entry, index)
+                    if word:
+                        word["source_path"] = str(path)
+                    explicit = bool(word and user_words._codex_word_from_record(word))
+                if explicit:
+                    turn = "turn_" + hashlib.sha256(str(index).encode("ascii") + b":" + line).hexdigest()[:24]
+                    if not all_turns:
+                        calls = []
+                candidates = list(entry.get("tool_calls") or [])
+                msg = entry.get("message")
+                if typ == "assistant" and isinstance(msg, dict) and isinstance(msg.get("content"), list):
+                    candidates += [b for b in msg["content"] if isinstance(b, dict) and b.get("type") == "tool_use"]
+                if isinstance(rec, dict) and rec.get("type") == "function_call":
+                    candidates.append(rec)
+                for call in candidates:
+                    if not isinstance(call, dict):
+                        continue
+                    name = _native_tool_name(str(call.get("name") or ""))
+                    args = call.get("args", call.get("arguments", call.get("input", {})))
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args)
+                        except (ValueError, RecursionError):
+                            args = {}
+                    if isinstance(args, dict) and _native_dispatch(name, args):
+                        calls.append({"name": name, "args": args, "index": index,
+                                      "call_id": call.get("call_id") or call.get("id") or ""})
+    except OSError:
+        pass
+    return turn, calls
+
+
+def _dispatch_commands(command: str, depth: int = 0):
+    if depth > MAX_WRAPPER_DEPTH:
+        return
+    for clause in handoff_gate._split_shell_clauses(command):
+        tokens = _safe_split_tokens(clause.strip())
+        inner = _unwrap_shell_script_layer(clause.strip())
+        if inner and inner != _INVALID_ENCODED_SENTINEL:
+            yield from _dispatch_commands(inner, depth + 1)
+        while tokens:
+            head = Path(tokens[0].replace(chr(92), "/")).name.lower().removesuffix(".exe")
+            if head in ("&", "command", "env", "call") or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tokens[0]):
+                tokens.pop(0)
+                continue
+            if head == "cmd":
+                marker = next((i for i, token in enumerate(tokens[1:], 1) if token.lower() in ("/c", "/k")), None)
+                if marker is None:
+                    break
+                tokens = tokens[marker + 1:]
+            elif head == "start":
+                # start 的首个引号参数是窗口标题；空标题会在分词时被移除。
+                title = re.search(r'(?:^|\s)start(?:\.exe)?\s+"([^"\n]*)"', clause.strip(), re.I)
+                if title and title[1] and tokens[1:]:
+                    tokens.pop(1)
+                i = 1
+                while i < len(tokens) and tokens[i].startswith("/"):
+                    flag = tokens[i].lower()
+                    i += 2 if flag in ("/d", "/node", "/affinity", "/machine") else 1
+                tokens = tokens[i:]
+            elif head in ("bash", "sh", "zsh", "pwsh", "powershell"):
+                marker = next((i for i, token in enumerate(tokens[1:], 1) if token.lower() == "-command"
+                               or re.fullmatch(r"-[a-z]*c", token.lower())), None)
+                if marker is None:
+                    break
+                yield from _dispatch_commands(" ".join(tokens[marker + 1:]), depth + 1)
+                tokens = []
+            elif head in ("wsl", "sudo", "timeout", "nohup", "nice"):
+                takes_value = {
+                    "wsl": ("-d", "--distribution", "-u", "--user", "--cd"),
+                    "sudo": ("-u", "--user", "-g", "--group", "-h", "--host", "-p", "--prompt", "-C", "--close-from", "-T", "--command-timeout", "-r", "--role", "-t", "--type", "-D", "--chdir", "-R", "--chroot"),
+                    "timeout": ("-k", "--kill-after", "-s", "--signal"),
+                    "nice": ("-n", "--adjustment"), "nohup": (),
+                }[head]
+                i = 1
+                while i < len(tokens) and tokens[i].startswith("-"):
+                    flag = tokens[i]
+                    i += 1
+                    if flag == "--" or (head == "wsl" and flag in ("-e", "--exec")):
+                        break
+                    if flag in takes_value and i < len(tokens):
+                        i += 1
+                if head == "timeout" and i < len(tokens):
+                    i += 1
+                tokens = tokens[i:]
+            else:
+                break
+            if len(tokens) == 1:
+                yield from _dispatch_commands(tokens[0], depth + 1)
+                tokens = []
+            elif tokens:
+                inner = _unwrap_shell_script_layer(" ".join(tokens))
+                if inner and inner != _INVALID_ENCODED_SENTINEL:
+                    yield from _dispatch_commands(inner, depth + 1)
+        if tokens:
+            yield tokens
+
+
+def _native_readonly(args):
+    kind = str(args.get("TypeName") or args.get("typeName") or args.get("agent_type") or args.get("subagent_type") or "self")
+    return kind.startswith("readonly-") or kind in ("research", "browser", "image-generator", "Explore", "Plan", "explorer")
+
+
+def _dispatch_option(tokens, name):
+    for i, token in enumerate(tokens):
+        if token.startswith(name + "="):
+            return token.split("=", 1)[1].strip("\"'")
+        if token == name and i + 1 < len(tokens):
+            return tokens[i + 1]
+    return None
+
+
+def _check_dispatch_locked(payload, tool_name, args, sid, state_dir):
+    if os.environ.get("CAE_HARNESS_DEPTH") or os.environ.get("USER_GUARD_DISABLE_TICKET_GATE") == "1":
+        return None
+    tool_name = _native_tool_name(tool_name)
+    command = str(args.get("CommandLine") or args.get("command_line") or args.get("command") or args.get("cmd") or "")
+    shell = tool_name in ("run_command", "Bash", "PowerShell", "exec_command", "bash")
+    heavy_tickets = []
+    if shell:
+        for tokens in _dispatch_commands(command):
+            names = [Path(t.replace(chr(92), "/")).name.lower().removesuffix(".exe").removesuffix(".cmd") for t in tokens]
+            if "cae_harness.py" in names and (names[0] == "cae_harness.py" or re.fullmatch(r"(?:python(?:[0-9.]+)?|py)", names[0])):
+                tail = tokens[names.index("cae_harness.py") + 1:]
+                code_task = tail[:1] == ["task"] and ("--kind=code" in tail or any(
+                    tail[i:i+2] == ["--kind", "code"] for i in range(len(tail))))
+                profile = user_words.load_fleet_profile(HOOKS_DIR)
+                config = profile.get("dispatch_confirmation") or profile.get("runtime_tunables", {}).get("dispatch_confirmation", {})
+                try:
+                    limit = float(config.get("heavy_max_light_timeout_sec", 600))
+                    default_timeout = profile.get("runtime_tunables", {}).get("headless_dispatch", {}).get("default_timeout_sec", 600)
+                    long_task = tail[:1] == ["task"] and float(_dispatch_option(tail, "--timeout") or default_timeout) > limit
+                except (TypeError, ValueError, OverflowError):
+                    long_task = False
+                large_target = False
+                target_arg = _dispatch_option(tail, "--target")
+                if tail[:1] == ["task"] and target_arg and "--dry-run" not in tail:
+                    base = Path(payload.get("cwd") or Path.cwd())
+                    command_cwd = args.get("Cwd") or args.get("cwd") or args.get("workdir")
+                    if command_cwd:
+                        base = base / Path(command_cwd).expanduser()
+                    target = (base / Path(target_arg).expanduser()).resolve()
+                    if target.exists():
+                        # 复用派工端的过滤与字节估算，目录链接、空文件等判据只维护一处。
+                        script = HOOKS_DIR.parent / "skills/cae-harness/scripts/cae_harness.py"
+                        spec = importlib.util.spec_from_file_location("_guard_harness_metrics", script)
+                        metrics = importlib.util.module_from_spec(spec)
+                        spec.loader.exec_module(metrics)
+                        count, tokens_estimate = metrics._target_metrics(target, _dispatch_option(tail, "--user-prompt") or _dispatch_option(tail, "--task") or "")
+                        large_target = (count > config.get("heavy_max_light_files", 2)
+                                        or tokens_estimate > config.get("heavy_max_light_tokens", 24000))
+                if tail and (tail[0] in ("batch", "audit", "gate") or code_task or long_task or large_target) and "--dry-run" not in tail:
+                    heavy_tickets.append(_dispatch_option(tail, "--ticket"))
+                continue
+            head, tail = names[0], tokens[1:]
+            low = [t.lower() for t in tail]
+            if any(t in low for t in ("--help", "-h", "--version")) or low[:2] in (["auth", "status"], ["plugin", "validate"]) or low[:1] == ["models"]:
+                continue
+            bare = (head == "codex" and "exec" in low or head == "claude" and any(t in low for t in ("-p", "--print"))
+                    or head == "dsh" and ("--profile=headless" in low or any(low[i:i+2] == ["--profile", "headless"] for i in range(len(low))))
+                    or head == "agy" and "task" in low)
+            if bare:
+                return "【user-guard】禁止裸调第三方子代理 CLI。请改用 cae_harness.py，保留声明窗口、非委派挡位、快照核验与额度检查。"
+    native = _native_dispatch(tool_name, args)
+    if not (native or heavy_tickets):
+        return None
+    if not user_words.valid_session_id(sid):
+        return _ticket_required_reason(sid)
+    # 外部重任务只对无轨迹且未显式启用门禁的离线夹具豁免。
+    offline = not (_dispatch_transcript(payload) or os.environ.get("USER_GUARD_ENFORCE_TICKET_GATE") == "1")
+    if offline and not native:
+        return None
+    if native:
+        tickets = user_words.find_session_approved_tickets(sid, state_dir)
+        turn, calls = _native_turn_snapshot(payload)
+        file = state_dir / (sid + "_dispatch_guard.json")
+        state = user_words._read_state_json(file) or {}
+        if not isinstance(state, dict):
+            return _ticket_required_reason(sid)
+        if state.get("turn") != turn:
+            state = {"turn": turn, "count": 0, "calls": [], "channel_counts": {}}
+        if type(state.get("count")) is not int or state["count"] < 0 or not isinstance(state.get("calls"), list):
+            return _ticket_required_reason(sid)
+        identity = str(payload.get("tool_use_id") or payload.get("call_id") or "")
+        if identity:
+            calls = [call for call in calls if call["call_id"] != identity]
+        prior = max(state["count"], len(calls))
+        duplicate = identity and identity in state.get("calls", [])
+        count = prior if duplicate else prior + 1
+        channel = {"run_workflow": "native_workflow", "swarm": "native_swarm"}.get(tool_name, "native_subagent")
+        channel_counts = state.get("channel_counts", {})
+        channel_prior = max(channel_counts.get(channel, 0), sum(
+            {"run_workflow": "native_workflow", "swarm": "native_swarm"}.get(call["name"], "native_subagent") == channel for call in calls))
+        channel_count = channel_prior if duplicate else channel_prior + 1
+        capacity = max((sum(isinstance(row, dict) and row.get("channel") == channel
+                            for row in ticket.get("streams", [])) for ticket in tickets), default=0)
+        heavy = tool_name in ("run_workflow", "swarm") or not _native_readonly(args) or count >= _heavy_min_streams()
+        if heavy and channel_count > capacity:
+            return _ticket_required_reason(sid)
+        if not duplicate:
+            state["count"] = count
+            state.setdefault("channel_counts", {})[channel] = channel_count
+            if identity:
+                state.setdefault("calls", []).append(identity)
+            user_words.atomic_write_json(file, state)
+    for ticket_id in heavy_tickets:
+        if not ticket_id or not user_words.find_session_approved_tickets(
+                sid, state_dir, ticket_id=ticket_id, channel="cae_harness_headless"):
+            return _ticket_required_reason(sid)
+    return None
+
+
+def _ticket_required_reason(sid):
+    return ("【user-guard 重负载派工门禁】未找到当前会话有效且未过期的 APPROVED 批次票据。"
+            f"请先调用 cae_harness.py plan --session-id {sid} ...，生成人话弹卡，包含内部与外部子代理完整 14 列参数矩阵；"
+            "获用户确认并执行 --approve-ticket 后再启动；原生调用须在票据中列出原生通道。")
 
 
 def _is_headless_subtask() -> bool:
@@ -2667,7 +2951,7 @@ def handle_pre_tool_use(payload: Dict[str, Any]) -> Dict[str, Any]:
                 cmd_str = str(args.get("CommandLine") or args.get("command_line") or args.get("command") or "")
                 cmd_summary = str(args.get("toolSummary") or args.get("description") or "").strip()
                 ext_hit = _detect_command_external_mutation(
-                    cmd_str, base_cwd, allowed_keys, allowed_res_keys, allow_os_temp
+                    cmd_str, cwd or base_cwd, allowed_keys, allowed_res_keys, allow_os_temp
                 )
                 if ext_hit:
                     act_desc, ext_target, clause_snip = ext_hit
@@ -2681,6 +2965,9 @@ def handle_pre_tool_use(payload: Dict[str, Any]) -> Dict[str, Any]:
                         snippet=clause_snip,
                     )
 
+    if not user_words.valid_session_id(conversation_id):
+        reason = _check_dispatch_locked(payload, tool_name, args, conversation_id, state_dir)
+        return {"decision": "deny", "reason": reason} if reason else boundary or {"decision": "allow"}
     try:
         with user_words.session_state_lock(state_dir, conversation_id):
             gate_response = handoff_gate.check_pre_tool_use_locked(payload, state_dir, boundary_blocked=boundary is not None)
@@ -2688,6 +2975,9 @@ def handle_pre_tool_use(payload: Dict[str, Any]) -> Dict[str, Any]:
                 return gate_response
             if boundary is not None:
                 return boundary
+            ticket_reason = _check_dispatch_locked(payload, tool_name, args, conversation_id, state_dir)
+            if ticket_reason:
+                return {"decision": "deny", "reason": ticket_reason}
             try:
                 return _check_polling_locked(tool_name, args, conversation_id, cwd, workspace_paths, transcript_path_str,
                                              state_dir, logs_dir)
@@ -2814,8 +3104,8 @@ def _claude_check_polling(tool_name: str, args: Dict[str, Any], sid: str, cwd: O
         signature = json.dumps({key: args.get(key) for key in
                                 ("pattern", "glob", "output_mode", "head_limit", "offset", "type", "-i", "-n", "-A", "-B", "-C", "multiline")},
                                sort_keys=True, ensure_ascii=False)
-    elif tool_name in ("Bash", "PowerShell"):
-        raw_target, subsystem, signature = parse_run_command_evidence(str(args.get("command") or ""))
+    elif tool_name in ("Bash", "PowerShell", "exec_command", "bash"):
+        raw_target, subsystem, signature = parse_run_command_evidence(str(args.get("command") or args.get("cmd") or ""))
         if subsystem:
             return {}
     else:
@@ -2856,13 +3146,14 @@ def handle_claude_pre_tool_use(payload: Dict[str, Any], state_dir: Optional[Path
     """Claude PreToolUse：项目边界与证据查询门禁，放行使用空对象。"""
     _sync_status_tunables()
     sid = str(payload.get("session_id") or "unknown_session").strip()
-    home = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude").expanduser()
+    client = payload.get("_client", "claude")
+    home = Path(os.environ.get("CODEX_HOME" if client == "codex" else "CLAUDE_CONFIG_DIR") or Path.home() / (".codex" if client == "codex" else ".claude")).expanduser()
     state_dir = Path(state_dir).expanduser() if state_dir is not None else home / "hooks" / "state"
     logs_dir = Path(logs_dir).expanduser() if logs_dir is not None else home / "hooks" / "logs"
     tool_name = str(payload.get("tool_name") or "").strip()
     args = payload.get("tool_input") if isinstance(payload.get("tool_input"), dict) else {}
     cwd = str(payload.get("cwd") or "").strip() or None
-    boundary_payload = {"cwd": cwd, "transcriptPath": payload.get("transcript_path"), "_client": "claude"}
+    boundary_payload = {"cwd": cwd, "transcriptPath": payload.get("transcript_path"), "_client": client, "toolCall": {"name": "run_command", "args": {"Cwd": args.get("workdir") or args.get("Cwd") or args.get("cwd")}}}
     projects, allowed, resolved, display, base_cwd = _collect_boundary_context(boundary_payload, state_dir, logs_dir)
     hit = None
     if projects:
@@ -2871,8 +3162,8 @@ def handle_claude_pre_tool_use(payload: Dict[str, Any], state_dir: Optional[Path
             target = str(args.get("file_path") or args.get("notebook_path") or args.get("path") or "").strip()
             if target and not _is_write_target_allowed(target, base_cwd, allowed, resolved, allow_temp):
                 hit = (f"{tool_name} 创建或修改文件", target, "")
-        elif tool_name in ("Bash", "PowerShell"):
-            hit = _detect_command_external_mutation(str(args.get("command") or ""), base_cwd, allowed, resolved, allow_temp)
+        elif tool_name in ("Bash", "PowerShell", "exec_command", "bash"):
+            hit = _detect_command_external_mutation(str(args.get("command") or args.get("cmd") or ""), base_cwd, allowed, resolved, allow_temp)
     if hit:
         action, target, snippet = hit
         decision = "deny" if _is_headless_subtask() else "ask"
@@ -2887,9 +3178,13 @@ def handle_claude_pre_tool_use(payload: Dict[str, Any], state_dir: Optional[Path
         log_event("PreToolUse:workspace_boundary", sid, reason, logs_dir)
         return _claude_permission(decision, reason)
     if not user_words.valid_session_id(sid):
-        return {}
+        reason = _check_dispatch_locked(payload, tool_name, args, sid, state_dir)
+        return _claude_permission("deny", reason) if reason else {}
     try:
         with user_words.session_state_lock(state_dir, sid):
+            reason = _check_dispatch_locked(payload, tool_name, args, sid, state_dir)
+            if reason:
+                return _claude_permission("deny", reason)
             return _claude_check_polling(tool_name, args, sid, cwd, state_dir, logs_dir)
     except (OSError, ValueError) as exc:
         log_event("PreToolUse:state_error", sid, f"Claude 轮询状态未更新（{exc}）", logs_dir)
@@ -2898,7 +3193,7 @@ def handle_claude_pre_tool_use(payload: Dict[str, Any], state_dir: Optional[Path
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="项目目录边界与防空转门禁")
-    parser.add_argument("--client", choices=("antigravity", "claude"), default="antigravity")
+    parser.add_argument("--client", choices=("antigravity", "claude", "codex"), default="antigravity")
     parser.add_argument("--state-dir", default="")
     parser.add_argument("--log-dir", default="")
     args, _ = parser.parse_known_args()
@@ -2906,18 +3201,18 @@ def main() -> None:
     try:
         payload = user_words.read_hook_payload()
     except (OSError, ValueError) as e:
-        if args.client == "claude":
+        if args.client in ("claude", "codex"):
             sys.stderr.write(f"Claude PreToolUse JSON parse error: {e}\n")
         else:
             log_event("PreToolUse:status_guard", "unknown", f"Failed to parse stdin JSON: {e}")
 
     try:
-        response = (handle_claude_pre_tool_use(payload, Path(args.state_dir) if args.state_dir else None,
+        response = (handle_claude_pre_tool_use({**payload, "_client": args.client}, Path(args.state_dir) if args.state_dir else None,
                                               Path(args.log_dir) if args.log_dir else None)
-                    if args.client == "claude" else handle_pre_tool_use(payload))
+                    if args.client in ("claude", "codex") else handle_pre_tool_use(payload))
     except Exception as e:
         stack_str = traceback.format_exc()
-        if args.client == "claude":
+        if args.client in ("claude", "codex"):
             sys.stderr.write(f"Claude PreToolUse: {e}\n")
             response = {}
         else:

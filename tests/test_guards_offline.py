@@ -43,8 +43,12 @@ class TestGuardsOffline(unittest.TestCase):
         self.old_plugin_data = os.environ.get("PLUGIN_DATA")
         self.old_harness_depth = os.environ.pop("CAE_HARNESS_DEPTH", None)
         os.environ["PLUGIN_DATA"] = str(self.plugin_data)
+        # 原有夹具独立验证路径、交接和轮询；派工票据由下方专用测试启用并覆盖。
+        self.ticket_gate_env = unittest.mock.patch.dict(os.environ, {"USER_GUARD_DISABLE_TICKET_GATE": "1"})
+        self.ticket_gate_env.start()
 
     def tearDown(self) -> None:
+        self.ticket_gate_env.stop()
         if self.old_plugin_data is None:
             os.environ.pop("PLUGIN_DATA", None)
         else:
@@ -1872,6 +1876,473 @@ class TestGuardsOffline(unittest.TestCase):
             decide("python -c \"import subprocess, sys; subprocess.run([sys.executable, '-c', \\\"open('../outside_neighbor/x.txt', 'w')\\\"])\""),
             "force_ask",
         )
+
+
+class TestDispatchAndBillingGuards(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=REPO_ROOT)
+        self.root = Path(self.temp.name)
+        self.state = self.root / "state"
+        self.logs = self.root / "logs"
+        self.project = self.root / "project"
+        self.project.mkdir()
+        self.trace = self.root / "transcript.jsonl"
+        self.env = unittest.mock.patch.dict(os.environ, {
+            "USER_GUARD_STATE_DIR": str(self.state), "USER_GUARD_LOGS_DIR": str(self.logs),
+            "CAE_PLAN_STATE_DIR": str(self.state / "dispatch_plans"),
+            "USER_GUARD_ENFORCE_TICKET_GATE": "1", "USER_GUARD_DISABLE_TICKET_GATE": "0",
+            "CAE_HARNESS_DEPTH": "",
+        })
+        self.env.start()
+        _append_jsonl(self.trace, {"type": "USER_INPUT", "step_index": 1, "content": "检查工程"})
+
+    def tearDown(self):
+        self.env.stop()
+        self.temp.cleanup()
+
+    def pre(self, name, args=None, sid="fixture"):
+        return status_guard.handle_pre_tool_use({"conversationId": sid,
+            "cwd": str(self.project), "transcriptPath": str(self.trace),
+            "toolCall": {"name": name, "args": args or {}}})
+
+    def approve(self, channel="native_subagent", sid="fixture", expires=None, status="APPROVED", count=1):
+        directory = self.state / "dispatch_plans"
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "ticket-fixture.json").write_text(json.dumps({"ticket_id": "ticket-fixture",
+            "session_id": sid, "status": status, "expires_at": expires or time.time() + 3600,
+            "streams": [{"stream_id": "S" + str(i + 1), "channel": channel} for i in range(count)]}), encoding="utf-8")
+
+    def test_bare_cli_and_readonly_self_checks(self):
+        for command in ("codex exec work", "claude -p work", "claude --print work",
+                        "dsh --profile headless work", "agy task work",
+                        "VAR=fixture codex exec work", "bash -lc 'claude -p work'",
+                        "python cae_harness.py probe; codex exec work",
+                        "cmd /c codex exec work", "cmd.exe /d /s /c codex exec work",
+                        "cmd /c call codex exec work", "call codex exec work", "start /b codex exec work",
+                        'start "" /b codex exec work', 'cmd /c start "fixture" /b codex exec work',
+                        'cmd.exe /d /s /c "codex exec work"',
+                        "wsl.exe -e codex exec work", "wsl --exec claude -p work",
+                        "wsl -d Ubuntu -u root --cd /tmp -- codex exec work",
+                        "wsl --distribution Ubuntu --user root --exec codex exec work",
+                        "sudo -u root codex exec work", "sudo --user=root -- codex exec work",
+                        "timeout --signal TERM -k 5 30 nohup nice -n 10 codex exec work",
+                        "sudo -u root bash -lc 'codex exec work'"):
+            with self.subTest(command=command):
+                result = self.pre("run_command", {"CommandLine": command})
+                self.assertEqual(result["decision"], "deny")
+                self.assertIn("声明窗口", result["reason"])
+        for command in ("codex --version", "claude --help", "dsh models", "agy auth status",
+                        "agy plugin validate", "codex exec --help", "echo codex exec",
+                        "echo cae_harness.py batch", "python cae_harness.py probe"):
+            self.assertEqual(self.pre("run_command", {"CommandLine": command})["decision"], "allow", command)
+        for key, value in (("CAE_HARNESS_DEPTH", "2"), ("USER_GUARD_DISABLE_TICKET_GATE", "1")):
+            with unittest.mock.patch.dict(os.environ, {key: value}):
+                self.assertEqual(self.pre("run_command", {"CommandLine": "codex exec work"})["decision"], "allow")
+
+    def test_native_ticket_count_turn_reset_and_ticket_validity(self):
+        no_trace = {"conversationId": "native-offline", "toolCall": {"name": "run_workflow", "args": {"Script": "print(1)"}}}
+        with unittest.mock.patch.dict(os.environ, {"USER_GUARD_ENFORCE_TICKET_GATE": "0"}):
+            self.assertEqual(status_guard.handle_pre_tool_use(no_trace)["decision"], "deny")
+        self.assertEqual(self.pre("invoke_subagent", {"TypeName": "readonly-reader"})["decision"], "allow")
+        self.assertEqual(self.pre("invoke_subagent", {"TypeName": "readonly-auditor"})["decision"], "deny")
+        for tool, args in (("run_workflow", {}), ("swarm", {"action": "add"}),
+                           ("invoke_subagent", {"TypeName": "self"}), ("spawn_agent", {}), ("Agent", {"subagent_type": "general-purpose"})):
+            self.assertEqual(self.pre(tool, args)["decision"], "deny")
+        self.approve(channel="cae_harness_headless")
+        self.assertEqual(self.pre("run_workflow")["decision"], "deny")
+        self.approve(expires=time.time() - 1)
+        self.assertEqual(self.pre("run_workflow")["decision"], "deny")
+        self.approve(status="PENDING")
+        self.assertEqual(self.pre("run_workflow")["decision"], "deny")
+        self.approve(sid="bob")
+        self.assertEqual(self.pre("run_workflow")["decision"], "deny")
+        self.approve(channel="native_workflow")
+        self.assertEqual(self.pre("run_workflow")["decision"], "allow")
+        self.assertEqual(self.pre("run_workflow")["decision"], "deny")
+        self.assertEqual(self.pre("swarm", {"action": "add"})["decision"], "deny")
+        self.assertEqual(self.pre("invoke_subagent", {"TypeName": "self"})["decision"], "deny")
+        _append_jsonl(self.trace, {"type": "USER_INPUT", "step_index": 7, "content": "下一项"})
+        (self.state / "dispatch_plans/ticket-fixture.json").unlink()
+        self.assertEqual(self.pre("invoke_subagent", {"TypeName": "readonly-reader"})["decision"], "allow")
+        with unittest.mock.patch.object(status_guard, "_heavy_min_streams", return_value=3):
+            self.assertEqual(self.pre("invoke_subagent", {"TypeName": "research"})["decision"], "allow")
+            self.assertEqual(self.pre("invoke_subagent", {"TypeName": "research"})["decision"], "deny")
+
+    def test_harness_heavy_and_offline_fixture_switch(self):
+        for command in ("batch", "gate", "audit", "task --kind code", "task --kind=code"):
+            result = self.pre("run_command", {"CommandLine": "python -B cae_harness.py " + command})
+            self.assertEqual(result["decision"], "deny", command)
+            self.assertIn("14 列", result["reason"])
+        for flags in ("batch --dry-run", "task --kind review"):
+            self.assertEqual(self.pre("run_command", {"CommandLine": "python cae_harness.py " + flags})["decision"], "allow")
+        payload = {"conversationId": "offline", "cwd": str(self.project),
+                   "toolCall": {"name": "run_command", "args": {"CommandLine": "python cae_harness.py gate"}}}
+        with unittest.mock.patch.dict(os.environ, {"USER_GUARD_ENFORCE_TICKET_GATE": "0"}):
+            self.assertEqual(status_guard.handle_pre_tool_use(payload)["decision"], "allow")
+            payload["transcriptPath"] = str(self.trace)
+            self.assertEqual(status_guard.handle_pre_tool_use(payload)["decision"], "deny")
+        self.approve(channel="cae_harness_headless")
+        self.assertEqual(self.pre("run_command", {"CommandLine": "python cae_harness.py batch"})["decision"], "deny")
+        for flags in ("gate --ticket missing", "gate --ticket ticket-fixture", "batch --ticket=ticket-fixture"):
+            self.assertEqual(self.pre("run_command", {"CommandLine": "python cae_harness.py " + flags})["decision"],
+                             "deny" if "missing" in flags else "allow")
+        self.approve(channel="native_subagent")
+        self.assertEqual(self.pre("run_command", {"CommandLine": "python cae_harness.py gate --ticket ticket-fixture"})["decision"], "deny")
+
+    def test_heavy_task_timeout_uses_dynamic_profile_and_explicit_ticket(self):
+        profile = {"runtime_tunables": {"dispatch_confirmation": {"heavy_max_light_timeout_sec": 40}}}
+        with unittest.mock.patch.object(status_guard.user_words, "load_fleet_profile", return_value=profile):
+            for flags, expected in (("--timeout 40", "allow"), ("--timeout=41", "deny"), ("--timeout 41 --ticket missing", "deny")):
+                self.assertEqual(self.pre("run_command", {"CommandLine": "python cae_harness.py task --kind review " + flags})["decision"], expected)
+            self.approve(channel="cae_harness_headless")
+            self.assertEqual(self.pre("run_command", {"CommandLine": "python cae_harness.py task --timeout 41 --ticket ticket-fixture"})["decision"], "allow")
+
+    def test_wp8_default_timeout_and_target_metrics_match_heavy_limits(self):
+        profile = json.loads((HOOKS_DIR.parent / "skills/cae-harness/fleet_profile.json").read_text(encoding="utf-8"))
+        tunables = profile["runtime_tunables"]
+        config = tunables["dispatch_confirmation"]
+        self.assertEqual(config["heavy_max_light_timeout_sec"], tunables["headless_dispatch"]["default_timeout_sec"])
+        command = "python cae_harness.py task --kind review"
+        with unittest.mock.patch.object(status_guard.user_words, "load_fleet_profile", return_value=profile):
+            self.assertEqual(self.pre("run_command", {"CommandLine": command})["decision"], "allow")
+            tunables["headless_dispatch"]["default_timeout_sec"] = config["heavy_max_light_timeout_sec"] + 1
+            self.assertEqual(self.pre("run_command", {"CommandLine": command})["decision"], "deny")
+            self.assertEqual(self.pre("run_command", {"CommandLine": command + " --timeout 60"})["decision"], "allow")
+            tunables["headless_dispatch"]["default_timeout_sec"] = config["heavy_max_light_timeout_sec"]
+            for index in range(config["heavy_max_light_files"]):
+                (self.project / (str(index) + ".py")).write_text("x=1", encoding="utf-8")
+            relative = command + " --target ."
+            self.assertEqual(self.pre("run_command", {"CommandLine": relative})["decision"], "allow")
+            extra = self.project / "extra.py"
+            extra.write_text("x=1", encoding="utf-8")
+            self.assertEqual(self.pre("run_command", {"CommandLine": relative})["decision"], "deny")
+            self.assertEqual(self.pre("run_command", {"CommandLine": relative + " --dry-run"})["decision"], "allow")
+            extra.unlink()
+            large = self.project / "large.py"
+            large.write_bytes(b"x" * (config["heavy_max_light_tokens"] * 3))
+            single = command + ' --target="' + str(large) + '"'
+            self.assertEqual(self.pre("run_command", {"CommandLine": single})["decision"], "allow")
+            large.write_bytes(large.read_bytes() + b"x")
+            self.assertEqual(self.pre("run_command", {"CommandLine": single})["decision"], "deny")
+            self.approve(channel="cae_harness_headless")
+            self.assertEqual(self.pre("run_command", {"CommandLine": single + " --ticket ticket-fixture"})["decision"], "allow")
+
+    def test_native_ticket_capacity_is_per_channel(self):
+        self.approve(channel="native_subagent", count=2)
+        for _ in range(2):
+            self.assertEqual(self.pre("spawn_agent", {"agent_type": "self"})["decision"], "allow")
+        self.assertEqual(self.pre("Agent", {"subagent_type": "general-purpose"})["decision"], "deny")
+        self.assertEqual(self.pre("run_workflow")["decision"], "deny")
+        self.approve(channel="native_swarm")
+        self.assertEqual(self.pre("swarm", {"action": "add"})["decision"], "allow")
+        self.assertEqual(self.pre("swarm", {"action": "add"})["decision"], "deny")
+
+    def test_path_regressions_and_invalid_session(self):
+        outside = self.root / "outside"
+        outside.mkdir()
+        for command in ("touch data.txt", "VAR=../fixture touch data.txt", "pushd ../outside && touch data.txt",
+                        "sed --in-place s/a/b/ data.txt", "robocopy ../project . data.txt /MIR"):
+            with self.subTest(command=command):
+                self.assertEqual(self.pre("run_command", {"Cwd": "../outside", "CommandLine": command})["decision"], "force_ask")
+        for command in ("pushd ../outside && touch data.txt", "VAR=../fixture touch ../outside/data.txt"):
+            self.assertEqual(self.pre("run_command", {"CommandLine": command})["decision"], "force_ask")
+        self.assertEqual(status_guard._normalize_cross_env_lexical("//host/share/.."), "//host/share")
+        self.assertEqual(status_guard._normalize_cross_env_lexical("//host/share/../../file"), "//host/share/file")
+        self.assertEqual(status_guard._extract_clause_path_targets(
+            ["robocopy", "source", "../outside", "*.py", "/R:0", "/MIR"], True, "robocopy"), ["../outside"])
+        with unittest.mock.patch.object(status_guard.user_words, "session_state_lock", side_effect=AssertionError("非法会话不得加锁")):
+            self.assertEqual(self.pre("read_file", {"Path": "data.py"}, "../outside")["decision"], "allow")
+
+    def test_state_logs_and_temp_resolved_exemptions(self):
+        physical = self.root / "physical"
+        physical.mkdir()
+        link = self.root / "state-link"
+        try:
+            link.symlink_to(physical, target_is_directory=True)
+        except OSError:
+            # Windows 无软链接权限时核对目录联接等价的解析差异。
+            original = status_guard._resolve_nearest_existing
+            def resolve(raw, base):
+                if str(raw).startswith(str(link)):
+                    return physical / Path(str(raw)).relative_to(link)
+                return original(raw, base)
+            patch = unittest.mock.patch.object(status_guard, "_resolve_nearest_existing", side_effect=resolve)
+        else:
+            patch = unittest.mock.patch.object(status_guard, "_resolve_nearest_existing", wraps=status_guard._resolve_nearest_existing)
+        with patch:
+            for field in ("state", "logs", "temp"):
+                state = link if field == "state" else self.state
+                logs = link if field == "logs" else self.logs
+                with unittest.mock.patch.object(status_guard.tempfile, "gettempdir", return_value=str(link) if field == "temp" else tempfile.gettempdir()):
+                    _, lexical, resolved, _, cwd = status_guard._collect_boundary_context({"cwd": str(self.project)}, state, logs)
+                    for target in (link / "guard.json", physical / "guard.json"):
+                        self.assertTrue(status_guard._is_write_target_allowed(str(target), cwd, lexical, resolved), str(target))
+
+    def test_codex_pretool_protocol(self):
+        import subprocess
+        script = HOOKS_DIR / "status_guard.py"
+        for command, expected in (("codex exec work", "deny"), ("touch ../outside/data", "ask"), ("python --version", None)):
+            payload = {"session_id": "codex-fixture", "tool_name": "exec_command", "tool_input": {"cmd": command}, "cwd": str(self.project)}
+            result = subprocess.run([sys.executable, "-B", "-X", "utf8", str(script), "--client", "codex",
+                                     "--state-dir", str(self.state), "--log-dir", str(self.logs)],
+                                    input=json.dumps(payload), text=True, encoding="utf-8", capture_output=True, check=True)
+            response = json.loads(result.stdout)
+            if expected:
+                specific = response["hookSpecificOutput"]
+                self.assertEqual(specific["hookEventName"], "PreToolUse")
+                self.assertEqual(specific["permissionDecision"], expected)
+            else:
+                self.assertEqual(response, {})
+
+    def completion(self, sid):
+        directory = self.state / "heavy_completions"
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / (sid + ".json")
+        path.write_text(json.dumps([{"run_id": sid, "reported_to_user": False,
+            "receipt_file": str(self.root / "receipt.json"), "all_succeeded": False,
+            "token_usage_summary": {"input_tokens": 20, "output_tokens": 6, "total_tokens": 26},
+            "streams": [{"stream_id": "S1", "engine": "fixture", "model": "inherit", "succeeded": True, "status": "ok",
+                         "token_usage": {"input_tokens": 10, "output_tokens": 3, "total_tokens": 13}},
+                        {"stream_id": "S2", "engine": "fixture", "model": "inherit", "succeeded": False, "status": "timeout",
+                         "token_usage": {"input_tokens": 10, "output_tokens": 3, "total_tokens": 13}}]}]), encoding="utf-8")
+        return path
+
+    def stop(self, client, sid, reply, active=False):
+        if client == "antigravity":
+            _append_jsonl(self.trace, {"type": "PLANNER_RESPONSE", "source": "MODEL", "step_index": time.time_ns(), "content": reply})
+            return reply_repeat_guard.handle_stop_repeat_guard({"conversationId": sid, "transcriptPath": str(self.trace),
+                "terminationReason": "model_stop", "continuationActive": active})
+        return reply_repeat_guard.handle_claude_stop_repeat_guard({"_client": client, "session_id": sid,
+            "transcript_path": str(self.trace), "last_assistant_message": reply, "stop_hook_active": active}, self.state, self.logs)
+
+    def test_all_clients_missing_each_bill_element_once_and_mark_reported(self):
+        for client in ("antigravity", "claude", "codex"):
+            for index, reply in enumerate(("S1 成功，S2 超时；回执 receipt.json", "Token 26；回执 receipt.json", "S1 成功，S2 超时；Token 26",
+                                           "完成；Token 1；回执稍后补", "S1 完成；Token 26；回执 receipt.json",
+                                           "S1 完成，S2 超时；Token 26；回执稍后补",
+                                           "S10 成功，S2 超时；Token 26；回执 receipt.json",
+                                           "S1 成功，S2 超时；Token 26；回执 old_receipt.json.bak",
+                                           "S1 成功，S2 超时；Token 26；回执 receipt.json.bak")):
+                sid = client + str(index)
+                ledger = self.completion(sid)
+                with self.subTest(client=client, reply=reply):
+                    blocked = self.stop(client, sid, reply)
+                    self.assertEqual(blocked["decision"], "continue" if client == "antigravity" else "block")
+                    for detail in ("S1", "S2", "timeout", "13", "26", str(self.root / "receipt.json")):
+                        self.assertIn(detail, blocked["reason"])
+                    self.assertNotIn("reason", self.stop(client, sid, reply, active=True))
+                    self.assertNotIn("reason", self.stop(client, sid, reply))
+                    self.assertFalse(json.loads(ledger.read_text(encoding="utf-8"))[0]["reported_to_user"])
+                    self.assertNotIn("reason", self.stop(client, sid, "S1 成功，S2 超时；Token 26；回执 receipt.json"))
+                    self.assertTrue(json.loads(ledger.read_text(encoding="utf-8"))[0]["reported_to_user"])
+
+    def test_wp8_native_stream_identifier_word_boundaries(self):
+        native = {"native": True, "turn_key": "turn", "receipt_file": str(self.trace),
+                  "streams": [{"stream_id": "S1", "native_id": "agent1", "engine": "readonly-reader"},
+                              {"stream_id": "S2", "native_id": "agent2", "engine": "readonly-auditor"}]}
+        with unittest.mock.patch.object(reply_repeat_guard, "_native_completion_bill", return_value=native):
+            blocked = reply_repeat_guard._check_heavy_report_locked({}, self.state, "native-boundary", "turn",
+                "S10 成功，S2 成功；Token 26；子代理日志见轨迹", "block")
+            self.assertEqual(blocked["decision"], "block")
+            accepted = reply_repeat_guard._check_heavy_report_locked({}, self.state, "native-boundary", "turn",
+                "S1 成功，S2 成功；Token 26；子代理日志见轨迹", "block")
+            self.assertIsNone(accepted)
+            saved = json.loads((self.state / "native-boundary_heavy_report_guard.json").read_text(encoding="utf-8"))
+            self.assertEqual(saved["reported_native_ids"], ["agent1", "agent2"])
+
+    def test_native_workflow_and_subagents_completion_not_start_handles(self):
+        for index in range(2):
+            _append_jsonl(self.trace, {"type": "PLANNER_RESPONSE", "tool_calls": [{"name": "invoke_subagent", "id": "call-" + str(index), "args": {"TypeName": "readonly-reader"}}]})
+            _append_jsonl(self.trace, {"type": "GENERIC", "tool_result": {"call_id": "call-" + str(index)},
+                "content": 'Created the following subagent: ' + json.dumps({"conversationId": "agent-" + str(index), "logAbsoluteUri": str(self.root / ("agent-" + str(index) + ".jsonl"))})})
+        self.assertIsNone(reply_repeat_guard._native_completion_bill({"transcriptPath": str(self.trace)}))
+        for index in range(2):
+            _append_jsonl(self.trace, {"type": "SYSTEM_MESSAGE", "content": "<SYSTEM_MESSAGE>\n[Message] sender=agent-" + str(index) + " content=核对完成\n</SYSTEM_MESSAGE>"})
+        response = self.stop("antigravity", "native", "核对完成")
+        self.assertEqual(response["decision"], "continue")
+        self.assertIn("未单独暴露 Token 整数", response["reason"])
+        self.assertIn("agent-0.jsonl", response["reason"])
+        self.assertNotIn("reason", self.stop("antigravity", "native", "两路完成；未单独暴露 Token 整数；子代理日志在轨迹中"))
+        self.assertNotIn("reason", self.stop("antigravity", "native", "已汇报"))
+        _append_jsonl(self.trace, {"type": "USER_INPUT", "step_index": 20, "content": "执行工作流"})
+        _append_jsonl(self.trace, {"type": "PLANNER_RESPONSE", "tool_calls": [{"id": "workflow", "name": "run_workflow", "args": {}}]})
+        _append_jsonl(self.trace, {"type": "GENERIC", "tool_result": {"call_id": "workflow"}, "content": "完成"})
+        self.assertEqual(self.stop("antigravity", "native", "已结束")["decision"], "continue")
+
+    def test_single_task_receipt_binding_and_single_swarm_bill(self):
+        for command in ("task", "gate", "batch"):
+            sid = "single-" + command
+            ledger = self.completion(sid)
+            entries = json.loads(ledger.read_text(encoding="utf-8"))
+            entries[0]["streams"] = entries[0]["streams"][:1]
+            entries[0]["streams"][0]["model"] = "fixture-model"
+            entries[0]["subcommand"] = command
+            ledger.write_text(json.dumps(entries), encoding="utf-8")
+            self.assertIn("reason", self.stop("antigravity", sid, "完成；Token 1；回执稍后补"))
+            self.stop("antigravity", sid, "fixture-model 成功；Token 13；回执 receipt.json")
+            reported = json.loads(ledger.read_text(encoding="utf-8"))[0]["reported_to_user"]
+            self.assertEqual(reported, command in ("task", "gate"))
+            if not reported:
+                self.stop("antigravity", sid, "S1 成功；Token 13；回执 receipt.json")
+                self.assertTrue(json.loads(ledger.read_text(encoding="utf-8"))[0]["reported_to_user"])
+        _append_jsonl(self.trace, {"type": "PLANNER_RESPONSE", "tool_calls": [{
+            "id": "swarm-call", "name": "swarm", "args": {"action": "add", "TypeName": "readonly-reader"}}]})
+        _append_jsonl(self.trace, {"type": "GENERIC", "tool_result": {"call_id": "swarm-call"}, "content": "完成"})
+        bill = reply_repeat_guard._native_completion_bill({"transcript_path": str(self.trace)})
+        self.assertEqual(bill["streams"][0]["channel"], "native_swarm")
+
+    def test_background_task_notice_does_not_reset_short_wait_counter(self):
+        for index in range(3):
+            _append_jsonl(self.trace, {"type": "SYSTEM_MESSAGE", "content": "<SYSTEM_MESSAGE>\n[Message] sender=fixture/task-42 content=Task finished\n</SYSTEM_MESSAGE>"})
+            result = self.stop("antigravity", "wait-fixture", "后台任务还在运行，继续等待。")
+        self.assertEqual(result["decision"], "continue")
+
+    def test_native_claude_and_codex_returns_and_codex_stop_cli(self):
+        import subprocess
+
+        for client in ("claude", "codex"):
+            self.trace.write_text("", encoding="utf-8")
+            if client == "claude":
+                _append_jsonl(self.trace, {"type": "user", "message": {"role": "user", "content": "核对文件"}})
+            else:
+                _append_jsonl(self.trace, {"type": "response_item", "payload": {
+                    "type": "message", "role": "user", "content": [{"type": "input_text", "text": "核对文件"}]}})
+            for index in range(2):
+                key = "call-" + str(index)
+                if client == "claude":
+                    _append_jsonl(self.trace, {"type": "assistant", "message": {"content": [{
+                        "type": "tool_use", "id": key, "name": "Agent", "input": {"subagent_type": "readonly-reader"}}]}})
+                    _append_jsonl(self.trace, {"type": "user", "message": {"content": [{
+                        "type": "tool_result", "tool_use_id": key, "content": "核对完成"}]},
+                        "toolUseResult": {"status": "completed", "agentId": "agent-" + str(index),
+                                          "usage": {"total_tokens": 8}}})
+                else:
+                    _append_jsonl(self.trace, {"type": "response_item", "payload": {
+                        "type": "function_call", "name": "functions.spawn_agent", "call_id": key,
+                        "arguments": json.dumps({"agent_type": "readonly-reader"})}})
+                    _append_jsonl(self.trace, {"type": "response_item", "payload": {
+                        "type": "function_call_output", "call_id": key,
+                        "output": json.dumps({"agent_id": "agent-" + str(index)})}})
+            if client == "codex":
+                self.assertIsNone(reply_repeat_guard._native_completion_bill({"transcript_path": str(self.trace)}))
+                _append_jsonl(self.trace, {"type": "response_item", "payload": {
+                    "type": "function_call_output", "call_id": "wait-call", "output": json.dumps({"status": {
+                        "agent-0": {"completed": "核对完成"}, "agent-1": {"failed": "核对失败"}}})}})
+            response = self.stop(client, "native-" + client, "核对完成")
+            self.assertEqual(response["decision"], "block", client)
+            self.assertIn(str(self.trace.resolve()), response["reason"])
+            if client == "claude":
+                self.assertIn('"total_tokens": 16', response["reason"])
+            else:
+                self.assertIn("失败", response["reason"])
+            self.assertNotIn("reason", self.stop(client, "native-" + client,
+                "两路完成返回；Token 未单独暴露整数；子代理轨迹见 transcript.jsonl"))
+
+        self.completion("cli-fixture")
+        payload = {"session_id": "cli-fixture", "transcript_path": str(self.trace), "last_assistant_message": "结束"}
+        result = subprocess.run([sys.executable, "-B", "-X", "utf8", str(HOOKS_DIR / "reply_repeat_guard.py"),
+                                 "--client", "codex", "--state-dir", str(self.state), "--log-dir", str(self.logs)],
+                                input=json.dumps(payload), text=True, encoding="utf-8", capture_output=True, check=True)
+        self.assertEqual(json.loads(result.stdout)["decision"], "block")
+
+    def test_handoff_allow_still_requires_completion_bill(self):
+        self.completion("handoff-bill")
+        for stage in ("drain", "freeze"):
+            sid = "handoff-bill-" + stage
+            ledger = self.completion(sid)
+            with unittest.mock.patch.object(reply_repeat_guard.handoff_gate, "check_stop_handoff_locked", return_value={"decision": "allow"}):
+                result = self.stop("antigravity", sid, "交接完成")
+                self.assertEqual(result["decision"], "continue")
+                self.assertIn("receipt.json", result["reason"])
+                self.assertNotIn("reason", self.stop("antigravity", sid, "S1 成功，S2 超时；Token 26；回执 receipt.json"))
+            self.assertTrue(json.loads(ledger.read_text(encoding="utf-8"))[0]["reported_to_user"])
+
+    def test_single_writable_and_cross_turn_async_native_completion(self):
+        for client in ("antigravity", "claude", "codex"):
+            with self.subTest(client=client):
+                self.trace.write_text("", encoding="utf-8")
+                if client == "antigravity":
+                    _append_jsonl(self.trace, {"type": "PLANNER_RESPONSE", "tool_calls": [
+                        {"id": "write-call", "name": "invoke_subagent", "args": {"TypeName": "self"}}]})
+                    _append_jsonl(self.trace, {"type": "GENERIC", "tool_result": {"call_id": "write-call"},
+                        "content": 'Created the following subagent: {"conversationId":"writer"}'})
+                    later_user = {"type": "USER_INPUT", "content": "补充要求"}
+                    done = {"type": "SYSTEM_MESSAGE", "content": "<SYSTEM_MESSAGE>\n[Message] sender=writer content=完成\n</SYSTEM_MESSAGE>"}
+                elif client == "claude":
+                    _append_jsonl(self.trace, {"type": "assistant", "message": {"content": [{
+                        "type": "tool_use", "id": "write-call", "name": "Agent", "input": {"subagent_type": "general-purpose"}}]}})
+                    _append_jsonl(self.trace, {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "write-call"}]},
+                        "toolUseResult": {"status": "async_launched", "agentId": "writer"}})
+                    later_user = {"type": "user", "message": {"content": "补充要求"}}
+                    _append_jsonl(self.trace, {"type": "assistant", "message": {"content": [{
+                        "type": "tool_use", "id": "wait-call", "name": "TaskOutput", "input": {"task_id": "writer"}}]}})
+                    done = {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "wait-call", "content": "完成"}]},
+                        "toolUseResult": {"status": "completed"}}
+                else:
+                    _append_jsonl(self.trace, {"type": "response_item", "payload": {"type": "function_call", "call_id": "write-call",
+                        "name": "functions.spawn_agent", "arguments": json.dumps({"agent_type": "self"})}})
+                    _append_jsonl(self.trace, {"type": "response_item", "payload": {"type": "function_call_output", "call_id": "write-call",
+                        "output": json.dumps({"agent_id": "writer"})}})
+                    later_user = {"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "补充要求"}]}}
+                    done = {"type": "response_item", "payload": {"type": "function_call_output", "call_id": "wait-call",
+                        "output": json.dumps({"status": {"writer": {"completed": "完成"}}})}}
+                _append_jsonl(self.trace, later_user)
+                self.assertIsNone(reply_repeat_guard._native_completion_bill({"transcript_path": str(self.trace)}))
+                _append_jsonl(self.trace, done)
+                sid = "async-writer-" + client
+                result = self.stop(client, sid, "完成；Token 1；回执稍后补")
+                self.assertIn(result["decision"], ("continue", "block"))
+                self.assertIn("write", result["reason"])
+                self.assertNotIn("reason", self.stop(client, sid, "1 路完成；Token 无法统计；子代理日志见 transcript.jsonl"))
+                state = json.loads((self.state / (sid + "_heavy_report_guard.json")).read_text(encoding="utf-8"))
+                self.assertIn("write-call", state["reported_native_ids"])
+                _append_jsonl(self.trace, later_user)
+                self.assertNotIn("reason", self.stop(client, sid, "已汇报"))
+
+    def test_native_call_id_idempotence_and_identical_user_turns(self):
+        payload = {"conversationId": "idempotent", "transcriptPath": str(self.trace),
+                   "tool_use_id": "first", "toolCall": {"name": "invoke_subagent", "args": {"TypeName": "readonly-reader"}}}
+        for _ in range(2):
+            self.assertEqual(status_guard.handle_pre_tool_use(payload)["decision"], "allow")
+        payload["tool_use_id"] = "second"
+        self.assertEqual(status_guard.handle_pre_tool_use(payload)["decision"], "deny")
+        _append_jsonl(self.trace, {"type": "USER_INPUT", "step_index": 1, "content": "检查工程"})
+        self.assertEqual(status_guard.handle_pre_tool_use(payload)["decision"], "allow")
+
+    def test_async_workflow_completion_and_same_turn_single_correction(self):
+        payload = {"transcriptPath": str(self.trace)}
+        for index in range(2):
+            key = "workflow-" + str(index)
+            _append_jsonl(self.trace, {"type": "PLANNER_RESPONSE", "tool_calls": [
+                {"id": key, "name": "run_workflow", "args": {}}]})
+            _append_jsonl(self.trace, {"type": "GENERIC", "tool_result": {"call_id": key},
+                "content": "Command is running in background with ID: task-" + str(index)})
+            if index == 0:
+                self.assertIsNone(reply_repeat_guard._native_completion_bill(payload))
+            _append_jsonl(self.trace, {"type": "SYSTEM_MESSAGE", "content": "<SYSTEM_MESSAGE>\n[Message] sender=fixture/task-" +
+                str(index) + " content=Task finished\n</SYSTEM_MESSAGE>"})
+            response = self.stop("antigravity", "async", "执行结束")
+            if index == 0:
+                self.assertEqual(response["decision"], "continue")
+            else:
+                self.assertNotIn("reason", response)
+        # 子代理返回可能在宿主中形成新的消息步骤，同一用户回合仍只能补正一次。
+        _append_jsonl(self.trace, {"type": "SYSTEM_MESSAGE", "content":
+            "<SYSTEM_MESSAGE>\n[Message] sender=fixture content=核对完成\n</SYSTEM_MESSAGE>"})
+        self.assertNotIn("reason", self.stop("antigravity", "async", "执行结束"))
+
+    @unittest.skipUnless(os.name == "nt", "Windows 路径 API 缓冲扩容边界")
+    def test_long_path_api_resizes_when_required_size_equals_capacity(self):
+        calls = []
+        def expand(raw, buffer, capacity):
+            calls.append(capacity)
+            if len(calls) == 1:
+                return capacity
+            buffer.value = "C:\\fixture\\long-path"
+            return len(buffer.value)
+        with unittest.mock.patch.object(status_guard, "_WIN_GET_LONG_PATH", side_effect=expand):
+            self.assertEqual(status_guard._win_expand_short_path("C:\\fixture\\LONG~1"), "C:\\fixture\\long-path")
+        self.assertEqual(len(calls), 2)
 
 
 if __name__ == "__main__":

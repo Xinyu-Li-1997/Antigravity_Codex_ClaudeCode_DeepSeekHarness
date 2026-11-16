@@ -62,6 +62,7 @@ HOOK_PYTHON_FLAGS = ["-X", "utf8", "-I", "-B"]
 LEGACY_PYTHON_FLAGS = ([], ["-B"], ["-I", "-B"], HOOK_PYTHON_FLAGS)
 HANDOFF_MARKER = re.compile(r"\[user-guard codex-handoff v1 mode=(advisory|enforce|off) compact_limit=([0-9]+)\]")
 CLAUDE_HOOK_SCRIPTS = ("user_words.py", "session_context_loader.py", "status_guard.py", "reply_repeat_guard.py", "handoff_gate.py")
+CODEX_HOOK_ENTRIES = ("session_context_loader.py", "status_guard.py", "reply_repeat_guard.py", "handoff_gate.py")
 CLAUDE_RETIRED_SCRIPTS = ("background_status.py", "read_delegation_guard.py", "receipts_stop.py")
 
 
@@ -1686,30 +1687,33 @@ def _sync_codex_global_rules(template_rules_path: Path, codex_root: Path, dry_ru
     _sync_global_rules(template_rules_path, codex_root / "AGENTS.md", "Codex", dry_run)
 
 
+_LOCAL_ENV_COLLISIONS = re.compile(r"^([ \t]*(?:(?:[-*+]|\d+\.)[ \t]+)?(?:#{1,6}[ \t]+)?(?:\*{1,2})?)(R10|R11)\.", re.MULTILINE)
+
+
 def _sync_global_rules(template_rules_path: Path, rules_path: Path, label: str, dry_run: bool) -> None:
-    """更新工程规则，保留末尾自定义『## 工具与本机』段的原文及换行。"""
+    """以完整模板更新规则，保留自定义尾段并迁移与标准规则冲突的编号。"""
     if not template_rules_path.is_file():
         return
     template_text = _decode_utf8(template_rules_path, template_rules_path.read_bytes()).replace("\r\n", "\n")
 
     env_sec_re = re.compile(r"^##[ \t]+工具与([^\r\n]*)[^\S\n]*(?:\r?\n|$)", re.MULTILINE)
-    template_env = env_sec_re.search(template_text)
-    template_core = template_text[:template_env.start()].rstrip() if template_env else template_text.rstrip()
 
     codex_agents = rules_path
     original = _read_optional_bytes(codex_agents)
     existing = _decode_utf8(codex_agents, original or b"")
 
     env_matches = list(env_sec_re.finditer(existing))
-    first_env = env_matches[0] if env_matches else None
     custom_env = next((m for m in env_matches if m.group(1).strip() != "运行环境"), None)
     newline = "\r\n" if "\r\n" in existing else "\n"
     if custom_env is not None:
-        custom_tail = existing[custom_env.start():]
+        custom_tail = _LOCAL_ENV_COLLISIONS.sub(
+            lambda match: match[1] + ("L1" if match[2] == "R10" else "L2") + ".",
+            existing[custom_env.start():],
+        )
         # 旧版安装器为尾段补一个末尾换行，继续兼容这一输出约定。
         if not custom_tail.endswith("\n"):
             custom_tail += newline
-        prefix = template_core if (first_env is custom_env) else template_text.rstrip()
+        prefix = template_text.rstrip()
         merged = (prefix.replace("\n", newline) + newline * 2 if prefix else "") + custom_tail
     else:
         merged = (template_text.rstrip() + "\n").replace("\n", newline)
@@ -1788,7 +1792,7 @@ def _codex_managed_hook(
 
     for idx, token in enumerate(tokens[1:], start=1):
         script_name = Path(token).name
-        if script_name not in {"session_context_loader.py", "handoff_gate.py"} or not matches(token, hook_root / script_name):
+        if script_name not in CODEX_HOOK_ENTRIES or not matches(token, hook_root / script_name):
             continue
         args = tokens[idx + 1:]
         executable = tokens[0]
@@ -1825,6 +1829,12 @@ def _codex_managed_hook(
             ):
                 return ManagedCodexHook("custom", None)
             return ManagedCodexHook("loader", interpreter)
+        if script_name in {"status_guard.py", "reply_repeat_guard.py"}:
+            if (len(args) == 6 and args[:3] == ["--client", "codex", "--state-dir"]
+                    and matches(args[3], hook_root / "state") and args[4] == "--log-dir"
+                    and matches(args[5], hook_root / "logs")):
+                return ManagedCodexHook(script_name, interpreter)
+            return ManagedCodexHook("custom", None)
         if (
             script_name == "handoff_gate.py" and len(args) == 8
             and actual_flags == launcher + HOOK_PYTHON_FLAGS
@@ -1928,7 +1938,8 @@ def _plan_codex_hooks(
         matcher = groups[0].get("matcher")
         desired = {}
         for handler in groups[0]["hooks"]:
-            kind = "gate" if "handoff_gate.py" in handler["command"] else "loader"
+            name = next(name for name in CODEX_HOOK_ENTRIES if name in handler["command"])
+            kind = {"handoff_gate.py": "gate", "session_context_loader.py": "loader"}.get(name, name)
             if kind == "gate" and mode == "off":
                 continue
             command = handler["command"].replace("--mode advisory --compact-limit 0", f"--mode {mode} --compact-limit {compact_limit}")
@@ -1967,10 +1978,10 @@ def _plan_codex_hooks(
                             updated_handler = {**handler, "command": desired[kind]["command"]}
                         else:
                             tokens = _codex_hook_tokens(handler)
-                            launcher = managed.interpreter[1]
+                            launcher = managed.interpreter[1] if managed.interpreter else (["-3"] if tokens[1:2] == ["-3"] else [])
                             latest_args = _codex_hook_tokens(desired[kind])[py_prefix_size:]
                             if (
-                                kind == "loader" and tokens[1:] != launcher + HOOK_PYTHON_FLAGS + latest_args
+                                kind != "gate" and tokens[1:] != launcher + HOOK_PYTHON_FLAGS + latest_args
                             ) or (kind == "gate" and managed.policy != (mode, compact_limit)):
                                 prefix = " ".join([quote_exe(tokens[0]), *launcher, *HOOK_PYTHON_FLAGS])
                                 updated_handler = {**handler, "command": prefix + desired[kind]["command"][len(py_cmd):]}
@@ -2004,10 +2015,7 @@ def _plan_codex_hooks(
 
 
 def _codex_hook_script_names(mode: str) -> List[str]:
-    names = ["session_context_loader.py", "user_words.py"]
-    if mode != "off":
-        names.append("handoff_gate.py")
-    return names
+    return [*CODEX_HOOK_ENTRIES, "user_words.py"]
 
 
 def _sync_codex_hooks(
@@ -2016,7 +2024,7 @@ def _sync_codex_hooks(
     plan: CodexHooksPlan,
     dry_run: bool = False,
 ) -> None:
-    """同步 Codex 原话恢复和长会话交接脚本，逐条合并已登记的 handler。"""
+    """同步 Codex 生命周期钩子脚本，逐条合并已登记的 handler。"""
     hooks_path = codex_root / "hooks.json"
     dst_hooks_dir = codex_root / "hooks"
     mode, compact_limit = plan.mode, plan.compact_limit
@@ -2081,6 +2089,8 @@ def _validate_codex_assets(
     if hooks_plan is not None:
         hooks_dir = codex_root / "hooks"
         _validate_path(hooks_dir, directory=True)
+        if hooks_plan.mode == "off":
+            _validate_path(hooks_dir / "handoff_gate.py", directory=False)
         for name in _codex_hook_script_names(hooks_plan.mode):
             source = codex_template_dir.parent / "user-guard" / "hooks" / name
             _decode_utf8(source, _validate_path(source, directory=False).read_bytes())
@@ -2271,7 +2281,7 @@ def _plan_claude_settings(
 
 
 def _claude_hook_script_names(mode: str) -> List[str]:
-    return [name for name in CLAUDE_HOOK_SCRIPTS if mode != "off" or name != "handoff_gate.py"]
+    return list(CLAUDE_HOOK_SCRIPTS)
 
 
 def _sync_claude_hooks(
@@ -2283,7 +2293,7 @@ def _sync_claude_hooks(
         original, content = _read_optional_bytes(target), (source_hooks / name).read_bytes()
         if original != content:
             _apply_file_change(FileChange(target, original, content), dry_run)
-    retired = list(CLAUDE_RETIRED_SCRIPTS) + (["handoff_gate.py"] if plan.mode == "off" else [])
+    retired = list(CLAUDE_RETIRED_SCRIPTS)
     for name in retired:
         target = _validate_path(hooks_dir / name, directory=False)
         if target.exists():
@@ -2313,11 +2323,22 @@ def _cc_router_files(template_dir: Path, claude_root: Path) -> List[Tuple[Path, 
 def _sync_cc_router(template_dir: Path, claude_root: Path, dry_run: bool = False) -> None:
     for source, target in _cc_router_files(template_dir, claude_root):
         original, content = _read_optional_bytes(target), source.read_bytes()
+        if target.name == "router.json" and original is None:
+            config = json.loads(content)
+            repo_root = template_dir.parent.parent.parent
+            router = _load_fleet_profile(repo_root).get("runtime_tunables", {}).get("headless_dispatch", {}).get("router", {})
+            port = router.get("port" if os.name == "nt" else "wsl_port", config.get("port"))
+            if type(port) is int and 1 <= port <= 65535 and config.get("port") != port:
+                config["port"] = port
+                content = (json.dumps(config, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
         if content != original:
             _apply_file_change(FileChange(target, original, content), dry_run)
-        if not dry_run and target.suffix in {".sh", ".py"} and os.name != "nt":
-            if stat.S_IMODE(target.stat().st_mode) != 0o755:
-                target.chmod(0o755)
+        if not dry_run and target.suffix in {".sh", ".py"}:
+            try:
+                if stat.S_IMODE(target.stat().st_mode) != 0o755:
+                    target.chmod(0o755)
+            except OSError:
+                pass
 
 
 def _load_ccswitch_admin(repo_root: Path) -> ModuleType:
@@ -2338,6 +2359,7 @@ def _validate_claude_assets(repo_root: Path, claude_root: Path, args: argparse.N
         sources.extend((source, claude_root / "agents" / source.name)
                        for source in (repo_root / "template/claude/agents").glob("readonly-*.md"))
     if not args.no_claude_hooks:
+        sources.append((repo_root / "template/claude/router/ccswitch_admin.py", claude_root / "hooks/ccswitch_admin.py"))
         sources.extend((repo_root / "template/user-guard/hooks" / name, claude_root / "hooks" / name)
                        for name in _claude_hook_script_names(mode))
     if args.with_cc_router:
@@ -2365,7 +2387,15 @@ def _audit_cli(info: Dict[str, Any]) -> Dict[str, Any]:
                 if os.name == "nt" and str(binary).lower().endswith((".cmd", ".bat"))
                 else [binary, "--version"]
             )
-            proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=3)
+            options = dict(capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=3)
+            if "cc-switch" in str(binary).lower():
+                with tempfile.TemporaryDirectory(prefix="cc-switch-audit-") as isolated_home:
+                    isolated_env = dict(os.environ)
+                    for key in ("HOME", "XDG_CONFIG_HOME", "APPDATA", "LOCALAPPDATA"):
+                        isolated_env[key] = isolated_home
+                    proc = subprocess.run(cmd, env=isolated_env, **options)
+            else:
+                proc = subprocess.run(cmd, **options)
             match = re.search(r"\b\d+(?:\.\d+){1,3}(?:-[A-Za-z0-9.]+)?\b", proc.stdout or "")
             if proc.returncode == 0 and match:
                 report["version"] = match[0]
@@ -2386,9 +2416,8 @@ def _rules_equal(actual_raw: bytes, expected_raw: bytes) -> bool:
     env_matches = list(env_sec_re.finditer(actual_text))
     custom_env = next((m for m in env_matches if m.group(1).strip() != "运行环境"), None)
     if custom_env is not None:
-        if env_matches and env_matches[0] is custom_env:
-            return _rules_core(actual_raw) == _rules_core(expected_raw)
-        return actual_text[:custom_env.start()].rstrip() == expected_text.rstrip()
+        return (actual_text[:custom_env.start()].rstrip() == expected_text.rstrip()
+                and _LOCAL_ENV_COLLISIONS.search(actual_text[custom_env.start():]) is None)
     return actual_text.rstrip() == expected_text.rstrip()
 
 
@@ -2484,7 +2513,7 @@ def _audit_redact(value: Any, roots: List[Tuple[Path, str]], secrets: Set[str]) 
         value,
     )
     value = re.sub(
-        r"(?i)(?:[A-Z]:[/\\]Users[/\\]|/mnt/[a-z]/Users/|(?:\\\\|//)wsl(?:\.localhost|\$)[/\\][^/\\\s]+[/\\]home[/\\]|/(?:home|Users)/)[^/\\\s\"']+",
+        r"(?i)(?:[A-Z]:[/\\]Users[/\\]|/mnt/[a-z]/Users[/]|(?:\\\\|//)wsl(?:\.localhost|\$)[/\\][^/\\\s]+[/\\]home[/\\]|/(?:home|Users)/)[^/\\\s\"']+",
         "<home>",
         value,
     )
@@ -2708,7 +2737,7 @@ def audit_upgrade_status(
                         tokens = _codex_hook_tokens(handler)
                         for idx, tok in enumerate(tokens[1:], start=1):
                             sname = Path(tok).name
-                            if sname in {"session_context_loader.py", "handoff_gate.py"} and _same_nonlink_path(
+                            if sname in CODEX_HOOK_ENTRIES and _same_nonlink_path(
                                 Path(tok).expanduser(), codex_root / "hooks" / sname
                             ):
                                 prefix_end = 2 if tokens[1:2] == ["-3"] else 1
@@ -2752,6 +2781,7 @@ def audit_upgrade_status(
     cl_sources = [(template / "rules/AGENTS.md", "CLAUDE.md")]
     cl_sources += [(source, "agents/" + source.name) for source in (repo_root / "template/claude/agents").glob("readonly-*.md")]
     cl_sources += [(template / "hooks" / name, "hooks/" + name) for name in _claude_hook_script_names(claude_mode)]
+    cl_sources += [(repo_root / "template/claude/router/ccswitch_admin.py", "hooks/ccswitch_admin.py")]
     cl_sources += skill_sources
     cl["drift_files"] = drift(claude_root, cl_sources, core_rules=True)
     cl["drift_files"].extend("hooks/" + name for name in CLAUDE_RETIRED_SCRIPTS if read_raw(claude_root / "hooks" / name) is not None)
@@ -2856,17 +2886,62 @@ def audit_upgrade_status(
             skills_dir_entries=[], settings_aligned=None,
         )
         uses_local_router = settings_uses_router
+    matrix = fleet_profile.get("subscription_matrix", {})
+    matrix = matrix if isinstance(matrix, dict) else {}
+    subscription_candidates: Dict[str, Any] = {"agents": {}, "models": {}}
+    peer_reports = {"agy": ag, "codex": cx, "claude": cl, "dsh": dsh}
+    for client, entry in (matrix.get("agents") or {}).items():
+        if not isinstance(entry, dict):
+            continue
+        detected = detection.get("antigravity" if client == "agy" else client, {})
+        subscription_candidates["agents"][client] = {
+            "enabled_in_profile": bool(entry.get("enabled", False)),
+            "currently_available": bool(peer_reports.get(client, {}).get("native_installed")
+                                        or detected.get("interop_available")),
+            "quota_scheme": entry.get("quota_scheme"),
+        }
+    catalogs = {"agy": ag_models, "codex": cx_models}
+    for model, entry in (matrix.get("models") or {}).items():
+        if not isinstance(entry, dict):
+            continue
+        client = entry.get("agent")
+        available = subscription_candidates["agents"].get(client, {}).get("currently_available", False)
+        scheme = entry.get("quota_scheme")
+        if entry.get("card"):
+            cards = [card for card in (cc.get("cards") or []) if isinstance(card, dict)
+                     and card.get("app_type") == client and card.get("name") == entry["card"]]
+            ready_cards = [card for card in cards if not card.get("invalid_json")
+                           and card.get("token") in {"present", "via-router"}]
+            available = available and bool(ready_cards)
+            scheme = next((card["quota_scheme"] for card in ready_cards if card.get("quota_scheme")), scheme)
+        elif client in catalogs:
+            available = available and any(item["slug"] == model and item.get("visibility") != "hide"
+                                          for item in catalogs[client])
+        elif client == "dsh":
+            available = available and (dsh["credentials_present"] or bool(os.environ.get("DEEPSEEK_API_KEY")))
+        subscription_candidates["models"][model] = {
+            "agent": client, "enabled_in_profile": bool(entry.get("enabled", False)),
+            "currently_available": bool(available), "quota_scheme": scheme,
+        }
     managed_card_names = {str(name) for name in (cl_rules.get("managed_cards") or ("Kimi", "DeepSeek")) if name}
     custom_card_refs: List[Tuple[str, str]] = []
+    _card_uuid_re = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
     for card in cc.get("cards") or []:
-        if isinstance(card, dict) and (card.get("app_type") != "claude" or card.get("name") not in managed_card_names):
+        if not isinstance(card, dict):
+            continue
+        if card.get("app_type") != "claude" or card.get("name") not in managed_card_names:
             if isinstance(card.get("app_type"), str) and isinstance(card.get("name"), str) and card["name"]:
                 custom_card_refs.append((card["app_type"], card["name"]))
             card["id"] = "<custom-card-id>"
             card["name"] = "<custom-card>"
-    if isinstance(cc.get("current_claude_card"), dict) and cc["current_claude_card"].get("name") not in managed_card_names:
-        cc["current_claude_card"]["id"] = "<custom-card-id>"
-        cc["current_claude_card"]["name"] = "<custom-card>"
+        elif isinstance(card.get("id"), str) and _card_uuid_re.fullmatch(card["id"]):
+            card["id"] = "<managed-card-id>"
+    if isinstance(cc.get("current_claude_card"), dict):
+        if cc["current_claude_card"].get("name") not in managed_card_names:
+            cc["current_claude_card"]["id"] = "<custom-card-id>"
+            cc["current_claude_card"]["name"] = "<custom-card>"
+        elif isinstance(cc["current_claude_card"].get("id"), str) and _card_uuid_re.fullmatch(cc["current_claude_card"]["id"]):
+            cc["current_claude_card"]["id"] = "<managed-card-id>"
     if custom_card_refs and isinstance(cc.get("warnings"), list):
         ordered_refs = sorted(set(custom_card_refs), key=lambda item: len(item[1]), reverse=True)
         ref_re = re.compile("|".join(re.escape(f"{app_t}:{raw_name}") for app_t, raw_name in ordered_refs))
@@ -2935,6 +3010,7 @@ def audit_upgrade_status(
               "host": {"platform": sys.platform, "python_version": sys.version.split()[0], "is_wsl": detection.get("is_wsl"),
                        "wsl_probe": detection.get("wsl_probe"), "toolchain": toolchain},
               "antigravity": ag, "codex": cx, "claude": cl, "dsh": dsh, "cc_switch": cc,
+              "subscription_candidates": subscription_candidates,
               "summary": {"all_aligned": not actions, "recommended_actions": actions}, "read_errors": errors}
     roots = [(home, "~"), (target_plugin_dir, "<antigravity>"), (codex_root, "<codex>"), (claude_root, "<claude>"),
              (dsh_root, "<dsh>"), (ccswitch_db.parent, "<ccswitch>"), (repo_root, "<repo>")]
@@ -3427,6 +3503,11 @@ def main() -> None:
                 _sync_claude_agents(claude_template_dir, claude_root, args.dry_run)
             if not args.no_claude_hooks:
                 _sync_claude_hooks(template_dir / "hooks", claude_root, claude_settings_plan, args.dry_run)
+                admin_target = claude_root / "hooks/ccswitch_admin.py"
+                admin_original = _read_optional_bytes(admin_target)
+                admin_content = (claude_template_dir / "router/ccswitch_admin.py").read_bytes()
+                if admin_original != admin_content:
+                    _apply_file_change(FileChange(admin_target, admin_original, admin_content), args.dry_run)
             else:
                 _apply_file_change(claude_settings_plan.change, args.dry_run)
             if args.with_cc_router:

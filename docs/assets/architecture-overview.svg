@@ -1,118 +1,65 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 584" width="1080" height="584" role="img" aria-labelledby="arch-title arch-desc">
-  <title id="arch-title">两层解耦配置与四客户端全动态协作总览</title>
-  <desc id="arch-desc">展示常驻机制层与全动态角色及运行期参数配置层的解耦关系、双工作区隔离、四个必停用户拍板节点，以及 Antigravity、Codex、Claude Code 与 DeepSeek Harness 四个对等客户端的全局目录挂载方式。</desc>
-  <defs>
-    <style>
-      .bg { fill: #f8fafc; stroke: #cbd5e1; stroke-width: 1.5; }
-      .title { font: 700 18px "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; fill: #0f172a; }
-      .subtitle { font: 400 12px "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; fill: #475569; }
-      .box-perm { fill: #eff6ff; stroke: #2563eb; stroke-width: 1.6; }
-      .box-dyn { fill: #fffbeb; stroke: #d97706; stroke-width: 1.6; }
-      .box-gate { fill: #fef2f2; stroke: #dc2626; stroke-width: 1.5; stroke-dasharray: 5 3; }
-      .box-peer { fill: #ffffff; stroke: #64748b; stroke-width: 1.4; }
-      .hdr-perm { font: 700 13.8px "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; fill: #1d4ed8; }
-      .hdr-dyn { font: 700 13.8px "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; fill: #b45309; }
-      .hdr-gate { font: 700 13px "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; fill: #b91c1c; }
-      .hdr-peer { font: 700 13.5px "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; fill: #0f172a; }
-      .body { font: 400 11.4px "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; fill: #1e293b; }
-      .mono { font: 600 11px Consolas, "SFMono-Regular", Menlo, monospace; fill: #0f172a; }
-      .mono-sm { font: 600 10px Consolas, "SFMono-Regular", Menlo, monospace; fill: #0f172a; }
-      .tag { fill: #e2e8f0; stroke: #94a3b8; stroke-width: 1; }
-      .arrow { stroke: #475569; stroke-width: 1.6; fill: none; marker-end: url(#arrow-head); }
-      .arrow-dyn { stroke: #d97706; stroke-width: 1.6; fill: none; stroke-dasharray: 4 3; marker-end: url(#arrow-amber); }
-    </style>
-    <marker id="arrow-head" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
-      <path d="M 0 1 L 10 5 L 0 9 z" fill="#475569"/>
-    </marker>
-    <marker id="arrow-amber" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
-      <path d="M 0 1 L 10 5 L 0 9 z" fill="#d97706"/>
-    </marker>
-  </defs>
-
-  <rect x="8" y="8" width="1064" height="568" rx="12" class="bg"/>
-  <text x="540" y="35" text-anchor="middle" class="title">两层解耦全局配置与四客户端对等协作架构</text>
-  <text x="540" y="55" text-anchor="middle" class="subtitle">课题业务仓库零侵入 · Python 3.11+ 纯标准库 · 通用课题与上游配置仓双模式隔离 · 全角色与定量参数动态校准</text>
-
-  <!-- Layer 1 Left: Permanent Layer -->
-  <rect x="28" y="72" width="500" height="184" rx="9" class="box-perm"/>
-  <text x="44" y="96" class="hdr-perm">1. 常驻机制层（零时期性模型名 · 零静态死数字）</text>
-  <text x="44" y="118" class="body">• 全局规则模板：template/user-guard/rules/AGENTS.md（R0–R11）</text>
-  <text x="44" y="138" class="body">• 5 个钩子脚本模块：user_words · session_context_loader</text>
-  <text x="58" y="156" class="body">status_guard · reply_repeat_guard · handoff_gate（短进程零驻留）</text>
-  <text x="44" y="176" class="body">• 角色编排与事实锚定：cae_harness.py（gate / audit / check-grounding）</text>
-  <text x="44" y="196" class="body">• 上游专属工具（workspace_mode 硬隔离）：install.py · fleet_state.py</text>
-  <text x="58" y="214" class="body">（推荐表审批锁 propose/approve · 重启重入锁 · 终审锚定门禁）</text>
-  <text x="44" y="236" class="body">• 只读子代理：readonly-reader · readonly-collaborator · readonly-auditor</text>
-
-  <!-- Layer 1 Right: Dynamic Fleet Profile Layer -->
-  <rect x="552" y="72" width="500" height="184" rx="9" class="box-dyn"/>
-  <text x="568" y="96" class="hdr-dyn">2. 全动态评估与参数层（随客户端与模型特性重算）</text>
-  <text x="568" y="118" class="body">• 唯一机器可读配置：skills/cae-harness/fleet_profile.json</text>
-  <text x="568" y="138" class="body">• 五个对等角色槽位全部动态选路（均无永久客户端或模型绑定）：</text>
-  <rect x="568" y="148" width="466" height="24" rx="5" class="tag"/>
-  <text x="801" y="164" text-anchor="middle" class="mono">role:orchestrator | role:math | role:code | role:review | role:fast</text>
-  <text x="568" y="192" class="body">• 受控定量参数 runtime_tunables：各端压缩恢复预算、实质子代理</text>
-  <text x="582" y="211" class="body">筛选窗口、交接与防轮询阈值、过期锁清理、路由并发与缓存上限</text>
-  <text x="568" y="236" class="body">• 上游双循环入口：fleet-evolve（全面更新 full · 全量优化 hygiene）</text>
-
-  <!-- Cross link between layers -->
-  <path d="M 552 164 L 530 164" class="arrow-dyn"/>
-
-  <!-- Middle Approval Gate -->
-  <rect x="28" y="274" width="1024" height="74" rx="8" class="box-gate"/>
-  <text x="44" y="296" class="hdr-gate">必停用户拍板门禁（R3.1.4 / R4，未获明确批准严禁跨步执行）</text>
-  <text x="44" y="317" class="body">① 生成或调整动态角色矩阵与 runtime_tunables（fleet_state.py propose）  ·  ② 写入宿主机全局目录（install.py）或切换主会话端</text>
-  <text x="44" y="337" class="body">③ 系统级 Python 跨次版本、CUDA 跨大版本或 WSL 跨 LTS 发行版等 ABI 强耦合升级   ·   ④ git push 推送远端仓库前</text>
-
-  <!-- Arrows down to 4 Peer Clients -->
-  <path d="M 278 256 L 278 274" class="arrow"/>
-  <path d="M 802 256 L 802 274" class="arrow"/>
-  <path d="M 150 348 L 150 374" class="arrow"/>
-  <path d="M 410 348 L 410 374" class="arrow"/>
-  <path d="M 670 348 L 670 374" class="arrow"/>
-  <path d="M 930 348 L 930 374" class="arrow"/>
-
-  <!-- Peer 1: Antigravity -->
-  <rect x="28" y="376" width="244" height="182" rx="8" class="box-peer"/>
-  <text x="40" y="398" class="hdr-peer">Antigravity (agy)</text>
-  <text x="40" y="416" class="mono-sm">~/.gemini/config/plugins/user-guard</text>
-  <text x="40" y="437" class="body">• 挂载 4 类事件钩子（存 PLUGIN_DATA）</text>
-  <text x="40" y="456" class="body">• 3 个 inherit 原生只读子代理</text>
-  <text x="40" y="475" class="body">• 订阅按模型组计 5h / 7d 滚动配额</text>
-  <text x="40" y="494" class="body">• CLI 不输出窗口整数，读取回退预</text>
-  <text x="52" y="513" class="body">算规划分片，过滤复合与异池模型</text>
-  <text x="40" y="534" class="body">• 严格校验：agy plugin validate</text>
-
-  <!-- Peer 2: Codex -->
-  <rect x="288" y="376" width="244" height="182" rx="8" class="box-peer"/>
-  <text x="300" y="398" class="hdr-peer">OpenAI Codex (codex)</text>
-  <text x="300" y="416" class="mono-sm">~/.codex</text>
-  <text x="300" y="437" class="body">• 挂载 5 类事件钩子（保 trusted_hash）</text>
-  <text x="300" y="456" class="body">• 3 个只读子代理 + workspace-write</text>
-  <text x="300" y="475" class="body">• 订阅共享 5h / 周度窗口或按量 API</text>
-  <text x="300" y="494" class="body">• 默认挡位偏低（low/medium），脚本</text>
-  <text x="312" y="513" class="body">显式声明最大窗口与非委派最高挡</text>
-  <text x="300" y="534" class="body">• 支持 --clean-room 空上下文盲读</text>
-
-  <!-- Peer 3: Claude Code -->
-  <rect x="548" y="376" width="244" height="182" rx="8" class="box-peer"/>
-  <text x="560" y="398" class="hdr-peer">Claude Code (claude / cc)</text>
-  <text x="560" y="416" class="mono-sm">~/.claude (+ router/ &amp; CC Switch)</text>
-  <text x="560" y="437" class="body">• settings.json 合入 5 类事件钩子</text>
-  <text x="560" y="456" class="body">• 原生 --json-schema 输出结构强校验</text>
-  <text x="560" y="475" class="body">• router.py 绑定 127.0.0.1 前缀直通</text>
-  <text x="572" y="494" class="body">原生兼容 /v1/messages 官方接口</text>
-  <text x="560" y="513" class="body">• 只读传 --permission-mode dontAsk</text>
-  <text x="560" y="534" class="body">• ccswitch_admin 在线备份安全切卡</text>
-
-  <!-- Peer 4: DeepSeek Harness -->
-  <rect x="808" y="376" width="244" height="182" rx="8" class="box-peer"/>
-  <text x="820" y="398" class="hdr-peer">DeepSeek Harness (dsh)</text>
-  <text x="820" y="416" class="mono-sm">~/.dsh</text>
-  <text x="820" y="437" class="body">• 同步 AGENTS.md（留尾段）与 skills/</text>
-  <text x="820" y="456" class="body">• 安装器不改 .credentials.yaml</text>
-  <text x="820" y="475" class="body">• 复用官方 OAuth 或 DEEPSEEK_API_KEY</text>
-  <text x="820" y="494" class="body">• 无头调用生成临时 --patch 激活凭据</text>
-  <text x="820" y="513" class="body">• 剥离外层代码围栏与尾随 DSML 标记</text>
-  <text x="820" y="534" class="body">• 支持单端直连起步与配额冷却接替</text>
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="1158" viewBox="0 0 1440 1158" role="img" aria-labelledby="title desc">
+  <title id="title">四客户端配置与全通道派工架构</title>
+  <desc id="desc">稳定执行机制与动态配置分开维护；长期启停决策与日常可用性复查分开执行。</desc>
+  <defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M 0 1 L 8 5 L 0 9" fill="none" stroke="#64748b" stroke-width="1.5"/></marker></defs>
+  <style>text { font-family: "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; fill: #23354d; } .title { font-size: 28px; font-weight: 700; } .subtitle { font-size: 17px; fill: #52657b; } .heading { font-size: 21px; font-weight: 700; } .body { font-size: 16px; } .link { fill: none; stroke: #64748b; stroke-width: 2; marker-end: url(#arrow); }</style>
+  <rect width="1440" height="1158" fill="#f3f6fb"/>
+  <text x="32" y="49" class="title">四客户端配置与全通道派工架构</text>
+  <text x="32" y="80" class="subtitle">稳定执行机制与动态配置分开维护；长期启停决策与日常可用性复查分开执行。</text>
+  <path class="link" d="M 367 274 L 367 304"/>
+  <path class="link" d="M 1073 274 L 1073 304"/>
+  <path class="link" d="M 720 430 L 720 460"/>
+  <path class="link" d="M 720 610 L 720 640"/>
+  <path class="link" d="M 367 806 L 367 836"/>
+  <path class="link" d="M 1073 806 L 1073 836"/>
+  <path class="link" d="M 367 968 L 367 998"/>
+  <path class="link" d="M 1073 968 L 1073 998"/>
+  <g><rect x="32" y="112" width="670" height="162" rx="14" fill="#ffffff" stroke="#b5c8e5"/>
+    <text x="54" y="146" class="heading">常驻机制：规则、钩子与验证入口</text>
+    <text x="54" y="177" class="body">全局规则与 readonly-* 代理约束工程边界。</text>
+    <text x="54" y="203" class="body">install.py 分发模板；cae_harness.py 组织后台验证。</text>
+    <text x="54" y="229" class="body">交互主会话保留用户选择的模型与推理强度。</text>
+  </g>
+  <g><rect x="738" y="112" width="670" height="162" rx="14" fill="#ffffff" stroke="#b5c8e5"/>
+    <text x="760" y="146" class="heading">动态来源：fleet_profile.json</text>
+    <text x="760" y="177" class="body">五角色：orchestrator、math、code、review、fast。</text>
+    <text x="760" y="203" class="body">runtime_tunables 集中维护运行参数。</text>
+    <text x="760" y="229" class="body">subscription_matrix 与 capability_ledger 分别记录启停和性能。</text>
+  </g>
+  <g><rect x="32" y="304" width="1376" height="126" rx="14" fill="#f3efff" stroke="#b8a7dc"/>
+    <text x="54" y="338" class="heading">第一道门：独立维护与用户拍板</text>
+    <text x="54" y="369" class="body">fleet-evolve 联网评估能力，展示本机可用性与额度类型；用户决定 agent 和 LLM 启停。</text>
+    <text x="54" y="395" class="body">subscription_matrix 中 enabled: false 的项全局跳过；日常派工不联网更新性能。</text>
+  </g>
+  <g><rect x="32" y="460" width="1376" height="150" rx="14" fill="#eefaf4" stroke="#81bfa0"/>
+    <text x="54" y="494" class="heading">第二道门：plan 弹卡前离线复查</text>
+    <text x="54" y="525" class="body">核对程序、凭据配置、所需路由存活和当前运行侧冷却。</text>
+    <text x="54" y="551" class="body">读取本机可得的滚动窗口百分比与重置时间、卡片套餐或余额类型、日月限额。</text>
+    <text x="54" y="577" class="body">过滤不可用或超限通道；未知信息保持未知，不推断服务端实时余额。</text>
+  </g>
+  <g><rect x="32" y="640" width="1376" height="166" rx="14" fill="#fff8e9" stroke="#d7b265"/>
+    <text x="54" y="674" class="heading">全通道重负载确认：用户点名 P0 与角色入口并列</text>
+    <text x="54" y="705" class="body">plan 生成人话背景、目标、预计后果与 14 列完整矩阵，列全模型、权限、额度和回执位置。</text>
+    <text x="54" y="731" class="body">显示 last_online_refresh_at 与 local_bench_verified_at；选项为批准、微调后批准、暂缓并交接。</text>
+    <text x="54" y="757" class="body">批准后以 --approve-ticket 登记；PreToolUse 检查票据并拦截裸 CLI 旁路。</text>
+    <text x="54" y="783" class="body">点名锁定已指定维度；窗口、非委派挡位、无头标志、行号内联与快照按实际通道补齐。</text>
+  </g>
+  <g><rect x="32" y="836" width="670" height="132" rx="14" fill="#ffffff" stroke="#b5c8e5"/>
+    <text x="54" y="870" class="heading">外部通道：cae-harness 无头子进程</text>
+    <text x="54" y="901" class="body">batch 仅执行 cae_harness_headless，按后端限制并发。</text>
+    <text x="54" y="927" class="body">只读快照与行号内联；可写绑定范围及验收命令。</text>
+    <text x="54" y="953" class="body">DSH 按命令能力适配权限参数与补丁。</text>
+  </g>
+  <g><rect x="738" y="836" width="670" height="132" rx="14" fill="#ffffff" stroke="#b5c8e5"/>
+    <text x="760" y="870" class="heading">内部通道：客户端原生子代理与工作流</text>
+    <text x="760" y="901" class="body">native_subagent、native_workflow、native_swarm。</text>
+    <text x="760" y="927" class="body">inherit 显示解析结果；多路或可写委派纳入确认。</text>
+    <text x="760" y="953" class="body">由对应客户端执行，不交给 batch，不声明净室隔离。</text>
+  </g>
+  <g><rect x="32" y="998" width="1376" height="132" rx="14" fill="#eefaf4" stroke="#81bfa0"/>
+    <text x="54" y="1032" class="heading">事件恢复、交接与完成核验</text>
+    <text x="54" y="1063" class="body">Codex 五事件：SessionStart、PostCompact、UserPromptSubmit、PreToolUse、Stop。</text>
+    <text x="54" y="1089" class="body">压缩后常规摘要与未决专项计划分开恢复；强制交接 Stop 检查【新对话提示词】和选项卡。</text>
+    <text x="54" y="1115" class="body">完工 Stop 按外部与原生规则检查成败词、Token 说明及回执或轨迹标识；主会话逐路核对状态与汇总。</text>
+  </g>
 </svg>
