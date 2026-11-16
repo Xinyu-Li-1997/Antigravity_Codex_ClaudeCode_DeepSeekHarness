@@ -1,5 +1,7 @@
 # 面向科学计算与工程研发的四客户端配置与验证工具
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.XXXXXXX.svg)](https://doi.org/10.5281/zenodo.XXXXXXX)
+
 本仓库 `Antigravity_Codex_ClaudeCode_DeepSeekHarness` 为 **Google Antigravity**（`agy`）、**OpenAI Codex**（`codex`）、**Claude Code**（`claude` 或 `cc`）与 **DeepSeek Harness**（`dsh`）提供一套**共用的全局工程规则、会话生命周期门禁、只读审查代理与跨客户端无头验证机制**。全仓仅依赖 Python 3.11+ 标准库，支持 Windows、WSL2 与 Linux；**只安装任意一个客户端即可独立工作**，多端并存时可按各自专长协同推导、编码与审查。
 
 全文分为**用户层**（快速安装、用户明确点名与角色选路、配置仓库自我更新）与**原理层**（常驻机制与动态配置解耦、共有生命周期门禁与四客户端协议适配）上下两篇，底层细节通过指针跳转查阅：
