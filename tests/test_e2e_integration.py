@@ -396,7 +396,11 @@ class TestEndToEndIntegration(unittest.TestCase):
             try:
                 content = path.read_text(encoding="utf-8")
             except UnicodeDecodeError:
-                self.fail(f"non-UTF8 file: {rel_name}")
+                # RFC 3161 时间戳查询与响应是 DER 二进制；按单字节解码后仍继续扫描敏感信息，
+                # 其余文件继续要求 UTF-8，避免以放宽编码要求换取通过。
+                if path.suffix.lower() not in {".tsq", ".tsr"}:
+                    self.fail(f"non-UTF8 file: {rel_name}")
+                content = path.read_bytes().decode("latin-1")
             checked_count += 1
             findings = _sensitive_findings(content, home_variants, user_name, hostname)
             self.assertEqual(findings, [], f"{rel_name}: {', '.join(findings)}")

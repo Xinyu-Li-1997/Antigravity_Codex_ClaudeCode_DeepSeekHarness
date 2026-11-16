@@ -5031,11 +5031,11 @@ def _fleet_profile_summary():
 
 _GROUNDING_GENERIC_ACRONYMS = frozenset({
     'API', 'CLI', 'CPU', 'GPU', 'RAM', 'OOM', 'ROM', 'SSD', 'SSH', 'SSL', 'TLS', 'TCP', 'UDP', 'DNS', 'URL', 'URI',
-    'HTTP', 'HTTPS', 'JSON', 'JSONL', 'YAML', 'TOML', 'XML', 'HTML', 'CSS', 'SVG', 'PNG', 'JPG', 'PDF', 'UTF', 'BOM',
-    'CRLF', 'EOF', 'EOL', 'AST', 'PID', 'TID', 'UID', 'GID', 'WSL', 'POSIX', 'GNU', 'MIT', 'BSD', 'SHA', 'RSA',
+    'HTTP', 'HTTPS', 'JSON', 'JSONL', 'YAML', 'TOML', 'XML', 'HTML', 'CSS', 'SVG', 'PNG', 'JPG', 'PDF', 'DER', 'UTF',
+    'BOM', 'CRLF', 'EOF', 'EOL', 'AST', 'PID', 'TID', 'UID', 'GID', 'WSL', 'POSIX', 'GNU', 'MIT', 'BSD', 'SHA', 'RSA',
     'LLM', 'IDE', 'SDK', 'MCP', 'SSE', 'RPC', 'IPC', 'ABI', 'ENV', 'CWD', 'TMP', 'DIR', 'WIN', 'MAC', 'APP',
     'PRO', 'MAX', 'MIN', 'AVG', 'TTL', 'LRU', 'RPM', 'TPM', 'QPS', 'TUN', 'NAT', 'LAN', 'WAN', 'VPN', 'RFC', 'ISO',
-    'UTC', 'GMT', 'CSC', 'ASCII', 'OAUTH',
+    'DOI', 'UTC', 'GMT', 'CSC', 'ASCII', 'OAUTH',
 })
 
 _GROUNDING_EXTERNAL_CLIS = frozenset({
