@@ -6134,6 +6134,143 @@ else:
         self.assertEqual(cnt_scoped, 1)
         self.assertLess(tok_scoped, tok_dir)
 
+    def test_agy_carbon_main_neon_coding_and_native_swarm_routing(self):
+        engines = self.four_backends()
+        engines['agy']['models'] = [
+            {'slug': 'gemini-4-neon-xhigh', 'display_name': 'Gemini 4 Neon (XHigh)'},
+            {'slug': 'gemini-4-neon-high', 'display_name': 'Gemini 4 Neon (High)'},
+            {'slug': 'gemini-4-neon-medium', 'display_name': 'Gemini 4 Neon (Medium)'},
+            {'slug': 'gemini-4-neon-low', 'display_name': 'Gemini 4 Neon (Low)'},
+            {'slug': 'gemini-4-carbon-high', 'display_name': 'Gemini 4 Carbon (High)'},
+            {'slug': 'gemini-4-carbon-medium', 'display_name': 'Gemini 4 Carbon (Medium)'},
+            {'slug': 'gemini-4-carbon-low', 'display_name': 'Gemini 4 Carbon (Low)'},
+            {'slug': 'gemini-4-argon-high', 'display_name': 'Gemini 4 Argon (High)'},
+            {'slug': 'gemini-4-hydrogen-xhigh', 'display_name': 'Gemini 4 Hydrogen (XHigh)'},
+            {'slug': 'gemini-4-hydrogen-low', 'display_name': 'Gemini 4 Hydrogen (Low)'},
+            {'slug': 'gemini-pro-orchestrator-neon', 'display_name': 'Orchestrator (Neon)'},
+            {'slug': 'gemini-pro-orchestrator', 'display_name': 'Orchestrator (Carbon)'},
+        ]
+
+        # 1) 外部无头路由：主控/审查/数理默认低幻觉 carbon，编码与门禁自动路由 neon，省额度路由 hydrogen
+        orch = harness.resolve_execution_profile(engines, 'agy:@orchestrator', 'high', '需求权衡与统筹', kind='review')
+        rev = harness.resolve_execution_profile(engines, 'agy:@review', 'max', '逐行审查离散边界条件', kind='review')
+        rev_deep = harness.resolve_execution_profile(engines, 'agy:default', 'max', '仔细核查 DGSEM 熵守恒边界', kind='review')
+        math_p = harness.resolve_execution_profile(engines, 'agy:@math', 'max', '推导 Roe 通量雅可比矩阵', kind='math')
+        pol_p = harness.resolve_execution_profile(engines, 'agy:default', 'medium', '润色段落', kind='polish')
+        self.assertEqual((orch['model'], orch['profile_source']), ('gemini-4-carbon-high', 'role_specialty_orchestrator'))
+        self.assertEqual((rev['model'], rev['profile_source']), ('gemini-4-carbon-high', 'role_specialty_review'))
+        self.assertEqual((rev_deep['model'], rev_deep['profile_source']), ('gemini-4-carbon-high', 'specialty_deep_reasoning'))
+        self.assertEqual((math_p['model'], math_p['profile_source']), ('gemini-4-carbon-high', 'role_specialty_math'))
+        self.assertEqual((pol_p['model'], pol_p['profile_source']), ('gemini-4-carbon-medium', 'frontier_catalog'))
+
+        code_role = harness.resolve_execution_profile(engines, 'agy:@code', 'max', '实现稀疏矩阵装配', kind='code')
+        code_def = harness.resolve_execution_profile(engines, 'agy:default', 'max', '实现稀疏矩阵装配', kind='code')
+        gate_def = harness.resolve_execution_profile(engines, 'agy:default', 'max', '修复并验证单元测试', kind='gate')
+        code_low = harness.resolve_execution_profile(engines, 'agy:@code', 'low', '显式编码角色降挡', kind='code')
+        fast_role = harness.resolve_execution_profile(engines, 'agy:@fast', 'low', '省额度快检', kind='review')
+        self.assertEqual((code_role['model'], code_role['reasoning_effort'], code_role['profile_source']),
+                         ('gemini-4-neon-xhigh', 'xhigh', 'role_specialty_code'))
+        self.assertEqual((code_def['model'], code_def['profile_source']), ('gemini-4-neon-xhigh', 'frontier_catalog'))
+        self.assertEqual((gate_def['model'], gate_def['profile_source']), ('gemini-4-neon-xhigh', 'frontier_catalog'))
+        self.assertEqual((code_low['model'], code_low['profile_source']), ('gemini-4-neon-low', 'role_specialty_code'))
+        self.assertEqual((fast_role['model'], fast_role['profile_source']), ('gemini-4-hydrogen-low', 'role_specialty_fast'))
+
+        # P0 显式/口语点名仍优先覆盖自动专长分流
+        p0_neon_rev = harness.resolve_execution_profile(engines, 'agy:neon', 'max', '显式点名 neon 审查', kind='review')
+        p0_carbon_code = harness.resolve_execution_profile(engines, 'agy:carbon', 'max', '显式点名 carbon 编码', kind='code')
+        p0_fuzzy = harness.resolve_execution_profile(engines, 'agy:default', 'max', '请调用 neon 模型审查', kind='review')
+        self.assertEqual(p0_neon_rev['model'], 'gemini-4-neon-xhigh')
+        self.assertEqual(p0_carbon_code['model'], 'gemini-4-carbon-high')
+        self.assertEqual((p0_fuzzy['model'], p0_fuzzy['profile_source']), ('gemini-4-neon-xhigh', 'prompt_fuzzy_model'))
+
+        # role:code 在 codex 不可用且跨端选路时，agy:@code 排在 claude/dsh 之前并路由至 gemini-4-neon-xhigh
+        no_codex = {k: dict(v) for k, v in engines.items()}
+        no_codex['codex'] = {**engines['codex'], 'available': False}
+        chosen_spec = harness.choose_engine(no_codex, 'dsh', 'role:code', '多文件编码实现')
+        self.assertEqual(chosen_spec, 'agy:@code')
+        chosen_prof = harness.resolve_execution_profile(no_codex, chosen_spec, 'max', '多文件编码实现', kind='code')
+        self.assertEqual(chosen_prof['model'], 'gemini-4-neon-xhigh')
+
+        # 2) 内部原生 native_swarm：code/gate 自动推荐 Neon High（可审批与微调），review/显式 inherit/P0/native_subagent 保持 inherit
+        target = self.root / 'swarm_mod.py'
+        target.write_text('def solve():\n    return 1\n', encoding='utf-8')
+        plans = self.root / 'swarm_plans'
+        agy_home = Path(engines['agy']['config_home'])
+        (agy_home / 'config').mkdir(parents=True, exist_ok=True)
+        (agy_home / 'config' / 'config.json').write_text(
+            json.dumps({'userSettings': {'model': 'Gemini 4 Carbon (High)'}}), encoding='utf-8',
+        )
+        common = ['--caller', 'antigravity', '--plan-dir', str(plans), '--target', str(target), '--timeout', '120']
+        with patch.object(harness, '_args_backends', return_value=engines):
+            _, sw_code = self.capture(
+                harness.cmd_plan,
+                self.args('plan', *common, '--channel', 'native_swarm', '--kind', 'code',
+                          '--write-scope', 'swarm_mod.py', '--verify-cmd', 'python -B swarm_mod.py',
+                          '--save-ticket', '--full-json'),
+            )
+            s1 = sw_code['streams'][0]
+            self.assertEqual(s1['model'], 'gemini-4-neon-high')
+            self.assertEqual(s1['tier'], 'high')
+            self.assertIn('Gemini 4 Neon (High)', s1['model_display'])
+            self.assertEqual(s1['execution_profile']['profile_source'], 'native_swarm_worker_profile')
+
+            # 直接批准与微调 tier -> xhigh 均无漂移报错
+            _, sw_approved = self.capture(
+                harness.cmd_plan,
+                self.args('plan', '--caller', 'antigravity', '--plan-dir', str(plans),
+                          '--approve-ticket', sw_code['ticket_id'], '--full-json'),
+            )
+            self.assertEqual(sw_approved['status'], 'APPROVED')
+            self.assertEqual(sw_approved['streams'][0]['model'], 'gemini-4-neon-high')
+
+            _, sw_code2 = self.capture(
+                harness.cmd_plan,
+                self.args('plan', *common, '--channel', 'native_swarm', '--kind', 'code',
+                          '--write-scope', 'swarm_mod.py', '--save-ticket', '--full-json'),
+            )
+            _, sw_ov = self.capture(
+                harness.cmd_plan,
+                self.args('plan', '--caller', 'antigravity', '--plan-dir', str(plans),
+                          '--approve-ticket', sw_code2['ticket_id'],
+                          '--override-json', '{"S1":{"tier":"xhigh"}}', '--full-json'),
+            )
+            self.assertEqual(sw_ov['status'], 'APPROVED')
+            self.assertEqual(sw_ov['streams'][0]['model'], 'gemini-4-neon-xhigh')
+            self.assertEqual(sw_ov['streams'][0]['tier'], 'xhigh')
+
+            # gate + 显式 --tier xhigh 命中 gemini-4-neon-xhigh
+            _, sw_gate = self.capture(
+                harness.cmd_plan,
+                self.args('plan', *common, '--channel', 'native_swarm', '--kind', 'gate', '--tier', 'xhigh',
+                          '--write-scope', 'swarm_mod.py', '--verify-cmd', 'python -B swarm_mod.py', '--full-json'),
+            )
+            self.assertEqual(sw_gate['streams'][0]['model'], 'gemini-4-neon-xhigh')
+
+            # review（Swarm verifier）、显式 --model inherit、P0 点名 carbon 与 native_subagent 均保持 inherit
+            _, sw_rev = self.capture(
+                harness.cmd_plan,
+                self.args('plan', *common, '--channel', 'native_swarm', '--kind', 'review', '--full-json'),
+            )
+            self.assertEqual(sw_rev['streams'][0]['model_display'], 'inherit (Gemini 4 Carbon (High))')
+            _, sw_inh = self.capture(
+                harness.cmd_plan,
+                self.args('plan', *common, '--channel', 'native_swarm', '--kind', 'code',
+                          '--model', 'inherit', '--write-scope', 'swarm_mod.py', '--full-json'),
+            )
+            self.assertEqual(sw_inh['streams'][0]['model_display'], 'inherit (Gemini 4 Carbon (High))')
+            _, sw_p0 = self.capture(
+                harness.cmd_plan,
+                self.args('plan', *common, '--channel', 'native_swarm', '--kind', 'code',
+                          '--user-prompt', '请用 carbon 模型跑 swarm', '--write-scope', 'swarm_mod.py', '--full-json'),
+            )
+            self.assertEqual(sw_p0['streams'][0]['model_display'], 'inherit (Gemini 4 Carbon (High))')
+            _, sub_code = self.capture(
+                harness.cmd_plan,
+                self.args('plan', *common, '--channel', 'native_subagent', '--kind', 'code',
+                          '--write-scope', 'swarm_mod.py', '--full-json'),
+            )
+            self.assertEqual(sub_code['streams'][0]['model_display'], 'inherit (Gemini 4 Carbon (High))')
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

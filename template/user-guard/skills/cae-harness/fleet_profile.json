@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "profile_id": "fleet-snapshot-v2",
-  "evaluated_at": "2026-11-19",
+  "evaluated_at": "2026-11-20",
   "evaluation_policy": {
     "bidirectional_strength_and_defect_audit": true,
     "all_roles_dynamic": true,
@@ -25,10 +25,10 @@
         "dsh:@orchestrator"
       ],
       "recommended_client": "antigravity",
-      "recommended_model_family": "neon",
+      "recommended_model_family": "carbon",
       "recommended_tier": "high",
-      "strengths": "现阶段中文工程表达自然平实，适合承担课题需求澄清、物理与数值方案权衡及主会话统筹；Gemini 4 Neon 提供 Low、Medium、High、XHigh 四挡与 1,000,000 token 窗口，吞吐速度约为同代 Carbon 的两倍，在编码代理与科学终端基准领先，CLI 支持流式 JSON 与原生 --json-schema 结构化输出校验，直接使用客户端订阅的模型组滚动配额（5 小时窗口与 7 天周期额度），无需单独按量采购 API；同代 Carbon 保持启用供深度抗幻觉核查点名调用。",
-      "defects_and_mitigations": "交互式会话在约 20 万至 26 万 token 附近会触发自动检查点压缩，且 agy models 命令不输出整数窗口字段；Neon 在极长上下文召回与无工具幻觉率上略逊于 Carbon。通过 R9 钩子按 runtime_tunables.compaction_recovery.per_client.antigravity 与 hooks/_lib/adaptive_policy.py 动态恢复历轮用户原话与实质子代理返回摘要，在 cae_harness.py 中按保守单分片预算规划审查，辅以 R6 原文行号复核与 check-grounding --strict，并通过 blocked_auto_tokens 与 agy_retiring_patterns 跳过共享窗口复合模式及待退役第三方模型。"
+      "strengths": "现阶段中文工程表达自然平实，无工具事实幻觉率与超长上下文召回表现更稳健，适合承担课题需求澄清、架构权衡、论文/技术文档重写与主会话统筹；Gemini 4 Carbon 提供 Low、Medium、High 三挡与 1,000,000 token 窗口，CLI 支持流式 JSON 与原生 --json-schema 结构化输出校验，直接使用客户端订阅的模型组滚动配额（5 小时窗口与 7 天周期额度），无需单独按量采购 API。同代 Gemini 4 Neon 保持启用，在外部编码代理（agy:@code，XHigh）与内部 Swarm 并行编码 worker（native_swarm，High）承担高速实现角色。",
+      "defects_and_mitigations": "交互式会话在约 20 万至 26 万 token 附近会触发自动检查点压缩，且 agy models 命令不输出整数窗口字段；Carbon 输出吞吐与代理编码速度慢于同代 Neon。通过 R9 钩子按 runtime_tunables.compaction_recovery.per_client.antigravity 与 hooks/_lib/adaptive_policy.py 动态恢复历轮用户原话与实质子代理返回摘要，在 cae_harness.py 中按保守单分片预算规划审查，将编码代理与并行编码 worker 按角色分流至 Neon，并继续以 R6 原文行号复核、check-grounding --strict 及 blocked_auto_tokens / agy_retiring_patterns 保证事实准确与跳过复合/待退役模型。"
     },
     "math": {
       "candidates": [
@@ -48,14 +48,14 @@
       "candidates": [
         "codex:code",
         "codex:math",
-        "claude:code",
         "agy:@code",
+        "claude:code",
         "dsh:code"
       ],
       "recommended_client": "codex",
       "recommended_model_family": "sol",
       "recommended_tier": "max",
-      "strengths": "现阶段主力 gpt-6.2-sol 适合核心数值求解器实现、跨模块重构以及配合验证命令（gate --verify-cmd）执行多轮闭环修复；客户端缓存声明最大窗口 872,000 token（单分片安全预算 745,560 token），多文件补丁修改稳定且输出更精炼。",
+      "strengths": "现阶段主力 gpt-6.2-sol 适合核心数值求解器实现、跨模块重构以及配合验证命令（gate --verify-cmd）执行多轮闭环修复；客户端缓存声明最大窗口 872,000 token（单分片安全预算 745,560 token），多文件补丁修改稳定且输出更精炼。跨端编码备选 agy:@code 通过 client_catalog_rules.agy.code_families 自动路由至 Gemini 4 Neon（XHigh，1,000,000 token 窗口），适合高吞吐代码实现与受验证命令约束的闭环修改。",
       "defects_and_mitigations": "客户端缓存默认推理强度为 low、默认窗口为 500,000 token，且在 Windows 下无范围遍历大型目录时易因进程调用开销触发超时；脚本显式传入 max 挡位与最大窗口，派发任务须配合 --write-scope 与精确行号限定范围。"
     },
     "review": {
@@ -68,7 +68,7 @@
       "recommended_client": "codex",
       "recommended_model_family": "sol",
       "recommended_tier": "max",
-      "strengths": "现阶段独立代码与文档审查优先跨客户端调用 Codex gpt-6.2-sol（872,000 token 窗口）、DeepSeek Harness 内置 DeepSeek-V4-Pro（1,048,576 token 窗口）及 Antigravity neon/carbon 系列；Claude Code 客户端保留完整的五类生命周期钩子、原生 --json-schema 结构化输出校验及本地 router.py 与 CC Switch 卡片通道，按 subscription_matrix 中已启用的卡片模型参与调度。",
+      "strengths": "现阶段独立代码与文档审查优先跨客户端调用 Codex gpt-6.2-sol（872,000 token 窗口）、DeepSeek Harness 内置 DeepSeek-V4-Pro（1,048,576 token 窗口）及 Antigravity carbon 系列（agy:@review 与深度审查默认选低幻觉 carbon，neon 按显式点名或编码角色调用）；Claude Code 客户端保留完整的五类生命周期钩子、原生 --json-schema 结构化输出校验及本地 router.py 与 CC Switch 卡片通道，按 subscription_matrix 中已启用的卡片模型参与调度。",
       "defects_and_mitigations": "Claude Code 当前启用的 DeepSeek 卡片为轻量模型 deepseek-flash[1M]，由脚本硬性拦截其冒充非 fast 审查角色主力；严禁接入第三方 Responses API 协议转换反代，无头只读调用固定附加 --permission-mode dontAsk 以规避 auto 分类器限流报错。"
     },
     "fast": {
@@ -87,9 +87,17 @@
   },
   "native_agent_profiles": {
     "antigravity": {
-      "main_model_family": "neon",
+      "main_model_family": "carbon",
       "main_tier": "high",
-      "fallback_model_family": "carbon",
+      "fallback_model_family": "neon",
+      "coding_agent_model_family": "neon",
+      "coding_agent_tier": "xhigh",
+      "swarm_worker_model_family": "neon",
+      "swarm_worker_tier": "high",
+      "swarm_worker_kinds": [
+        "code",
+        "gate"
+      ],
       "subagent_mechanisms": [
         "invoke_subagent",
         "run_workflow",
@@ -102,7 +110,7 @@
         "readonly-reader"
       ],
       "hook_protocol": "plugin_lifecycle_hooks",
-      "notes": "主会话保留用户前端选择；原生只读代理默认继承当前主会话模型，swarm add 按 tasks 长度或 n 精确计入票据容量。"
+      "notes": "主会话保留用户前端选择（推荐低幻觉 Carbon High）；invoke_subagent 与 run_workflow 仅支持 inherit/pro/flash/flash_lite 抽象挡，只读代理保持 inherit 跟随主控；native_swarm 承担 code/gate 并行实现 worker 时由 plan 推荐 Neon High（经用户确认后在 swarm add 显式传入 model），Swarm 协调器与审查 verifier 仍保持 inherit；外部无头编码角色 agy:@code 由 code_families 自动路由至 Neon XHigh。"
     },
     "codex": {
       "main_model": "gpt-6.2-sol",
@@ -168,10 +176,16 @@
   "client_catalog_rules": {
     "agy": {
       "family_priority": [
-        "neon",
         "carbon",
+        "neon",
         "argon",
         "pro"
+      ],
+      "code_families": [
+        "neon"
+      ],
+      "deep_families": [
+        "carbon"
       ],
       "fast_tags": [
         "lite",
@@ -462,13 +476,13 @@
     }
   },
   "capability_ledger": {
-    "last_online_refresh_at": "2026-11-19",
+    "last_online_refresh_at": "2026-11-20",
     "local_bench_verified_at": "2026-11-19",
     "online_refresh_module": "fleet-evolve",
     "dispatch_online_lookup": false
   },
   "subscription_matrix": {
-    "decided_at": "2026-11-19",
+    "decided_at": "2026-11-20",
     "agents": {
       "agy": {
         "enabled": true,
@@ -549,14 +563,14 @@
         "enabled": true,
         "context_window": 1000000,
         "quota_scheme": "rolling_window_5h_7d",
-        "offline_perf_note": "主会话总控、编码代理与高效工程协作主力，支持 Low/Medium/High/XHigh 四挡"
+        "offline_perf_note": "高吞吐编码代理与并行实现主力（外部 agy:@code 默认 XHigh、内部 native_swarm 编码 worker 默认 High），须配合测试或行号核验防止事实幻觉"
       },
       "gemini-4-carbon": {
         "agent": "agy",
         "enabled": true,
         "context_window": 1000000,
         "quota_scheme": "rolling_window_5h_7d",
-        "offline_perf_note": "深度长程推演与低幻觉核查模型，保留启用供深度任务点名调用"
+        "offline_perf_note": "低幻觉主会话总控、深度推理与独立审查主力（agy:@orchestrator/@math/@review 默认 High），支持 Low/Medium/High 三挡"
       },
       "gemini-4-hydrogen": {
         "agent": "agy",

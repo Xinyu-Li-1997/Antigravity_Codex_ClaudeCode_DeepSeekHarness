@@ -2,6 +2,19 @@
 
 本文件记录四客户端共用规则、会话钩子、后台验证工具与上游维护流程的版本演进。当前插件版本以 `template/user-guard/plugin.json` 为准；常驻使用文档只说明机制和配置键，不重复维护版本号与性能日期。
 
+## [1.17.3] - 2026-11-20
+
+结合长周期科研总控与高频编码代理的评测及实战边界，完成 Antigravity 主控与内外子代理编排专长分流优化：
+
+- **元配置驱动的 `agy` 无头专长选模与内部 `native_swarm` 编码分流（`cae_harness.py`、`cae-harness/SKILL.md`）**：
+  - 新增无模型名硬编码辅助函数 `_pick_agy_tagged_family`，在 `resolve_execution_profile` 中对 `code`/`gate` 优先匹配 `client_catalog_rules.agy.code_families`，对 `math`/`direction` 及高复杂度 `review` 优先匹配 `deep_families`（未配置或未命中时回退既有 `family_priority` 与非委派最高强度选择），修正此前深度推导与高复杂度审查仅按最高强度后缀而误选高速编码系列的问题；
+  - 新增 `_native_swarm_worker_model` 并在 `_resolve_plan_streams` 及 `--approve-ticket --override-json` 中接入：当 `native_swarm` 在 `native_agent_profiles` 中配置了 `swarm_worker_model_family` 与 `swarm_worker_kinds`（`code`、`gate`）且未显式指定 `--model` 或用户模型点名时，确认单自动推荐对应高速编码模型（默认 `swarm_worker_tier`，支持挡位微调且审批无漂移），而 `review` 验收代理、`invoke_subagent` 与 `run_workflow` 保持 `inherit` 继承主控模型。
+- **动态角色矩阵与内生代理档案更新（`fleet_profile.json`、`README.md`、`tests/`）**：
+  - 将 `roles.orchestrator`、`native_agent_profiles.antigravity.main_model_family` 与 `client_catalog_rules.agy.family_priority` 首位更新为低幻觉 `carbon` 系列（`high`），配置 `deep_families: ["carbon"]`、`code_families: ["neon"]`，并将 `agy:@code`（自动路由 `neon` `xhigh`）提升至 `roles.code.candidates` 跨端编码第一备选；
+  - 在 `native_agent_profiles.antigravity` 登记 `coding_agent_model_family`（`xhigh`）与 `swarm_worker_model_family`（`high`）及 `swarm_worker_kinds`，同步 `README.md` 五角色示例表，将 `neon` 纳入常驻文档禁硬编码检查，并新增完整外部无头与内部 `native_swarm` 审批/微调回归测试。
+
+---
+
 ## [1.17.2] - 2026-11-20
 
 修复运行态子代理并发计数、AST 静态审查指数膨胀、大目录全盘扫盘与多路选项卡重复注入等缺陷，并合入远端跨环境兼容修复（Windows `CC Switch` 桌面识别、WSL2 代理编码容错与 Python 3.14 深层 JSON 嵌套预检）：

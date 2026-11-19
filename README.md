@@ -140,10 +140,10 @@ python -B -X utf8 install.py --audit-upgrade     # 4. 检查各端配置是否�
 
 | 角色名称 | 随附配置示例客户端与模型系列 | 推荐强度 | 适用任务与边界 |
 | --- | --- | --- | --- |
-| `orchestrator` | Antigravity，`neon` 系列（保留 `carbon` 供深度抗幻觉核查点名） | `high` | 主对话需求沟通、方案权衡与任务统筹；配置矩阵声明大窗口，并由 `adaptive_policy.py` 按窗口与强度动态规划预算（高难度无头子任务可调用 `xhigh`） |
+| `orchestrator` | Antigravity，`carbon` 系列（低幻觉主控；编码代理与并行实现分流至 `neon`） | `high` | 主对话需求沟通、方案权衡、技术文档重写与任务统筹；配置矩阵声明大窗口，并由 `adaptive_policy.py` 按窗口与强度动态规划预算 |
 | `math` | Codex，`astra` 系列 | `max` | PDE 离散格式推导、守恒与熵稳定证明；显式传入声明最大窗口，跳过 `ultra` 自动委派挡（常规分片亦可按需指定 `high` 兼顾单轮耗时） |
-| `code` | Codex，`sol` 系列 | `max` | 核心求解器编码与 `gate --verify-cmd` 测试验证；限制 `--write-scope` 可写文件范围 |
-| `review` | Codex `sol` 系列（备选含 DSH、Antigravity `neon`/`carbon`、Claude Code） | `max` | 优先跨客户端交叉审查（同端 `readonly-*` 仅做摘录与行号初筛）；拒绝用轻量模型替代主力审查 |
+| `code` | Codex `sol` 系列（跨端备选含 Antigravity `agy:@code` 路由 `neon` `xhigh`；内部 `native_swarm` 编码 worker 推荐 `neon` `high`） | `max` | 核心求解器编码与 `gate --verify-cmd` 测试验证；限制 `--write-scope` 可写文件范围并配合测试验收 |
+| `review` | Codex `sol` 系列（备选含 DSH、Antigravity `carbon`、Claude Code） | `max` | 优先跨客户端交叉审查（同端 `readonly-*` 继承主控模型，仅做摘录与行号初筛）；拒绝用轻量模型替代主力审查 |
 | `fast` | DeepSeek Harness，`deepseek-flash` 系列 | `low` | 用户要求节省额度或做表面格式初筛；不用于核心数学与代码正确性审查 |
 
 ### 2. 共用钩子脚本与四端事件映射

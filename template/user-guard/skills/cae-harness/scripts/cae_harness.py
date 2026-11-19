@@ -1720,6 +1720,15 @@ def _agy_family_order(name):
     return tuple(-v for v in (version + (0, 0, 0))[:3]), priority, name
 
 
+def _pick_agy_tagged_family(candidates, configured_tags):
+    tags = [str(tag).strip().lower() for tag in (configured_tags or ()) if str(tag).strip()]
+    for tag in tags:
+        for name in candidates:
+            if tag in _tokens_lower(name):
+                return name
+    return None
+
+
 def _match_effort_level(supported, target_tier, delegating_efforts=None):
     """max 表示目录声明的最高非委派挡；仅显式 ultra 可以放行委派挡。"""
     valid = [item for item in supported if item in EFFORT_LADDER]
@@ -2368,15 +2377,23 @@ def resolve_execution_profile(backends, spec, tier='max', prompt_text='', kind='
                                 error='未找到原生旗舰模型，请刷新目录或显式指定模型。')
             normal = normal or eligible
             chosen, source = normal[0], 'frontier_catalog'
+            agy_rules = _catalog_rules('agy')
             if role_target == 'fast' or (not role_target and tier == 'low' and not forbid_lightweight):
                 fast = [name for name in eligible if is_fast(name)]
                 if fast:
                     chosen, source = fast[0], 'specialty_fast_lightweight'
+            elif kind in ('code', 'gate'):
+                top_gen = _agy_family_order(normal[0])[0]
+                top_normal = [name for name in normal if _agy_family_order(name)[0] == top_gen]
+                code_pick = _pick_agy_tagged_family(top_normal, agy_rules.get('code_families'))
+                if code_pick:
+                    chosen = code_pick
             elif kind in ('math', 'direction') or (kind == 'review' and tier != 'low'
                                                   and _has_positive_cue(prompt_text, HIGH_COMPLEXITY_CUES)):
                 top_gen = _agy_family_order(normal[0])[0]
                 top_normal = [name for name in normal if _agy_family_order(name)[0] == top_gen]
-                chosen = max(top_normal, key=lambda name: EFFORT_LADDER.index(
+                deep_pick = _pick_agy_tagged_family(top_normal, agy_rules.get('deep_families'))
+                chosen = deep_pick or max(top_normal, key=lambda name: EFFORT_LADDER.index(
                     _agy_slug_tier(_match_agy_family(families[name], tier)['slug'])[1]))
                 source = 'specialty_deep_reasoning'
             record = _match_agy_family(families[chosen], tier)
@@ -7923,6 +7940,37 @@ def _native_plan_model(prefix, info, requested_model, agent_type=''):
     return model, display, home, config
 
 
+def _native_swarm_worker_model(prefix, info, kind, raw_tier=''):
+    """当 native_swarm 配置了专长 worker 模型且当前流未显式锁定模型时，按目录解析对应模型。"""
+    native_cfg = _native_agent_profile(prefix)
+    worker_family = str(native_cfg.get('swarm_worker_model_family') or '').strip().lower()
+    worker_kinds = {str(k).strip().lower() for k in (native_cfg.get('swarm_worker_kinds') or ()) if str(k).strip()}
+    if not worker_family or kind not in worker_kinds:
+        return None, None, None
+    default_tier = str(native_cfg.get('swarm_worker_tier') or 'high').strip().lower() or 'high'
+    target_tier = raw_tier if raw_tier and raw_tier != 'auto' else default_tier
+    if prefix == 'agy':
+        agy_blocked = {str(t).lower() for t in (_catalog_rules('agy').get('blocked_auto_tokens') or ())}
+        native_models = [
+            item for item in info.get('models', [])
+            if _model_category('agy', item) == 'native'
+            and _is_subscription_enabled('agy', item.get('slug', ''))
+            and not (_tokens_lower(f"{item.get('slug', '')} {item.get('display_name', '')}") & agy_blocked)
+        ]
+        families = _agy_families(native_models)
+        eligible = sorted((name for name in families if _match_agy_family(families[name], target_tier)), key=_agy_family_order)
+        chosen = _pick_agy_tagged_family(eligible, [worker_family])
+        if chosen:
+            record = _match_agy_family(families[chosen], target_tier)
+            slug = record.get('slug')
+            if slug:
+                label = record.get('display_name') or slug
+                _, resolved_tier = _agy_slug_tier(slug)
+                display = f'{slug} (native_swarm 编码专长推荐；swarm add 传入 model="{label}")'
+                return slug, display, resolved_tier or target_tier
+    return None, None, None
+
+
 def _plan_stream_details(args, stream, profile, prefix, channel):
     native = channel != 'cae_harness_headless'
     readonly = stream['kind'] not in ('code', 'gate')
@@ -8020,18 +8068,41 @@ def _resolve_plan_streams(args, streams, backends):
             if prefix not in ('codex', 'agy', 'claude', 'dsh'):
                 raise HarnessError('原生通道必须指定或识别 caller 客户端')
             info = backends.get(prefix, {})
-            requested_model = requested_model or 'inherit'
+            raw_requested_model = requested_model
             native_agent_type = stream.get('agent_type') or getattr(args, 'agent_type', '') or 'self'
-            model, display, home, config = _native_plan_model(prefix, info, requested_model, agent_type=native_agent_type)
+            raw_tier_arg = stream.get('tier') or args.tier
             if override_tier:
                 sub_sample = stream.get('subtask', '')
-                tier, _ = select_task_tier(
-                    stream.get('tier') or args.tier, kind,
+                tier, tier_reason = select_task_tier(
+                    raw_tier_arg, kind,
                     '' if sub_sample == user_text else sub_sample, count, tokens,
                 )
             else:
-                tier, _ = _resolve_effective_tier(stream.get('tier') or args.tier, kind, user_text, text,
-                                                  file_count=count, estimated_tokens=tokens)
+                tier, tier_reason = _resolve_effective_tier(raw_tier_arg, kind, user_text, text,
+                                                            file_count=count, estimated_tokens=tokens)
+            swarm_model, swarm_display, swarm_tier = (None, None, None)
+            if (channel == 'native_swarm' and not raw_requested_model
+                    and not _extract_prompt_model_hint(user_text)):
+                explicit_swarm_tier = (
+                    tier if (override_tier or raw_tier_arg not in ('', 'auto')
+                             or tier_reason.startswith(('user_description_', 'economy_')))
+                    else ''
+                )
+                if override_tier and raw_tier_arg == 'auto' and not tier_reason.startswith(('user_description_', 'economy_')):
+                    explicit_swarm_tier = ''
+                swarm_model, swarm_display, swarm_tier = _native_swarm_worker_model(
+                    prefix, info, kind, explicit_swarm_tier,
+                )
+            if swarm_model:
+                _, _, home, config = _native_plan_model(prefix, info, 'inherit', agent_type=native_agent_type)
+                model, display = swarm_model, swarm_display
+                tier = swarm_tier or tier
+                requested_model = ''
+                profile_source = 'native_swarm_worker_profile'
+            else:
+                requested_model = raw_requested_model or 'inherit'
+                model, display, home, config = _native_plan_model(prefix, info, requested_model, agent_type=native_agent_type)
+                profile_source = 'native_frontend_config'
             record = _exact_model_record(info.get('models', []), model) if model else {}
             capacity = _execution_budget(prefix, info, record or {})
             if prefix == 'codex' and model and model == config.get('model'):
@@ -8039,7 +8110,7 @@ def _resolve_plan_streams(args, streams, backends):
                                                      or capacity['selected_window_tokens'])
             engine = prefix + ':' + (model or 'default')
             profile = {'spec': engine, 'model': model, 'tier': tier, 'capacity': capacity,
-                       'profile_source': 'native_frontend_config'}
+                       'profile_source': profile_source}
             native_cfg = _native_agent_profile(prefix)
             if native_cfg:
                 profile['native_agent_profile'] = native_cfg
@@ -8505,12 +8576,31 @@ def cmd_plan(args):
                         if stream.get('channel', 'cae_harness_headless') != 'cae_harness_headless':
                             if 'tier' in override:
                                 sub_sample = stream.get('subtask', '')
-                                tier, _ = select_task_tier(
+                                tier, tier_reason = select_task_tier(
                                     stream['tier'], stream['kind'],
                                     '' if sub_sample == args.user_prompt else sub_sample,
                                     stream.get('file_count', 1), stream.get('estimated_tokens', 0),
                                 )
                                 core['tier'] = tier
+                                if (stream.get('channel') == 'native_swarm'
+                                        and not stream.get('requested_model')
+                                        and not _extract_prompt_model_hint(args.user_prompt)):
+                                    caller_p = resolve_caller(stream.get('caller') or args.caller)
+                                    p_prefix = 'agy' if caller_p == 'antigravity' else caller_p
+                                    eff_swarm_tier = (
+                                        '' if stream['tier'] == 'auto'
+                                        and not tier_reason.startswith(('user_description_', 'economy_'))
+                                        else tier
+                                    )
+                                    sm, _, st = _native_swarm_worker_model(
+                                        p_prefix, backends.get(p_prefix, {}), stream['kind'], eff_swarm_tier,
+                                    )
+                                    if sm:
+                                        core['model'] = sm
+                                        core['engine'] = p_prefix + ':' + sm
+                                        core['tier'] = st or tier
+                                        profile_core['model'] = sm
+                                        profile_core['spec'] = p_prefix + ':' + sm
                             continue
                         locked_model_target = False
                         if 'engine' in override:

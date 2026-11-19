@@ -81,7 +81,7 @@ HARDWARE_PATTERNS = (
 UUID_PATTERN = re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.I)
 POSIX_DEVICE_PATTERN = re.compile("/de" + r"v/(?:null|zero|full|random|urandom|tty|stdin|stdout|stderr|fd|shm|pts)\b", re.I)
 SEASONAL_MODEL_PATTERN = re.compile(
-    r"\b(?:astra|sol|terra|carbon|argon|hydrogen|luna|k3\.1-pro|deepseek-v4|deepseek-flash)\b",
+    r"\b(?:astra|sol|terra|carbon|neon|argon|hydrogen|luna|k3\.1-pro|deepseek-v4|deepseek-flash)\b",
     re.I,
 )
 GIT_ENV_KEYS = frozenset({
@@ -2943,7 +2943,7 @@ raise SystemExit(module.main(sys.argv[3:]))
 
         # 常驻规则与技能说明中严禁硬编码季节性模型名
         seasonal_re = re.compile(
-            r"\b(?:astra|sol|terra|carbon|argon|hydrogen|luna|k3\.1-pro|deepseek-v4|deepseek-flash)\b",
+            r"\b(?:astra|sol|terra|carbon|neon|argon|hydrogen|luna|k3\.1-pro|deepseek-v4|deepseek-flash)\b",
             re.I,
         )
         for permanent_doc in (
