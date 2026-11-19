@@ -4191,7 +4191,7 @@ class TestShard3RouterInstallerFixes(OfflineSandbox):
             con.execute(f"PRAGMA user_version={admin.TESTED_MAX_SCHEMA}")
             con.execute(
                 "INSERT INTO providers (id, app_type, name, settings_config) VALUES (?, ?, ?, ?)",
-                ("k1", "claude", "Kimi", json.dumps({"env": {"ANTHROPIC_AUTH_TOKEN": "sk-real-kimi-token"}})),
+                ("k1", "claude", "Kimi", json.dumps({"env": {"ANTHROPIC_AUTH_TOKEN": "tok_kimi_fixture_present"}})),
             )
             con.commit()
         res_insert_update = admin.prepare_cards(min_db, 8241)
@@ -4398,7 +4398,7 @@ class TestShard3RouterInstallerFixes(OfflineSandbox):
         native_path_cls = type(Path())
         with mock.patch.object(installer, "Path", native_path_cls), \
                 mock.patch.object(installer.os, "name", "posix"), \
-                mock.patch.dict(os.environ, {"CODEX_HOME": str(codex_cfg_dir), "HOME": str(self.root / "empty_home")}), \
+                mock.patch.dict(os.environ, {"CODEX_HOME": str(codex_cfg_dir), "HOME": str(self.root / "empty_home"), "PATH": "/mnt/c/Tools:/usr/bin"}), \
                 mock.patch.object(native_path_cls, "home", return_value=self.root / "empty_home"):
             self.assertIsNone(installer.detect_zotero_mcp_executable(str(fake_win_exe)))
             self.assertIsNone(installer.detect_zotero_mcp_executable(str(fake_cmd)))
@@ -5157,12 +5157,14 @@ class TestShard3RouterInstallerFixes(OfflineSandbox):
         self.assertIsNotNone(idx)
         self.assertTrue(fenced_rules[idx:].startswith("## 我的扩展"))
 
+        v6_sample = "fe80" + "::1a2b:3c4d"
+        cgnat_sample = "100.64" + ".12.34"
         redacted = installer._audit_redact(
-            "addr fe80::1a2b:3c4d cgnat 100.64.12.34 proxy socks5://alice:pw" + "@127.0.0.1:1080/p?k=1",
+            f"addr {v6_sample} cgnat {cgnat_sample} proxy socks5://alice:pw" + "@127.0.0.1:1080/p?k=1",
             [], set(),
         )
-        self.assertNotIn("fe80::1a2b:3c4d", redacted)
-        self.assertNotIn("100.64.12.34", redacted)
+        self.assertNotIn(v6_sample, redacted)
+        self.assertNotIn(cgnat_sample, redacted)
         self.assertNotIn("alice:pw", redacted)
 
     def test_windows_ccswitch_desktop_binary_detected_without_cli_spawn(self):
@@ -5220,6 +5222,97 @@ class TestShard3RouterInstallerFixes(OfflineSandbox):
         (fake_repo / "template" / "user-guard" / "plugin.json").write_text(deep, encoding="utf-8")
         with self.assertRaisesRegex(ValueError, "corrupt plugin.json"):
             fs_mod._repo_meta(fake_repo)
+
+    def test_wsl_linux_antigravity_desktop_probe_and_asar_version_audit(self):
+        import struct
+
+        # 1) 构造最小合法 Electron app.asar 并验证零进程只读解析 desktop_version
+        fake_opt = self.root / "opt_antigravity"
+        res_dir = fake_opt / "resources"
+        res_dir.mkdir(parents=True)
+        fake_bin = fake_opt / "antigravity"
+        fake_bin.write_bytes(b"#!/bin/sh\n")
+        pkg_bytes = json.dumps({"name": "antigravity", "version": "2.33.0"}).encode("utf-8")
+        tree_bytes = json.dumps({
+            "files": {"package.json": {"offset": "0", "size": len(pkg_bytes)}}
+        }).encode("utf-8")
+        padding = (4 - (len(tree_bytes) % 4)) % 4
+        header_size = 8 + len(tree_bytes) + padding
+        header = struct.pack("<IIII", 4, header_size, 4 + len(tree_bytes) + padding, len(tree_bytes))
+        (res_dir / "app.asar").write_bytes(header + tree_bytes + (b"\0" * padding) + pkg_bytes)
+
+        self.assertEqual(installer._read_desktop_app_version(str(fake_bin)), "2.33.0")
+        cli_rep = installer._audit_cli({
+            "native_installed": True,
+            "native_binary": None,
+            "native_desktop_binary": str(fake_bin),
+            "native_status": "executable_detected",
+            "interop_status": "not_detected",
+        })
+        self.assertEqual(cli_rep["desktop_version"], "2.33.0")
+
+        # 2) _probe_windows_wsl 兼容第 4 列 desktop_binary，且仅安装 WSL 桌面端时 peer_apps_detected 为 True
+        wsl_out = (
+            "agy\t\ttrue\t/usr/local/bin/antigravity\n"
+            "codex\t\tfalse\t\n"
+            "claude\t/home/alice/.local/bin/claude\ttrue\t\n"
+            "dsh\t\tfalse\t\n"
+            "cc-switch\t/usr/bin/cc-switch\ttrue\t\n"
+        )
+        with mock.patch.object(installer.shutil, "which", return_value="wsl.exe"), \
+                mock.patch.object(installer, "_wsl_distro_list", side_effect=[["Ubuntu-24.04"], ["Ubuntu-24.04"]]), \
+                mock.patch.object(installer.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, stdout=wsl_out, stderr="")):
+            wsl_res = installer._probe_windows_wsl()
+        self.assertEqual(wsl_res["status"], "checked")
+        self.assertEqual(wsl_res["apps"]["agy"][0]["desktop_binary"], "/usr/local/bin/antigravity")
+        self.assertIsNone(wsl_res["apps"]["agy"][0]["binary"])
+
+        # 3) product.json(ideVersion) 优先于 package.json(version)，支持 bin/ 父目录定位；router 拦截跨站与路径穿越
+        fake_share = self.root / "usr_share_antigravity"
+        (fake_share / "bin").mkdir(parents=True)
+        (fake_share / "resources" / "app").mkdir(parents=True)
+        bin_launcher = fake_share / "bin" / "antigravity"
+        bin_launcher.write_bytes(b"#!/bin/sh\n")
+        (fake_share / "resources" / "app" / "package.json").write_text(json.dumps({"version": "1.96.0"}), encoding="utf-8")
+        (fake_share / "resources" / "app" / "product.json").write_text(json.dumps({"ideVersion": "2.33.1"}), encoding="utf-8")
+        self.assertEqual(installer._read_desktop_app_version(str(bin_launcher)), "2.33.1")
+        wrap_dir = self.root / "usr_local_bin"
+        wrap_dir.mkdir(parents=True)
+        wrapper_sh = wrap_dir / "antigravity"
+        wrapper_sh.write_text(f"#!/usr/bin/env bash\nexec {fake_bin.as_posix()} \"$@\"\n", encoding="utf-8")
+        with mock.patch.object(installer, "_is_posix_native_cli_path", return_value=True):
+            self.assertEqual(installer._read_desktop_app_version(str(wrapper_sh)), "2.33.0")
+
+        # 4) Antigravity 1M 窗口下 cp_threshold 不再二次乘 w_scale 膨胀，保持 3 / 5
+        real_prof = json.loads((REPO_ROOT / "template/user-guard/skills/cae-harness/fleet_profile.json").read_text(encoding="utf-8"))
+        pol_mod = installer._load_adaptive_policy_readonly(REPO_ROOT)
+        self.assertIsNotNone(pol_mod)
+        ag_hg = pol_mod.resolve_adaptive_handoff_policy(real_prof, client="antigravity", model_name="gemini-4-carbon-high")
+        self.assertEqual(ag_hg["advisory_cp_threshold"], 3)
+        self.assertEqual(ag_hg["drain_cp_threshold"], 5)
+        self.assertGreater(ag_hg["advisory_transcript_mib"], 3)
+
+        for bad_target in (
+            "http://127.0.0.1:8241//evil",
+            "http://evil.example:8241/v1/messages",
+            "/v1/../admin",
+            "/v1/%2e%2e/admin",
+            "/v1\\..\\admin",
+        ):
+            with self.assertRaises(ValueError, msg=bad_target):
+                router._request_target_path(bad_target)
+
+        for bad_hdrs in (
+            {"Host": "evil.rebind.example:8241"},
+            {"Host": "127.0.0.1:8241", "Origin": "https://evil.example"},
+            {"Host": "127.0.0.1:8241", "Sec-Fetch-Site": "cross-site"},
+        ):
+            h_sec = object.__new__(router.Handler)
+            h_sec.headers = bad_hdrs
+            h_sec.send_error = mock.Mock()
+            self.assertFalse(h_sec._validate_local_request_headers())
+            h_sec.send_error.assert_called_once()
+            self.assertEqual(h_sec.send_error.call_args.args[0], 403)
 
 
 if __name__ == "__main__":

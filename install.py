@@ -25,6 +25,7 @@ import shlex
 import shutil
 import stat
 import sqlite3
+import struct
 import subprocess
 import sys
 import tempfile
@@ -103,6 +104,20 @@ def _default_claude_effort(repo_root: Optional[Path] = None) -> str:
     return val if val in {"low", "medium", "high", "xhigh", "max"} else "xhigh"
 
 
+def _load_adaptive_policy_readonly(repo_root: Optional[Path] = None) -> Optional[ModuleType]:
+    base_root = Path(repo_root) if repo_root is not None else Path(__file__).resolve().parent
+    policy_path = base_root / "template/user-guard/hooks/_lib/adaptive_policy.py"
+    if not policy_path.is_file():
+        return None
+    try:
+        mod = ModuleType("_install_adaptive_policy")
+        mod.__file__ = str(policy_path)
+        exec(compile(policy_path.read_text(encoding="utf-8"), str(policy_path), "exec"), mod.__dict__)
+        return mod
+    except (OSError, SyntaxError, ValueError, RuntimeError):
+        return None
+
+
 def _default_handoff_policy(
     client: str,
     repo_root: Optional[Path] = None,
@@ -111,26 +126,22 @@ def _default_handoff_policy(
     explicit_window: Optional[int] = None,
 ) -> Tuple[str, int]:
     profile = _load_fleet_profile(repo_root)
-    hooks_lib_parent = (repo_root / "template/user-guard/hooks") if repo_root is not None else (Path(__file__).resolve().parent / "template/user-guard/hooks")
-    if hooks_lib_parent.is_dir() and str(hooks_lib_parent) not in sys.path:
-        sys.path.insert(0, str(hooks_lib_parent))
-    try:
-        from _lib import adaptive_policy  # type: ignore
+    adaptive_policy = _load_adaptive_policy_readonly(repo_root)
+    if adaptive_policy is not None:
         resolved = adaptive_policy.resolve_adaptive_handoff_policy(
             profile, client, model_name=model_name, effort=effort, explicit_window=explicit_window,
         )
         return str(resolved["default_mode"]), int(resolved["default_compact_limit"])
-    except ImportError:
-        tunables = profile.get("runtime_tunables")
-        ht = tunables.get("handoff_thresholds") if isinstance(tunables, dict) else None
-        cfg = ht.get(client) if isinstance(ht, dict) else None
-        if not isinstance(cfg, dict):
-            return "advisory", 0
-        raw_mode = str(cfg.get("default_mode") or "advisory").strip().lower()
-        mode = raw_mode if raw_mode in {"advisory", "enforce", "off"} else "advisory"
-        raw_lim = cfg.get("default_compact_limit")
-        limit = int(raw_lim) if isinstance(raw_lim, int) and not isinstance(raw_lim, bool) and raw_lim >= 0 else 0
-        return mode, limit
+    tunables = profile.get("runtime_tunables")
+    ht = tunables.get("handoff_thresholds") if isinstance(tunables, dict) else None
+    cfg = ht.get(client) if isinstance(ht, dict) else None
+    if not isinstance(cfg, dict):
+        return "advisory", 0
+    raw_mode = str(cfg.get("default_mode") or "advisory").strip().lower()
+    mode = raw_mode if raw_mode in {"advisory", "enforce", "off"} else "advisory"
+    raw_lim = cfg.get("default_compact_limit")
+    limit = int(raw_lim) if isinstance(raw_lim, int) and not isinstance(raw_lim, bool) and raw_lim >= 0 else 0
+    return mode, limit
 
 
 def _is_mnt_windows_path(path_str: Optional[str]) -> bool:
@@ -789,23 +800,25 @@ def _decode_wsl_reg_output(raw: bytes, reg_exe: str, reg_cwd: Optional[str]) -> 
     if raw.isascii():
         return raw.decode("ascii")
     try:
-        cp_proc = subprocess.run(
-            [reg_exe, "query", r"HKLM\SYSTEM\CurrentControlSet\Control\Nls\CodePage", "/v", "ACP"],
-            cwd=reg_cwd,
-            capture_output=True,
-            timeout=5,
-        )
-        if cp_proc.returncode == 0:
-            cp_match = re.search(rb"ACP\s+REG_SZ\s+([0-9]+)", cp_proc.stdout)
-            if cp_match:
-                acp = cp_match.group(1).decode("ascii")
-                return raw.decode("utf-8" if acp == "65001" else f"cp{acp}")
-    except (LookupError, OSError, subprocess.SubprocessError, UnicodeDecodeError):
-        return None
-    try:
         return raw.decode("utf-8")
     except UnicodeDecodeError:
-        return None
+        pass
+    for value_name in ("OEMCP", "ACP"):
+        try:
+            cp_proc = subprocess.run(
+                [reg_exe, "query", r"HKLM\SYSTEM\CurrentControlSet\Control\Nls\CodePage", "/v", value_name],
+                cwd=reg_cwd,
+                capture_output=True,
+                timeout=5,
+            )
+            if cp_proc.returncode == 0:
+                cp_match = re.search(rf"{value_name}\s+REG_SZ\s+([0-9]+)".encode("ascii"), cp_proc.stdout)
+                if cp_match:
+                    cp_num = cp_match.group(1).decode("ascii")
+                    return raw.decode("utf-8" if cp_num == "65001" else f"cp{cp_num}")
+        except (LookupError, OSError, subprocess.SubprocessError, UnicodeDecodeError):
+            continue
+    return None
 
 
 def _find_wsl_windows_codex_package() -> Tuple[Optional[str], Optional[str]]:
@@ -874,14 +887,20 @@ def _probe_wsl_windows_profile_dir() -> Optional[Path]:
         return None
     try:
         profile = subprocess.run(
-            [cmd_exe, "/d", "/u", "/c", "echo", "%USERPROFILE%"],
+            [cmd_exe, "/d", "/u", "/c", "set", "USERPROFILE"],
             cwd=str(Path(cmd_exe).parent),
             capture_output=True,
             text=True,
             encoding="utf-16-le",
             timeout=5,
         )
-        win_profile = profile.stdout.strip().lstrip("\ufeff")
+        raw_out = profile.stdout.strip().lstrip("\ufeff")
+        win_profile = raw_out
+        for line in raw_out.splitlines():
+            clean_line = line.strip()
+            if clean_line.upper().startswith("USERPROFILE="):
+                win_profile = clean_line.split("=", 1)[1].strip()
+                break
         if profile.returncode != 0 or not PureWindowsPath(win_profile).is_absolute():
             return None
         converted = subprocess.run(
@@ -931,23 +950,35 @@ def _probe_windows_wsl() -> Dict[str, Any]:
 
     # --exec 不加载交互配置，不运行被探测的 CLI。
     script = (
+        'is_native() { '
+        '  local p="$1" r; [ -n "$p" ] && [ -f "$p" ] && [ -x "$p" ] || return 1; '
+        '  r=$(readlink -f "$p" 2>/dev/null || printf "%s" "$p"); '
+        '  case "$r" in /*) case "$r" in /mnt/[a-zA-Z]/*|*.[eE][xX][eE]|*.[cC][mM][dD]|*.[bB][aA][tT]) return 1;; esac;; *) return 1;; esac; '
+        '  return 0; '
+        '}; '
         'for name in agy codex claude dsh cc-switch; do '
-        '  bin=$(command -v "$name"); '
+        '  bin=; '
         '  for candidate in "$HOME/.gemini/bin/$name" "$HOME/.local/bin/$name" "$HOME/.cargo/bin/$name" '
         '    "$HOME/.npm-global/bin/$name" "/usr/local/bin/$name" "/usr/bin/$name" '
-        '    "/opt/DeepSeek Harness/resources/runtime/cli/bin/$name"; do '
-        '    if [ -f "$candidate" ] && [ -x "$candidate" ]; then bin=$candidate; break; fi; '
+        '    "/opt/DeepSeek Harness/resources/runtime/cli/bin/$name" "$(command -v "$name" 2>/dev/null)"; do '
+        '    if is_native "$candidate"; then bin=$candidate; break; fi; '
         '  done; '
-        '  resolved=$(readlink -f "$bin" 2>/dev/null || printf "%s" "$bin"); '
-        '  case "$resolved" in /*) case "$resolved" in /mnt/[a-zA-Z]/*|*.exe|*.cmd|*.bat) bin=;; esac;; *) bin=;; esac; '
+        '  desk=; '
+        '  if [ "$name" = agy ]; then '
+        '    for dcand in "$HOME/.local/bin/antigravity" "/usr/local/bin/antigravity" "/usr/bin/antigravity" '
+        '      "/usr/share/antigravity/antigravity" "/opt/antigravity/antigravity" "/opt/Antigravity/antigravity"; do '
+        '      if is_native "$dcand"; then desk=$dcand; break; fi; '
+        '    done; '
+        '  fi; '
         '  trace=false; '
         '  if [ "$name" = agy ]; then '
-        '    [ -d "$HOME/.gemini/config" ] || [ -d "$HOME/.gemini/antigravity-cli" ] || [ -d "$HOME/.gemini/antigravity" ]; '
+        '    [ -d "$HOME/.gemini/config" ] || [ -d "$HOME/.gemini/antigravity-cli" ] '
+        '      || [ -d "$HOME/.gemini/antigravity" ] || [ -d "$HOME/.config/Antigravity" ]; '
         '  elif [ "$name" = codex ]; then [ -d "$HOME/.codex" ]; '
         '  elif [ "$name" = claude ]; then [ -d "$HOME/.claude" ]; '
         '  elif [ "$name" = dsh ]; then [ -d "$HOME/.dsh" ]; '
         '  else [ -f "$HOME/.cc-switch/cc-switch.db" ]; fi && trace=true; '
-        '  printf "%s\\t%s\\t%s\\n" "$name" "$bin" "$trace"; '
+        '  printf "%s\\t%s\\t%s\\t%s\\n" "$name" "$bin" "$trace" "$desk"; '
         'done'
     )
     complete = set(installed) == set(running)
@@ -962,11 +993,17 @@ def _probe_windows_wsl() -> Dict[str, Any]:
                 continue
             for line in probe.stdout.splitlines():
                 fields = line.split("\t")
-                if len(fields) == 3 and fields[0] in {"agy", "codex", "claude", "dsh", "cc-switch"}:
-                    name, binary, trace = fields
-                    result["apps"].setdefault(name, []).append(
-                        {"distro": distro, "binary": binary or None, "config_dir_exists": trace == "true"}
-                    )
+                if len(fields) in (3, 4) and fields[0] in {"agy", "codex", "claude", "dsh", "cc-switch"}:
+                    name, binary, trace = fields[0], fields[1], fields[2]
+                    desktop_bin = fields[3] if len(fields) == 4 else ""
+                    entry: Dict[str, Any] = {
+                        "distro": distro,
+                        "binary": binary or None,
+                        "config_dir_exists": trace == "true",
+                    }
+                    if desktop_bin:
+                        entry["desktop_binary"] = desktop_bin
+                    result["apps"].setdefault(name, []).append(entry)
             if any(not any(item["distro"] == distro for item in result["apps"].get(name, [])) for name in ("agy", "codex", "claude", "dsh", "cc-switch")):
                 complete = False
         except (OSError, ValueError, subprocess.SubprocessError):
@@ -1022,6 +1059,32 @@ def detect_installed_apps() -> Dict[str, Any]:
     windows_home = _probe_wsl_windows_profile_dir() if wsl else None
     wsl_probe = _probe_windows_wsl() if os.name == "nt" else None
 
+    def _prefer_codex_package_binaries(
+        cur_cli: Optional[str],
+        cur_desktop: Optional[str],
+        pkg_cli: Optional[str],
+        pkg_desktop: Optional[str],
+        user_home: Optional[Path],
+    ) -> Tuple[Optional[str], Optional[str]]:
+        standalone_bins = set()
+        if user_home is not None:
+            for user_bin in (user_home / ".local" / "bin" / "codex.exe", user_home / ".cargo" / "bin" / "codex.exe"):
+                try:
+                    standalone_bins.add(str(user_bin.resolve()).lower())
+                except OSError:
+                    standalone_bins.add(str(user_bin).lower())
+        cli_norm = ""
+        if cur_cli:
+            try:
+                cli_norm = str(Path(cur_cli).resolve()).lower()
+            except OSError:
+                cli_norm = cur_cli.lower()
+        if pkg_cli and (not cur_cli or (cli_norm not in standalone_bins and _newer_executable(pkg_cli, cur_cli))):
+            cur_cli = pkg_cli
+        if pkg_desktop and (not cur_desktop or _newer_executable(pkg_desktop, cur_desktop)):
+            cur_desktop = pkg_desktop
+        return cur_cli, cur_desktop
+
     def app_info(name: str, config_dir_exists: bool) -> Dict[str, Any]:
         cli = _native_cli(name, home)
         desktop = None
@@ -1030,24 +1093,17 @@ def detect_installed_apps() -> Dict[str, Any]:
             _, desktop = _windows_app_binaries(home, local_app, name)
             if name == "codex":
                 pkg_cli, pkg_desktop = _find_windows_codex_package()
-                standalone_bins = set()
-                for user_bin in (home / ".local" / "bin" / "codex.exe", home / ".cargo" / "bin" / "codex.exe"):
-                    try:
-                        standalone_bins.add(str(user_bin.resolve()).lower())
-                    except OSError:
-                        standalone_bins.add(str(user_bin).lower())
-                cli_norm = ""
-                if cli:
-                    try:
-                        cli_norm = str(Path(cli).resolve()).lower()
-                    except OSError:
-                        cli_norm = cli.lower()
-                if pkg_cli and (not cli or (cli_norm not in standalone_bins and _newer_executable(pkg_cli, cli))):
-                    cli = pkg_cli
-                if pkg_desktop and (not desktop or _newer_executable(pkg_desktop, desktop)):
-                    desktop = pkg_desktop
+                cli, desktop = _prefer_codex_package_binaries(cli, desktop, pkg_cli, pkg_desktop, home)
         elif name == "agy":
-            desktop = _first_executable([Path("/usr/bin/antigravity"), Path("/opt/Antigravity/antigravity")])
+            cand_desk = _first_executable([
+                home / ".local/bin/antigravity",
+                Path("/usr/local/bin/antigravity"),
+                Path("/usr/bin/antigravity"),
+                Path("/usr/share/antigravity/antigravity"),
+                Path("/opt/antigravity/antigravity"),
+                Path("/opt/Antigravity/antigravity"),
+            ])
+            desktop = cand_desk if _is_posix_native_cli_path(cand_desk) else None
 
         evidence = []
         interop_complete = not wsl
@@ -1066,23 +1122,7 @@ def detect_installed_apps() -> Dict[str, Any]:
                 trace = (windows_home / config_name).is_dir()
             if name == "codex":
                 pkg_cli, pkg_desktop = _find_wsl_windows_codex_package()
-                standalone_bins = set()
-                if windows_home is not None:
-                    for user_bin in (windows_home / ".local" / "bin" / "codex.exe", windows_home / ".cargo" / "bin" / "codex.exe"):
-                        try:
-                            standalone_bins.add(str(user_bin.resolve()).lower())
-                        except OSError:
-                            standalone_bins.add(str(user_bin).lower())
-                win_cli_norm = ""
-                if win_cli:
-                    try:
-                        win_cli_norm = str(Path(win_cli).resolve()).lower()
-                    except OSError:
-                        win_cli_norm = win_cli.lower()
-                if pkg_cli and (not win_cli or (win_cli_norm not in standalone_bins and _newer_executable(pkg_cli, win_cli))):
-                    win_cli = pkg_cli
-                if pkg_desktop and (not win_desktop or _newer_executable(pkg_desktop, win_desktop)):
-                    win_desktop = pkg_desktop
+                win_cli, win_desktop = _prefer_codex_package_binaries(win_cli, win_desktop, pkg_cli, pkg_desktop, windows_home)
             evidence.append({"binary": win_cli, "desktop_binary": win_desktop, "config_dir_exists": trace})
         elif wsl_probe is not None:
             evidence = wsl_probe["apps"].get(name, [])
@@ -1101,7 +1141,11 @@ def detect_installed_apps() -> Dict[str, Any]:
             "authentication_status": "not_checked",
         }
 
-    ag = app_info("agy", any((gemini_root / sub).is_dir() for sub in ("antigravity", "antigravity-cli", "config")))
+    ag = app_info(
+        "agy",
+        any((gemini_root / sub).is_dir() for sub in ("antigravity", "antigravity-cli", "config"))
+        or (os.name != "nt" and (home / ".config" / "Antigravity").is_dir()),
+    )
     cx = app_info("codex", codex_root.is_dir())
     cl = app_info("claude", claude_root.is_dir())
     dsh = app_info("dsh", dsh_root.is_dir())
@@ -1232,18 +1276,7 @@ def detect_hook_python_command(*, antigravity: bool = False) -> str:
 
 
 def _is_usable_zotero_binary(path_str: Optional[str]) -> bool:
-    if not path_str:
-        return False
-    if os.name != "nt":
-        if _is_mnt_windows_path(path_str) or path_str.lower().endswith((".exe", ".cmd", ".bat")):
-            return False
-        try:
-            resolved = str(Path(path_str).resolve())
-        except OSError:
-            return False
-        if _is_mnt_windows_path(resolved) or resolved.lower().endswith((".exe", ".cmd", ".bat")):
-            return False
-    return True
+    return bool(path_str) and (os.name == "nt" or _is_posix_native_cli_path(path_str))
 
 
 def detect_zotero_mcp_executable(explicit_cmd: str = "") -> Optional[str]:
@@ -1527,13 +1560,14 @@ def mirror_sync_plugin(
     if not target_plugin_dir.exists():
         return
 
-    stale_files = _stale_mirror_files(template_dir, target_plugin_dir, expected_rel_files)
-    stale_dirs = []
-    for existing in sorted(target_plugin_dir.rglob("*")):
-        if existing.is_dir():
-            rel = existing.relative_to(target_plugin_dir)
-            if existing.name == "__pycache__" and not any(parent.name == "__pycache__" for parent in rel.parents):
-                stale_dirs.append(existing)
+    if not dry_run:
+        stale_files = _stale_mirror_files(template_dir, target_plugin_dir, expected_rel_files)
+        stale_dirs = []
+        for existing in sorted(target_plugin_dir.rglob("*")):
+            if existing.is_dir():
+                rel = existing.relative_to(target_plugin_dir)
+                if existing.name == "__pycache__" and not any(parent.name == "__pycache__" for parent in rel.parents):
+                    stale_dirs.append(existing)
 
     for stale_file in stale_files:
         rel = stale_file.relative_to(target_plugin_dir)
@@ -2710,7 +2744,7 @@ def _sync_cc_router(template_dir: Path, claude_root: Path, dry_run: bool = False
     for source, target in _cc_router_files(template_dir, claude_root):
         original, content = _read_optional_bytes(target), source.read_bytes()
         if target.name == "router.json" and original is None:
-            config = json.loads(content)
+            config = json.loads(content.decode("utf-8-sig"))
             repo_root = template_dir.parent.parent.parent
             router = _load_fleet_profile(repo_root).get("runtime_tunables", {}).get("headless_dispatch", {}).get("router", {})
             port = router.get("port" if os.name == "nt" else "wsl_port", config.get("port"))
@@ -2786,11 +2820,95 @@ def _validate_claude_assets(repo_root: Path, claude_root: Path, args: argparse.N
 # 七、零写入升级体检
 
 
+def _read_desktop_app_version(desktop_binary: Optional[str]) -> Optional[str]:
+    """纯文件只读提取桌面应用包版本（不启动 GUI 进程）。"""
+    if not desktop_binary:
+        return None
+    try:
+        real_bin = Path(desktop_binary).resolve()
+    except OSError:
+        real_bin = Path(desktop_binary)
+    def _append_bin_roots(bin_path: Path, out_roots: List[Path]) -> None:
+        for r in ([bin_path.parent] + ([bin_path.parent.parent] if bin_path.parent.name.lower() == "bin" and bin_path.parent.parent != bin_path.parent else [])):
+            if r not in out_roots:
+                out_roots.append(r)
+
+    candidate_roots: List[Path] = []
+    _append_bin_roots(real_bin, candidate_roots)
+    try:
+        if real_bin.is_file() and not _is_link_or_junction(real_bin) and 0 < real_bin.stat().st_size <= 65536:
+            head_bytes = real_bin.read_bytes()
+            if head_bytes.startswith(b"#!"):
+                script_txt = head_bytes.decode("utf-8", errors="ignore")
+                bin_stem = re.escape(real_bin.stem)
+                for m_exec in re.finditer(rf"((?:[A-Za-z]:)?(?:/[A-Za-z0-9_./-]+)+/{bin_stem})\b", script_txt, re.I):
+                    exec_cand = Path(m_exec.group(1))
+                    if os.name == "nt" or _is_posix_native_cli_path(str(exec_cand)):
+                        try:
+                            _append_bin_roots(exec_cand.resolve(), candidate_roots)
+                        except OSError:
+                            _append_bin_roots(exec_cand, candidate_roots)
+    except OSError:
+        pass
+    for app_root in candidate_roots:
+        res_dir = app_root / "resources"
+        if _is_link_or_junction(res_dir):
+            continue
+        for rel, prefer_ide_only in (("resources/app/product.json", True), ("resources/app/package.json", False)):
+            cand = app_root / rel
+            try:
+                if (
+                    cand.is_file()
+                    and not _is_link_or_junction(cand)
+                    and not _is_link_or_junction(cand.parent)
+                    and cand.stat().st_size <= 2 * 1024 * 1024
+                ):
+                    doc = json.loads(cand.read_text(encoding="utf-8-sig"))
+                    if isinstance(doc, dict):
+                        ver = doc.get("ideVersion") if prefer_ide_only else (doc.get("ideVersion") or doc.get("version"))
+                        if isinstance(ver, str) and ver.strip():
+                            return ver.strip()
+            except (OSError, ValueError, TypeError, RecursionError):
+                continue
+        asar = res_dir / "app.asar"
+        try:
+            if asar.is_file() and not _is_link_or_junction(asar):
+                with asar.open("rb") as handle:
+                    header = handle.read(16)
+                    if len(header) != 16:
+                        continue
+                    pickle0, header_size, _, json_len = struct.unpack("<IIII", header)
+                    if pickle0 != 4 or not (0 < json_len <= 16 * 1024 * 1024 and json_len + 8 <= header_size <= 32 * 1024 * 1024):
+                        continue
+                    tree = json.loads(handle.read(json_len).decode("utf-8-sig"))
+                    files = tree.get("files") if isinstance(tree, dict) else None
+                    if not isinstance(files, dict):
+                        continue
+                    for entry_name, prefer_ide_only in (("product.json", True), ("package.json", False)):
+                        pkg_entry = files.get(entry_name)
+                        if not isinstance(pkg_entry, dict):
+                            continue
+                        offset = int(pkg_entry.get("offset", -1))
+                        size = int(pkg_entry.get("size", -1))
+                        if offset < 0 or not (0 < size <= 512 * 1024):
+                            continue
+                        handle.seek(8 + header_size + offset)
+                        pkg = json.loads(handle.read(size).decode("utf-8-sig"))
+                        if isinstance(pkg, dict):
+                            ver = pkg.get("ideVersion") if prefer_ide_only else (pkg.get("ideVersion") or pkg.get("version"))
+                            if isinstance(ver, str) and ver.strip():
+                                return ver.strip()
+        except (OSError, ValueError, TypeError, RecursionError, struct.error):
+            continue
+    return None
+
+
 def _audit_cli(info: Dict[str, Any]) -> Dict[str, Any]:
     report = {key: info.get(key) for key in (
         "native_installed", "native_binary", "native_desktop_binary", "native_status", "interop_status",
     )}
     report["version"] = None
+    report["desktop_version"] = _read_desktop_app_version(info.get("native_desktop_binary"))
     binary = info.get("native_binary")
     if binary:
         try:
@@ -2997,16 +3115,8 @@ def _build_adaptive_meta_summary(
     repo_root: Optional[Path] = None,
     ag_models: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
-    base_root = Path(repo_root) if repo_root is not None else Path(__file__).resolve().parent
-    policy_path = base_root / "template/user-guard/hooks/_lib/adaptive_policy.py"
-    if not policy_path.is_file():
-        return {}
-    try:
-        import types
-        adaptive_policy = types.ModuleType("_install_adaptive_policy")
-        adaptive_policy.__file__ = str(policy_path)
-        exec(compile(policy_path.read_text(encoding="utf-8"), str(policy_path), "exec"), adaptive_policy.__dict__)
-    except (OSError, SyntaxError, ValueError, RuntimeError):
+    adaptive_policy = _load_adaptive_policy_readonly(repo_root)
+    if adaptive_policy is None:
         return {}
     ag_model_val, ag_effort_val, ag_win_val = _normalize_agy_configured_model(
         ag.get("configured_model"), ag_models,
@@ -3213,7 +3323,7 @@ def audit_upgrade_status(
         errors[str(config_path)] = type(exc).__name__
         config = {}
     cx.update({key: config.get(key) for key in ("model", "model_reasoning_effort", "model_context_window")})
-    cx_models = read_json(codex_root / "models_cache.json").get("models", [])
+    cx_models = read_json(codex_root / "models_cache.json", allow_hardlinks=True).get("models", [])
     cx_models = [item for item in cx_models if isinstance(item, dict) and isinstance(item.get("slug"), str)] if isinstance(cx_models, list) else []
     workhorse_fams = [str(fam).lower() for fam in (cx_rules.get("workhorse_families") or ())]
     deep_fams = [str(fam).lower() for fam in (cx_rules.get("deep_tags") or ())]
@@ -3269,7 +3379,7 @@ def audit_upgrade_status(
             codex_hooks_path, repo_root / "template/codex/hooks.json", "python3 -X utf8 -I -B",
             verify_interpreters=False, repo_root=repo_root,
         )
-        expected_cx_doc = json.loads(cx_plan.change.content) if cx_plan.change else codex_doc
+        expected_cx_doc = json.loads(cx_plan.change.content.decode("utf-8-sig")) if cx_plan.change else codex_doc
 
         def _hook_exe_exists_if_abs(exe_tok: str) -> bool:
             if os.name == "nt":
@@ -3312,7 +3422,7 @@ def audit_upgrade_status(
     try:
         plan = _plan_claude_settings(settings_path, repo_root / "template/claude/hooks.json", "python3 -X utf8 -I -B",
                                     include_model=False, verify_interpreters=False, repo_root=repo_root)
-        expected_doc = json.loads(plan.change.content) if plan.change else settings
+        expected_doc = json.loads(plan.change.content.decode("utf-8-sig")) if plan.change else settings
         def hook_layout(doc: Dict[str, Any], *, check_exe: bool = False) -> List[Any]:
             result = []
             for event, groups in doc.get("hooks", {}).items():
@@ -3611,7 +3721,11 @@ def audit_upgrade_status(
                 entries = next((wsl_apps[k] for k in aliases if k in wsl_apps), [])
                 peer_apps_detected[app_key] = bool(
                     isinstance(entries, list)
-                    and any(isinstance(item, dict) and (item.get("binary") or item.get("config_dir_exists")) for item in entries)
+                    and any(
+                        isinstance(item, dict)
+                        and (item.get("binary") or item.get("desktop_binary") or item.get("config_dir_exists"))
+                        for item in entries
+                    )
                 )
     elif detection.get("is_wsl"):
         peer_statuses = []
@@ -3795,8 +3909,6 @@ def resolve_multi_app_plan(
 def main() -> None:
     """先解析参数、完成各端预检，再按预演或正式安装路径执行。"""
     parser = argparse.ArgumentParser(description="Antigravity、Codex、Claude Code 与 DeepSeek Harness 统一配置安装脚本")
-    if sys.version_info < (3, 11):
-        parser.error("需要 Python 3.11 或更高版本")
     parser.add_argument(
         "--app",
         choices=("auto", "all", "both", "antigravity", "codex", "claude", "dsh"),

@@ -132,12 +132,12 @@ else:
         echo "Digest mismatch (expected $want, got $got); aborting." >&2
         exit 1
     fi
-    if [ -L "$deb" ]; then
-        echo "Refusing symbolic link target package path: $deb" >&2
+    if [ -L "$deb" ] || [ -d "$deb" ]; then
+        echo "Refusing symbolic link or directory target package path: $deb" >&2
         exit 1
     fi
     chmod 0644 -- "$part"
-    mv -- "$part" "$deb"
+    mv -f -- "$part" "$deb"
     part=""
 fi
 
@@ -147,11 +147,18 @@ dpkg-deb -f "$deb" Package Version
 APP_PAT='(^|/)cc-switch( |$)'
 LAUNCHER="$(resolve_launcher || true)"
 matching_app_pids() {
-    local pid raw_pids
+    local pid raw_pids exe_real
     raw_pids="$(pgrep -u "$UID_CUR" -f "$APP_PAT" 2>/dev/null)" || true
     for pid in $raw_pids; do
         if [ "$pid" != "$$" ] && [ "$pid" != "$PPID" ] && [ "$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')" != "$$" ]; then
-            printf '%s\n' "$pid"
+            if [ -L "/proc/$pid/exe" ]; then
+                exe_real="$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)"
+                case "$exe_real" in
+                    */cc-switch|*/cc-switch\ \(deleted\)) printf '%s\n' "$pid" ;;
+                esac
+            else
+                printf '%s\n' "$pid"
+            fi
         fi
     done
 }

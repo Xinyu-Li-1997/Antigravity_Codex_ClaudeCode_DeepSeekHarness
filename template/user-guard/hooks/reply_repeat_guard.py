@@ -1189,7 +1189,7 @@ def _codex_turn_reply(payload):
                     if flushed_step is not None and (
                         (isinstance(rec, dict) and rec.get("type") in (
                             "function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output",
-                            "local_shell_call", "local_shell_call_output", "web_search_call",
+                            "local_shell_call", "local_shell_call_output", "web_search_call", "web_search_call_output",
                         ))
                         or typ in ("TOOL_CALL", "TOOL_RESULT", "TOOL_RESPONSE", "GENERIC")
                     ):

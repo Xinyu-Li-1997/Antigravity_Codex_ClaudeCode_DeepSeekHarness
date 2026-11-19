@@ -134,6 +134,96 @@ def _candidate_matches_query(
     return False
 
 
+def _extract_entry_window(entry: Dict[str, Any], has_1m_suffix: bool, has_1m_id: bool) -> Optional[int]:
+    if has_1m_suffix:
+        for cw_key in ("context_window", "max_context_window", "max_context_tokens"):
+            cw = entry.get(cw_key)
+            if _valid_window(cw) and int(cw) >= 1_000_000:
+                return int(cw)
+        return 1_000_000
+    for cw_key in ("context_window", "max_context_window", "max_context_tokens"):
+        cw = entry.get(cw_key)
+        if _valid_window(cw):
+            return int(cw)
+    if has_1m_id:
+        return 1_000_000
+    return None
+
+
+def _match_subscription_and_builtin(
+    profile: Dict[str, Any],
+    query_low: str,
+    client: str = "",
+) -> Tuple[Optional[Dict[str, Any]], bool, Optional[Dict[str, Any]], bool]:
+    if not query_low:
+        return None, False, None, False
+    has_1m_suffix = query_low.endswith("[1m]")
+    c_norm = _normalize_client_name(client)
+    agent_key = "agy" if c_norm == "antigravity" else c_norm
+    stripped = _strip_ctx_suffix(query_low, strip_1m=has_1m_suffix)
+    family_target = _normalize_model_family_base(query_low, strip_1m=has_1m_suffix)
+
+    sub_match: Optional[Dict[str, Any]] = None
+    sub_1m_id = False
+    sub = profile.get("subscription_matrix") if isinstance(profile.get("subscription_matrix"), dict) else {}
+    models = sub.get("models") if isinstance(sub.get("models"), dict) else {}
+    for allow_family in (False, True):
+        for k, v in models.items():
+            if not isinstance(v, dict):
+                continue
+            v_agent_norm = _normalize_client_name(str(v.get("agent") or ""))
+            v_agent_key = "agy" if v_agent_norm == "antigravity" else v_agent_norm
+            if agent_key and v_agent_key and v_agent_key != agent_key:
+                continue
+            kl = str(k).strip().lower()
+            pl = str(v.get("provider_model") or "").strip().lower()
+            if kl.endswith("[1m]") and not has_1m_suffix and (not pl or pl != query_low):
+                continue
+            if _candidate_matches_query(kl, query_low, stripped, family_target, has_1m_suffix, allow_family) or (
+                pl and _candidate_matches_query(pl, query_low, stripped, family_target, has_1m_suffix, allow_family)
+            ):
+                sub_match = v
+                sub_1m_id = kl.endswith("[1m]") or pl.endswith("[1m]")
+                break
+        if sub_match is not None:
+            break
+
+    builtin_match: Optional[Dict[str, Any]] = None
+    builtin_1m_id = False
+    rules = profile.get("client_catalog_rules") if isinstance(profile.get("client_catalog_rules"), dict) else {}
+    if client or agent_key:
+        raw_c_rule = rules.get(client) or rules.get(c_norm) or rules.get(agent_key)
+        candidate_rules = [raw_c_rule] if isinstance(raw_c_rule, dict) else []
+    else:
+        candidate_rules = [r for r in rules.values() if isinstance(r, dict)]
+
+    for allow_family in (False, True):
+        for c_rule in candidate_rules:
+            builtin = c_rule.get("builtin_models")
+            if not isinstance(builtin, list):
+                continue
+            for item in builtin:
+                if not isinstance(item, dict):
+                    continue
+                slug_low = str(item.get("slug") or item.get("model") or "").strip().lower()
+                if slug_low.endswith("[1m]") and not has_1m_suffix:
+                    continue
+                for id_key in ("slug", "model", "name", "display_name"):
+                    cand = str(item.get(id_key) or "").strip().lower()
+                    if _candidate_matches_query(cand, query_low, stripped, family_target, has_1m_suffix, allow_family):
+                        builtin_match = item
+                        builtin_1m_id = cand.endswith("[1m]")
+                        break
+                if builtin_match is not None:
+                    break
+            if builtin_match is not None:
+                break
+        if builtin_match is not None:
+            break
+
+    return sub_match, sub_1m_id, builtin_match, builtin_1m_id
+
+
 def infer_context_window(
     profile: Dict[str, Any],
     client: str,
@@ -144,10 +234,6 @@ def infer_context_window(
         return int(explicit_window)  # type: ignore[arg-type]
     raw_model = (model_name or "").strip()
     low_model = raw_model.lower()
-    if low_model.endswith("[200k]"):
-        return 200_000
-    if low_model.endswith("[128k]"):
-        return 128_000
     m_small = _SMALL_CTX_SUFFIX_RE.search(low_model)
     if m_small:
         k_val = int(m_small.group(1)) * 1_000
@@ -157,84 +243,27 @@ def infer_context_window(
     has_1m_suffix = low_model.endswith("[1m]")
     c_norm = _normalize_client_name(client)
     agent_key = "agy" if c_norm == "antigravity" else c_norm
-    norm_target = _strip_ctx_suffix(low_model, strip_1m=has_1m_suffix)
-    family_target = _normalize_model_family_base(low_model, strip_1m=has_1m_suffix)
-
     if low_model == "unknown":
         low_model = ""
         has_1m_suffix = False
-        norm_target = ""
-        family_target = ""
 
     if low_model:
-        sub = profile.get("subscription_matrix") if isinstance(profile.get("subscription_matrix"), dict) else {}
-        models = sub.get("models") if isinstance(sub.get("models"), dict) else {}
-        for allow_family in (False, True):
-            for key, meta in models.items():
-                if not isinstance(meta, dict):
-                    continue
-                m_agent_norm = _normalize_client_name(str(meta.get("agent") or ""))
-                m_agent_key = "agy" if m_agent_norm == "antigravity" else m_agent_norm
-                if agent_key and m_agent_key and m_agent_key != agent_key:
-                    continue
-                k_low = str(key).strip().lower()
-                p_low = str(meta.get("provider_model") or "").strip().lower()
-                # 若条目键本身为 [1m] 专属键而查询模型未带 [1m]，仅允许精确命中非 [1m] 的 provider_model（如 deepseek-chat-1m）
-                if k_low.endswith("[1m]") and not has_1m_suffix and (not p_low or p_low != low_model):
-                    continue
-                if _candidate_matches_query(
-                    k_low, low_model, norm_target, family_target, has_1m_suffix, allow_family
-                ) or (
-                    p_low
-                    and _candidate_matches_query(
-                        p_low, low_model, norm_target, family_target, has_1m_suffix, allow_family
-                    )
-                ):
-                    if has_1m_suffix:
-                        for cw_key in ("context_window", "max_context_window", "max_context_tokens"):
-                            cw = meta.get(cw_key)
-                            if _valid_window(cw) and int(cw) >= 1_000_000:
-                                return int(cw)
-                        return 1_000_000
-                    for cw_key in ("context_window", "max_context_window", "max_context_tokens"):
-                        cw = meta.get(cw_key)
-                        if _valid_window(cw):
-                            return int(cw)
-                    if k_low.endswith("[1m]") or p_low.endswith("[1m]"):
-                        return 1_000_000
+        sub_match, sub_1m, builtin_match, builtin_1m = _match_subscription_and_builtin(profile, low_model, client)
+        if sub_match is not None:
+            cw = _extract_entry_window(sub_match, has_1m_suffix, sub_1m)
+            if cw is not None:
+                return cw
+        if builtin_match is not None:
+            cw = _extract_entry_window(builtin_match, has_1m_suffix, builtin_1m)
+            if cw is not None:
+                return cw
+
+    if has_1m_suffix:
+        return 1_000_000
 
     rules = profile.get("client_catalog_rules") if isinstance(profile.get("client_catalog_rules"), dict) else {}
     raw_c_rule = rules.get(client) or rules.get(c_norm) or rules.get(agent_key)
     c_rule = raw_c_rule if isinstance(raw_c_rule, dict) else {}
-
-    if low_model and isinstance(c_rule.get("builtin_models"), list):
-        for allow_family in (False, True):
-            for item in c_rule["builtin_models"]:
-                if not isinstance(item, dict):
-                    continue
-                slug_low = str(item.get("slug") or item.get("model") or "").strip().lower()
-                if slug_low.endswith("[1m]") and not has_1m_suffix:
-                    continue
-                for id_key in ("slug", "model", "name", "display_name"):
-                    cand = str(item.get(id_key) or "").strip().lower()
-                    if _candidate_matches_query(
-                        cand, low_model, norm_target, family_target, has_1m_suffix, allow_family
-                    ):
-                        if has_1m_suffix:
-                            for cw_key in ("context_window", "max_context_window", "max_context_tokens"):
-                                cw = item.get(cw_key)
-                                if _valid_window(cw) and int(cw) >= 1_000_000:
-                                    return int(cw)
-                            return 1_000_000
-                        for cw_key in ("context_window", "max_context_window", "max_context_tokens"):
-                            cw = item.get(cw_key)
-                            if _valid_window(cw):
-                                return int(cw)
-                        if cand.endswith("[1m]"):
-                            return 1_000_000
-
-    if has_1m_suffix:
-        return 1_000_000
 
     fallback_cw_keys = (
         ("declared_max_context_window", "default_context_window", "max_context_tokens")
@@ -256,70 +285,9 @@ def infer_context_window(
 
 def _lookup_model_meta(profile: Dict[str, Any], model_name: str, client: str = "") -> Dict[str, Any]:
     raw = (model_name or "").strip().lower()
-    if not raw:
+    if not raw or raw == "unknown":
         return {}
-    has_1m_suffix = raw.endswith("[1m]")
-    c_norm = _normalize_client_name(client)
-    agent_key = "agy" if c_norm == "antigravity" else c_norm
-    stripped = _strip_ctx_suffix(raw, strip_1m=has_1m_suffix)
-    family_target = _normalize_model_family_base(raw, strip_1m=has_1m_suffix)
-
-    sub_match: Optional[Dict[str, Any]] = None
-    sub = profile.get("subscription_matrix") if isinstance(profile.get("subscription_matrix"), dict) else {}
-    models = sub.get("models") if isinstance(sub.get("models"), dict) else {}
-    for allow_family in (False, True):
-        for k, v in models.items():
-            if not isinstance(v, dict):
-                continue
-            v_agent_norm = _normalize_client_name(str(v.get("agent") or ""))
-            v_agent_key = "agy" if v_agent_norm == "antigravity" else v_agent_norm
-            if agent_key and v_agent_key and v_agent_key != agent_key:
-                continue
-            kl = str(k).strip().lower()
-            pl = str(v.get("provider_model") or "").strip().lower()
-            if kl.endswith("[1m]") and not has_1m_suffix and (not pl or pl != raw):
-                continue
-            if _candidate_matches_query(
-                kl, raw, stripped, family_target, has_1m_suffix, allow_family
-            ) or (
-                pl and _candidate_matches_query(pl, raw, stripped, family_target, has_1m_suffix, allow_family)
-            ):
-                sub_match = v
-                break
-        if sub_match is not None:
-            break
-
-    builtin_match: Optional[Dict[str, Any]] = None
-    rules = profile.get("client_catalog_rules") if isinstance(profile.get("client_catalog_rules"), dict) else {}
-    if client or agent_key:
-        raw_c_rule = rules.get(client) or rules.get(c_norm) or rules.get(agent_key)
-        candidate_rules = [raw_c_rule] if isinstance(raw_c_rule, dict) else []
-    else:
-        candidate_rules = [r for r in rules.values() if isinstance(r, dict)]
-
-    for allow_family in (False, True):
-        for c_rule in candidate_rules:
-            builtin = c_rule.get("builtin_models")
-            if not isinstance(builtin, list):
-                continue
-            for item in builtin:
-                if not isinstance(item, dict):
-                    continue
-                slug_low = str(item.get("slug") or item.get("model") or "").strip().lower()
-                if slug_low.endswith("[1m]") and not has_1m_suffix:
-                    continue
-                for id_key in ("slug", "model", "name", "display_name"):
-                    cand = str(item.get(id_key) or "").strip().lower()
-                    if _candidate_matches_query(cand, raw, stripped, family_target, has_1m_suffix, allow_family):
-                        builtin_match = item
-                        break
-                if builtin_match is not None:
-                    break
-            if builtin_match is not None:
-                break
-        if builtin_match is not None:
-            break
-
+    sub_match, _, builtin_match, _ = _match_subscription_and_builtin(profile, raw, client)
     if builtin_match and sub_match:
         return {**builtin_match, **sub_match}
     return sub_match or builtin_match or {}
@@ -436,7 +404,6 @@ def resolve_adaptive_handoff_policy(
     meta = _lookup_model_meta(profile, model_name, eff_client)
     cw = infer_context_window(profile, eff_client, model_name, eff_explicit)
     w_scale = compute_window_scale(eff_client, cw)
-    e_scale = _EFFORT_SCALES.get((effort or "").strip().lower(), 1.0)
 
     if isinstance(meta.get("handoff_mode"), str) and meta["handoff_mode"].strip().lower() in {"advisory", "enforce", "off"}:
         mode = meta["handoff_mode"].strip().lower()
@@ -446,7 +413,7 @@ def resolve_adaptive_handoff_policy(
         limit = max(1, int(round(limit * (1.0 + (w_scale - 1.0) * 0.5))))
 
     if norm_client == "antigravity" and abs(w_scale - 1.0) > 1e-6:
-        for k in ("advisory_cp_threshold", "drain_cp_threshold", "advisory_transcript_mib", "drain_transcript_mib"):
+        for k in ("advisory_transcript_mib", "drain_transcript_mib"):
             cur_v = cfg.get(k)
             if isinstance(cur_v, (int, float)) and not isinstance(cur_v, bool):
                 cfg[k] = max(1, int(round(cur_v * w_scale)))
@@ -454,7 +421,6 @@ def resolve_adaptive_handoff_policy(
     cfg["default_mode"] = mode
     cfg["default_compact_limit"] = limit
     cfg["effective_context_window"] = cw
-    cfg["effort_scale"] = e_scale
     return cfg
 
 
@@ -549,7 +515,7 @@ def resolve_adaptive_card_params(
     compact_int = parsed_compact if parsed_compact is not None else default_compact_int
 
     timeout_s = _parse_strict_pos_int(router_cfg.get("timeout_sec")) or 900
-    eff_port = 8241 if isinstance(port, bool) or not isinstance(port, int) else port
+    eff_port = port if (not isinstance(port, bool) and isinstance(port, int) and 1 <= port <= 65535) else 8241
     return {
         "port": eff_port,
         "kimi_model": resolved_kimi,

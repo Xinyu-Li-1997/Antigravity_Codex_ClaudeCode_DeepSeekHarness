@@ -517,15 +517,13 @@ def _close_unbalanced_fence(text: str, max_len: Optional[int] = None) -> str:
 def _truncate_single_item(content: str, turn: int, max_chars: int = MAX_INLINE_ITEM_CHARS) -> str:
     if len(content) <= max_chars:
         return _close_unbalanced_fence(content)
-    head_len = max(max_chars - 220, 200)
-    tail_len = 120
+    marker = f"\n...[第 {turn} 条记录的中间部分省略]...\n"
+    usable = max(max_chars - len(marker), 80)
+    tail_len = min(120, max(usable // 3, 25))
+    head_len = max(usable - tail_len, 40)
     head_part = _close_unbalanced_fence(content[:head_len].rstrip())
     tail_part = _close_unbalanced_fence(content[-tail_len:].lstrip())
-    return (
-        f"{head_part}\n"
-        f"...[第 {turn} 条记录的中间部分省略]...\n"
-        f"{tail_part}"
-    )
+    return f"{head_part}{marker}{tail_part}"
 
 
 def _format_inline_subagent_section(

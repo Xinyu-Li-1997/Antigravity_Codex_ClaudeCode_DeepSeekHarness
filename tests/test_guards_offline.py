@@ -3439,6 +3439,69 @@ class TestDispatchAndBillingGuards(unittest.TestCase):
         self.assertEqual(native_ids, {"conv-a", "conv-b", "task-99"})
         self.assertTrue(any(s["channel"] == "native_workflow" for s in bill["streams"]))
 
+    def test_v1175_shell_comment_quotes_ast_indirect_and_bash_flag_unwrapping(self):
+        project = self.root / "proj_v1175"
+        project.mkdir()
+        outside = self.root / "outside_v1175"
+        outside.mkdir()
+        out_file = (outside / "escape.txt").as_posix()
+        keys = [status_guard._normalize_cross_env_lexical(str(project))]
+
+        # 1) Shell 行注释中的未闭合单引号不可吞并下一行子句绕过 R4 与交接冻结门禁
+        comment_bypass = f"echo ok # '\nrm -rf {out_file}"
+        self.assertIsNotNone(
+            status_guard._detect_command_external_mutation(comment_bypass, str(project), keys, keys, False)
+        )
+        self.assertEqual(status_guard.handoff_gate._classify_run_command("echo ok # '\ngit push origin main"), "blocked_always")
+
+        # 2) git commit -m 无引号消息紧贴重定向、bash -v / -o pipefail / +e -c 拆壳与 python -R -c
+        for bad_shell in (
+            f"git commit -m msg>{out_file}",
+            f"bash -v -c 'rm -rf {out_file}'",
+            f"bash -o pipefail -c 'rm -rf {out_file}'",
+            f"bash +e -c 'rm -rf {out_file}'",
+            f"python3 -R -c \"open('{out_file}', 'w').write('x')\"",
+        ):
+            self.assertIsNotNone(
+                status_guard._detect_command_external_mutation(bad_shell, str(project), keys, keys, False),
+                bad_shell,
+            )
+        self.assertEqual(status_guard.handoff_gate._classify_run_command("bash -v -c 'git push'"), "blocked_always")
+        self.assertEqual(status_guard.handoff_gate._classify_run_command("bash -o pipefail -c 'git push'"), "blocked_always")
+
+        # 3) Python AST 通配导入、动态导入、类方法、容器下标函数、字典原地修改与 Image 遮蔽拦截
+        for bad_py in (
+            f"from os import *\nremove('{out_file}')",
+            f"__import__('os').remove('{out_file}')",
+            f"import importlib\nimportlib.import_module('shutil').rmtree('{outside.as_posix()}')",
+            f"exec(\"open('{out_file}', 'w').write('x')\")",
+            f"class C:\n    def w(self, p):\n        open(p, 'w').write('x')\nC().w('{out_file}')",
+            f"def w(p):\n    open(p, 'w').write('x')\nlist(map(w, ['{out_file}']))",
+            f"fns = [lambda p: open(p, 'w').write('x')]\nfns[0]('{out_file}')",
+            f"d = {{'p': 'inside.txt'}}\nd.update({{'p': '{out_file}'}})\nopen(d['p'], 'w')",
+            f"from pathlib import Path\nImage = Path('{out_file}')\nImage.open('w').write('x')",
+            f"import zipfile\nzipfile.ZipFile('{out_file}', 'w')",
+        ):
+            self.assertIsNotNone(
+                status_guard._scan_inline_python_code(bad_py, str(project), keys, keys, False),
+                bad_py,
+            )
+        for safe_py in (
+            "class C:\n    def w(self, p):\n        open(p, 'w').write('x')\nC().w('inside.txt')",
+            "fns = [lambda p: open(p, 'w').write('x')]\nfns[0]('inside.txt')",
+            "import zipfile\nzipfile.ZipFile('archive.zip', 'r')",
+        ):
+            self.assertIsNone(
+                status_guard._scan_inline_python_code(safe_py, str(project), keys, keys, False),
+                safe_py,
+            )
+
+        # 4) _INSTALLER_INVOKE_RE 在长链 env/sudo 下保持毫秒级线性时间无 ReDoS
+        t0 = time.monotonic()
+        long_env = "env " * 30 + "echo ok"
+        self.assertIsNone(status_guard._detect_command_external_mutation(long_env, str(project), keys, keys, False))
+        self.assertLess(time.monotonic() - t0, 0.5)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

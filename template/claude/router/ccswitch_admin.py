@@ -766,21 +766,23 @@ def derive_adaptive_card_defaults(
     if len(here.parents) > 2:
         hook_candidates.append(here.parents[2] / "user-guard" / "hooks")
     for hooks_dir in hook_candidates:
-        if (hooks_dir / "_lib" / "adaptive_policy.py").is_file():
-            if str(hooks_dir) not in sys.path:
-                sys.path.insert(0, str(hooks_dir))
-            break
-    try:
-        from _lib import adaptive_policy  # type: ignore
-        return adaptive_policy.resolve_adaptive_card_params(
-            profile, port=port, kimi_model=kimi_model, deepseek_model=deepseek_model,
-            max_context=max_context, compact_window=compact_window,
-        )
-    except ImportError:
-        return _resolve_card_params(
-            profile, port=port, kimi_model=kimi_model, deepseek_model=deepseek_model,
-            max_context=max_context, compact_window=compact_window,
-        )
+        policy_path = hooks_dir / "_lib" / "adaptive_policy.py"
+        if policy_path.is_file():
+            try:
+                import types
+                mod = types.ModuleType("_ccswitch_adaptive_policy")
+                mod.__file__ = str(policy_path)
+                exec(compile(policy_path.read_text(encoding="utf-8"), str(policy_path), "exec"), mod.__dict__)
+                return mod.resolve_adaptive_card_params(
+                    profile, port=port, kimi_model=kimi_model, deepseek_model=deepseek_model,
+                    max_context=max_context, compact_window=compact_window,
+                )
+            except (OSError, SyntaxError, ValueError, RuntimeError):
+                break
+    return _resolve_card_params(
+        profile, port=port, kimi_model=kimi_model, deepseek_model=deepseek_model,
+        max_context=max_context, compact_window=compact_window,
+    )
 
 
 def prepare_cards(
@@ -1006,12 +1008,18 @@ def switch_card(
             if isinstance(pre_target_cfg, dict) and isinstance(pre_target_cfg.get("env"), dict)
             else None
         )
-        endpoint = urlsplit(pre_base_url) if isinstance(pre_base_url, str) else None
+        try:
+            endpoint = urlsplit(pre_base_url) if isinstance(pre_base_url, str) else None
+            ep_scheme = (endpoint.scheme or "").lower() if endpoint else ""
+            ep_host = (endpoint.hostname or "").lower() if endpoint else ""
+            ep_port = endpoint.port if endpoint else None
+        except ValueError:
+            endpoint, ep_scheme, ep_host, ep_port = None, "", "", None
         router_health_warning: Optional[str] = None
-        if endpoint and endpoint.hostname and endpoint.hostname.lower() in ("127.0.0.1", "localhost", "::1"):
-            host = "[::1]" if endpoint.hostname == "::1" else endpoint.hostname
-            port = endpoint.port or (443 if endpoint.scheme == "https" else 80)
-            health_url = f"{endpoint.scheme}://{host}:{port}/__router/health"
+        if endpoint and ep_scheme in ("http", "https") and ep_host in ("127.0.0.1", "localhost", "::1"):
+            host = "[::1]" if ep_host == "::1" else ep_host
+            port = ep_port or (443 if ep_scheme == "https" else 80)
+            health_url = f"{ep_scheme}://{host}:{port}/__router/health"
             try:
                 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}),
                                                      urllib.request.HTTPHandler(), urllib.request.HTTPSHandler())

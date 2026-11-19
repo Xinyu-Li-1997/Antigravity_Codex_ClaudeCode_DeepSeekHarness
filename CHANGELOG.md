@@ -2,6 +2,22 @@
 
 本文件记录四客户端共用规则、会话钩子、后台验证工具与上游维护流程的版本演进。当前插件版本以 `template/user-guard/plugin.json` 为准；常驻使用文档只说明机制和配置键，不重复维护版本号与性能日期。
 
+## [1.17.5] - 2026-11-20
+
+融合 WSL2 Linux 原生 Antigravity 桌面版无进程版本体检，并结合五路跨端全仓交叉审查完成 Shell/Python AST 安全边界加固、回环路由跨域防护、配置体检零字节码写入收口、重复代码去重与常驻指南去模型名润色：
+
+- **WSL2 Linux 原生 Antigravity 桌面版识别与无进程版本审计（`install.py`、`fleet-evolve/SKILL.md`、`ci.yml`）**：
+  - 扩展 `detect_installed_apps` 与 `_probe_windows_wsl` 探测 Linux/WSL2 原生桌面端路径（含 `/usr/local/bin/antigravity`、`/usr/share/antigravity/antigravity`、`/opt/antigravity/antigravity` 及 `~/.config/Antigravity`）并严格剔除 `/mnt/` 跨盘软链；新增 `_read_desktop_app_version` 按 `product.json`（`ideVersion`）优先于 `package.json` 及 `app.asar` 二进制索引纯文件提取 `desktop_version`；
+  - 统一 `install.py` 与 `ccswitch_admin.py` 对 `adaptive_policy.py` 的无缓存 `exec(compile(...))` 加载，修复未带 `-B` 运行 `--audit-upgrade` 时向仓库写入 `__pycache__` 的漏口，兼容含 UTF-8 BOM 的钩子配置文件比对，并在 CI 增补无 `-B` 零字节码写入断言。
+- **钩子词法/AST 边界、长会话收口阈值标定、回环路由与编排票据状态机加固（`hooks/`、`fleet_profile.json`、`cae_harness.py`、`fleet_state.py`、`router.py`）**：
+  - 校准 `handoff_thresholds.antigravity` 收口阈值（`advisory_cp_threshold=3`、`drain_cp_threshold=5`、`advisory_transcript_mib=3`、`drain_transcript_mib=5`、`advisory_thrash_min_cp=3`、`drain_thrash_min_cp=4`、`drain_media_min_cp=3`），并在 `adaptive_policy.py` 中取消对 `advisory_cp_threshold` 与 `drain_cp_threshold` 的窗口系数二次放大（保留 `transcript_mib` 按窗口缩放），解决百万窗口长会话多次 `CHECKPOINT` 压缩后仍不触发收口提醒的问题；
+  - 修复 `_lib/shell_lex.py` 未识别非引号 `#` 行注释导致注释内单引号跨行吞并子句绕过门禁的问题，消除 `_INSTALLER_INVOKE_RE` 嵌套量词回溯，收窄 `_COMMIT_MSG_RE` 重定向边界，加固 `status_guard.py` 内联 Python AST 对通配导入、动态导入、`exec`/`eval`、类方法与容器下标函数、`_AstDict` 原地变更及归档落盘接口的检查，为 Claude `Grep` 证据扫描补齐花括号展开与目录遍历上限，并修正 `bash -v -c` / `-o pipefail -c` 拆壳与冻结期动态重定向目标拦截；
+  - 在 `router.py` 增加回环 `Host` 校验、`Origin` / `Sec-Fetch-Site` 跨站拦截及 `//` 与 `..` 路径穿越拒绝，同步 Windows 重解析标签精确判定以避免云同步占位符误触发；在 `cae_harness.py` 补齐非 `fast` 默认选路对轻量卡片的过滤、正向单端 P0 指令在双盲 `audit` 下的同端锁定、终态票据（`CANCELLED` / `SUPERSEDED`）防静默复活、部分只读内联提示头区分与多处重复逻辑合并。
+- **常驻指南去模型名重写与静态脱敏门禁加固（`docs/`、`tests/`）**：
+  - 重写 `docs/workflow-guide.md` 日常无感分流与 4 类特殊口语速查表，消除时期性模型代号硬编码并纳入 `SEASONAL_MODEL_PATTERN` 静态检查，合并精简 `docs/architecture-and-hooks.md` 重复的 14 项参数长表；将 `test_e2e_integration.py` 良性主机词元改为静态受控集合以杜绝源码自豁免盲区，补齐运营商级共享内网段与 IPv6 私有地址静态脱敏扫描及全链路回归单测。
+
+---
+
 ## [1.17.4] - 2026-11-20
 
 沉淀认识论校准与硬验证器闭环双轴评估方法论、日常无感与模糊口语编排规范，并补齐 `native_swarm` 异构验收保护及单端受限时的同端异构双盲审查：

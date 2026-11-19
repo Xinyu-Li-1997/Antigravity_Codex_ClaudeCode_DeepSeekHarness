@@ -30,8 +30,8 @@ description: >
 
 `full` 同时回答能力是否适合任务、本机目前是否可用、本机配置何种额度三个问题，并按四个独立维度逐项盘点与提审：
 
-1. **四端客户端与配套工具**：分别核查 Antigravity、Codex、Claude Code、DeepSeek Harness 与 CC Switch 的本地版本、上游更新及协议能力（DSH 须核对 `hook_protocol`、`hard_hooks_supported` 与 `meta_update_trigger`，CC Switch 须核对卡片、路由与旧残余提示词）。
-2. **Windows 与 WSL2 双端**：依据 `install.py --audit-upgrade` 输出的 `cross_side_status`，在已检测到对侧客户端或配置时分别对 Windows 与 WSL2 两侧执行只读体检、预览与同步，不以跨端互操作代替对侧原生配置对齐。
+1. **四端客户端与配套工具**：分别核查 Antigravity、Codex、Claude Code、DeepSeek Harness 与 CC Switch 的本地 CLI 及原生桌面端版本（如 `desktop_version`）、上游更新及协议能力（DSH 须核对 `hook_protocol`、`hard_hooks_supported` 与 `meta_update_trigger`，CC Switch 须核对卡片、路由与旧残余提示词）。
+2. **Windows 与 WSL2 双端**：依据 `install.py --audit-upgrade` 输出的 `cross_side_status` 与 `wsl_probe`，在已检测到对侧客户端（含 WSL2 Linux 原生 Antigravity 桌面端与 CLI）或配置时，分别对 Windows 与 WSL2 两侧执行版本核查、只读体检、预览与同步，不以跨端互操作代替对侧原生应用及插件对齐。
 3. **各客户端内生代理维度**：在 `native_agent_profiles` 中独立评估每个客户端自身的主会话默认模型与挡位、内生子代理机制（如 `invoke_subagent`、`swarm`、`spawn_agent`、`Agent`）、只读代理定义与并发上限，与跨端派工解耦。
 4. **跨端协同维度（`cae-harness`）**：独立评估五个角色槽位、`subscription_matrix`、`runtime_tunables`、有头原生与无头跨端通道分工，以及 `--isolation`（`full`、`no_skills`、`hooks_only`、`clean_room`）在各端的实际支持边界。
 

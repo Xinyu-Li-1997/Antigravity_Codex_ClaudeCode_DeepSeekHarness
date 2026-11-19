@@ -43,20 +43,20 @@ DEFAULT_DRAIN_INVOCATIONS = 4
 DEFAULT_DRAIN_ACTIONS = 8
 
 # 遥测阈值是项目收口策略的启发式参数，不能据此推断模型的上下文容量。
-ADVISORY_CP_THRESHOLD = 11
-ADVISORY_TRANSCRIPT_BYTES = 4 * 1024 * 1024
-ADVISORY_THRASH_MIN_CP = 6
+ADVISORY_CP_THRESHOLD = 3
+ADVISORY_TRANSCRIPT_BYTES = 3 * 1024 * 1024
+ADVISORY_THRASH_MIN_CP = 3
 ADVISORY_THRASH_AVG_INTERVAL = 90.0
 ADVISORY_MEDIA_STEPS = 60
 ADVISORY_IMAGE_CALLS = 35
 ADVISORY_IMAGE_BYTES = 50 * 1024 * 1024
 
-DRAIN_CP_THRESHOLD = 16
-DRAIN_THRASH_MIN_CP = 10
+DRAIN_CP_THRESHOLD = 5
+DRAIN_THRASH_MIN_CP = 4
 DRAIN_THRASH_AVG_INTERVAL = 75.0
-DRAIN_TRANSCRIPT_BYTES = 6 * 1024 * 1024
+DRAIN_TRANSCRIPT_BYTES = 5 * 1024 * 1024
 DRAIN_MEDIA_STEPS = 160
-DRAIN_MEDIA_MIN_CP = 6
+DRAIN_MEDIA_MIN_CP = 3
 DRAIN_IMAGE_CALLS = 65
 DRAIN_IMAGE_BYTES = 100 * 1024 * 1024
 
@@ -274,7 +274,7 @@ def _sync_handoff_tunables(
         "DEFAULT_DRAIN_INVOCATIONS": user_words._coerce_pos_int(agy.get("default_drain_invocations"), _HANDOFF_BUILTINS["DEFAULT_DRAIN_INVOCATIONS"]),
         "DEFAULT_DRAIN_ACTIONS": user_words._coerce_pos_int(agy.get("default_drain_actions"), _HANDOFF_BUILTINS["DEFAULT_DRAIN_ACTIONS"]),
         "ADVISORY_CP_THRESHOLD": user_words._coerce_pos_int(agy.get("advisory_cp_threshold"), _HANDOFF_BUILTINS["ADVISORY_CP_THRESHOLD"]),
-        "ADVISORY_TRANSCRIPT_BYTES": user_words._coerce_pos_int(agy.get("advisory_transcript_mib"), 4) * 1024 * 1024,
+        "ADVISORY_TRANSCRIPT_BYTES": user_words._coerce_pos_int(agy.get("advisory_transcript_mib"), 3) * 1024 * 1024,
         "ADVISORY_THRASH_MIN_CP": user_words._coerce_pos_int(agy.get("advisory_thrash_min_cp"), _HANDOFF_BUILTINS["ADVISORY_THRASH_MIN_CP"]),
         # 注意：近期压缩频率统计单位为“步数（steps）”；优先读取语义准确的 *_steps，并兼容历史 *_sec 键名。
         "ADVISORY_THRASH_AVG_INTERVAL": _pos_float(
@@ -290,7 +290,7 @@ def _sync_handoff_tunables(
             agy.get("drain_thrash_avg_interval_steps", agy.get("drain_thrash_avg_interval_sec")),
             _HANDOFF_BUILTINS["DRAIN_THRASH_AVG_INTERVAL"],
         ),
-        "DRAIN_TRANSCRIPT_BYTES": user_words._coerce_pos_int(agy.get("drain_transcript_mib"), 6) * 1024 * 1024,
+        "DRAIN_TRANSCRIPT_BYTES": user_words._coerce_pos_int(agy.get("drain_transcript_mib"), 5) * 1024 * 1024,
         "DRAIN_MEDIA_STEPS": user_words._coerce_pos_int(agy.get("drain_media_steps"), _HANDOFF_BUILTINS["DRAIN_MEDIA_STEPS"]),
         "DRAIN_MEDIA_MIN_CP": user_words._coerce_pos_int(agy.get("drain_media_min_cp"), _HANDOFF_BUILTINS["DRAIN_MEDIA_MIN_CP"]),
         "DRAIN_IMAGE_CALLS": user_words._coerce_pos_int(agy.get("drain_image_calls"), _HANDOFF_BUILTINS["DRAIN_IMAGE_CALLS"]),
@@ -621,14 +621,22 @@ def _unwrap_clause_or_shell(tokens: List[str]) -> Tuple[List[str], Optional[str]
             is_ps_shell = head_name in ("pwsh", "pwsh.exe", "powershell", "powershell.exe")
             is_posix_shell = head_name in ("bash", "sh", "zsh")
             while idx < n:
-                fl = _strip_token_quotes(tokens[idx]).lower()
+                raw_flag = _strip_token_quotes(tokens[idx])
+                fl = raw_flag.lower()
                 if (
-                    fl in (
+                    is_ps_shell
+                    and fl in (
                         "-executionpolicy", "-ep", "-windowstyle", "-w", "-inputformat",
                         "-outputformat", "-configurationname", "-workingdirectory", "-version", "-v",
                     )
                     and idx + 1 < n
                 ):
+                    idx += 2
+                    continue
+                if is_posix_shell and (
+                    raw_flag in ("-o", "+o", "-O", "+O")
+                    or (len(raw_flag) > 2 and raw_flag[0] == "-" and raw_flag[1] != "-" and raw_flag[-1] in ("o", "O") and "c" not in raw_flag[1:])
+                ) and idx + 1 < n:
                     idx += 2
                     continue
                 if is_ps_shell and (fl == "-ec" or (fl.startswith("-e") and "-encodedcommand".startswith(fl))):
@@ -672,7 +680,7 @@ def _unwrap_clause_or_shell(tokens: List[str]) -> Tuple[List[str], Optional[str]
                         return [], _strip_token_quotes(tokens[idx])
                     rest = [_strip_token_quotes(tokens[idx])] + list(tokens[idx + 1 :])
                     return [], " ".join(rest)
-                if fl.startswith("-") or (is_cmd_shell and fl.startswith("/")):
+                if fl.startswith("-") or (is_posix_shell and raw_flag.startswith("+") and len(raw_flag) > 1) or (is_cmd_shell and fl.startswith("/")):
                     idx += 1
                     continue
                 break
@@ -2018,7 +2026,8 @@ def _scan_codex_compactions(transcript: Path, ledger: Dict[str, Any]) -> Optiona
             anchor = hashlib.sha256(stream.read(min(128, offset))).hexdigest()
             if (cursor.get("identity") != identity or offset > stat.st_size or anchor != cursor.get("anchor")):
                 for key in list(records):
-                    if key.startswith("record:") and records[key].get("path") == str(transcript):
+                    rec_path = records[key].get("path")
+                    if key.startswith("record:") and (rec_path == str(transcript) or (isinstance(rec_path, str) and _path_key(Path(rec_path)) == path_key)):
                         del records[key]
                 cursor = {"identity": identity, "activeTurn": "", "pendingRecord": "", "occurrences": {}}
                 offset = 0
@@ -2307,6 +2316,9 @@ def _claude_handoff_targets(raw_paths: List[str], cwd: str) -> List[Path]:
         targets = []
         for raw in raw_paths:
             if not raw or not str(raw).strip():
+                return []
+            raw_s = str(raw).strip()
+            if "$" in raw_s or "`" in raw_s or re.search(r"%[A-Za-z_][A-Za-z_0-9]*%", raw_s):
                 return []
             raw_path = _resolve_candidate_path(raw, cwd)
             path = Path(os.path.abspath(str(raw_path)))
@@ -2649,7 +2661,10 @@ def _handle_native_handoff(
                 sh_str = " ".join(str(x) for x in raw_sh) if isinstance(raw_sh, list) else str(raw_sh)
                 is_img_block = (
                     short_tname.lower() in ("view_image", "open_image", "imagegen", "generate_image")
-                    or (short_tname.lower() == "read" and is_image_path(str(t_args.get("file_path") or t_args.get("path") or "")))
+                    or (
+                        short_tname.lower() in ("read", "read_file")
+                        and is_image_path(str(t_args.get("file_path") or t_args.get("path") or t_args.get("Path") or ""))
+                    )
                     or (
                         kind == "blocked_always"
                         and short_tname.lower() in ("bash", "powershell", "exec_command", "run_command", "shell", "shell_command")

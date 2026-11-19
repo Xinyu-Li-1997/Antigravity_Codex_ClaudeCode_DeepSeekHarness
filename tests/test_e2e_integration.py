@@ -168,28 +168,30 @@ def _without_git_env(env: dict[str, str] | None = None) -> dict[str, str]:
 HTML_ANCHOR_ATTR_PATTERN = re.compile('<a\\b[^>]*\\b(?:id|name)=["\']([^"\']+)["\']', re.I)
 
 
+STATIC_BENIGN_REPO_TOKENS = frozenset({
+    "admin", "administrator", "agent", "antigravity", "app", "arch", "audit", "azure",
+    "bash", "build", "builder", "cae", "cae-harness", "centos", "ci", "claude", "cli",
+    "client", "cloud", "code", "coder", "codex", "compute", "config", "container", "core",
+    "cpu", "credentials", "data", "debian", "default", "desktop", "dev", "devel",
+    "developer", "docker", "dsh", "ec2", "eng", "env", "evolve", "fedora", "fleet",
+    "fleet-evolve", "git", "github", "gitlab", "gnu", "gpu", "guard", "guest", "harness",
+    "home", "host", "hpc", "kali", "kernel", "kube", "lab", "laptop", "latest", "linux",
+    "local", "localhost", "mac", "macbook", "main", "master", "nixos", "node", "office",
+    "opt", "pc", "persist", "persist-credentials", "podman", "pro", "prod", "python",
+    "readonly", "readonly-auditor", "readonly-collaborator", "readonly-reader", "redhat",
+    "remote", "repo", "research", "rocky", "root", "router", "run", "runner", "sandbox",
+    "science", "server", "shell", "sim", "solver", "ssh", "staff", "staging", "station",
+    "std", "student", "sudo", "sys", "system", "team", "temp", "test", "tester", "tmp",
+    "ubuntu", "ubuntu-latest", "unix", "user", "user-guard", "users", "usr", "vagrant",
+    "vm", "win", "windows", "windows-latest", "work", "worker", "workspace",
+    "workspace-write", "workstation", "write", "wsl", "wsl2",
+})
+
+
 def _collect_repo_benign_tokens(repo_root: Path) -> set[str]:
-    sources: list[Path] = [repo_root / "install.py"]
-    for folder, patterns in (
-        (repo_root / "template", ("*.py", "*.toml", "*.json", "*.sh", "*.ps1")),
-        (repo_root / ".github", ("*.yml", "*.yaml")),
-    ):
-        if folder.is_dir():
-            for pat in patterns:
-                sources.extend(sorted(folder.rglob(pat)))
-    tokens: set[str] = set()
-    for src_path in sources:
-        if not src_path.is_file():
-            continue
-        text = src_path.read_text(encoding="utf-8")
-        for raw_tok in re.findall(r"[A-Za-z_][A-Za-z0-9_-]{2,}", text):
-            lowered = raw_tok.casefold()
-            tokens.add(lowered)
-            if "-" in lowered:
-                for stem in lowered.split("-"):
-                    if len(stem) >= 3:
-                        tokens.add(stem)
-    return tokens
+    """返回静态受控的公共环境/协议词表，不动态读取待扫源码以杜绝泄露主机名或用户名自豁免。"""
+    _ = repo_root
+    return set(STATIC_BENIGN_REPO_TOKENS)
 
 
 def _extract_md_heading_anchors(markdown_text: str) -> set[str]:
@@ -295,7 +297,12 @@ def _sensitive_findings(content, home_variants=(), user_name="", hostname=""):
     for match in re.finditer(r"\b[A-Za-z0-9._%+-]+@([A-Za-z0-9.-]+\.[A-Za-z]{2,})\b", content):
         if match[1].lower() not in ("example.com", "example.org", "example.net", "example.invalid"):
             findings.append("邮箱")
-    if re.search(r"\b(?:10(?:\.\d{1,3}){3}|192\.168(?:\.\d{1,3}){2}|172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2})\b", content):
+    if re.search(
+        r"\b(?:10(?:\.\d{1,3}){3}|192\.168(?:\.\d{1,3}){2}|172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2}"
+        r"|100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])(?:\.\d{1,3}){2})\b"
+        r"|(?i:\b(?:fd[0-9a-f]{2}|fe80):[0-9a-f:]{2,}\b)",
+        content,
+    ):
         findings.append("内网地址")
     return findings
 
@@ -645,7 +652,7 @@ class TestEndToEndIntegration(unittest.TestCase):
         checked_count = 0
         for path in REPO_ROOT.rglob("*"):
             rel_parts = path.relative_to(REPO_ROOT).parts
-            if not path.is_file() or any(p in rel_parts for p in (".git", "__pycache__", ".pytest_cache")):
+            if not path.is_file() or any(p in rel_parts for p in (".git", "__pycache__", ".pytest_cache", ".venv", "venv")):
                 continue
             rel_name = path.relative_to(REPO_ROOT).as_posix()
             try:
@@ -2951,6 +2958,8 @@ raise SystemExit(module.main(sys.argv[3:]))
             REPO_ROOT / "AGENTS.md",
             TEMPLATE_DIR / "skills" / "cae-harness" / "SKILL.md",
             TEMPLATE_DIR / "skills" / "fleet-evolve" / "SKILL.md",
+            REPO_ROOT / "docs" / "workflow-guide.md",
+            REPO_ROOT / "docs" / "architecture-and-hooks.md",
         ):
             doc_text = permanent_doc.read_text(encoding="utf-8")
             self.assertIsNone(

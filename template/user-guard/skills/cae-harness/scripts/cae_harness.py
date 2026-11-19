@@ -185,7 +185,7 @@ def _fleet_profile():
         _FLEET_PROFILE_CACHE['key'] = key
         _FLEET_PROFILE_CACHE['data'] = raw
         return raw
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, RecursionError) as exc:
         if os.environ.get('CAE_FLEET_PROFILE', '').strip():
             raise HarnessError(f'无法读取指定的模型评估快照 {path}: {exc}') from exc
         return {}
@@ -366,7 +366,7 @@ def emit_event(event, **fields):
 def _read_json(path):
     try:
         return json.loads(path.read_text(encoding='utf-8-sig'))
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return {}
 
 
@@ -1144,9 +1144,12 @@ def inspect_backend_quota_and_availability(prefix, info, model_slug=None, redact
     return result
 
 
-def _peer_auto_ready(backends, name, *, ignore_cooldown=False):
+def _peer_auto_ready(backends, name, *, ignore_cooldown=False, allow_lightweight=False):
     info = backends.get(name, {})
     if name == 'claude' and info.get('uses_local_router') is True and info.get('router_alive') is False:
+        return False
+    if (not allow_lightweight and name == 'claude' and info.get('llm_source') != 'local_router'
+            and _is_lightweight('claude', info.get('model'))):
         return False
     return bool(_is_subscription_enabled(name, info.get('model'))
                 and (ignore_cooldown or not _active_quota_record(name, info))
@@ -1180,10 +1183,10 @@ def _resolve_role_engine(backends, caller, role_spec, prompt_text='', *, ignore_
     if not parsed:
         raise HarnessError(f'提示词已排除角色 {role_name} 的全部候选后端，请显式指定 --engine/--worker')
     ready_peers = [spec for prefix, spec in parsed if prefix != caller_backend
-                   and _peer_auto_ready(backends, prefix, ignore_cooldown=ignore_cooldown)]
+                   and _peer_auto_ready(backends, prefix, ignore_cooldown=ignore_cooldown, allow_lightweight=(role_name == 'fast'))]
     if ready_peers:
         return ready_peers[0]
-    ready_any = [spec for prefix, spec in parsed if _peer_auto_ready(backends, prefix, ignore_cooldown=ignore_cooldown)]
+    ready_any = [spec for prefix, spec in parsed if _peer_auto_ready(backends, prefix, ignore_cooldown=ignore_cooldown, allow_lightweight=(role_name == 'fast'))]
     if ready_any:
         return ready_any[0]
     avail_any = [spec for prefix, spec in parsed if backends.get(prefix, {}).get('available')
@@ -1274,10 +1277,23 @@ def choose_engine(backends, caller, explicit='', prompt_text='', user_prompt='',
     return explicit
 
 
+_WIN_LINK_REPARSE_TAGS = frozenset({
+    getattr(stat, 'IO_REPARSE_TAG_SYMLINK', 0xA000000C),
+    getattr(stat, 'IO_REPARSE_TAG_MOUNT_POINT', 0xA0000003),
+})
+
+
 def _is_link(path, *, st=None):
     st = path.lstat() if st is None else st
+    if stat.S_ISLNK(st.st_mode):
+        return True
     attributes = getattr(st, 'st_file_attributes', 0) or 0
-    return stat.S_ISLNK(st.st_mode) or bool(attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+    if bool(attributes & getattr(stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 0x400)):
+        tag = getattr(st, 'st_reparse_tag', None)
+        if not isinstance(tag, int):
+            return True
+        return tag == 0 or tag in _WIN_LINK_REPARSE_TAGS
+    return False
 
 
 def _ps_literal(text):
@@ -2347,7 +2363,12 @@ def resolve_execution_profile(backends, spec, tier='max', prompt_text='', kind='
         if enforce_subscription:
             _require_subscription(prefix, slug)
         conflict = None
-        if prefix == 'claude' and role_target in ('math', 'code', 'review', 'orchestrator') and not query and _is_lightweight(prefix, slug):
+        if (
+            prefix == 'claude'
+            and not query
+            and (role_target in ('math', 'code', 'review', 'orchestrator') or (not role_target and tier not in ('low', 'minimal')))
+            and _is_lightweight(prefix, slug)
+        ):
             conflict = '当前 Claude 配置卡片为轻量模型，不满足非 fast 专长角色要求；请切换主力卡片、启用本地路由或显式指定轻量模型/role:fast'
         return _profile(prefix, info, spec, slug, record, tier, source, effort, effort,
                         'catalog_declared' if record.get('supported_efforts') else 'unverified_request', error=conflict)
@@ -2780,15 +2801,8 @@ def _claude_info(binary, requested=None):
 def _dsh_info(binary, requested=None):
     root, interop = _dsh_home(binary)
     env_api_key = _usable_credential(os.environ.get('DEEPSEEK_API_KEY'))
-    dotenv_api_key = False
+    dotenv_api_key = bool(_dsh_dotenv_key(root))
     yaml_api_key = False
-    for line in _optional_text(root / '.env').splitlines():
-        if line.strip().startswith('#'):
-            continue
-        key, equal, value = line.partition('=')
-        clean_key = re.sub(r'^export\s+', '', key.strip())
-        if equal and clean_key == 'DEEPSEEK_API_KEY':
-            dotenv_api_key = dotenv_api_key or _usable_credential(_credential_scalar(value))
     account = False
     # 仅识别凭据文件中两种官方提供方及其密钥字段，不实现通用 YAML 解析器。
     scopes = []
@@ -2872,14 +2886,15 @@ def _probe_router_health(info):
 
 
 def _verify_claude_router_card_key(info, model_name):
-    cfg = _load_claude_router_config(info['config_home'], require_valid_file=True)
+    interop = bool(info.get('windows_interop'))
+    cfg = _load_claude_router_config(info['config_home'], interop=interop, require_valid_file=True)
     card = _resolve_claude_router_card(cfg, model_name or info.get('model') or '')
     if not card:
         return
-    db_value = str(cfg.get('ccswitch_db') or '~/.cc-switch/cc-switch.db')
-    if info.get('windows_interop') and db_value.startswith('~/'):
+    db_value = str(os.environ.get('CAE_CCSWITCH_DB') or cfg.get('ccswitch_db') or '~/.cc-switch/cc-switch.db')
+    if interop and not os.environ.get('CAE_CCSWITCH_DB') and db_value.startswith('~/'):
         db = Path(info['config_home']).parent / db_value[2:]
-    elif info.get('windows_interop') and ntpath.isabs(db_value) and not posixpath.isabs(db_value):
+    elif interop and not os.environ.get('CAE_CCSWITCH_DB') and ntpath.isabs(db_value) and not posixpath.isabs(db_value):
         db = Path(_wsl_path(Path(db_value), windows=False))
     else:
         db = Path(db_value).expanduser()
@@ -4509,10 +4524,11 @@ def _inline_readonly_prompt(prompt, root, rel_files=None, *, exclude_agent_instr
             if records and not filtered:
                 raise HarnessError(_CLEAN_ROOM_ONLY_INSTR_ERROR)
             records = filtered
-    cap = (_positive_int(_headless_tunables().get('inline_readonly_max_kib')) or 256) * 1024
-    header = '\n\n所需目标文件原文已附带精确行号内联在下方，请勿再重复调用文件读取工具遍历工作区。\n'
+    cap = (_positive_int(_headless_tunables().get('inline_readonly_max_kib')) or 512) * 1024
+    header_full = '\n\n所需目标文件原文已附带精确行号内联在下方，请勿再重复调用文件读取工具遍历工作区。\n'
+    header_partial = '\n\n以下已内联文件附带精确行号，对已内联文件请勿再重复调用文件读取工具；未内联清单中的非敏感文本文件可按需单次读取。\n'
     blocks, omitted = [], []
-    size = len(header.encode('utf-8'))
+    size = max(len(header_full.encode('utf-8')), len(header_partial.encode('utf-8')))
     for item in records:
         path, rel = Path(item['path']), item['rel_path']
         if (path.name.startswith('.env') or re.search(r'(?i)(credential|secret|auth\.json|private.?key|\.pem$|\.key$)', path.name)):
@@ -4542,6 +4558,7 @@ def _inline_readonly_prompt(prompt, root, rel_files=None, *, exclude_agent_instr
             blocks.append(block)
         except (OSError, ValueError):
             omitted.append(rel)
+    header = header_partial if omitted else header_full
     suffix = ('\n未内联清单：' + ', '.join(omitted)) if omitted else ''
     return prompt + (header + ''.join(blocks) if blocks else '') + suffix
 
@@ -4823,16 +4840,6 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
                     shutil.copy2(src_home / '.credentials.yaml', iso_dsh / '.credentials.yaml')
                 if iso_mode == 'no_skills' and src_home and (src_home / 'AGENTS.md').is_file() and not _is_link(src_home / 'AGENTS.md'):
                     shutil.copy2(src_home / 'AGENTS.md', iso_dsh / 'AGENTS.md')
-                if src_home and not env.get('DEEPSEEK_API_KEY') and (src_home / '.env').is_file() and not _is_link(src_home / '.env'):
-                    for line in _optional_text(src_home / '.env').splitlines():
-                        if line.strip().startswith('#'):
-                            continue
-                        k_env, eq_env, v_env = line.partition('=')
-                        if eq_env and re.sub(r'^export\s+', '', k_env.strip()) == 'DEEPSEEK_API_KEY':
-                            extracted_key = _credential_scalar(v_env)
-                            if _usable_credential(extracted_key):
-                                env['DEEPSEEK_API_KEY'] = extracted_key
-                            break
                 effective_dsh_home = str(iso_dsh)
         if prefix == 'codex' and effective_codex_home and not interop:
             env['CODEX_HOME'] = effective_codex_home
@@ -5567,8 +5574,11 @@ def _same_backend_heterogeneous_right(prefix, left_spec, backends, prompt_text='
 
 def _audit_engines(backends, dual_blind, left_override, right_override, allow_unconfigured, caller, prompt_text='', *,
                    ignore_cooldown=False):
-    negated = _extract_negated_backends(prompt_text)
-    if not left_override and caller == 'caller' and not _extract_prompt_backend_hint(prompt_text):
+    negated = set(_extract_negated_backends(prompt_text))
+    pos_backend = _extract_prompt_backend_hint(prompt_text)
+    if pos_backend and pos_backend not in negated:
+        negated.update(peer for peer in ('agy', 'codex', 'claude', 'dsh') if peer != pos_backend)
+    if not left_override and caller == 'caller' and not pos_backend:
         available = [name for name in ('codex', 'agy', 'claude', 'dsh')
                      if name not in negated and _peer_auto_ready(backends, name, ignore_cooldown=ignore_cooldown)]
         if not available:
@@ -5589,7 +5599,7 @@ def _audit_engines(backends, dual_blind, left_override, right_override, allow_un
             if same_het:
                 return left, same_het
         if not right_override and not candidates:
-            raise HarnessError('提示词已排除其余候选后端，无法组建双路审查')
+            raise HarnessError('提示词已限定单一候选后端且该端无异构双模型，请加 --single 或允许跨端双路审查')
         other = ready_other or (candidates[0] if candidates else ('agy' if name == 'codex' else 'codex'))
         right_prompt = prompt_text if (right_override or '').strip().lower().startswith('role:') else ''
         right = choose_engine(backends, caller, right_override or other + ':default', right_prompt,
@@ -5714,7 +5724,12 @@ def run_physics_gate_loop(target_dir, task_desc, verify_cmd, worker_fn, verify_f
         raise HarnessError('--verify-cmd 不能为空白命令')
 
     def default_verify(command, directory):
-        result = run_process(command, directory, timeout_sec=timeout_sec, shell=True)
+        verify_env = {
+            k: v for k, v in os.environ.items()
+            if k not in _GIT_REPO_ENV_VARS and k not in _CHILD_SCRUB_SESSION_ENV_VARS
+        }
+        verify_env['CAE_HARNESS_DEPTH'] = '1'
+        result = run_process(command, directory, timeout_sec=timeout_sec, shell=True, env=verify_env)
         return result.returncode, (result.stdout + '\n' + result.stderr).strip()
 
     verifier = verify_fn or default_verify
@@ -5805,7 +5820,7 @@ def run_physics_gate_loop(target_dir, task_desc, verify_cmd, worker_fn, verify_f
             verification_changes.update(verify_changes)
             entry['verification_changed_files'] = verify_changes
         history.append(entry)
-        if status in ('ok', 'cancelled', 'timeout', 'scope_violation', 'invalid_output', 'quota_exhausted'):
+        if status in ('ok', 'failed', 'cancelled', 'timeout', 'scope_violation', 'invalid_output', 'quota_exhausted'):
             break
     final = checked_snapshot('final') if not scope_failure else None
     changes = changed_files(initial, final) if final is not None else None
@@ -7330,12 +7345,12 @@ def cmd_task(args):
 
 def _atomic_text(path, content):
     raw_path = Path(path).expanduser()
-    for candidate in (raw_path, raw_path.parent):
+    for candidate in (raw_path, raw_path.parent, *raw_path.parent.parents):
         if os.path.lexists(candidate) and _is_link(candidate):
             raise HarnessError(f'拒绝通过符号链接写入文件: {candidate}')
     path = raw_path.resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
-    for candidate in (raw_path, raw_path.parent, path, path.parent):
+    for candidate in (raw_path, raw_path.parent, *raw_path.parent.parents, path, path.parent, *path.parent.parents):
         if os.path.lexists(candidate) and _is_link(candidate):
             raise HarnessError(f'拒绝通过符号链接写入文件: {candidate}')
     temporary = path.with_name(path.name + '.' + uuid.uuid4().hex + '.tmp')
@@ -7344,35 +7359,22 @@ def _atomic_text(path, content):
             stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())
-        if os.path.lexists(path) and _is_link(path):
-            raise HarnessError(f'拒绝通过符号链接写入文件: {path}')
-        os.replace(temporary, path)
+        for attempt in range(5):
+            if os.path.lexists(path) and _is_link(path):
+                raise HarnessError(f'拒绝通过符号链接写入文件: {path}')
+            try:
+                os.replace(temporary, path)
+                break
+            except PermissionError:
+                if attempt >= 4:
+                    raise
+                time.sleep(0.01 * (2 ** attempt))
     finally:
         temporary.unlink(missing_ok=True)
 
 
 def _atomic_json(path, value):
-    raw_path = Path(path).expanduser()
-    for candidate in (raw_path, raw_path.parent):
-        if os.path.lexists(candidate) and _is_link(candidate):
-            raise HarnessError(f'拒绝通过符号链接写入文件: {candidate}')
-    path = raw_path.resolve()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    for candidate in (raw_path, raw_path.parent, path, path.parent):
-        if os.path.lexists(candidate) and _is_link(candidate):
-            raise HarnessError(f'拒绝通过符号链接写入文件: {candidate}')
-    temporary = path.with_name(path.name + '.' + uuid.uuid4().hex + '.tmp')
-    try:
-        with temporary.open('x', encoding='utf-8', newline='\n') as stream:
-            json.dump(value, stream, ensure_ascii=False, indent=2)
-            stream.write('\n')
-            stream.flush()
-            os.fsync(stream.fileno())
-        if os.path.lexists(path) and _is_link(path):
-            raise HarnessError(f'拒绝通过符号链接写入文件: {path}')
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    _atomic_text(path, json.dumps(value, ensure_ascii=False, indent=2) + '\n')
 
 
 def resolve_dispatch_plan_dir(state_dir=None):
@@ -7820,7 +7822,22 @@ def record_heavy_completion_for_stop_hook(args, payload):
         with _COMPLETION_LOCK, _heavy_completion_file_lock(hc_dir, session_id):
             if os.path.lexists(path) and _is_link(path):
                 raise HarnessError(f'拒绝通过符号链接写入重负载完工记录: {path}')
-            entries = _read_json(path) or []
+            if not path.exists():
+                entries = []
+            else:
+                raw_hc = None
+                for attempt in range(4):
+                    try:
+                        raw_hc = path.read_text(encoding='utf-8-sig')
+                        break
+                    except PermissionError:
+                        if attempt >= 3:
+                            raise
+                        time.sleep(0.01 * (2 ** attempt))
+                try:
+                    entries = json.loads(raw_hc) if raw_hc and raw_hc.strip() else []
+                except (ValueError, RecursionError) as exc:
+                    raise HarnessError(f'重负载完工记录 JSON 已损坏: {path}') from exc
             if not isinstance(entries, list):
                 raise HarnessError('重负载完工记录状态格式无效')
             entries.append(entry)
@@ -8606,10 +8623,12 @@ def cmd_plan(args):
                 ticket['status'] = 'CANCELLED'
                 _save_plan(ticket, plan_dir)
             elif args.mark_handed_off:
-                if ticket.get('status') == 'APPROVED' and not forced:
-                    raise HarnessError('已批准票据不可直接降级为已交接状态，如需强制交接请传 --force', 'ticket_invalid')
+                if ticket.get('status') in ('APPROVED', 'CANCELLED', 'SUPERSEDED') and not forced:
+                    raise HarnessError(f'票据当前状态为 {ticket.get("status")}，不可直接转为已交接状态；如需强制交接请传 --force', 'ticket_invalid')
                 ticket['status'] = 'HANDED_OFF'
             else:
+                if args.approve_ticket and ticket.get('status') in ('CANCELLED', 'SUPERSEDED') and not forced:
+                    raise HarnessError(f'终态票据（{ticket.get("status")}）不可直接批准，请重新生成计划或传 --force', 'ticket_invalid')
                 orig_streams = copy.deepcopy(ticket['streams'])
                 candidate_streams = copy.deepcopy(orig_streams)
                 overrides = {}
@@ -8880,6 +8899,11 @@ def cmd_plan(args):
                             'ticket_changed',
                         )
                     # 仅刷新实时可用性/额度视图供展示，绝不改写磁盘已批票据与 plan_hash。
+                    ticket = copy.deepcopy(ticket)
+                    ticket['streams'] = streams
+                    _render_plan(ticket)
+                elif ticket.get('status') in ('CANCELLED', 'SUPERSEDED') and not forced:
+                    # 终态票据在只读复核时仅刷新内存展示视图，不静默复活为 PENDING 或覆盖会话指针。
                     ticket = copy.deepcopy(ticket)
                     ticket['streams'] = streams
                     _render_plan(ticket)

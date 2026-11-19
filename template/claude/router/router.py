@@ -35,7 +35,7 @@ import time
 import types
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 _BASE_DEFAULTS = types.MappingProxyType({
@@ -97,6 +97,12 @@ _log_lock = threading.Lock()
 _INFLIGHT_SEM = threading.BoundedSemaphore(64)
 
 
+_WIN_LINK_REPARSE_TAGS = frozenset({
+    getattr(stat, "IO_REPARSE_TAG_SYMLINK", 0xA000000C),
+    getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", 0xA0000003),
+})
+
+
 def _is_reparse_or_symlink(path):
     if path.is_symlink():
         return True
@@ -104,8 +110,15 @@ def _is_reparse_or_symlink(path):
         st = path.lstat()
     except OSError:
         return False
+    if stat.S_ISLNK(st.st_mode):
+        return True
     reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
-    return stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_file_attributes", 0) & reparse_flag)
+    if bool(getattr(st, "st_file_attributes", 0) & reparse_flag):
+        tag = getattr(st, "st_reparse_tag", None)
+        if not isinstance(tag, int):
+            return True
+        return tag == 0 or tag in _WIN_LINK_REPARSE_TAGS
+    return False
 
 
 def _read_router_tunables_from_file(cand):
@@ -647,20 +660,31 @@ def log_line(cfg, rec):
 _CLIENT_DISCONNECT_ERRORS = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)
 
 
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
 def _request_target_path(raw_path):
     if not isinstance(raw_path, str) or not raw_path:
         raise ValueError("request target must be non-empty")
-    if any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in raw_path):
-        raise ValueError("request target contains control or whitespace characters")
+    if "\\" in raw_path or any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in raw_path):
+        raise ValueError("request target contains invalid or control characters")
     if raw_path.lower().startswith(("http://", "https://")):
         parts = urlsplit(raw_path)
-        if not parts.hostname:
-            raise ValueError("absolute request target missing hostname")
+        if not parts.hostname or parts.hostname.lower() not in _LOOPBACK_HOSTS:
+            raise ValueError("absolute request target must target loopback host")
         rel_path = parts.path if parts.path.startswith("/") else ("/" + parts.path if parts.path else "/")
-        return f"{rel_path}?{parts.query}" if parts.query else rel_path
-    if not raw_path.startswith("/") or raw_path.startswith("//"):
-        raise ValueError("request target must be an origin-form path starting with '/'")
-    return raw_path
+        if rel_path.startswith("//"):
+            raise ValueError("request target must not start with '//'")
+        target = f"{rel_path}?{parts.query}" if parts.query else rel_path
+    else:
+        if not raw_path.startswith("/") or raw_path.startswith("//"):
+            raise ValueError("request target must be an origin-form path starting with '/'")
+        target = raw_path
+    path_only = target.split("?", 1)[0]
+    decoded_path = unquote(path_only)
+    if "\\" in decoded_path or "\x00" in decoded_path or ".." in path_only.split("/") or ".." in decoded_path.split("/"):
+        raise ValueError("request target contains parent traversal segment")
+    return target
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -677,7 +701,34 @@ class Handler(BaseHTTPRequestHandler):
         except _CLIENT_DISCONNECT_ERRORS:
             pass
 
+    def _validate_local_request_headers(self):
+        hdrs = getattr(self, "headers", None)
+        if not hdrs:
+            return True
+        for k, v in hdrs.items():
+            kl = str(k).lower()
+            vs = str(v or "").strip()
+            if not vs:
+                continue
+            if kl == "origin":
+                self._safe_send_error(403, "cross-origin browser request forbidden")
+                return False
+            if kl == "sec-fetch-site" and vs.lower() not in ("none", "same-origin"):
+                self._safe_send_error(403, "cross-site fetch forbidden")
+                return False
+            if kl == "host":
+                try:
+                    parsed_host = (urlsplit("//" + vs).hostname or "").lower()
+                except ValueError:
+                    parsed_host = ""
+                if parsed_host not in _LOOPBACK_HOSTS:
+                    self._safe_send_error(403, "non-loopback Host header forbidden")
+                    return False
+        return True
+
     def do_GET(self):
+        if not self._validate_local_request_headers():
+            return
         try:
             target_path = _request_target_path(self.path)
         except ValueError:
@@ -707,6 +758,8 @@ class Handler(BaseHTTPRequestHandler):
             sem.release()
 
     def _read_and_forward_locked(self):
+        if not self._validate_local_request_headers():
+            return
         max_bytes = int(self.server.cfg.get("max_body_bytes") or (64 * 1024 * 1024))
         hdr_items = list(self.headers.items())
         raw_tes = [v for k, v in hdr_items if k.lower() == "transfer-encoding"]
@@ -771,6 +824,8 @@ class Handler(BaseHTTPRequestHandler):
             sem.release()
 
     def _forward_locked(self, body):
+        if not self._validate_local_request_headers():
+            return
         cfg = self.server.cfg
         t0 = time.time()
         try:

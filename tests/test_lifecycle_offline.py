@@ -972,7 +972,7 @@ class TestLifecycleCompactionEngine(unittest.TestCase):
         tp_ok = self.tmp_root / "healthy.jsonl"
         _append_jsonl(tp_ok, {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "开始长期研究"})
         step_cursor = 140
-        for _ in range(11):
+        for _ in range(4):
             _append_jsonl(tp_ok, {"step_index": step_cursor, "source": "SYSTEM", "type": "CHECKPOINT"})
             step_cursor += 140
         out_ok = session_context_loader.handle_pre_invocation({"conversationId": conv_healthy, "transcriptPath": str(tp_ok)})
@@ -983,14 +983,14 @@ class TestLifecycleCompactionEngine(unittest.TestCase):
         gate_ok = handoff_gate.load_gate_state(self.plugin_data / "state", conv_healthy)
         self.assertEqual(gate_ok["phase"], "advisory")
 
-        # 3) 检查点间隔坍塌（cp >= 10 且尾 3 段间隔 <= 75）：触发 Stage-2 drain
+        # 3) 检查点间隔坍塌（cp >= 4 且尾 3 段间隔 <= 75）：触发 Stage-2 drain
         conv_thrash = "ag-handoff-thrash"
         tp_th = self.tmp_root / "thrash.jsonl"
         _append_jsonl(tp_th, {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "/goal\n完成批量校准，不要擅自停止"})
         s = 100
-        for i in range(10):
+        for i in range(4):
             _append_jsonl(tp_th, {"step_index": s, "source": "SYSTEM", "type": "CHECKPOINT"})
-            s += 150 if i < 6 else 50
+            s += 50
         out_th = session_context_loader.handle_pre_invocation({"conversationId": conv_thrash, "transcriptPath": str(tp_th)})
         msg_th = out_th["injectSteps"][0]["systemMessage"]["systemMessage"]
         self.assertIn("Stage-2 drain", msg_th)
@@ -2189,9 +2189,9 @@ class TestCodexHandoffAdapter(unittest.TestCase):
             handoff_gate._sync_handoff_tunables()
             self.assertEqual(handoff_gate.ADVISORY_CP_THRESHOLD, 9)
             self.assertEqual(handoff_gate.DRAIN_CP_THRESHOLD, 14)
-            with mock.patch.object(handoff_gate, "ADVISORY_CP_THRESHOLD", 3):
+            with mock.patch.object(handoff_gate, "ADVISORY_CP_THRESHOLD", 2):
                 handoff_gate._sync_handoff_tunables()
-                self.assertEqual(handoff_gate.ADVISORY_CP_THRESHOLD, 3)
+                self.assertEqual(handoff_gate.ADVISORY_CP_THRESHOLD, 2)
 
             reply_repeat_guard._sync_repeat_tunables()
             self.assertEqual(reply_repeat_guard.CONSECUTIVE_WAIT_LIMIT, 4)
@@ -2203,7 +2203,7 @@ class TestCodexHandoffAdapter(unittest.TestCase):
         handoff_gate._sync_handoff_tunables()
         reply_repeat_guard._sync_repeat_tunables()
         status_guard._sync_status_tunables()
-        self.assertEqual(handoff_gate.ADVISORY_CP_THRESHOLD, 11)
+        self.assertEqual(handoff_gate.ADVISORY_CP_THRESHOLD, 3)
         self.assertEqual(reply_repeat_guard.CONSECUTIVE_WAIT_LIMIT, 3)
 
     def test_truncated_subagent_full_restore_fence_closure_and_stale_lock_sweep(self) -> None:

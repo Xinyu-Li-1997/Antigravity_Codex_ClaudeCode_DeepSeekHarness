@@ -1018,10 +1018,10 @@ def _scrub_lifecycle_entry(val: Any) -> Any:
     return val
 
 
-def append_jsonl_log(log_path: Path, entry: Dict[str, Any]) -> None:
+def append_jsonl_log(log_path: Path, entry: Dict[str, Any], anchor_dir: Optional[Path] = None) -> None:
     """日志共用独立锁；裁剪仅读尾部，避免大会话日志全量入内存或并发丢行。"""
     try:
-        max_bytes, trim_bytes = _effective_log_limits()
+        max_bytes, trim_bytes = _effective_log_limits(anchor_dir)
         row = json.dumps(_scrub_lifecycle_entry(entry), ensure_ascii=False) + "\n"
         lock_id = "log-" + hashlib.sha256(_canonical_path_key(log_path).encode("utf-8")).hexdigest()[:24]
         with session_state_lock(log_path.parent, lock_id):
@@ -1049,10 +1049,14 @@ def append_lifecycle_log(
 ) -> None:
     """向 logs/lifecycle.log 追加结构化 JSONL 日志，按配置上限自动滚动裁剪防无限膨胀"""
     _, logs_dir = resolve_data_dirs(hooks_dir)
-    append_jsonl_log(logs_dir / "lifecycle.log", {
-        "timestamp": current_iso_time(), "event": event_name,
-        "conversationId": conversation_id, "message": message, "summary": payload_summary or {},
-    })
+    append_jsonl_log(
+        logs_dir / "lifecycle.log",
+        {
+            "timestamp": current_iso_time(), "event": event_name,
+            "conversationId": conversation_id, "message": message, "summary": payload_summary or {},
+        },
+        anchor_dir=hooks_dir,
+    )
 
 
 # ③ 用户正文、控制指令与 Markdown 归档格式
@@ -1199,12 +1203,12 @@ class _HarnessArchiveCollector:
                 if start < 0:
                     break
                 try:
-                    obj, used = decoder.raw_decode(raw[start:])
+                    obj, end = decoder.raw_decode(raw, start)
                 except (ValueError, RecursionError):
                     pos = start + 1
                     continue
-                yield from _HarnessArchiveCollector._objects(obj)
-                pos = start + used
+                yield from _HarnessArchiveCollector._objects(obj, parse_text=True)
+                pos = end
 
     def _file(self, raw_path, cwd=""):
         if not isinstance(raw_path, str) or not raw_path:

@@ -60,7 +60,10 @@ def _is_reparse_or_symlink(path: Path) -> bool:
 
 
 def _reject_symlink_chain(path: Path) -> Path:
-    target = path.expanduser().absolute()
+    expanded = path.expanduser()
+    if ".." in expanded.parts:
+        raise ValueError(f"Refusing parent traversal in fleet-evolve state path: {path}")
+    target = expanded.absolute()
     if ".." in target.parts:
         raise ValueError(f"Refusing parent traversal in fleet-evolve state path: {path}")
     for candidate in (*reversed(target.parents), target):
@@ -135,6 +138,8 @@ def _resolve_repo_root(raw_repo: str | None) -> Path:
 def _run_repo_grounding_gate(repo_root: Path) -> Dict[str, Any]:
     try:
         harness_py = repo_root / "template" / "user-guard" / "skills" / "cae-harness" / "scripts" / "cae_harness.py"
+        if _is_reparse_or_symlink(harness_py):
+            raise ValueError(f"Refusing symbolic link or reparse point in cae_harness.py: {harness_py}")
         if not harness_py.is_file():
             raise FileNotFoundError("cae_harness.py is missing")
         import importlib.util
@@ -578,6 +583,14 @@ def main(argv: list[str] | None = None) -> int:
                     ):
                         reason = "active_pass2_claimed" if existing.get("claimed_by_session_id") else "active_master_reload"
                         print(json.dumps({"ok": False, "reason": reason, "saved": existing}, ensure_ascii=False, indent=2))
+                        return 2
+                    if (
+                        existing.get("phase") == "AWAITING_USER_APPROVAL"
+                        and existing.get("proposing_session_id")
+                        and existing.get("proposing_session_id") != sid
+                        and now - _int_field(existing, "updated_at_epoch", 0) <= _int_field(existing, "ttl_seconds", default_ttl, positive=True)
+                    ):
+                        print(json.dumps({"ok": False, "reason": "active_other_session_proposal", "saved": existing}, ensure_ascii=False, indent=2))
                         return 2
                 _atomic_write_json(state_file, payload)
             print(json.dumps({"ok": True, "user_approval_required": True, "state_file": str(state_file), "state": payload}, ensure_ascii=False, indent=2))

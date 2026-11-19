@@ -232,9 +232,21 @@ def pos_inside_quotes(text: str, target_pos: int, *, backslash_escape: bool = Tr
             and not in_ansi_single
             and not in_double
             and idx + 1 < len(text)
-            and text[idx + 1] in "\"'$\\` \t\r\n;|&<>()"
+            and text[idx + 1] in "\"'$\\` \t\r\n;|&<>()#"
         ):
             idx += 2
+            continue
+        if (
+            not in_single
+            and not in_ansi_single
+            and not in_double
+            and ch == "#"
+            and (idx == 0 or text[idx - 1] in " \t\r\n;|&({")
+        ):
+            nl = text.find("\n", idx)
+            if nl == -1 or nl > target_pos:
+                return True
+            idx = nl + 1
             continue
         if not in_single and not in_ansi_single and not in_double and ch == "$" and idx + 1 < limit and text[idx + 1] == "'":
             in_ansi_single = True
@@ -301,9 +313,16 @@ def split_shell_clauses(cmd_str: str, *, backslash_escape: bool = True) -> List[
             i += 1
             continue
 
-        if ch == "\\" and i + 1 < n and cmd_str[i + 1] in ";&|{}()\n\"'":
+        if backslash_escape and ch == "\\" and i + 1 < n and cmd_str[i + 1] in ";&|{}()\n\"'#":
             buf.extend((ch, cmd_str[i + 1]))
             i += 2
+            continue
+
+        if not embedded_braces and ch == "#" and (i == 0 or cmd_str[i - 1] in " \t\r\n;|&({"):
+            nl = cmd_str.find("\n", i)
+            if nl == -1:
+                break
+            i = nl
             continue
 
         if embedded_braces:
@@ -404,9 +423,15 @@ def strip_quoted_segments(clause: str, *, backslash_escape: bool = True) -> str:
             out.append("  ")
             i += 2
             continue
-        if backslash_escape and ch == "\\" and i + 1 < n and clause[i + 1] in ("'", '"', "$", "\\", ">", "<"):
+        if backslash_escape and ch == "\\" and i + 1 < n and clause[i + 1] in ("'", '"', "$", "\\", ">", "<", "#"):
             out.append("  ")
             i += 2
+            continue
+        if ch == "#" and (i == 0 or clause[i - 1] in " \t\r\n;|&({"):
+            nl = clause.find("\n", i)
+            end = n if nl == -1 else nl
+            out.append(" " * (end - i))
+            i = end
             continue
         if ch in ("'", '"'):
             quote_ch = ch
@@ -433,6 +458,12 @@ def extract_cmd_substitutions(clause: str, *, backslash_escape: bool = True) -> 
             continue
         if not backslash_escape and ch == "`" and in_double and i + 1 < n:
             i += 2
+            continue
+        if not in_single and not in_ansi_single and not in_double and ch == "#" and (i == 0 or clause[i - 1] in " \t\r\n;|&({"):
+            nl = clause.find("\n", i)
+            if nl == -1:
+                break
+            i = nl + 1
             continue
         if not in_single and not in_ansi_single and not in_double and ch == "$" and i + 1 < n and clause[i + 1] == "'":
             in_ansi_single = True
@@ -464,11 +495,21 @@ def extract_cmd_substitutions(clause: str, *, backslash_escape: bool = True) -> 
                 d_q = False
                 while j < n and depth > 0:
                     c2 = clause[j]
-                    if c2 == "\\" and not s_q and j + 1 < n:
+                    if backslash_escape and c2 == "\\" and not s_q and j + 1 < n:
+                        j += 2
+                        continue
+                    if not backslash_escape and c2 == "`" and d_q and j + 1 < n:
                         j += 2
                         continue
                     if s_q and c2 == "'" and j + 1 < n and clause[j + 1] == "'":
                         j += 2
+                        continue
+                    if not s_q and not a_q and not d_q and c2 == "#" and (j == i + 2 or clause[j - 1] in " \t\r\n;|&({"):
+                        nl = clause.find("\n", j)
+                        if nl == -1:
+                            j = n
+                            break
+                        j = nl + 1
                         continue
                     if not s_q and not a_q and not d_q and c2 == "$" and j + 1 < n and clause[j + 1] == "'":
                         a_q = True

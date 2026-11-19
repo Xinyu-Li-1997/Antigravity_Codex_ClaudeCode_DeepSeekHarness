@@ -62,24 +62,7 @@
 
 ### 1. 全通道 14 项明细落盘、精简总览卡与 `PreToolUse` 票据门禁
 
-`plan` 支持单流参数与 `--spec-file` 多流列表，统一覆盖 `cae_harness_headless`、`native_subagent`、`native_workflow`、`native_swarm` 四类通道，并支持 `--isolation` 四级正交隔离（`full`、`no_skills`、`hooks_only`、`clean_room`，`--clean-room` 为兼容别名）。`_save_plan` 先原子写入 `<ticket_id>.json`，再将含背景、要做什么、预计后果、4 列总览表及分路 3 列纵向 14 项完整参数明细的 Markdown 写入 `<ticket_id>_card.md`，同时生成带可点击 `[<ticket_id>_card.md](file:///...)` 链接的 `compact_summary_card` 与 `compact_handoff_prompt_block`——对话与恢复默认仅展示精简 4 列总览卡与可点击明细链接，不展开多路 14 项长表。完整 14 项字段顺序如下：
-
-| 序号 | 参数项 |
-| --- | --- |
-| 1 | 流号 |
-| 2 | 子任务与范围 |
-| 3 | 通道 |
-| 4 | 客户端及子代理类型 |
-| 5 | 模型名字（原生 `inherit` 优先读取 Codex `agents/*.toml` 与 Claude/Antigravity 代理前置元数据中的显式 `model`，缺省再按宿主配置与 `native_agent_profiles` 解析） |
-| 6 | 挡位 |
-| 7 | 上下文窗口 |
-| 8 | 是否无头 |
-| 9 | 是否净室与隔离级别（显式指定任一非净室 `--isolation` 级别时追加标注 `（隔离：<级别>）`） |
-| 10 | 访问模式、写入范围与验收命令 |
-| 11 | 内联与超时 |
-| 12 | 当前是否可用 |
-| 13 | 本机配置额度类型与当前状态 |
-| 14 | 回执或子代理日志位置 |
+`plan` 支持单流参数与 `--spec-file` 多流列表，统一覆盖 `cae_harness_headless`、`native_subagent`、`native_workflow`、`native_swarm` 四类通道，并支持 `--isolation` 四级正交隔离（`full`、`no_skills`、`hooks_only`、`clean_room`，`--clean-room` 为兼容别名）。`_save_plan` 先原子写入 `<ticket_id>.json`，再将含背景、要做什么、预计后果、4 列总览表及分路 3 列纵向 14 项完整参数明细（涵盖流号、范围、通道、子代理与实际模型解析、挡位、窗口、无头与隔离状态、读写及验收边界、内联与超时、可用性、额度状态及回执位置；逐项定义见 [日常实战指南](workflow-guide.md) 与 [cae-harness 技能说明](../template/user-guard/skills/cae-harness/SKILL.md)）的 Markdown 写入 `<ticket_id>_card.md`，同时生成带可点击 `[<ticket_id>_card.md](file:///...)` 链接的 `compact_summary_card` 与 `compact_handoff_prompt_block`——对话与恢复默认仅展示精简 4 列总览卡与可点击明细链接，不展开多路 14 项长表。
 
 用户批准并运行 `plan --approve-ticket`（登记前脚本再次离线复查可用性与选路漂移）后，`status_guard.py` 在 `PreToolUse` 阶段完成四项派工检查：① 拦截绕过 `cae_harness.py` 直接调用客户端无头 CLI 的命令（含环境变量前缀、`cmd /c`、`powershell -EncodedCommand` 及最短唯一前缀缩写、`bash -lc`、`wsl`、`sudo`、`timeout` 等常见包装拆壳）；② 对外部重负载核验当前会话有效且未过期的 `APPROVED` 票据（含显式 `--plan-dir`、`--isolation` 一致性、`--write-scope` 子集及可写流 `--verify-cmd` 双向严格一致性校验）；③ 对客户端内部多路或可写原生子代理按回合调用快照核验票据中的原生通道容量（`_native_call_stream_weight` 对 `swarm add` 按 `tasks` 列表长度或正整数 `n` 精确计入流数）；④ `task` 省略 `--target` 时按当前工作目录估算规模阈值。
 
@@ -100,7 +83,7 @@
 | --- | --- |
 | **Antigravity** (`agy`) | 同步至 `~/.gemini/config/plugins/user-guard`；原生插件 `hooks.json` 注册 `SessionStart`、`PreInvocation`、`PreToolUse`、`Stop` 四类事件，脚本内部联动 `handoff_gate.py`，运行态写入宿主 `PLUGIN_DATA`，遇到 `truncated_fields` 自动单遍回查 `transcript_full.jsonl` 还原截断正文后再做实质筛选；`--isolation` 拒绝 `hooks_only` 与 `clean_room` |
 | **Codex** (`codex`) | 同步至 `~/.codex`；`hooks.json` 对称注册 `SessionStart`（匹配 `^(compact|resume)$`）、`PostCompact`、`UserPromptSubmit`、`PreToolUse`、`Stop` 五类事件；安装器比对钩子实质内容一致时不重写文件以保留已有信任哈希，合并 `sessions/` 与 `archived_sessions/` 分段提取原话与 `spawn_agent`/`wait_agent` 完成返回；`--isolation` 完整支持全部四档 |
-| **Claude Code** (`claude` / `cc`) | 同步至 `~/.claude`；将上述五类事件合并写入 `settings.json`，默认随钩子同步 `hooks/ccswitch_admin.py`（`--no-claude-hooks` 跳过），可选 `--with-cc-router` 分发 `router/`；无头只读任务固定传 `--permission-mode dontAsk` 避免 `auto` 分类器限流，`--isolation clean_room` 补传 `--disable-slash-commands` |
+| **Claude Code** (`claude` / `cc`) | 同步至 `~/.claude`；将上述五类事件合并写入 `settings.json`，默认随钩子同步 `hooks/ccswitch_admin.py`（`--no-claude-hooks` 跳过），可选 `--with-cc-router` 分发 `router/`；无头只读任务固定传 `--permission-mode dontAsk` 避免 `auto` 分类器限流，`--isolation clean_room` 同时启用 `--bare` 与 `--disable-slash-commands`（仅限只读盲读） |
 | **DeepSeek Harness** (`dsh`) | 同步至 `~/.dsh/AGENTS.md` 与 `skills/`，原样保留 `.credentials.yaml`；当前官方 CLI 处于 `soft_rules_only`（无交互硬钩子），`install.py --audit-upgrade` 上报 `hook_protocol`、`hard_hooks_supported` 与 `meta_update_trigger` 以便上游开放硬钩子后触发元更新；由 `cae_harness.py` 无头调用时自动探测 `--profile headless --help` 权限参数能力（新版传 `--permission-mode` 与 `--approval-policy never`，旧版回退补丁与 `DSH_PERMISSION_MODE`），`--isolation` 拒绝 `hooks_only` 并支持 `clean_room`，统一执行单 JSON 平衡解码与尾随 `DSML` 清洗 |
 
 ---

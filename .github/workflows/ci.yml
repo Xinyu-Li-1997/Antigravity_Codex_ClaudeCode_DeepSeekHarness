@@ -119,14 +119,17 @@ jobs:
                           for path in base.rglob("*")}
 
               before_audit = snapshot()
+              clean_env = {k: v for k, v in __import__("os").environ.items() if k != "PYTHONDONTWRITEBYTECODE"}
               audit = subprocess.run(
-                  [*py, "install.py", "--audit-upgrade", "--target-dir", str(base / "all_agy" / "plugins" / "user-guard"),
+                  [sys.executable, "-X", "utf8", "install.py", "--audit-upgrade", "--target-dir", str(base / "all_agy" / "plugins" / "user-guard"),
                    "--codex-home", str(base / "all_codex"), "--claude-home", str(base / "all_claude"),
                    "--dsh-home", str(base / "all_dsh"), "--with-cc-router"],
-                  cwd=repo, check=True, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                  cwd=repo, env=clean_env, check=True, capture_output=True, text=True, encoding="utf-8", errors="replace",
               )
               report = json.loads(audit.stdout)
               assert snapshot() == before_audit, "Upgrade audit changed sandbox files or directories"
+              pycache_leaks = [str(p.relative_to(repo)) for p in (repo / "template").rglob("__pycache__")]
+              assert not pycache_leaks, f"Upgrade audit without -B wrote __pycache__: {pycache_leaks}"
               assert (report.get("errors") == [] if "errors" in report else True) and not report.get("read_errors"), report
               assert set(report["summary"]["recommended_actions"]) <= {"refresh_codex_model_catalog"}, report["summary"]
               for name in ("antigravity", "codex", "claude", "dsh"):

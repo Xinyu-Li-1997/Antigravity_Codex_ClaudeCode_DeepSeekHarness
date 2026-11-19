@@ -149,13 +149,13 @@ DENY_REASON_TEXT = (
 _NULL_SINKS = {"/dev/null", "nul", "$null"}
 # 引号内的转义与普通字符分支互斥；命令头限定在子句起点，避免长串失败匹配反复回扫。
 _COMMIT_MSG_RE = re.compile(
-    r"""((?:^|[\r\n;|&])\s*\bgit\b[^\r\n;|&]*?\bcommit\b[^\r\n;|&]*?(?:\s-(?:m|am)|--message(?:=|\s+)))(?:"(?:\\.|[^"\\])*"|'(?:''|[^'])*'|\S+)""",
+    r"""((?:^|[\r\n;|&])\s*\bgit\b[^\r\n;|&]*?\bcommit\b[^\r\n;|&]*?(?:\s-(?:m|am)|--message(?:=|\s+)))(?:"(?:\\.|[^"\\])*"|'(?:''|[^'])*'|[^\s;|&<>()]+)""",
     re.IGNORECASE,
 )
 _GIT_WORKTREE_ADD_RE = re.compile(r"\bgit\b[^\r\n;|&]*?\bworktree\s+add\b([^\r\n;|&]+)", re.IGNORECASE)
 _INSTALLER_INVOKE_RE = re.compile(
     r"(?:^|[;&|\r\n]\s*)(?:[A-Za-z_]\w*=\S+\s+)*"
-    r"(?:(?:(?:env|sudo|uv\s+run)\b[^\r\n;|&]*?\s+)*"
+    r"(?:(?:(?:env|sudo|uv\s+run)\b[^\r\n;|&]*?\s+)?"
     r"""(?:["']?[^\s;|&"']+[\\/])?(?:wsl(?:\.exe)?|bash|sh|pwsh(?:\.exe)?|powershell(?:\.exe)?|cmd(?:\.exe)?|"""
     r"""python[0-9.]*(?:\.exe)?|py(?:\.exe)?(?:\s+-[0-9.]+)?)\b["']?[^\r\n;|&]*?[\s"'\\/]+|(?:\.[\\/]))"""
     r"(?<![A-Za-z0-9_.-])install\.(?:py|ps1|sh)\b\"?'?([^\r\n;|&]*)",
@@ -165,8 +165,8 @@ _INSTALLER_INVOKE_RE = re.compile(
 _PY_OPT_VAL_RE = r"""(?:"(?:\\.|[^"\\])*"|'(?:''|[^'])*'|\$'(?:\\.|[^'\\])*'|[^\s"';|&()])+"""
 _PY_INLINE_HEAD_RE = re.compile(
     r"""(?<![^\s;|&()])(?:"[^"\r\n]*[\\/]|'[^'\r\n]*[\\/]|[^\s"';|&()]+[\\/]|["'])?\b(?i:(?:python[0-9.]*|py)(?:\.exe)?)\b["']?"""
-    rf"""(?:\s+(?:["']?-[0-9][0-9.]*["']?|["']?-[BbIdEisSuqvVxOP]+["']?|["']?(?i:--safe-path)["']?|-[WXQ](?:\s+{_PY_OPT_VAL_RE}|{_PY_OPT_VAL_RE})|(?i:--check-hash-based-pycs)(?:={_PY_OPT_VAL_RE}|\s+{_PY_OPT_VAL_RE})))*"""
-    r"""(?:\s+(?:"-(?:[BbIdEisSuqvVxOP]+)?c"|'-(?:[BbIdEisSuqvVxOP]+)?c'|-(?:[BbIdEisSuqvVxOP]+)?c)(?:\s+|(?=['"]|\$'|[A-Za-z_0-9\\]))|\s+(?=(?:"|'|\$')-(?:[BbIdEisSuqvVxOP]+)?c\S))"""
+    rf"""(?:\s+(?:["']?-[0-9][0-9.]*["']?|["']?-[BbIdEisSuqvVxOPR]+["']?|["']?(?i:--safe-path)["']?|-[WXQ](?:\s+{_PY_OPT_VAL_RE}|{_PY_OPT_VAL_RE})|(?i:--check-hash-based-pycs)(?:={_PY_OPT_VAL_RE}|\s+{_PY_OPT_VAL_RE})))*"""
+    r"""(?:\s+(?:"-(?:[BbIdEisSuqvVxOPR]+)?c"|'-(?:[BbIdEisSuqvVxOPR]+)?c'|-(?:[BbIdEisSuqvVxOPR]+)?c)(?:\s+|(?=['"]|\$'|[A-Za-z_0-9\\]))|\s+(?=(?:"|'|\$')-(?:[BbIdEisSuqvVxOPR]+)?c\S))"""
 )
 _PS_HERESTRING_PY_RE = re.compile(
     r"@(['\"])\r?\n([\s\S]*?)\r?\n\1@\s*\|\s*[^\r\n|]*\bpython[0-9.]*(?:\.exe)?\b",
@@ -1402,12 +1402,15 @@ _AST_MODULE_CALLS = {
     "subprocess": {"run", "Popen", "call", "check_call", "check_output", "getoutput", "getstatusoutput"},
     "numpy": {"save", "savez", "savez_compressed", "savetxt"},
     "builtins": {"open"},
-    "io": {"open"},
+    "io": {"open", "FileIO"},
     "gzip": {"open"},
     "bz2": {"open"},
     "lzma": {"open"},
     "codecs": {"open"},
-    "tarfile": {"open"},
+    "tarfile": {"open", "TarFile"},
+    "zipfile": {"ZipFile"},
+    "logging": {"FileHandler"},
+    "importlib": {"import_module"},
 }
 _AST_READONLY_OPEN_RECEIVERS = frozenset({"Image", "webbrowser"})
 _AST_TEMP_DIR_INDEX = {"mkdtemp": 2, "TemporaryDirectory": 2, "mkstemp": 2, "NamedTemporaryFile": 6}
@@ -1422,6 +1425,7 @@ _AST_WRITE_CALL_ARGS = {
     **{"shutil." + name: ((1, ("dst",)),) for name in ("copy", "copy2", "copyfile", "copytree")},
     "shutil.make_archive": ((0, ("base_name",)),),
     "shutil.unpack_archive": ((1, ("extract_dir",)),),
+    "logging.FileHandler": ((0, ("filename",)),),
 }
 
 
@@ -1433,6 +1437,17 @@ class _AstModule:
 class _AstCallable:
     def __init__(self, qualname):
         self.qualname = qualname
+
+
+class _AstClass:
+    def __init__(self, methods):
+        self.methods = methods
+
+
+class _AstBoundMethod:
+    def __init__(self, func, self_val):
+        self.func = func
+        self.self_val = self_val
 
 
 class _AstDict:
@@ -1541,9 +1556,15 @@ def _eval_ast_path_candidates(node, bindings):
             owners = _eval_ast_path_candidates(node.value, bindings)
             if any(isinstance(owner, _AstModule) and owner.name == "sys" for owner in owners):
                 return frozenset((sys.executable,))
-        values = frozenset(_AstCallable(owner.name + "." + node.attr)
-                           for owner in _eval_ast_path_candidates(node.value, bindings) if isinstance(owner, _AstModule))
-        return values or dynamic
+        owners = _eval_ast_path_candidates(node.value, bindings)
+        attr_vals = set()
+        for owner in owners:
+            if isinstance(owner, _AstModule):
+                attr_vals.add(_AstCallable(owner.name + "." + node.attr))
+            elif isinstance(owner, _AstClass) and node.attr in owner.methods:
+                for fn_cand in owner.methods[node.attr]:
+                    attr_vals.add(_AstBoundMethod(fn_cand, owner))
+        return frozenset(attr_vals) or dynamic
     if isinstance(node, (ast.List, ast.Tuple)):
         parts = [_eval_ast_path_candidates(elt, bindings) for elt in node.elts]
         if any(_AST_DYNAMIC in part for part in parts):
@@ -1622,10 +1643,51 @@ def _eval_ast_path_candidates(node, bindings):
         result = set()
         for value in _eval_ast_path_candidates(node.value, bindings):
             for key in keys:
-                result.update(value.fields.get(key, dynamic) if isinstance(value, _AstDict) and not value.uncertain else dynamic)
+                if isinstance(value, _AstDict) and not value.uncertain:
+                    result.update(value.fields.get(key, dynamic))
+                elif isinstance(value, tuple):
+                    if isinstance(key, int) and not isinstance(key, bool):
+                        result.add(value[key] if -len(value) <= key < len(value) else _AST_DYNAMIC)
+                    else:
+                        result.update(value or dynamic)
+                else:
+                    result.update(dynamic)
         return frozenset(result) or dynamic
     if isinstance(node, ast.Call):
+        fn_cands = _eval_ast_path_candidates(node.func, bindings)
+        cls_cands = frozenset(c for c in fn_cands if isinstance(c, _AstClass))
+        if cls_cands:
+            return cls_cands
         qualnames = _ast_call_qualnames(node.func, bindings)
+        if (isinstance(node.func, ast.Name) and node.func.id == "__import__" and "__import__" not in bindings) or (
+            "importlib.import_module" in qualnames
+        ):
+            mod_cands = _ast_call_arg_candidates(node, 0, ("name",), bindings)
+            mods = set()
+            for mc in mod_cands:
+                if isinstance(mc, str):
+                    top_mod = mc.split(".", 1)[0]
+                    mods.add(_AstModule(top_mod) if top_mod in _AST_MODULE_CALLS else _AST_DYNAMIC)
+                else:
+                    mods.add(_AST_DYNAMIC)
+            return frozenset(mods) or dynamic
+        if isinstance(node.func, ast.Name) and node.func.id == "getattr" and "getattr" not in bindings and len(node.args) >= 2:
+            owners = _eval_ast_path_candidates(node.args[0], bindings)
+            attrs = _eval_ast_path_candidates(node.args[1], bindings)
+            resolved_attrs = set()
+            for owner in owners:
+                for attr in attrs:
+                    if isinstance(owner, _AstModule) and isinstance(attr, str):
+                        if owner.name == "sys" and attr == "executable":
+                            resolved_attrs.add(sys.executable)
+                        else:
+                            resolved_attrs.add(_AstCallable(owner.name + "." + attr))
+                    elif isinstance(owner, _AstClass) and isinstance(attr, str) and attr in owner.methods:
+                        for fn_cand in owner.methods[attr]:
+                            resolved_attrs.add(_AstBoundMethod(fn_cand, owner))
+                    else:
+                        resolved_attrs.add(_AST_DYNAMIC)
+            return frozenset(resolved_attrs) or dynamic
         temp_names = qualnames & {"tempfile." + name for name in _AST_MODULE_CALLS["tempfile"]}
         if temp_names:
             return frozenset().union(*(_ast_temp_path_candidates(node, name.split(".")[1], bindings) for name in temp_names))
@@ -1780,6 +1842,9 @@ def _iter_ast_calls_in_order(node, bindings, active=(), budget=None):
                                 for arg, value in zip((list(node.args.posonlyargs) + list(node.args.args))[-len(node.args.defaults):], node.args.defaults)}
         node._guard_defaults.update({arg.arg: _eval_ast_path_candidates(value, bindings)
                                     for arg, value in zip(node.args.kwonlyargs, node.args.kw_defaults) if value is not None})
+        node._guard_globals = frozenset(
+            name for sub in ast.walk(node) if isinstance(sub, (ast.Global, ast.Nonlocal)) for name in sub.names
+        )
         if not isinstance(node, ast.Lambda):
             bindings[node.name] = frozenset((node,))
         # 定义时检查已知危险路径；未知形参留待调用点叠加实参后核验。
@@ -1796,7 +1861,13 @@ def _iter_ast_calls_in_order(node, bindings, active=(), budget=None):
         local = _copy_ast_bindings(bindings)
         for stmt in node.body:
             yield from walk(stmt, local)
-        bindings[node.name] = frozenset((_AST_DYNAMIC,))
+        methods = {
+            k: frozenset(fn for fn in _ast_values(v) if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)))
+            for k, v in local.items()
+            if isinstance(k, str) and (k not in bindings or local[k] != bindings[k])
+        }
+        methods = {k: v for k, v in methods.items() if v}
+        bindings[node.name] = frozenset((_AstClass(methods),))
         return
     if isinstance(node, ast.ExceptHandler):
         if node.type is not None:
@@ -1866,7 +1937,13 @@ def _iter_ast_calls_in_order(node, bindings, active=(), budget=None):
         return
     if isinstance(node, ast.ImportFrom) and node.module in _AST_MODULE_CALLS:
         for alias in node.names:
-            if alias.name in _AST_MODULE_CALLS[node.module]:
+            if alias.name == "*":
+                for m_name in _AST_MODULE_CALLS[node.module]:
+                    if node.module == "sys" and m_name == "executable":
+                        bindings[m_name] = frozenset((sys.executable,))
+                    else:
+                        bindings[m_name] = frozenset((_AstCallable(node.module + "." + m_name),))
+            elif alias.name in _AST_MODULE_CALLS[node.module]:
                 if node.module == "sys" and alias.name == "executable":
                     bindings[alias.asname or alias.name] = frozenset((sys.executable,))
                 else:
@@ -1879,6 +1956,10 @@ def _iter_ast_calls_in_order(node, bindings, active=(), budget=None):
         for child in ast.walk(node):
             if isinstance(child, ast.Name) and isinstance(child.ctx, (ast.Store, ast.Del)):
                 bindings[child.id] = frozenset((_AST_DYNAMIC,))
+            elif isinstance(child, ast.Subscript) and isinstance(child.ctx, (ast.Store, ast.Del)):
+                for container in _eval_ast_path_candidates(child.value, bindings):
+                    if isinstance(container, _AstDict):
+                        container.uncertain = True
     if isinstance(node, ast.Call):
         # 参数中的海象赋值先于外层调用生效。
         yield from walk(node.func)
@@ -1886,10 +1967,20 @@ def _iter_ast_calls_in_order(node, bindings, active=(), budget=None):
             yield from walk(arg)
         for kw in node.keywords:
             yield from walk(kw.value)
+        if isinstance(node.func, ast.Attribute) and node.func.attr in ("update", "setdefault", "pop", "popitem", "clear"):
+            for container in _eval_ast_path_candidates(node.func.value, bindings):
+                if isinstance(container, _AstDict):
+                    container.uncertain = True
         yield node, bindings
         functions = _eval_ast_path_candidates(node.func, bindings)
-        for function in functions:
-            if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+        for fn_item in functions:
+            bound_self = None
+            if isinstance(fn_item, _AstBoundMethod):
+                function = fn_item.func
+                bound_self = fn_item.self_val
+            elif isinstance(fn_item, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                function = fn_item
+            else:
                 continue
             if function in active or len(active) >= 12:
                 # 递归无法继续静态展开时，将后续绑定置脏，避免沿用安全值。
@@ -1902,8 +1993,12 @@ def _iter_ast_calls_in_order(node, bindings, active=(), budget=None):
             params = list(function.args.posonlyargs) + list(function.args.args)
             for arg in params + list(function.args.kwonlyargs):
                 local[arg.arg] = function._guard_defaults.get(arg.arg, frozenset((_AST_DYNAMIC,)))
-            for param, value in zip(params, node.args):
-                local[param.arg] = _eval_ast_path_candidates(value, bindings)
+            eff_args = ([ast.Constant(value=None)] if bound_self is not None else []) + list(node.args)
+            for idx_p, (param, value) in enumerate(zip(params, eff_args)):
+                if idx_p == 0 and bound_self is not None:
+                    local[param.arg] = frozenset((bound_self,))
+                else:
+                    local[param.arg] = _eval_ast_path_candidates(value, bindings)
             for kw in node.keywords:
                 if kw.arg:
                     local[kw.arg] = _eval_ast_path_candidates(kw.value, bindings)
@@ -1913,10 +2008,21 @@ def _iter_ast_calls_in_order(node, bindings, active=(), budget=None):
             for stmt in function.body if isinstance(function.body, list) else [function.body]:
                 yield from _iter_ast_calls_in_order(stmt, local, active + (function,), budget)
             bindings[_AST_CWD] = local.get(_AST_CWD, bindings.get(_AST_CWD, frozenset(("",))))
-            for stmt in ast.walk(function):
-                if isinstance(stmt, (ast.Global, ast.Nonlocal)):
-                    for name in stmt.names:
-                        bindings[name] = local.get(name, frozenset((_AST_DYNAMIC,)))
+            for name in getattr(function, "_guard_globals", ()):
+                bindings[name] = local.get(name, frozenset((_AST_DYNAMIC,)))
+        for arg_expr in list(node.args) + [kw.value for kw in node.keywords]:
+            for esc in _eval_ast_path_candidates(arg_expr, bindings):
+                esc_fn = esc.func if isinstance(esc, _AstBoundMethod) else esc
+                if not isinstance(esc_fn, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                    continue
+                if esc_fn in active or len(active) >= 12:
+                    continue
+                esc_local = _copy_ast_bindings(bindings)
+                esc_local.pop(_AST_DEFINITION, None)
+                for arg in list(esc_fn.args.posonlyargs) + list(esc_fn.args.args) + list(esc_fn.args.kwonlyargs):
+                    esc_local[arg.arg] = frozenset((_AST_DYNAMIC,))
+                for stmt in esc_fn.body if isinstance(esc_fn.body, list) else [esc_fn.body]:
+                    yield from _iter_ast_calls_in_order(stmt, esc_local, active + (esc_fn,), budget)
         return
     for child in ast.iter_child_nodes(node):
         yield from walk(child)
@@ -2023,19 +2129,19 @@ def _scan_inline_python_code(
                 # 模块函数先于同名 Path 方法检查，模块与可调用标识不能作为路径字符串使用。
                 qualnames = _ast_call_qualnames(fn, bindings)
                 for qualname in qualnames:
-                    if qualname in ("builtins.open", "io.open", "gzip.open", "bz2.open", "lzma.open", "codecs.open"):
+                    if qualname in ("builtins.open", "io.open", "io.FileIO", "gzip.open", "bz2.open", "lzma.open", "codecs.open", "zipfile.ZipFile"):
                         is_mut, mode_s = _open_mode_is_mutating(node, 1, bindings)
                         if is_mut:
-                            tgt = _ast_call_arg_candidates(node, 0, ("file", "filename"), bindings)
+                            tgt = _ast_call_arg_candidates(node, 0, ("file", "filename", "name"), bindings)
                             if _bad(tgt):
                                 label = "open" if qualname in ("builtins.open", "io.open") else qualname
                                 return f"Python 写入/修改文件 ({label} mode='{mode_s}')", _format_ast_candidates(tgt), snippet
-                    elif qualname == "tarfile.open":
+                    elif qualname in ("tarfile.open", "tarfile.TarFile"):
                         is_mut, mode_s = _tarfile_open_mode_is_mutating(node, 1, bindings)
                         if is_mut:
                             tgt = _ast_call_arg_candidates(node, 0, ("name",), bindings)
                             if _bad(tgt):
-                                return f"Python 写入/修改归档 (tarfile.open mode='{mode_s}')", _format_ast_candidates(tgt), snippet
+                                return f"Python 写入/修改归档 ({qualname} mode='{mode_s}')", _format_ast_candidates(tgt), snippet
                     elif qualname == "os.open":
                         flags = _ast_call_arg_candidates(node, 1, ("flags",), bindings)
                         if not all(type(value) is int and value == 0 for value in flags):
@@ -2096,7 +2202,7 @@ def _scan_inline_python_code(
                                             if tok == "--safe-path" or tok.startswith(("-W", "-X", "-Q", "--check-hash-based-pycs=")):
                                                 idx_arg += 1
                                                 continue
-                                            m_inline_c = re.fullmatch(r"-[BbIdEisSuqvVxOP]*c(.*)", tok, re.DOTALL)
+                                            m_inline_c = re.fullmatch(r"-[BbIdEisSuqvVxOPR]*c(.*)", tok, re.DOTALL)
                                             if m_inline_c:
                                                 if m_inline_c.group(1):
                                                     direct_py_code = m_inline_c.group(1)
@@ -2132,20 +2238,43 @@ def _scan_inline_python_code(
                 if qualnames:
                     continue
 
-                # 内置 open 与 Path 方法分别检查路径、模式和解包参数。
+                # 内置 open、exec/eval 与 Path 方法分别检查路径、模式和解包参数。
                 if isinstance(fn, ast.Name) and fn.id == "open":
                     is_mut, mode_s = _open_mode_is_mutating(node, 1, bindings)
                     if is_mut:
                         tgt = _ast_call_arg_candidates(node, 0, ("file",), bindings)
                         if _bad(tgt):
                             return f"Python 写入/修改文件 (open mode='{mode_s}')", _format_ast_candidates(tgt), snippet
+                elif isinstance(fn, ast.Name) and fn.id in ("exec", "eval") and fn.id not in bindings:
+                    if depth >= MAX_WRAPPER_DEPTH:
+                        if _AST_DEFINITION not in bindings:
+                            return "深层嵌套动态代码超出静态目录边界审查上限", "<NESTED_DEPTH_EXCEEDED>", snippet
+                    else:
+                        code_cands = _ast_call_arg_candidates(node, 0, ("object", "source", "expression"), bindings)
+                        cwds = _ast_values(bindings.get(_AST_CWD, base_cwd))
+                        for code_val in code_cands:
+                            if not isinstance(code_val, str):
+                                if _AST_DEFINITION not in bindings:
+                                    return f"Python 动态代码执行无法静态确定边界 ({fn.id})", "<DYNAMIC_UNRESOLVED>", snippet
+                                continue
+                            for cwd in cwds:
+                                if not isinstance(cwd, (str, type(None))):
+                                    if _AST_DEFINITION not in bindings:
+                                        return f"Python 动态代码工作目录无法静态确定 ({fn.id})", "<DYNAMIC_UNRESOLVED>", snippet
+                                    continue
+                                dyn_hit = _scan_inline_python_code(
+                                    code_val, cwd, allowed_norm_keys, allowed_resolved_keys,
+                                    allow_os_temp, depth + 1, wsl_distribution,
+                                )
+                                if dyn_hit:
+                                    return dyn_hit
 
                 elif isinstance(fn, ast.Attribute):
                     attr = fn.attr
 
                     # 2) Path(p).open(mode)
                     if attr == "open":
-                        if isinstance(fn.value, ast.Name) and fn.value.id in _AST_READONLY_OPEN_RECEIVERS:
+                        if isinstance(fn.value, ast.Name) and fn.value.id in _AST_READONLY_OPEN_RECEIVERS and fn.value.id not in bindings:
                             continue
                         is_mut, mode_s = _open_mode_is_mutating(node, 0, bindings)
                         if is_mut:
@@ -2172,6 +2301,12 @@ def _scan_inline_python_code(
                         for tgt in (_eval_ast_path_candidates(fn.value, bindings), target):
                             if _bad(tgt):
                                 return f"Python 移动/替换文件 (.{attr})", _format_ast_candidates(tgt), snippet
+
+                    elif attr in ("extractall", "extract"):
+                        idx_ext = 0 if attr == "extractall" else 1
+                        tgt = _ast_call_arg_candidates(node, idx_ext, ("path",), bindings, ".")
+                        if _bad(tgt):
+                            return f"Python 归档解压写入 (.{attr})", _format_ast_candidates(tgt), snippet
 
                     elif attr in ("savefig", "to_csv", "to_parquet", "to_excel", "to_feather", "to_pickle"):
                         keywords = ("fname",) if attr == "savefig" else (("excel_writer",) if attr == "to_excel" else ("path_or_buf", "path"))
@@ -2520,18 +2655,28 @@ def _unwrap_shell_script_with_tail(cmd: str) -> Optional[Tuple[str, str]]:
         except (binascii.Error, ValueError, UnicodeDecodeError):
             return _INVALID_ENCODED_SENTINEL, ""
 
+    _posix_sh_opts = r"(?:\s+(?:--[a-z-]+\b|[+-][oO]\s+\S+|-[A-Za-z]*[oO]\b\s+\S+|-(?![A-Za-z]*c\b)[A-Za-z]+|\+[A-Za-z]+))*"
+    _ps_sh_opts = (
+        rf"(?:\s+(?:-(?:ExecutionPolicy|ep|WindowStyle|w|InputFormat|OutputFormat|ConfigurationName|WorkingDirectory|Version|v)\s+\S+"
+        rf"|-(?!(?:[A-Za-z]*c|{_ps_cmd_sw})\b)[A-Za-z]+))*"
+    )
+    _cmd_sh_opts = r"(?:\s+/(?![ck]\b)[A-Za-z](?::[A-Za-z]+)?)*"
     m = re.match(
         lead_prefix
-        + rf"""{_SHELL_BIN_PREFIX_RE}(?P<sh>bash|sh|zsh|pwsh(?:\.exe)?|powershell(?:\.exe)?|cmd(?:\.exe)?)\b["']?"""
-        + rf"(?:\s+(?:-(?:ExecutionPolicy|ep|WindowStyle|w|InputFormat|OutputFormat|ConfigurationName|WorkingDirectory|Version|v)\s+\S+|-(?!(?:[A-Za-z]*c|{_ps_cmd_sw})\b)[A-Za-z]+|/(?![ck]\b)[A-Za-z](?::[A-Za-z]+)?))*"
-        + rf"""\s+(?P<sw>["']?-(?:[A-Za-z]*c|{_ps_cmd_sw})["']?|["']?/[ck]["']?)\s+""",
+        + rf"""{_SHELL_BIN_PREFIX_RE}(?:"""
+        + rf"""(?P<sh_posix>bash|sh|zsh)\b["']?{_posix_sh_opts}\s+(?P<sw_posix>["']?-[A-Za-z]*c["']?)"""
+        + rf"""|(?P<sh_ps>pwsh(?:\.exe)?|powershell(?:\.exe)?)\b["']?{_ps_sh_opts}\s+(?P<sw_ps>["']?-(?:{_ps_cmd_sw})["']?)"""
+        + rf"""|(?P<sh_cmd>cmd(?:\.exe)?)\b["']?{_cmd_sh_opts}\s+(?P<sw_cmd>["']?/[ck]["']?)"""
+        + r""")\s+""",
         cmd,
         re.IGNORECASE,
     )
     if not m:
         return None
-    sh_low = m.group("sh").lower().removesuffix(".exe")
-    sw_low = m.group("sw").strip("\"'").lower()
+    sh_raw = m.group("sh_posix") or m.group("sh_ps") or m.group("sh_cmd") or ""
+    sw_raw = m.group("sw_posix") or m.group("sw_ps") or m.group("sw_cmd") or ""
+    sh_low = sh_raw.lower().removesuffix(".exe")
+    sw_low = sw_raw.strip("\"'").lower()
     if sh_low in ("bash", "sh", "zsh") and not re.fullmatch(r"-[a-z]*c", sw_low):
         return None
     if sh_low in ("pwsh", "powershell") and not (sw_low.startswith("-c") and "-command".startswith(sw_low)):
@@ -2879,7 +3024,7 @@ def _detect_command_external_mutation(
                     return "创建项目外 Git 工作树 (git worktree add)", wt_path, _compact_snippet(m_wt.group(0))
 
     # 2. 专项拦截: 执行生产级全局安装脚本 (默认改写四端全局配置或 ~/.cc-switch)
-    for m_inst in _INSTALLER_INVOKE_RE.finditer(shell_masked):
+    for m_inst in (_INSTALLER_INVOKE_RE.finditer(shell_masked) if "install." in shell_masked.casefold() else ()):
         if _pos_inside_quotes(shell_masked, m_inst.start()):
             continue
         prefix_seg = shell_masked[m_inst.start():m_inst.start(1)]
@@ -4119,15 +4264,23 @@ def _claude_permission(decision: str, reason: str) -> Dict[str, Any]:
                                    "permissionDecisionReason": reason}}
 
 
-def _expand_rg_braces(pattern: str) -> List[str]:
-    match = re.search(r"\{([^{}]+)\}", pattern)
-    if not match:
-        return [pattern]
-    prefix, suffix = pattern[:match.start()], pattern[match.end():]
+def _expand_rg_braces(pattern: str, _limit: int = 64) -> List[str]:
+    queue = [pattern]
     expanded: List[str] = []
-    for part in match.group(1).split(","):
-        expanded.extend(_expand_rg_braces(prefix + part.strip() + suffix))
-    return expanded
+    while queue and len(expanded) + len(queue) <= _limit:
+        cur = queue.pop(0)
+        match = re.search(r"\{([^{}]+)\}", cur)
+        if not match:
+            expanded.append(cur)
+            continue
+        prefix, suffix = cur[:match.start()], cur[match.end():]
+        parts = [p.strip() for p in match.group(1).split(",")]
+        if len(expanded) + len(queue) + len(parts) > _limit:
+            expanded.append(cur)
+            break
+        queue.extend(prefix + part + suffix for part in parts)
+    expanded.extend(queue)
+    return expanded[:_limit]
 
 
 def _rg_glob_to_regex(pattern: str) -> Tuple[bool, re.Pattern[str]]:
@@ -4193,24 +4346,33 @@ def _rg_glob_matches(rel_posix: str, name: str, pattern: str) -> bool:
 def _claude_grep_evidence_targets(target: Path, raw_glob: Any) -> List[Path]:
     raw_pat = str(raw_glob or "").strip()
     clauses = [item.strip() for item in (_expand_rg_braces(raw_pat) if raw_pat else []) if item.strip()]
-    positives = [item for item in clauses if not item.startswith("!")]
-    negatives = [item[1:].strip() for item in clauses if item.startswith("!") and item[1:].strip()]
-    skip_dirs = {".git", "__pycache__", "node_modules", ".venv", ".mypy_cache", ".pytest_cache"}
+    pos_compiled = [_rg_glob_to_regex(item) for item in clauses if not item.startswith("!")]
+    neg_compiled = [_rg_glob_to_regex(item[1:].strip()) for item in clauses if item.startswith("!") and item[1:].strip()]
+    skip_dirs = {
+        ".git", "__pycache__", "node_modules", ".venv", "venv", ".mypy_cache", ".pytest_cache",
+        "runs", "build", "dist", "target", ".cache",
+    }
     matched: List[Path] = []
+    visited = 0
     try:
         for root_str, dirs, files in os.walk(target):
             dirs[:] = [d for d in dirs if d not in skip_dirs]
             root_path = Path(root_str)
             for fname in files:
+                visited += 1
+                if visited > 4000:
+                    return []
                 fpath = root_path / fname
                 if not is_evidence_file(str(fpath)):
                     continue
                 rel_posix = fpath.relative_to(target).as_posix()
-                if positives and not any(_rg_glob_matches(rel_posix, fname, pat) for pat in positives):
+                if pos_compiled and not any(rx.match(rel_posix if mp else fname) for mp, rx in pos_compiled):
                     continue
-                if any(_rg_glob_matches(rel_posix, fname, pat) for pat in negatives):
+                if any(rx.match(rel_posix if mp else fname) for mp, rx in neg_compiled):
                     continue
                 matched.append(fpath)
+                if len(matched) > 64:
+                    return []
     except OSError:
         return []
     return sorted(matched)
@@ -4345,7 +4507,7 @@ def _python_tokens_is_safe_inline_readonly(tokens: List[str]) -> bool:
         if tok == "--safe-path" or tok.startswith(("-W", "-X", "-Q", "--check-hash-based-pycs=")) or re.fullmatch(r"-[0-9][0-9.]*", tok):
             i += 1
             continue
-        m_c = re.fullmatch(r"-[BbIdEisSuqvVxOP]*c(.*)", tok, re.DOTALL)
+        m_c = re.fullmatch(r"-[BbIdEisSuqvVxOPR]*c(.*)", tok, re.DOTALL)
         if m_c:
             if m_c.group(1):
                 code_str = m_c.group(1)
@@ -4353,7 +4515,7 @@ def _python_tokens_is_safe_inline_readonly(tokens: List[str]) -> bool:
                 code_str = args[i + 1]
             break
         if tok.startswith("-") and tok != "-" and not tok.startswith("-m") and tok != "--":
-            if re.fullmatch(r"-[BbIdEisSuqvVxOP]+", tok):
+            if re.fullmatch(r"-[BbIdEisSuqvVxOPR]+", tok):
                 i += 1
                 continue
         return False
@@ -4387,7 +4549,7 @@ _READONLY_SUBAGENT_EXPLICIT_MUTATION_VERBS = (
     | _SHELL_COPY_VERBS
     | _SHELL_LINK_VERBS
     | {"sed", "perl", "python", "python3", "py"}
-    | {"apply_patch", "patch", "chmod", "chown", "chgrp", "truncate", "unlink", "shred", "dd", "install"}
+    | {"apply_patch", "patch", "chmod", "chown", "chgrp", "truncate", "unlink", "shred", "dd", "install", "xargs"}
     | {"pytest", "make", "cmake", "ninja", "ctest", "cargo", "npm", "npx", "pnpm", "yarn", "node", "awk", "gawk", "curl", "wget"}
 )
 
@@ -4509,7 +4671,10 @@ def handle_claude_pre_tool_use(payload: Dict[str, Any], state_dir: Optional[Path
     ro_subagent = _codex_readonly_subagent_role(payload)
     if ro_subagent:
         ro_hit: Optional[Tuple[str, str, str]] = None
-        if tool_name in ("Write", "Edit", "MultiEdit", "NotebookEdit", "write", "edit", "multiedit", "notebookedit", "write_file", "write_to_file", "edit_file"):
+        if tool_name in (
+            "Write", "Edit", "MultiEdit", "NotebookEdit", "write", "edit", "multiedit", "notebookedit",
+            "write_file", "write_to_file", "edit_file", "replace_file_content", "multi_replace_file_content",
+        ):
             target = str(args.get("file_path") or args.get("notebook_path") or args.get("path") or args.get("Path") or "<FILE>").strip()
             ro_hit = (f"{tool_name} 修改文件", target, "")
         elif tool_name == "apply_patch":
@@ -4532,21 +4697,24 @@ def handle_claude_pre_tool_use(payload: Dict[str, Any], state_dir: Optional[Path
     hit = None
     if projects:
         allow_temp = not any(_is_standard_os_temp_key(key) for key in projects)
+
+        def _validate_patch_text(patch_str: str, label_name: str) -> Optional[Tuple[str, str, str]]:
+            edits = _APPLY_PATCH_HEADER_RE.findall(patch_str)
+            if not edits:
+                return (f"{label_name} 未解析标准补丁头", "<UNPARSED_PATCH>", _compact_snippet(patch_str) if patch_str.strip() else "<EMPTY_PATCH>")
+            for op, raw_p in edits:
+                cand_p = raw_p.strip()
+                if not cand_p or not _is_write_target_allowed(cand_p, base_cwd, allowed, resolved, allow_temp, from_shell=False):
+                    return (f"{label_name} ({op})", cand_p or "<EMPTY_PATCH_PATH>", f"*** {op}: {cand_p}")
+            return None
+
         if tool_name in ("Write", "Edit", "MultiEdit", "NotebookEdit", "write", "edit", "multiedit", "notebookedit", "write_file", "write_to_file", "edit_file", "replace_file_content", "multi_replace_file_content"):
             target = str(args.get("file_path") or args.get("notebook_path") or args.get("path") or args.get("Path") or "").strip()
             if target and not _is_write_target_allowed(target, base_cwd, allowed, resolved, allow_temp, from_shell=False):
                 hit = (f"{tool_name} 创建或修改文件", target, "")
             elif not target and (args.get("patch") or args.get("patch_text") or isinstance(raw_input, str)):
                 patch_text = str(args.get("patch") or args.get("patch_text") or (raw_input if isinstance(raw_input, str) else ""))
-                edits = _APPLY_PATCH_HEADER_RE.findall(patch_text)
-                if not edits:
-                    hit = (f"{tool_name} 未解析标准补丁头", "<UNPARSED_PATCH>", _compact_snippet(patch_text) if patch_text.strip() else "<EMPTY_PATCH>")
-                else:
-                    for op, raw_p in edits:
-                        cand_p = raw_p.strip()
-                        if not cand_p or not _is_write_target_allowed(cand_p, base_cwd, allowed, resolved, allow_temp, from_shell=False):
-                            hit = (f"{tool_name} ({op})", cand_p or "<EMPTY_PATCH_PATH>", f"*** {op}: {cand_p}")
-                            break
+                hit = _validate_patch_text(patch_text, tool_name)
         elif tool_name == "apply_patch":
             patch_text = str(
                 args.get("patch")
@@ -4556,15 +4724,7 @@ def handle_claude_pre_tool_use(payload: Dict[str, Any], state_dir: Optional[Path
                 or args.get("cmd")
                 or (raw_input if isinstance(raw_input, str) else "")
             )
-            edits = _APPLY_PATCH_HEADER_RE.findall(patch_text)
-            if not edits:
-                hit = ("apply_patch 未解析标准补丁头", "<UNPARSED_PATCH>", _compact_snippet(patch_text) if patch_text.strip() else "<EMPTY_PATCH>")
-            else:
-                for op, raw_p in edits:
-                    cand_p = raw_p.strip()
-                    if not cand_p or not _is_write_target_allowed(cand_p, base_cwd, allowed, resolved, allow_temp, from_shell=False):
-                        hit = (f"apply_patch ({op})", cand_p or "<EMPTY_PATCH_PATH>", f"*** {op}: {cand_p}")
-                        break
+            hit = _validate_patch_text(patch_text, "apply_patch")
         elif tool_name in ("Bash", "PowerShell", "exec_command", "bash", "shell", "shell_command"):
             hit = _detect_command_external_mutation(_extract_native_shell_command(args), base_cwd, allowed, resolved, allow_temp)
         elif tool_name.lower() == "write_stdin":

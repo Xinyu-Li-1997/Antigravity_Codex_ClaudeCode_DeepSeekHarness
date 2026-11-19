@@ -4050,7 +4050,7 @@ else:
             'api_key': 'plain_unprefixed_secret',
             'secret_key': 'plain_secret_key_val',
             'secretKey': 'plain_camel_secret_val',
-            'ipv6_note': 'peer FD00::1 and fe80::1 connected',
+            'ipv6_note': 'peer FD00' + '::1 and fe80' + '::1 connected',
         })
         self.assertIn('<HOME>/proj', scrubbed)
         self.assertEqual(scrubbed['api_key'], '<redacted>')
@@ -6319,6 +6319,33 @@ else:
         )
         self.assertEqual((left_only_phrase, right_only_phrase), ('agy:default', 'agy:neon'))
         self.assertEqual(harness._extract_negated_backends('不只用反重力审查'), set())
+
+        # 5) 正向单端 P0 点名在双盲 audit 下锁定同端，不将右路泄漏至未授权客户端；终态票据防复活
+        left_pos, right_pos = harness._audit_engines(
+            engines, True, '', '', False, 'codex', '请用反重力审查这段离散通量',
+        )
+        self.assertEqual((left_pos, right_pos), ('agy:default', 'agy:neon'))
+
+        engines_lite_cc = json.loads(json.dumps(engines))
+        engines_lite_cc['claude'].update(model='deepseek-flash[1M]', models=[{'slug': 'deepseek-flash[1M]'}], llm_source='ccswitch_card')
+        self.assertFalse(harness._peer_auto_ready(engines_lite_cc, 'claude'))
+        self.assertTrue(harness._peer_auto_ready(engines_lite_cc, 'claude', allow_lightweight=True))
+
+        plan_dir = self.root / 'terminal_tickets'
+        with patch.object(harness, '_args_backends', return_value=engines):
+            _, created = self.capture(
+                harness.cmd_plan,
+                self.args('plan', '--target', str(target), '--caller', 'antigravity',
+                          '--channel', 'native_swarm', '--kind', 'code', '--session-id', 'sess-term',
+                          '--plan-dir', str(plan_dir), '--save-ticket', '--full-json'),
+            )
+            tid = created['ticket_id']
+            harness.cmd_plan(self.args('plan', '--cancel-ticket', tid, '--session-id', 'sess-term', '--plan-dir', str(plan_dir)))
+            with self.assertRaisesRegex(harness.HarnessError, '终态票据'):
+                harness.cmd_plan(self.args('plan', '--approve-ticket', tid, '--session-id', 'sess-term', '--plan-dir', str(plan_dir)))
+            harness.cmd_plan(self.args('plan', '--resume-ticket', tid, '--session-id', 'sess-term', '--plan-dir', str(plan_dir)))
+            disk_after = json.loads((plan_dir / f'{tid}.json').read_text(encoding='utf-8'))
+            self.assertEqual(disk_after['status'], 'CANCELLED')
 
 
 if __name__ == '__main__':

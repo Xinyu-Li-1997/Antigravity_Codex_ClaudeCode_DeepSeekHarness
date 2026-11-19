@@ -70,6 +70,23 @@ def is_reparse_or_link(path: Path) -> bool:
     return tag in (_IO_REPARSE_TAG_SYMLINK, _IO_REPARSE_TAG_MOUNT_POINT)
 
 
+def _unlock_and_close_fd(fd: int, locked: bool) -> None:
+    if fd >= 0:
+        if locked:
+            with contextlib.suppress(OSError):
+                if os.name == "nt":
+                    import msvcrt
+
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+        with contextlib.suppress(OSError):
+            os.close(fd)
+
+
 def atomic_write_text(target_path: Path, content: str) -> None:
     """使用同目录临时文件 + fsync + os.replace 原子更新文件，防止并发或中断产生半截损坏文件"""
     target_abs = Path(os.path.abspath(str(target_path)))
@@ -88,8 +105,19 @@ def atomic_write_text(target_path: Path, content: str) -> None:
     tmp_path = target_path.with_name(f".{target_path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
     created = False
     try:
-        with open(tmp_path, "x", encoding="utf-8", newline="\n") as f:
-            created = True
+        tmp_fd = os.open(
+            tmp_path,
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        created = True
+        try:
+            f_obj = os.fdopen(tmp_fd, "w", encoding="utf-8", newline="\n")
+        except Exception:
+            with contextlib.suppress(OSError):
+                os.close(tmp_fd)
+            raise
+        with f_obj as f:
             f.write(content)
             f.flush()
             try:
@@ -97,16 +125,16 @@ def atomic_write_text(target_path: Path, content: str) -> None:
             except OSError as exc:
                 if exc.errno not in (errno.EINVAL, errno.ENOSYS):
                     raise
-        for attempt in range(5):
+        for attempt in range(6):
             if is_reparse_or_link(target_path) or is_reparse_or_link(target_abs):
                 raise OSError(errno.EINVAL, "拒绝通过符号链接或重解析点写入状态文件", str(target_path))
             try:
                 os.replace(tmp_path, target_path)
                 break
             except PermissionError:
-                if attempt >= 4:
+                if attempt >= 5:
                     raise
-                time.sleep(0.01)
+                time.sleep(0.01 * (2 ** attempt))
     finally:
         try:
             if created:
@@ -133,25 +161,13 @@ def session_state_lock(state_dir: Path, session_id: str, timeout_sec: float = 1.
     token = uuid.uuid4().hex.encode("ascii")
     fd = -1
     locked = False
+    lock_busy_errnos = (errno.EACCES, errno.EAGAIN, getattr(errno, "EWOULDBLOCK", errno.EAGAIN), errno.EDEADLK)
 
     def _unlock_and_close_current() -> None:
         nonlocal fd, locked
-        if fd >= 0:
-            if locked:
-                with contextlib.suppress(OSError):
-                    if os.name == "nt":
-                        import msvcrt
-
-                        os.lseek(fd, 0, os.SEEK_SET)
-                        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-                    else:
-                        import fcntl
-
-                        fcntl.flock(fd, fcntl.LOCK_UN)
-                locked = False
-            with contextlib.suppress(OSError):
-                os.close(fd)
-            fd = -1
+        _unlock_and_close_fd(fd, locked)
+        fd = -1
+        locked = False
 
     try:
         while True:
@@ -195,7 +211,7 @@ def session_state_lock(state_dir: Path, session_id: str, timeout_sec: float = 1.
                     locked = True
                     break
                 except OSError as exc:
-                    if exc.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                    if exc.errno not in lock_busy_errnos:
                         raise
                     if time.monotonic() >= deadline:
                         raise TimeoutError("未取得会话状态锁，本次未更新状态") from exc
@@ -236,20 +252,7 @@ def session_state_lock(state_dir: Path, session_id: str, timeout_sec: float = 1.
                 if os.read(fd, len(token)) == token:
                     os.ftruncate(fd, 1)
     finally:
-        if fd >= 0:
-            if locked:
-                with contextlib.suppress(OSError):
-                    if os.name == "nt":
-                        import msvcrt
-
-                        os.lseek(fd, 0, os.SEEK_SET)
-                        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-                    else:
-                        import fcntl
-
-                        fcntl.flock(fd, fcntl.LOCK_UN)
-            with contextlib.suppress(OSError):
-                os.close(fd)
+        _unlock_and_close_fd(fd, locked)
 
 
 def try_unlink_unheld_lock(lock_path: Path) -> bool:
@@ -298,20 +301,7 @@ def try_unlink_unheld_lock(lock_path: Path) -> bool:
     except OSError:
         return False
     finally:
-        if fd >= 0:
-            if locked:
-                with contextlib.suppress(OSError):
-                    if os.name == "nt":
-                        os.lseek(fd, 0, os.SEEK_SET)
-                        import msvcrt
-
-                        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-                    else:
-                        import fcntl
-
-                        fcntl.flock(fd, fcntl.LOCK_UN)
-            with contextlib.suppress(OSError):
-                os.close(fd)
+        _unlock_and_close_fd(fd, locked)
     if os.name == "nt" and locked and verified and st is not None:
         try:
             cur_st = lock_path.lstat()
