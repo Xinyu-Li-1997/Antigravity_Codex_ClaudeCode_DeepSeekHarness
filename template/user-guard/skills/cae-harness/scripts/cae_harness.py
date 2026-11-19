@@ -1864,6 +1864,48 @@ def _extract_negated_backends(prompt_text):
             for match in re.finditer(r'(?<![A-Za-z0-9_.=-])' + pattern + r'(?![A-Za-z0-9_.=-])', clause, re.I):
                 if _cue_is_negated(clause[:match.start()]):
                     negated.add(name)
+    major_split = re.compile(r'[，。；,;.!?！？\n]+|\b(?:but|however|instead)\b|但是|而是|而只', re.I)
+    any_backend = '|'.join(f'(?P<b_{k}>{v})' for k, v in _BACKEND_HINT_NAMES.items())
+    chain_step = re.compile(r'^\s*(?:、|/|和|与|及|或|\band\b|\bor\b)\s*(?:' + any_backend + r')(?![A-Za-z0-9_.=-])', re.I)
+    only_head = re.compile(
+        r'(?:只|仅)(?:使用|调用|采用|选用|用|限(?:使用|调用|用)?)\s*(?:' + any_backend + r')(?![A-Za-z0-9_.=-])',
+        re.I,
+    )
+
+    def _matched_backend(m):
+        return next((k[2:] for k, v in m.groupdict().items() if k.startswith('b_') and v is not None), '')
+
+    for sentence in major_split.split(text):
+        for name, pattern in _BACKEND_HINT_NAMES.items():
+            for match in re.finditer(r'(?<![A-Za-z0-9_.=-])' + pattern + r'(?![A-Za-z0-9_.=-])', sentence, re.I):
+                sub_prefix = _CUE_BOUNDARIES.split(sentence[:match.start()])[-1]
+                if _cue_is_negated(sub_prefix):
+                    negated.add(name)
+                    pos = match.end()
+                    while True:
+                        nxt = chain_step.match(sentence[pos:])
+                        if not nxt:
+                            break
+                        b_name = _matched_backend(nxt)
+                        if b_name:
+                            negated.add(b_name)
+                        pos += nxt.end()
+        for match in only_head.finditer(sentence):
+            sub_prefix = _CUE_BOUNDARIES.split(sentence[:match.start()])[-1]
+            if _cue_is_negated(sub_prefix):
+                continue
+            allowed = {_matched_backend(match)} - {''}
+            pos = match.end()
+            while True:
+                nxt = chain_step.match(sentence[pos:])
+                if not nxt:
+                    break
+                b_name = _matched_backend(nxt)
+                if b_name:
+                    allowed.add(b_name)
+                pos += nxt.end()
+            if allowed:
+                negated.update(set(_BACKEND_HINT_NAMES) - allowed)
     return negated
 
 
@@ -5489,6 +5531,40 @@ def _budget_for_spec(backends, spec):
     return resolve_execution_profile(backends, spec, kind='audit')['capacity']['input_budget_tokens']
 
 
+def _same_backend_heterogeneous_right(prefix, left_spec, backends, prompt_text='', *, ignore_cooldown=False):
+    if prefix != 'agy' or _extract_prompt_model_hint(prompt_text):
+        return None
+    if not _peer_auto_ready(backends, 'agy', ignore_cooldown=ignore_cooldown):
+        return None
+    agy_rules = _catalog_rules('agy')
+    pair_tags = list(dict.fromkeys([
+        *(str(t).strip().lower() for t in (agy_rules.get('deep_families') or ()) if str(t).strip()),
+        *(str(t).strip().lower() for t in (agy_rules.get('code_families') or ()) if str(t).strip()),
+    ]))
+    if len(pair_tags) < 2:
+        return None
+    try:
+        left_prof = resolve_execution_profile(backends, left_spec, 'max', prompt_text, 'audit')
+    except HarnessError:
+        return None
+    left_slug = str(left_prof.get('model') or '')
+    if not left_slug or left_prof.get('execution_blocked_reason'):
+        return None
+    left_tokens = _tokens_lower(left_slug)
+    for tag in pair_tags:
+        if tag in left_tokens:
+            continue
+        alt_spec = f'agy:{tag}'
+        try:
+            alt_prof = resolve_execution_profile(backends, alt_spec, 'max', '', 'audit')
+        except HarnessError:
+            continue
+        if (alt_prof.get('model') and not alt_prof.get('execution_blocked_reason')
+                and alt_prof.get('spec') != left_prof.get('spec')):
+            return alt_spec
+    return None
+
+
 def _audit_engines(backends, dual_blind, left_override, right_override, allow_unconfigured, caller, prompt_text='', *,
                    ignore_cooldown=False):
     negated = _extract_negated_backends(prompt_text)
@@ -5505,10 +5581,16 @@ def _audit_engines(backends, dual_blind, left_override, right_override, allow_un
     if dual_blind:
         name, _ = _engine_parts(left)
         candidates = [peer for peer in ('agy', 'codex', 'claude', 'dsh') if peer != name and peer not in negated]
+        ready_other = next((peer for peer in candidates if _peer_auto_ready(backends, peer, ignore_cooldown=ignore_cooldown)), None)
+        if not right_override and ready_other is None:
+            same_het = _same_backend_heterogeneous_right(
+                name, left, backends, prompt_text, ignore_cooldown=ignore_cooldown,
+            )
+            if same_het:
+                return left, same_het
         if not right_override and not candidates:
             raise HarnessError('提示词已排除其余候选后端，无法组建双路审查')
-        other = next((peer for peer in candidates if _peer_auto_ready(backends, peer, ignore_cooldown=ignore_cooldown)),
-                     candidates[0] if candidates else ('agy' if name == 'codex' else 'codex'))
+        other = ready_other or (candidates[0] if candidates else ('agy' if name == 'codex' else 'codex'))
         right_prompt = prompt_text if (right_override or '').strip().lower().startswith('role:') else ''
         right = choose_engine(backends, caller, right_override or other + ':default', right_prompt,
                               ignore_cooldown=ignore_cooldown)
@@ -7940,14 +8022,25 @@ def _native_plan_model(prefix, info, requested_model, agent_type=''):
     return model, display, home, config
 
 
-def _native_swarm_worker_model(prefix, info, kind, raw_tier=''):
-    """当 native_swarm 配置了专长 worker 模型且当前流未显式锁定模型时，按目录解析对应模型。"""
+def _native_swarm_worker_model(prefix, info, kind, raw_tier='', parent_model=''):
+    """当 native_swarm 配置了编码专长或异构验收模型且当前流未显式锁定模型时，按目录解析对应模型。"""
     native_cfg = _native_agent_profile(prefix)
     worker_family = str(native_cfg.get('swarm_worker_model_family') or '').strip().lower()
     worker_kinds = {str(k).strip().lower() for k in (native_cfg.get('swarm_worker_kinds') or ()) if str(k).strip()}
-    if not worker_family or kind not in worker_kinds:
+    verifier_family = str(native_cfg.get('swarm_verifier_model_family') or '').strip().lower()
+    verifier_kinds = {str(k).strip().lower() for k in (native_cfg.get('swarm_verifier_kinds') or ()) if str(k).strip()}
+    if worker_family and kind in worker_kinds:
+        target_family = worker_family
+        default_tier = str(native_cfg.get('swarm_worker_tier') or 'high').strip().lower() or 'high'
+        role_note = 'native_swarm 编码专长推荐'
+        require_heterogeneous_parent = False
+    elif verifier_family and kind in verifier_kinds:
+        target_family = verifier_family
+        default_tier = str(native_cfg.get('swarm_verifier_tier') or 'high').strip().lower() or 'high'
+        role_note = 'native_swarm 异构验收推荐'
+        require_heterogeneous_parent = True
+    else:
         return None, None, None
-    default_tier = str(native_cfg.get('swarm_worker_tier') or 'high').strip().lower() or 'high'
     target_tier = raw_tier if raw_tier and raw_tier != 'auto' else default_tier
     if prefix == 'agy':
         agy_blocked = {str(t).lower() for t in (_catalog_rules('agy').get('blocked_auto_tokens') or ())}
@@ -7957,16 +8050,26 @@ def _native_swarm_worker_model(prefix, info, kind, raw_tier=''):
             and _is_subscription_enabled('agy', item.get('slug', ''))
             and not (_tokens_lower(f"{item.get('slug', '')} {item.get('display_name', '')}") & agy_blocked)
         ]
+        if require_heterogeneous_parent:
+            parent_text = str(parent_model or '').strip()
+            if not parent_text or target_family in _tokens_lower(parent_text):
+                return None, None, None
+            try:
+                parent_rec, _ = _resolve_explicit_agy_record(native_models, parent_text, 'high')
+            except HarnessError:
+                parent_rec = {}
+            if not parent_rec or target_family in _tokens_lower(parent_rec.get('slug', '')):
+                return None, None, None
         families = _agy_families(native_models)
         eligible = sorted((name for name in families if _match_agy_family(families[name], target_tier)), key=_agy_family_order)
-        chosen = _pick_agy_tagged_family(eligible, [worker_family])
+        chosen = _pick_agy_tagged_family(eligible, [target_family])
         if chosen:
             record = _match_agy_family(families[chosen], target_tier)
             slug = record.get('slug')
             if slug:
                 label = record.get('display_name') or slug
                 _, resolved_tier = _agy_slug_tier(slug)
-                display = f'{slug} (native_swarm 编码专长推荐；swarm add 传入 model="{label}")'
+                display = f'{slug} ({role_note}；swarm add 传入 model="{label}")'
                 return slug, display, resolved_tier or target_tier
     return None, None, None
 
@@ -8081,6 +8184,7 @@ def _resolve_plan_streams(args, streams, backends):
                 tier, tier_reason = _resolve_effective_tier(raw_tier_arg, kind, user_text, text,
                                                             file_count=count, estimated_tokens=tokens)
             swarm_model, swarm_display, swarm_tier = (None, None, None)
+            inh_model, _, home, config = _native_plan_model(prefix, info, 'inherit', agent_type=native_agent_type)
             if (channel == 'native_swarm' and not raw_requested_model
                     and not _extract_prompt_model_hint(user_text)):
                 explicit_swarm_tier = (
@@ -8091,10 +8195,9 @@ def _resolve_plan_streams(args, streams, backends):
                 if override_tier and raw_tier_arg == 'auto' and not tier_reason.startswith(('user_description_', 'economy_')):
                     explicit_swarm_tier = ''
                 swarm_model, swarm_display, swarm_tier = _native_swarm_worker_model(
-                    prefix, info, kind, explicit_swarm_tier,
+                    prefix, info, kind, explicit_swarm_tier, parent_model=inh_model or '',
                 )
             if swarm_model:
-                _, _, home, config = _native_plan_model(prefix, info, 'inherit', agent_type=native_agent_type)
                 model, display = swarm_model, swarm_display
                 tier = swarm_tier or tier
                 requested_model = ''
@@ -8592,8 +8695,14 @@ def cmd_plan(args):
                                         and not tier_reason.startswith(('user_description_', 'economy_'))
                                         else tier
                                     )
+                                    p_info = backends.get(p_prefix, {})
+                                    p_inh, _, _, _ = _native_plan_model(
+                                        p_prefix, p_info, 'inherit',
+                                        agent_type=stream.get('agent_type') or getattr(args, 'agent_type', '') or 'self',
+                                    )
                                     sm, _, st = _native_swarm_worker_model(
-                                        p_prefix, backends.get(p_prefix, {}), stream['kind'], eff_swarm_tier,
+                                        p_prefix, p_info, stream['kind'], eff_swarm_tier,
+                                        parent_model=p_inh or '',
                                     )
                                     if sm:
                                         core['model'] = sm

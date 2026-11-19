@@ -29,6 +29,12 @@ description: >
 
 五个槽位的候选、声明窗口与推荐挡位均读取 [fleet_profile.json](fleet_profile.json)。后台常规任务默认采用所选模型支持的单模型非委派最高强度，跳过自动委派的 `ultra`。`polish` 按配置篇幅阈值选短篇 `medium` 或长篇 `high`；`role:fast` 按其低消耗配置执行。显式非 `fast` 角色即使降到 `low`，仍保留该槽位主力模型。轻量卡片承担非 `fast` 角色或所需本地路由未存活时，必须明确报错。
 
+日常协作无需用户记忆模型名或底层参数，主会话按任务是否存在确定性硬验证器（编译、单元测试或给定待审文本）自动完成无感分流，并按模糊口语意图组织复合工作流：
+
+1. **常规编码、审查与异构验收无感分流**：代码实现与门禁默认走 `role:code`（内部 `native_swarm` 走 `swarm_worker_model_family`），常规审查与正向推导默认走跨端或审慎槽位（`role:review`、`role:math`）。当主会话前端选用高吞吐编码系列模型统筹时，后台审查与配置了 `swarm_verifier_model_family` 的 `native_swarm` 验收流自动切换至审慎低幻觉系列，规避同源审查盲区。
+2. **早期方案探索与定纲收口分离**：用户表达技术栈横评、发散探路或草案排雷意图时，可并发派高吞吐推理流铺开候选并检查计算与存储资源边界；正式写入项目规范或总体架构前，须由主会话核对历史归档与物理前提条件后收口。
+3. **未闭环数理推导的正反双流协同**：用户表达核心命题证明、正反推演或寻找反例意图且缺乏现成单测裁判时，避免仅靠单路激进高吞吐模型独立下定论；优先通过 `--spec-file` 编排“审慎模型从零正向立论（`role:math`）+ 高算力模型对照初稿逐式找反例与奇点边界”的双流计划，再由主会话按 R6 复核。其他对等端不可用或被提示词排除时，双盲 `audit` 自动配对同客户端内的 `deep_families` 与 `code_families` 组建异构双源审查。
+
 外部调用由脚本补齐声明最大上下文窗口、无头非交互标志、只读小文件行号内联、前后快照与脱敏。`--inline-readonly` 默认开启，实际内联还受目标规模和配置限制。`--output` 保存结构化回执，文件默认脱敏；`--redact` 控制标准输出脱敏。原生通道的能力按客户端实际支持说明，不把外部无头隔离承诺套用于原生代理。
 
 ## 两道可用性检查
@@ -45,7 +51,7 @@ description: >
 
 轻任务按 `runtime_tunables.dispatch_confirmation` 的流数、文件数、估算 Token 和超时阈值静默执行。多路、可写或超出轻任务阈值的调用进入重负载流程，不能仅凭名称自行判轻。内部 `invoke_subagent`、`run_workflow`、`spawn_agent`、`Agent`、`swarm` 等多路或可写委派与外部无头调用均须纳入确认。
 
-`plan` 可接收单流参数，也可通过 `--spec-file` 读取非空对象列表。流内字段覆盖相应公共默认值。通道有 `cae_harness_headless`、`native_subagent`、`native_workflow`、`native_swarm`。原生通道必须指定或识别 `--caller`，默认模型为 `inherit`；确认单按前端配置（含 Codex 代理配置与 Claude/Antigravity 代理前置元数据的显式 `model`）解析实际模型，并独立挂载 `fleet_profile.json` 中可选的 `native_agent_profiles` 元数据，无法解析时保留未解析状态。其中 `native_swarm` 若在 `native_agent_profiles` 中配置了 `swarm_worker_model_family` 与 `swarm_worker_kinds`，对应任务且未显式传入 `--model` 时，确认单自动推荐该系列模型供用户审定，获批后在 `swarm` 的 `add` 中显式传入 `model`；只读核查与其他原生通道保持 `inherit`。原生通道不属于无头调用，也不提供净室隔离。`status_guard.py` 对 `swarm` 的 `add` 调用按 `tasks` 列表长度或 `n` 计入通道并发容量，避免单次批量派生绕过票据流数上限。
+`plan` 可接收单流参数，也可通过 `--spec-file` 读取非空对象列表。流内字段覆盖相应公共默认值。通道有 `cae_harness_headless`、`native_subagent`、`native_workflow`、`native_swarm`。原生通道必须指定或识别 `--caller`，默认模型为 `inherit`；确认单按前端配置（含 Codex 代理配置与 Claude/Antigravity 代理前置元数据的显式 `model`）解析实际模型，并独立挂载 `fleet_profile.json` 中可选的 `native_agent_profiles` 元数据，无法解析时保留未解析状态。其中 `native_swarm` 若在 `native_agent_profiles` 中配置了 `swarm_worker_model_family`（对应 `swarm_worker_kinds`）或 `swarm_verifier_model_family`（对应 `swarm_verifier_kinds`），未显式传入 `--model` 时，确认单对编码流自动推荐对应高速实现系列，并在宿主前端处于非验收系列时对验收流自动推荐异构审慎系列，获批后在 `swarm` 的 `add` 中显式传入 `model`；宿主已处于同一审慎系列及其他原生通道保持 `inherit`。原生通道不属于无头调用，也不提供净室隔离。`status_guard.py` 对 `swarm` 的 `add` 调用按 `tasks` 列表长度或 `n` 计入通道并发容量，避免单次批量派生绕过票据流数上限。
 
 重负载确认单在落盘文件 `<ticket_id>_card.md` 中完整记录工作流背景、要做什么、预计后果、4 列各路总览表与每路纵向展开的 14 项完整参数表（保存票据时先写 `<ticket_id>.json` 再写 `<ticket_id>_card.md`），同时生成含可点击明细链接的精简总览卡 `compact_summary_card` 与 `compact_handoff_prompt_block`。已落盘票据的 `plan` 标准输出默认采用精简视图（置顶 `compact_summary_card`，省略已落盘的 14 项长表与 `execution_profile`；仅需完整结构时加 `--full-json`）。本地交互生成确认单不要对 `plan` 传 `--redact`，以免将 `<ticket_id>_card.md` 的本地链接替换成占位符。对话展示默认仅呈现 `compact_summary_card`（背景、目标、预计后果、4 列总览表、性能更新时间、可点击 `<ticket_id>_card.md` 链接与三选项），严禁将多路 14 项长表全文刷屏对话污染主上下文；仅当未保存明细文件或用户明确要求展开时才输出完整 14 项表。不能省略未知字段，也不能以角色槽位代替实际模型。
 

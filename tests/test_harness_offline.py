@@ -6070,7 +6070,7 @@ else:
         })
         self.assertEqual(harness.extract_cli_token_usage('dsh', dsh_already_incl)['input_tokens'], 12800)
 
-        # 7) _extract_json_object 保守修复尾部缺失 ]（复现 df6e061c S1），但不修复截断未闭合字符串
+        # 7) _extract_json_object 保守修复尾部缺失 ]，但不修复截断未闭合字符串
         missing_bracket = json.dumps({
             'type': 'final',
             'reason': {'kind': 'completed'},
@@ -6270,6 +6270,55 @@ else:
                           '--write-scope', 'swarm_mod.py', '--full-json'),
             )
             self.assertEqual(sub_code['streams'][0]['model_display'], 'inherit (Gemini 4 Carbon (High))')
+
+            # 3) 当成熟工程仓前端主控切至 Neon High 时，native_swarm 的 review/math 验收流无感推荐异构低幻觉 Carbon High
+            (agy_home / 'config' / 'config.json').write_text(
+                json.dumps({'userSettings': {'model': 'Gemini 4 Neon (High)'}}), encoding='utf-8',
+            )
+            _, sw_het_rev = self.capture(
+                harness.cmd_plan,
+                self.args('plan', *common, '--channel', 'native_swarm', '--kind', 'review',
+                          '--save-ticket', '--full-json'),
+            )
+            self.assertEqual(sw_het_rev['streams'][0]['model'], 'gemini-4-carbon-high')
+            self.assertEqual(sw_het_rev['streams'][0]['tier'], 'high')
+            self.assertIn('native_swarm 异构验收推荐', sw_het_rev['streams'][0]['model_display'])
+            _, sw_het_ok = self.capture(
+                harness.cmd_plan,
+                self.args('plan', '--caller', 'antigravity', '--plan-dir', str(plans),
+                          '--approve-ticket', sw_het_rev['ticket_id'], '--full-json'),
+            )
+            self.assertEqual(sw_het_ok['status'], 'APPROVED')
+            self.assertEqual(sw_het_ok['streams'][0]['model'], 'gemini-4-carbon-high')
+
+            # 显式 --model inherit 仍可覆盖异构推荐
+            _, sw_het_inh = self.capture(
+                harness.cmd_plan,
+                self.args('plan', *common, '--channel', 'native_swarm', '--kind', 'review',
+                          '--model', 'inherit', '--full-json'),
+            )
+            self.assertEqual(sw_het_inh['streams'][0]['model_display'], 'inherit (Gemini 4 Neon (High))')
+
+        # 4) 单端受限或排除其余后端时，audit 自动配对同端异构双子星（Carbon High + Neon XHigh）
+        left_excl, right_excl = harness._audit_engines(
+            engines, True, '', '', False, 'antigravity', '不要用 codex、claude、dsh，只用反重力双路审查',
+        )
+        self.assertEqual((left_excl, right_excl), ('agy:default', 'agy:neon'))
+        audit_plan = harness.select_audit_plan(
+            120, [{'rel_path': 'swarm_mod.py', 'tokens': 20}], engines,
+            dual_blind=True, caller='antigravity', focus='不要用 codex、claude、dsh，只用反重力双路审查',
+        )
+        self.assertEqual(audit_plan['execution_profiles']['left']['model'], 'gemini-4-carbon-high')
+        self.assertEqual(audit_plan['execution_profiles']['right']['model'], 'gemini-4-neon-xhigh')
+
+        only_agy = {k: ({**v, 'available': False} if k != 'agy' else dict(v)) for k, v in engines.items()}
+        left_only, right_only = harness._audit_engines(only_agy, True, '', '', False, 'antigravity', '审查离散通量')
+        self.assertEqual((left_only, right_only), ('agy:default', 'agy:neon'))
+        left_only_phrase, right_only_phrase = harness._audit_engines(
+            engines, True, '', '', False, 'antigravity', '只用反重力双路审查',
+        )
+        self.assertEqual((left_only_phrase, right_only_phrase), ('agy:default', 'agy:neon'))
+        self.assertEqual(harness._extract_negated_backends('不只用反重力审查'), set())
 
 
 if __name__ == '__main__':

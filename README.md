@@ -92,8 +92,9 @@ python -B -X utf8 install.py --audit-upgrade     # 4. 检查各端配置是否�
 | **方案讨论与单文件小修改** | 直接在主窗口讨论方案、修改局部代码或做小范围只读检查 | `role:orchestrator`（保持主窗口当前客户端与模型，直接执行不额外询问） |
 | **多篇文献摘录与大源码行号定位** | “把这三篇文献的控制方程和对应源码行号整理出来” | 当前客户端内部 `readonly-*` 只读子代理并行读取，禁止写文件、禁止运行构建与测试 |
 | **控制方程与离散守恒性质推导** | “推导弯曲网格几何守恒律（GCL）离散条件与熵稳定判据” | `role:math`，默认选用单模型最高非自动委派强度（跳过会自动派生多层子代理、易导致轮询超时的 `ultra` 挡） |
+| **高风险新命题正反双流攻坚与方案排雷** | “这个命题正反双路深推并找反例挑刺”“并发对比候选方案并排查显存边界” | 自动按 `--spec-file` 组织“审慎模型从零正向立论 + 高算力模型反例挑刺”双流确认单，正式定纲前由主会话核对历史归档收口 |
 | **核心求解器实现与测试验证** | “实现二维 Euler 方程 HLLC 界面通量并跑通守恒单测” | `role:code` 配合 `cae_harness.py gate`，限制 `--write-scope` 可写路径并强制通过非空 `--verify-cmd` 测试命令 |
-| **关键代码交叉审查与文档独立检查** | “独立审查 `src/flux/` 边界相容性”“检查文档是否存在未定义缩写” | 优先跨客户端调用 `role:review` 或双源 `audit`；文档可读性使用 `--isolation clean_room` 空上下文盲读 |
+| **关键代码交叉审查与文档独立检查** | “独立审查 `src/flux/` 边界相容性”“检查文档是否存在未定义缩写” | 优先跨客户端调用 `role:review` 或双源 `audit`（其他端受限时自动组建同端异构双模型审查）；文档可读性使用 `--isolation clean_room` 空上下文盲读 |
 | **格式初筛与低成本检查** | “快速扫一遍目录结构与明显拼写错误” | `role:fast`，使用轻量快速模型低消耗完成，不替代正式数学与代码审查 |
 | **文档润色与供应商配置卡切换** | “重新整理说明文档并核对源码参数”“切换到备用供应商卡片” | 文档重写或 `task --kind polish` 润色后运行 `check-grounding --strict` 校验；切卡由 `ccswitch_admin.py` 在线备份数据库后执行 |
 
@@ -172,7 +173,7 @@ python -B -X utf8 install.py --audit-upgrade     # 4. 检查各端配置是否�
 
 | 查阅内容 | 对应文档 |
 | --- | --- |
-| **指令与子命令对照、14 项参数说明、Euler HLLC 示例、中断恢复与四级（L1–L4）验证流程** | [日常工作流实战指南](docs/workflow-guide.md) |
+| **阶段选型与日常无感/模糊口语矩阵、14 项参数说明、Euler HLLC 示例、中断恢复与四级（L1–L4）验证流程** | [日常工作流实战指南](docs/workflow-guide.md) |
 | **钩子模块分工、`fleet_profile.json` 配置键说明、压缩恢复细节、分片预算公式、本地路由与卸载清理** | [架构设计与钩子说明](docs/architecture-and-hooks.md) |
 | **`cae_harness.py` 子命令（`probe`、`assess`、`plan`、`batch`、`gate`、`audit`、`task`、`check-grounding`）说明** | [cae-harness 技能规程](template/user-guard/skills/cae-harness/SKILL.md) |
 | **上游仓库维护流程（`full`、`hygiene`、`audit`）、`fleet_state.py` 状态锁与 `install.py` 维护说明** | [fleet-evolve 维护规程](template/user-guard/skills/fleet-evolve/SKILL.md) · [仓库维护说明](AGENTS.md) |

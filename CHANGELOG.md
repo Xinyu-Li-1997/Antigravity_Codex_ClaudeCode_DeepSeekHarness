@@ -2,6 +2,19 @@
 
 本文件记录四客户端共用规则、会话钩子、后台验证工具与上游维护流程的版本演进。当前插件版本以 `template/user-guard/plugin.json` 为准；常驻使用文档只说明机制和配置键，不重复维护版本号与性能日期。
 
+## [1.17.4] - 2026-11-20
+
+沉淀认识论校准与硬验证器闭环双轴评估方法论、日常无感与模糊口语编排规范，并补齐 `native_swarm` 异构验收保护及单端受限时的同端异构双盲审查：
+
+- **双轴正交评估准则与日常无感 / 模糊口语编排落位（`fleet-evolve/SKILL.md`、`cae-harness/SKILL.md`、`docs/workflow-guide.md`、`README.md`、`fleet_profile.json`）**：
+  - 在 `fleet-evolve/SKILL.md` 与 `fleet_profile.json`（`evaluation_policy.defect_veto_priority`）确立两条正交评估轴：无确定性验证器场景下的审慎拒答校准（无工具幻觉率与拒答率拆解，决定未闭环理论总控、论文定稿与正向立论）与有硬验证器约束下的代理执行及反例挑刺吞吐（决定受控编码、并行实现与对抗挑刺）；
+  - 在 `cae-harness/SKILL.md` 增补无感分流、早期探索与定纲收口分离、未闭环数理正反双流协同三条无模型名编排定式；在 `docs/workflow-guide.md` 与 `README.md` 同步公开脱敏的课题阶段选型与日常模糊口语速查矩阵。
+- **`native_swarm` 异构验收保护与单端受限 `audit` 异构双盲回退（`cae_harness.py`、`fleet_profile.json`、`tests/`）**：
+  - 在 `native_agent_profiles.antigravity` 新增 `swarm_verifier_model_family`（`carbon`）、`swarm_verifier_tier`（`high`）与 `swarm_verifier_kinds`（`review`、`math`）；当宿主前端模型处于非 `carbon` 系列（如成熟工程仓选用 `neon` 主控）时，`plan --channel native_swarm` 对验收与数理流自动推荐异构低幻觉 `carbon` 系列（宿主已为 `carbon` 或合成测试夹具时保持 `inherit`）；
+  - 新增 `_same_backend_heterogeneous_right` 接入 `_audit_engines`（同步增强 `_extract_negated_backends` 对顿号/连词并列排除与“只用/仅用”排他口语的识别）：当其余跨端后端均未就绪、处于配额冷却或被提示词排除且未显式指定 `--right` 时，`audit` 自动配对同客户端内的 `deep_families` 与 `code_families` 组建异构双模型审查，并补充离线回归单测。
+
+---
+
 ## [1.17.3] - 2026-11-20
 
 结合长周期科研总控与高频编码代理的评测及实战边界，完成 Antigravity 主控与内外子代理编排专长分流优化：
