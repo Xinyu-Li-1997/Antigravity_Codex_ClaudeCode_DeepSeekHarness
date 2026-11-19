@@ -63,7 +63,7 @@
         "codex:review",
         "dsh:review",
         "agy:@review",
-        "claude:default"
+        "claude:review"
       ],
       "recommended_client": "codex",
       "recommended_model_family": "sol",
@@ -131,6 +131,7 @@
         "Agent",
         "Task"
       ],
+      "subagent_model_policy": "card_env_or_frontmatter",
       "readonly_agents": [
         "readonly-auditor",
         "readonly-collaborator",
