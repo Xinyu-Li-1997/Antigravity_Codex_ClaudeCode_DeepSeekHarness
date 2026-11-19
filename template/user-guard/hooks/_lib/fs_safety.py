@@ -50,13 +50,24 @@ def read_bounded_first_line(
     return b"".join(chunks), False
 
 
+_IO_REPARSE_TAG_SYMLINK = getattr(stat, "IO_REPARSE_TAG_SYMLINK", 0xA000000C)
+_IO_REPARSE_TAG_MOUNT_POINT = getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", 0xA0000003)
+
+
 def is_reparse_or_link(path: Path) -> bool:
     try:
         st = path.lstat()
     except OSError:
         return False
+    if stat.S_ISLNK(st.st_mode):
+        return True
     reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
-    return stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_file_attributes", 0) & reparse_flag)
+    if not (getattr(st, "st_file_attributes", 0) & reparse_flag):
+        return False
+    tag = getattr(st, "st_reparse_tag", None)
+    if tag is None:
+        return True
+    return tag in (_IO_REPARSE_TAG_SYMLINK, _IO_REPARSE_TAG_MOUNT_POINT)
 
 
 def atomic_write_text(target_path: Path, content: str) -> None:
@@ -149,7 +160,8 @@ def session_state_lock(state_dir: Path, session_id: str, timeout_sec: float = 1.
             try:
                 fd = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
             except OSError as exc:
-                if exc.errno == errno.ENOENT and time.monotonic() < deadline:
+                retryable = exc.errno == errno.ENOENT or (os.name == "nt" and exc.errno == errno.EACCES)
+                if retryable and time.monotonic() < deadline:
                     time.sleep(0.005)
                     continue
                 raise

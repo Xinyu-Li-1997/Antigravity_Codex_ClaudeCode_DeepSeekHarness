@@ -203,6 +203,10 @@ def _validate_upstream_url(val, name):
     parsed = urlsplit(raw)
     if parsed.scheme.lower() not in ("http", "https") or not parsed.hostname:
         raise ValueError(f"{name} must use http or https with a non-empty hostname")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError(f"{name} must not contain embedded credentials")
+    if parsed.query or parsed.fragment:
+        raise ValueError(f"{name} must not contain query or fragment")
     try:
         _ = parsed.port
     except ValueError as exc:
@@ -250,6 +254,10 @@ def load_config(path):
         raise ValueError("follow_windows_proxy must be a boolean")
     if not isinstance(cfg.get("listen"), str) or not cfg["listen"].strip():
         raise ValueError("listen must be a non-empty string")
+    listen_host = cfg["listen"].strip().strip("[]")
+    if not _is_loopback_host(listen_host):
+        raise ValueError("listen must be a loopback address (127.0.0.1, ::1, or localhost)")
+    cfg["listen"] = listen_host
     port = cfg.get("port")
     if isinstance(port, bool) or not isinstance(port, int) or not (1 <= port <= 65535):
         raise ValueError("port must be an integer between 1 and 65535")
@@ -640,10 +648,18 @@ _CLIENT_DISCONNECT_ERRORS = (BrokenPipeError, ConnectionResetError, ConnectionAb
 
 
 def _request_target_path(raw_path):
-    if isinstance(raw_path, str) and raw_path.lower().startswith(("http://", "https://")):
+    if not isinstance(raw_path, str) or not raw_path:
+        raise ValueError("request target must be non-empty")
+    if any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in raw_path):
+        raise ValueError("request target contains control or whitespace characters")
+    if raw_path.lower().startswith(("http://", "https://")):
         parts = urlsplit(raw_path)
+        if not parts.hostname:
+            raise ValueError("absolute request target missing hostname")
         rel_path = parts.path if parts.path.startswith("/") else ("/" + parts.path if parts.path else "/")
         return f"{rel_path}?{parts.query}" if parts.query else rel_path
+    if not raw_path.startswith("/") or raw_path.startswith("//"):
+        raise ValueError("request target must be an origin-form path starting with '/'")
     return raw_path
 
 
@@ -662,8 +678,12 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     def do_GET(self):
-        target_path = _request_target_path(self.path)
-        if target_path.startswith("/__router/health"):
+        try:
+            target_path = _request_target_path(self.path)
+        except ValueError:
+            self._safe_send_error(400, "invalid request target")
+            return
+        if target_path.split("?", 1)[0] == "/__router/health":
             body = json.dumps({"ok": True, "port": self.server.cfg["port"]}).encode()
             try:
                 self.send_response(200)
@@ -736,7 +756,9 @@ class Handler(BaseHTTPRequestHandler):
         self._forward_locked(body)
 
     do_PUT = do_POST
-    do_DELETE = do_GET
+
+    def do_DELETE(self):
+        self.forward(b"")
 
     def forward(self, body):
         sem = getattr(self.server, "inflight_sem", _INFLIGHT_SEM)
@@ -751,7 +773,11 @@ class Handler(BaseHTTPRequestHandler):
     def _forward_locked(self, body):
         cfg = self.server.cfg
         t0 = time.time()
-        req_target = _request_target_path(self.path)
+        try:
+            req_target = _request_target_path(self.path)
+        except ValueError:
+            self._safe_send_error(400, "invalid request target")
+            return
         rec = {"t": time.strftime("%Y-%m-%d %H:%M:%S"), "m": self.command,
                "path": req_target.split("?")[0], "transport": "direct"}
         upstream, route, data = cfg["default_upstream"], None, None
@@ -813,7 +839,12 @@ class Handler(BaseHTTPRequestHandler):
         u = urlsplit(upstream)
         origin_path = u.path.rstrip("/") + req_target
         headers["Host"] = u.netloc
-        headers["Content-Length"] = str(len(body))
+        if body or self.command in ("POST", "PUT", "PATCH"):
+            headers["Content-Length"] = str(len(body))
+        else:
+            for k in list(headers):
+                if k.lower() == "content-length":
+                    del headers[k]
         conn_cls = http.client.HTTPSConnection if u.scheme == "https" else http.client.HTTPConnection
         conn = None
         sent, side, total = False, "upstream", 0
@@ -856,8 +887,13 @@ class Handler(BaseHTTPRequestHandler):
                 invalidate_card_key_cache(cfg, key_card)
             side = "client"
             self.send_response(resp.status, resp.reason)
-            for k, v in end_to_end_headers(resp.getheaders()):
+            resp_headers = resp.getheaders()
+            for k, v in end_to_end_headers(resp_headers):
                 self.send_header(k, v)
+            if not getattr(resp, "chunked", False):
+                resp_cl = next((v for k, v in resp_headers if k.lower() == "content-length"), None)
+                if resp_cl is not None and re.fullmatch(r"[0-9]+", str(resp_cl).strip()):
+                    self.send_header("Content-Length", str(resp_cl).strip())
             self.send_header("Connection", "close")
             self.end_headers()
             sent = True
@@ -902,8 +938,17 @@ def main(argv=None):
         cfg = load_config(cfg_path)
     except (OSError, ValueError) as exc:
         ap.error(f"invalid router config ({cfg_path}): {exc}")
+    class _IPv6ThreadingHTTPServer(ThreadingHTTPServer):
+        address_family = socket.AF_INET6
+
     try:
-        srv = ThreadingHTTPServer((cfg["listen"], cfg["port"]), Handler)
+        is_ipv6 = False
+        try:
+            is_ipv6 = ipaddress.ip_address(cfg["listen"]).version == 6
+        except ValueError:
+            is_ipv6 = False
+        server_cls = _IPv6ThreadingHTTPServer if is_ipv6 else ThreadingHTTPServer
+        srv = server_cls((cfg["listen"], cfg["port"]), Handler)
     except OSError as exc:
         host = f"[{cfg['listen']}]" if ":" in str(cfg["listen"]) and not str(cfg["listen"]).startswith("[") else cfg["listen"]
         health_url = f"http://{host}:{cfg['port']}/__router/health"

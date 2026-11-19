@@ -934,7 +934,8 @@ def _probe_windows_wsl() -> Dict[str, Any]:
         '    "/opt/DeepSeek Harness/resources/runtime/cli/bin/$name"; do '
         '    if [ -f "$candidate" ] && [ -x "$candidate" ]; then bin=$candidate; break; fi; '
         '  done; '
-        '  case "$bin" in /*) case "$bin" in /mnt/[a-zA-Z]/*|*.exe|*.cmd|*.bat) bin=;; esac;; *) bin=;; esac; '
+        '  resolved=$(readlink -f "$bin" 2>/dev/null || printf "%s" "$bin"); '
+        '  case "$resolved" in /*) case "$resolved" in /mnt/[a-zA-Z]/*|*.exe|*.cmd|*.bat) bin=;; esac;; *) bin=;; esac; '
         '  trace=false; '
         '  if [ "$name" = agy ]; then '
         '    [ -d "$HOME/.gemini/config" ] || [ -d "$HOME/.gemini/antigravity-cli" ] || [ -d "$HOME/.gemini/antigravity" ]; '
@@ -989,8 +990,10 @@ def _probe_dsh_hook_capability(dsh_bin: Optional[str]) -> Dict[str, Any]:
             cmd,
             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=3,
         )
-        help_txt = (proc.stdout or "") + "\n" + (proc.stderr or "")
-        if any(tok in help_txt for tok in ("PreToolUse", "SessionStart", "hooks.json", "--hooks")):
+        help_txt = proc.stdout or ""
+        rc = getattr(proc, "returncode", 0)
+        rc_ok = not (isinstance(rc, int) and not isinstance(rc, bool) and rc != 0)
+        if rc_ok and any(tok in help_txt for tok in ("PreToolUse", "SessionStart", "hooks.json", "--hooks")):
             info["hook_protocol"] = "lifecycle_hooks"
             info["hard_hooks_supported"] = True
             info["meta_update_trigger"] = "ready_for_fleet_evolve_dsh_hooks"
@@ -1296,7 +1299,10 @@ def detect_zotero_mcp_executable(explicit_cmd: str = "") -> Optional[str]:
     codex_cfg = codex_root / "config.toml"
     if codex_cfg.is_file():
         try:
-            cfg = _parse_toml(codex_cfg.read_bytes().decode("utf-8-sig"), codex_cfg)
+            raw_codex_cfg = _read_optional_bytes(codex_cfg, allow_hardlinks=True)
+            if raw_codex_cfg is None:
+                return None
+            cfg = _parse_toml(raw_codex_cfg.decode("utf-8-sig"), codex_cfg)
             command = cfg.get("mcp_servers", {}).get("zotero", {}).get("command")
             if isinstance(command, str):
                 candidate = Path(command).expanduser()
@@ -1482,6 +1488,24 @@ def mirror_sync_plugin(
         if original != content:
             pending_updates.append((src, FileChange(dst, original, content)))
 
+    stale_files: List[Path] = []
+    stale_dirs: List[Path] = []
+    if target_plugin_dir.exists():
+        stale_files = _stale_mirror_files(template_dir, target_plugin_dir, expected_rel_files)
+        for existing in sorted(target_plugin_dir.rglob("*")):
+            if existing.is_dir():
+                rel = existing.relative_to(target_plugin_dir)
+                if existing.name == "__pycache__" and not any(parent.name == "__pycache__" for parent in rel.parents):
+                    stale_dirs.append(existing)
+        for stale_file in stale_files:
+            if stale_file.is_dir() and not _is_link_or_junction(stale_file):
+                _validate_path(stale_file, directory=True)
+            else:
+                _validate_path(stale_file, directory=False)
+        for stale_dir in stale_dirs:
+            _validate_path(stale_dir, directory=True)
+            _validate_tree_links(stale_dir)
+
     if dry_run:
         if pending_updates:
             print(f"[Dry-Run] 将同步 {len(pending_updates)} 个变更文件至: {target_plugin_dir}")
@@ -1500,7 +1524,7 @@ def mirror_sync_plugin(
         return
 
     stale_files = _stale_mirror_files(template_dir, target_plugin_dir, expected_rel_files)
-    stale_dirs: List[Path] = []
+    stale_dirs = []
     for existing in sorted(target_plugin_dir.rglob("*")):
         if existing.is_dir():
             rel = existing.relative_to(target_plugin_dir)
@@ -1627,29 +1651,27 @@ def _select_agy_frontier_max_label(
             tiered.append((match.group(1), match.group(2), item["display_name"]))
     if not tiered:
         for pref in family_priority:
-            matched = next(
-                (item["display_name"] for item in eligible if pref in _tokens(item["slug"]) and not (_tokens(item["slug"]) & light_tokens)),
-                None,
-            )
-            if matched:
-                return matched
-        return next(
-            (item["display_name"] for item in eligible if not (_tokens(item["slug"]) & light_tokens)),
-            eligible[0]["display_name"],
-        )
+            matched_items = [
+                item for item in eligible
+                if pref in _tokens(item["slug"]) and not (_tokens(item["slug"]) & light_tokens)
+            ]
+            if matched_items:
+                return max(matched_items, key=lambda item: _model_generation(item["slug"]))["display_name"]
+        non_light = [item for item in eligible if not (_tokens(item["slug"]) & light_tokens)]
+        pool = non_light or eligible
+        return max(pool, key=lambda item: _model_generation(item["slug"]))["display_name"]
     primary_family = None
     for pref in family_priority:
-        primary_family = next(
-            (fam for fam, _, _ in tiered if pref in _tokens(fam) and not (_tokens(fam) & light_tokens)),
-            None,
-        )
-        if primary_family:
+        matched_fams = list(dict.fromkeys(
+            fam for fam, _, _ in tiered if pref in _tokens(fam) and not (_tokens(fam) & light_tokens)
+        ))
+        if matched_fams:
+            primary_family = max(matched_fams, key=_model_generation)
             break
     if not primary_family:
-        primary_family = next(
-            (fam for fam, _, _ in tiered if not (_tokens(fam) & light_tokens)),
-            tiered[0][0],
-        )
+        non_light_fams = list(dict.fromkeys(fam for fam, _, _ in tiered if not (_tokens(fam) & light_tokens)))
+        fam_pool = non_light_fams or list(dict.fromkeys(fam for fam, _, _ in tiered))
+        primary_family = max(fam_pool, key=_model_generation)
     variants = {tier: label for fam, tier, label in tiered if fam == primary_family}
     best_tier = max(variants, key=EFFORT_ORDER.index)
     return variants[best_tier]
@@ -1785,12 +1807,15 @@ def _apply_codex_frontier_max(
 
     cur_model = values.get("model", "").strip()
     cur_effort = values.get("model_reasoning_effort", "").strip()
-    if cur_model and cur_effort and not overwrite:
+    if cur_model and cur_effort and "model_context_window" in editor.data and not overwrite:
         print("[*] 保留 Codex 已配置的默认模型和推理挡位。")
         return
 
     try:
-        cache = _read_json_object(cache_path, cache_path.read_bytes())
+        raw_cache = _read_optional_bytes(cache_path, allow_hardlinks=True)
+        if raw_cache is None:
+            raise ValueError("缺少 Codex 模型目录")
+        cache = _read_json_object(cache_path, raw_cache)
         if not isinstance(cache.get("models"), list):
             raise ValueError("模型目录的 models 必须是列表")
         models = [model for model in cache["models"]
@@ -1935,17 +1960,39 @@ _LOCAL_ENV_COLLISIONS = re.compile(r"^([ \t]*(?:(?:[-*+]|\d+\.)[ \t]+)?(?:#{1,6}
 
 
 def _find_custom_rules_tail_start(text: str) -> Optional[int]:
-    env_sec_re = re.compile(r"^##[ \t]+工具与([^\r\n]*)[^\S\n]*(?:\r?\n|$)", re.MULTILINE)
-    env_matches = list(env_sec_re.finditer(text))
-    custom_env = next((m for m in env_matches if m.group(1).strip() != "运行环境"), None)
-    tail_start = custom_env.start() if custom_env is not None else None
-    standard_env = re.search(r"^##[ \t]+工具与运行环境[^\S\n]*(?:\r?\n|$)", text, re.MULTILINE)
-    if standard_env is not None:
-        following = re.search(r"^##[ \t]+\S[^\r\n]*", text[standard_env.end():], re.MULTILINE)
-        if following is not None:
-            following_start = standard_env.end() + following.start()
-            tail_start = min(tail_start, following_start) if tail_start is not None else following_start
-    return tail_start
+    fence_re = re.compile(r"^[ \t]*(`{3,}|~{3,})")
+    env_sec_re = re.compile(r"^##[ \t]+工具与([^\r\n]*)[^\S\n]*(?:\r?\n|$)")
+    h2_re = re.compile(r"^##[ \t]+\S[^\r\n]*")
+    in_fence_char = ""
+    in_fence_len = 0
+    custom_env_start: Optional[int] = None
+    standard_env_seen = False
+    following_start: Optional[int] = None
+    pos = 0
+    for line in text.splitlines(keepends=True):
+        f_match = fence_re.match(line)
+        if f_match:
+            marker = f_match.group(1)
+            if not in_fence_char:
+                in_fence_char, in_fence_len = marker[0], len(marker)
+            elif marker[0] == in_fence_char and len(marker) >= in_fence_len and not line[f_match.end():].strip():
+                in_fence_char, in_fence_len = "", 0
+            pos += len(line)
+            continue
+        if not in_fence_char:
+            env_m = env_sec_re.match(line)
+            if env_m:
+                if env_m.group(1).strip() == "运行环境":
+                    if not standard_env_seen:
+                        standard_env_seen = True
+                elif custom_env_start is None:
+                    custom_env_start = pos
+            elif standard_env_seen and following_start is None and h2_re.match(line):
+                following_start = pos
+        pos += len(line)
+    if custom_env_start is not None and following_start is not None:
+        return min(custom_env_start, following_start)
+    return custom_env_start if custom_env_start is not None else following_start
 
 
 def _sync_global_rules(template_rules_path: Path, rules_path: Path, label: str, dry_run: bool) -> None:
@@ -2864,10 +2911,15 @@ def _audit_redact(value: Any, roots: List[Tuple[Path, str]], secrets: Set[str]) 
             return f"{parsed.scheme}://{host}" + (f":{parsed.port}" if parsed.port else "") + parsed.path
         except ValueError:
             return "<redacted-url>"
-    value = re.sub(r"https?://[^\s\"<>]+", endpoint, value)
+    value = re.sub(r"(?:https?|wss?|socks5h?)://[^\s\"<>]+", endpoint, value, flags=re.IGNORECASE)
     octet = r"(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)"
     value = re.sub(
-        rf"(?<![0-9A-Za-z_.-])(?:10\.{octet}\.{octet}\.{octet}|172\.(?:1[6-9]|2\d|3[01])\.{octet}\.{octet}|192\.168\.{octet}\.{octet}|169\.254\.{octet}\.{octet})(?![0-9A-Za-z_.-])",
+        rf"(?<![0-9A-Za-z_.-])(?:10\.{octet}\.{octet}\.{octet}|100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.{octet}\.{octet}|172\.(?:1[6-9]|2\d|3[01])\.{octet}\.{octet}|192\.168\.{octet}\.{octet}|169\.254\.{octet}\.{octet})(?![0-9A-Za-z_.-])",
+        "<private-ip>",
+        value,
+    )
+    value = re.sub(
+        r"(?i)(?<![0-9A-Fa-f:])(?:fe[89ab][0-9a-f]|f[cd][0-9a-f]{2}):[0-9a-f:]+(?![0-9A-Fa-f:])",
         "<private-ip>",
         value,
     )
@@ -2942,12 +2994,15 @@ def _build_adaptive_meta_summary(
     ag_models: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     base_root = Path(repo_root) if repo_root is not None else Path(__file__).resolve().parent
-    hooks_parent = base_root / "template/user-guard/hooks"
-    if hooks_parent.is_dir() and str(hooks_parent) not in sys.path:
-        sys.path.insert(0, str(hooks_parent))
+    policy_path = base_root / "template/user-guard/hooks/_lib/adaptive_policy.py"
+    if not policy_path.is_file():
+        return {}
     try:
-        from _lib import adaptive_policy  # type: ignore
-    except ImportError:
+        import types
+        adaptive_policy = types.ModuleType("_install_adaptive_policy")
+        adaptive_policy.__file__ = str(policy_path)
+        exec(compile(policy_path.read_text(encoding="utf-8"), str(policy_path), "exec"), adaptive_policy.__dict__)
+    except (OSError, SyntaxError, ValueError, RuntimeError):
         return {}
     ag_model_val, ag_effort_val, ag_win_val = _normalize_agy_configured_model(
         ag.get("configured_model"), ag_models,
@@ -3087,9 +3142,14 @@ def audit_upgrade_status(
             or installed_ag_hooks != json.loads(_agy_hooks_bytes((template / "hooks.json").read_bytes(), prefix))
         ):
             ag["drift_files"].append("hooks.json")
-    except (KeyError, IndexError, TypeError, ValueError):
+    except (KeyError, IndexError, TypeError, ValueError, StopIteration, AttributeError):
         ag["drift_files"].append("hooks.json")
-    gemini_root = target_plugin_dir.parent.parent.parent if target_plugin_dir.parent.name == "plugins" else target_plugin_dir.parent
+    if target_plugin_dir.parent.name == "plugins" and target_plugin_dir.parent.parent.name == "config":
+        gemini_root = target_plugin_dir.parent.parent.parent
+    elif target_plugin_dir.parent.name == "plugins":
+        gemini_root = target_plugin_dir.parent.parent
+    else:
+        gemini_root = target_plugin_dir.parent
     ag_settings = read_json(gemini_root / "antigravity-cli/settings.json", allow_hardlinks=True)
     ag_desktop = read_json(gemini_root / "config/config.json", allow_hardlinks=True).get("userSettings", {})
     desktop_model = ag_desktop.get("model") if isinstance(ag_desktop, dict) else None
@@ -3504,8 +3564,11 @@ def audit_upgrade_status(
             actions.append("sync_claude")
         if cl["effortLevel"] != _default_claude_effort(repo_root) or cl["locked_effort_env"]:
             actions.append("sync_claude_model_defaults")
-    if dsh_active and dsh["drift_files"]:
-        actions.append("sync_dsh")
+    if dsh_active:
+        if dsh["drift_files"]:
+            actions.append("sync_dsh")
+        if dsh.get("hard_hooks_supported"):
+            actions.append("upgrade_dsh_hook_protocol")
     if router_active and (router_drift or not cl["router"]["config_exists"]):
         actions.append("sync_cc_router")
     if cc_active:
@@ -3524,36 +3587,54 @@ def audit_upgrade_status(
     native_profiles = fleet_profile.get("native_agent_profiles") if isinstance(fleet_profile.get("native_agent_profiles"), dict) else {}
     wsl_probe_data = detection.get("wsl_probe") if isinstance(detection.get("wsl_probe"), dict) else {}
     peer_apps_detected: Dict[str, bool] = {}
-    if os.name == "nt" and isinstance(wsl_probe_data.get("apps"), dict):
-        wsl_apps = wsl_probe_data["apps"]
-        wsl_key_map = {
-            "antigravity": ("agy", "antigravity"),
-            "codex": ("codex",),
-            "claude": ("claude",),
-            "dsh": ("dsh",),
-            "cc_switch": ("cc-switch", "cc_switch"),
-        }
-        for app_key, aliases in wsl_key_map.items():
-            entries = next((wsl_apps[k] for k in aliases if k in wsl_apps), [])
-            peer_apps_detected[app_key] = bool(
-                isinstance(entries, list)
-                and any(isinstance(item, dict) and (item.get("binary") or item.get("config_dir_exists")) for item in entries)
-            )
+    peer_probe_status = "not_applicable"
+    stopped_wsl_distros: List[str] = []
+    if os.name == "nt":
+        peer_probe_status = str(wsl_probe_data.get("status") or "unknown")
+        installed_distros = [d for d in (wsl_probe_data.get("installed_distros") or []) if isinstance(d, str)]
+        running_set = {d for d in (wsl_probe_data.get("running_distros") or []) if isinstance(d, str)}
+        stopped_wsl_distros = [d for d in installed_distros if d not in running_set]
+        if isinstance(wsl_probe_data.get("apps"), dict):
+            wsl_apps = wsl_probe_data["apps"]
+            wsl_key_map = {
+                "antigravity": ("agy", "antigravity"),
+                "codex": ("codex",),
+                "claude": ("claude",),
+                "dsh": ("dsh",),
+                "cc_switch": ("cc-switch", "cc_switch"),
+            }
+            for app_key, aliases in wsl_key_map.items():
+                entries = next((wsl_apps[k] for k in aliases if k in wsl_apps), [])
+                peer_apps_detected[app_key] = bool(
+                    isinstance(entries, list)
+                    and any(isinstance(item, dict) and (item.get("binary") or item.get("config_dir_exists")) for item in entries)
+                )
     elif detection.get("is_wsl"):
+        peer_statuses = []
         for app_key in ("antigravity", "codex", "claude", "dsh", "cc_switch"):
-            peer_apps_detected[app_key] = bool((detection.get(app_key) or {}).get("interop_available"))
+            app_det = detection.get(app_key) or {}
+            peer_apps_detected[app_key] = bool(app_det.get("interop_available"))
+            peer_statuses.append(app_det.get("interop_status"))
+        peer_probe_status = "checked" if any(st and st != "unknown" for st in peer_statuses) else "unknown"
     peer_side_present = bool(any(peer_apps_detected.values()))
+    peer_audit_hint = None
+    if not is_sandbox_run:
+        if peer_side_present:
+            peer_audit_hint = (
+                "检测到对侧环境存在客户端或配置，全面更新须在 Windows 与 WSL2 两侧分别执行 install.py --audit-upgrade 与同步（不依赖单侧覆盖）。"
+            )
+        elif peer_probe_status == "unknown" and stopped_wsl_distros:
+            peer_audit_hint = (
+                "存在未启动的 WSL2 发行版（只读探测不自动拉起），请启动目标 WSL2 发行版后在对侧单独执行 install.py --audit-upgrade 核对双端配置。"
+            )
     cross_side_status = {
         "current_side": "windows" if os.name == "nt" else ("wsl" if detection.get("is_wsl") else "posix"),
         "peer_side": "wsl" if os.name == "nt" else ("windows" if detection.get("is_wsl") else None),
+        "peer_probe_status": peer_probe_status,
         "peer_side_present": peer_side_present,
         "peer_apps_detected": peer_apps_detected,
         "dual_side_sync_required": bool(not is_sandbox_run and peer_side_present),
-        "peer_audit_hint": (
-            "检测到对侧环境存在客户端或配置，全面更新须在 Windows 与 WSL2 两侧分别执行 install.py --audit-upgrade 与同步（不依赖单侧覆盖）。"
-            if (not is_sandbox_run and peer_side_present)
-            else None
-        ),
+        "peer_audit_hint": peer_audit_hint,
     }
     report = {"plugin_version": repo_version,
               "fleet_profile": {
@@ -3575,6 +3656,10 @@ def audit_upgrade_status(
               "read_errors": errors}
     roots = [(home, "~"), (target_plugin_dir, "<antigravity>"), (codex_root, "<codex>"), (claude_root, "<claude>"),
              (dsh_root, "<dsh>"), (ccswitch_db.parent, "<ccswitch>"), (repo_root, "<repo>")]
+    if detection.get("is_wsl") and not is_sandbox_run:
+        win_home = _probe_wsl_windows_profile_dir()
+        if win_home is not None:
+            roots.append((win_home, "<home>"))
     return _audit_redact(report, roots, secrets)
 
 

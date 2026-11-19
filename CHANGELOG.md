@@ -2,12 +2,34 @@
 
 本文件记录四客户端共用规则、会话钩子、后台验证工具与上游维护流程的版本演进。当前插件版本以 `template/user-guard/plugin.json` 为准；常驻使用文档只说明机制和配置键，不重复维护版本号与性能日期。
 
+## [1.17.1] - 2026-11-20
+
+完成精简 4 列总览卡与可点击 `<ticket_id>_card.md` 明细链接闭环，开展多模型全仓深度只读审计与主会话逐行复核，修复调度器、四阶段生命周期钩子、安装器、状态锁、本地分流代理与 WSL2 脚本中的全部已核实 P0/P1/P2 隐患，并全面重写同步主说明、指南、架构文档与三张 SVG 流程图：
+
+- **精简 4 列总览卡与 `<ticket_id>_card.md` 明细链接统一机制（`cae_harness.py`、`user_words.py`、`session_context_loader.py`、`handoff_gate.py`、`status_guard.py`、`AGENTS.md`、`SKILL.md`）**：
+  - 统一四端共用机制：`_save_plan` 生成带可点击 `[<ticket_id>_card.md](file:///...)` 链接的 `compact_summary_card` 与 `compact_handoff_prompt_block`，对话展示、压缩恢复与强制交接提示词默认仅呈现 4 列总览表与明细链接（校验 `_card.md` 真实落盘且非链接，仅未落盘时回退 14 项长表），彻底消除多路 14 项长表刷屏污染主上下文；
+  - 新增 `find_session_pending_tickets` 覆盖多张未决票据恢复，`handoff_session_pending_tickets` 幂等同步 `HANDED_OFF` 卡片文本，`handoff_gate.py` 按单票据消耗匹配行消除多票据 `S1` 混叠，`status_guard.py` 阻断文案附带可点击明细链接。
+- **调度器 `cae_harness.py` 票据安全与跨端隔离加固**：
+  - 修复 `_check_ticket_execution` 可写流 `verify_cmd` 双向严格校验，拦截空字符串或 `None` 绕过；修复 `plan --resume-ticket` 在未传 `--force` 时对已批准票据的 `user_prompt` 保留、核心规格漂移拦截及内存只读刷新；将锁名空间收口为 `ticket_<id>` 消除 `plan_dir` 自锁；
+  - 补齐 `_resolve_effective_tier` 长篇 `polish` 文件/Token 传递、单文件可写流 `write_scope` 自动填充、`--override-json` 换端后可用性字段同步；补齐 Claude `hooks_only` 凭据复制与 `clean_room` 跨端环境变量隔离、DSH 互操作环境透传与 `.cmd` 探测、`cmd_audit --isolation clean_room` 指令文件预过滤及 `staged_scope` 合并、`cmd_batch --isolation` 票据核验、Claude 失活本地路由拒绝、`agy` 桌面优先 `inherit` 解析及连字符敏感请求头/代理 URL 脱敏。
+- **四阶段钩子与 `_lib/` 跨平台安全及 PowerShell 词法加固（`fs_safety.py`、`shell_lex.py`、`status_guard.py`、`reply_repeat_guard.py`、`handoff_gate.py`、`session_context_loader.py`、`adaptive_policy.py`）**：
+  - `fs_safety.py` 对齐 Windows `st_reparse_tag` 区分符号链接/挂载点与云盘占位目录，并在 Windows `EACCES` 锁竞争时重试；`shell_lex.py` 增加 `backslash_escape=False` 适配 PowerShell 引号规则；
+  - `status_guard.py` 与 `handoff_gate.py` 补齐 PowerShell `-e`..`-encodedcommand` / `-c`..`-command` 最短唯一前缀缩写与双轨反斜杠扫描，在提交信息掩码前提取命令替换，拦截 `>&/outside`、PowerShell 冒号路径参数、GNU `-t<path>`、安装器路径前缀包装、`builtins.open` 别名、内联危险模块及只读子代理构建/网络命令，并在 `reply_repeat_guard.py` 补齐 `continuationActive` 静默销账对账、负偏移 EOF 游标与大小写不敏感词边界匹配。
+- **状态锁、安装器、本地分流代理、WSL 脚本与 CI 加固（`fleet_state.py`、`install.py`、`router.py`、`ccswitch_admin.py`、`launch-cc-switch-wsl.sh`、`update-cc-switch-wsl.sh`、`ci.yml`）**：
+  - `fleet_state.py` 为 `clear` 新增可选 `--session-id` 解决 Pass 2 已认领锁的正常归位死锁，对齐 `st_reparse_tag` 与硬链接校验并统一 `AWAITING_USER_APPROVAL` 漂移语义；
+  - `install.py` 修复 Codex 已有模型与挡位时无法补齐缺失 `model_context_window` 的早返回缺陷，修复 `audit_upgrade_status` 异常捕获与路径层级、`_probe_dsh_hook_capability` 退出码校验与 `upgrade_dsh_hook_protocol` 推荐动作、`cross_side_status` 未启动 WSL2 提示与 `readlink -f` 解析、`_select_agy_frontier_max_label` 最高代数选择、`_audit_redact` 私网 IPv6/共享内网段/代理 URL 脱敏、规则尾段扫描跳过代码围栏及无 `__pycache__` 加载 `adaptive_policy.py`；
+  - `router.py` 在 `load_config` 强制回环地址监听并支持 IPv6 `::1`，收紧 `_request_target_path` 防止非 `/` 路径拼接跨主机请求伪造、拒绝上游 URL 凭据/查询/片段、拆分 `do_DELETE`、精确匹配 `/__router/health` 并规范 `Content-Length`；`ccswitch_admin.py` 单次读取 `settings.json`、将路由健康探测移出 SQLite 写锁、以 `0o600` 原子写备份、在回滚失败时保留备份，并在损坏 `settings.json` 时仍探测 `router_health`；`update-cc-switch-wsl.sh` 与 `launch-cc-switch-wsl.sh` 补齐符号链接拦截、`.deb` `0644` 权限、`dpkg-query` 失败保护、`umask 077` 日志与 `/proc/<pid>/exe` 校验；`.github/workflows/ci.yml` 补充 `errors="replace"` 与 Linux `install.sh --probe-apps` 冒烟校验。
+- **全仓用户文档、三张 SVG 流程图与技能全面对齐（`README.md`、`docs/`、`template/user-guard/README.md`、`AGENTS.md`、`SKILL.md`）**：
+  - 更新 `README.md` 五角色示例表（`orchestrator` 同步为 `neon` 系列）、更正 `check-grounding --strict` 跳过 `tests/` 与 Markdown 代理契约的说明，依据净室盲读意见补齐全部行话解释并修正逻辑跳步；同步重写 `docs/workflow-guide.md`、`docs/architecture-and-hooks.md`、`template/user-guard/README.md` 与三张 SVG，补全精简 4 列总览卡与明细链接、`--isolation` 四级正交隔离、`native_agent_profiles`、`swarm add` 计流、`cross_side_status` 与 DSH `hook_protocol`，移除架构文档中固化本机派生窗口数值，并同步全仓 `AGENTS.md` 与双技能细则。
+
+---
+
 ## [1.17.0] - 2026-11-19
 
 补齐多维正交隔离参数 `--isolation`、独立内生代理档案 `native_agent_profiles`、`swarm` 并发流数精确计费与 Windows/WSL2 双端体检，并完成四客户端 `fleet-evolve` 全面更新与本机无头实测：
 
 - **正交隔离级别与内生代理独立建档（`cae_harness.py`、`user_words.py`、`cae-harness/SKILL.md`）**：
-  - 在 `task`、`gate`、`audit`、`plan`、`batch` 及 `--spec-file` 新增 `--isolation`（`full`、`no_skills`、`hooks_only`、`clean_room`），与后端、模型、挡位、读写模式解耦并保持 `--clean-room` 兼容；为 Claude `clean_room` 补齐 `--disable-slash-commands`，对 `agy` 的 `hooks_only`/`clean_room` 及 `dsh` 当前 `soft_rules_only` 状态的 `hooks_only` 显式报错拒绝；确认单第 9 项对非默认隔离模式追加标注并在持票执行时校验一致性；
+  - 在 `task`、`gate`、`audit`、`plan`、`batch` 及 `--spec-file` 新增 `--isolation`（`full`、`no_skills`、`hooks_only`、`clean_room`），与后端、模型、挡位、读写模式解耦并保持 `--clean-room` 兼容；为 Claude `clean_room` 补齐 `--disable-slash-commands`，对 `agy` 的 `hooks_only`/`clean_room` 及 `dsh` 当前 `soft_rules_only` 状态的 `hooks_only` 显式报错拒绝；确认单第 9 项对显式指定的非净室隔离模式追加标注并在持票执行时校验一致性；
   - 新增 `_native_agent_profile` 读取 `fleet_profile.json` 中独立的 `native_agent_profiles`，并在 `_native_plan_model` 解析 `inherit` 时优先识别 Codex `agents/*.toml` 与 Claude/Antigravity 代理前置元数据中的显式 `model`；在 `PHYSICAL_SUBSTANCE_TAGS` 补充 `neon` 以防气体组分提示误触发模型点名。
 - **并发流数计费与双端安装体检加固（`status_guard.py`、`install.py`、`fleet-evolve/SKILL.md`）**：
   - 在 `status_guard.py` 新增 `_native_call_stream_weight`，对 `swarm` 的 `add` 调用按 `tasks` 列表长度或正整数 `n` 精确计入通道票据容量；

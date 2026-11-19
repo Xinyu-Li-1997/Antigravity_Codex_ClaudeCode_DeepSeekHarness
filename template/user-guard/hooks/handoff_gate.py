@@ -624,7 +624,7 @@ def _unwrap_clause_or_shell(tokens: List[str]) -> Tuple[List[str], Optional[str]
                 ):
                     idx += 2
                     continue
-                if is_ps_shell and fl in ("-encodedcommand", "-ec"):
+                if is_ps_shell and (fl == "-ec" or (fl.startswith("-e") and "-encodedcommand".startswith(fl))):
                     idx += 1
                     if idx >= n:
                         return [], _ENCODED_CMD_BLOCKED_SENTINEL
@@ -655,7 +655,7 @@ def _unwrap_clause_or_shell(tokens: List[str]) -> Tuple[List[str], Optional[str]
                     return [], decoded_script
                 if (
                     (is_cmd_shell and fl in ("/c", "/k"))
-                    or (is_ps_shell and fl in ("-c", "-command"))
+                    or (is_ps_shell and fl.startswith("-c") and "-command".startswith(fl))
                     or (is_posix_shell and bool(re.fullmatch(r"-[a-z]*c", fl)))
                 ):
                     idx += 1
@@ -757,8 +757,17 @@ def _classify_run_command(cmd_str: str, is_daemon: bool = False, _depth: int = 0
     has_mutating = False
 
     clauses = _split_shell_clauses(cmd_str)
+    if r'\"' in cmd_str:
+        for extra_cl in _shell_lex.split_shell_clauses(cmd_str, backslash_escape=False):
+            if extra_cl not in clauses:
+                clauses.append(extra_cl)
     for clause in clauses:
-        for sub_expr in _extract_cmd_substitutions(clause):
+        sub_exprs = list(_extract_cmd_substitutions(clause))
+        if r'\"' in clause or r'\$' in clause:
+            for ps_sub in _shell_lex.extract_cmd_substitutions(clause, backslash_escape=False):
+                if ps_sub not in sub_exprs:
+                    sub_exprs.append(ps_sub)
+        for sub_expr in sub_exprs:
             sub_expr_kind = _classify_run_command(sub_expr, is_daemon=False, _depth=_depth + 1)
             if sub_expr_kind == "blocked_always":
                 return "blocked_always"
@@ -1010,7 +1019,7 @@ def _workflow_handoff_present(text: str, tickets) -> bool:
     columns = ["流号", "子任务与范围", "通道", "客户端及子代理类型", "模型名字", "挡位", "上下文窗口",
                "是否无头", "是否净室", "访问模式、写入范围与验收命令", "内联与超时", "当前是否可用",
                "本机配置额度类型与当前状态", "回执或子代理日志位置"]
-    rows, vertical = [], {}
+    rows, overview_rows, vertical = [], [], {}
 
     def finish_vertical():
         if all(column in vertical for column in columns):
@@ -1021,6 +1030,10 @@ def _workflow_handoff_present(text: str, tickets) -> bool:
             cells = re.split(r"(?<!\\)\|", line.strip())[1:-1]
             if len(cells) == 14:
                 rows.append([normalize(cell) for cell in cells])
+            elif len(cells) == 4:
+                norm_cells = [normalize(cell) for cell in cells]
+                if norm_cells[0] not in ("流号", "---") and not all(re.fullmatch(r":?-{2,}:?", c or "") for c in norm_cells):
+                    overview_rows.append(norm_cells)
             elif len(cells) == 2 or (len(cells) == 3 and re.fullmatch(r"\s*(?:[1-9]|1[0-4])\s*", cells[0])):
                 key, value = cells[-2].strip(), normalize(cells[-1])
                 if key == "流号":
@@ -1038,17 +1051,8 @@ def _workflow_handoff_present(text: str, tickets) -> bool:
             return True
         return ("是" if value else "否") in cell
 
-    for ticket in tickets:
-        for value in (ticket.get("ticket_id"), ticket.get("workflow_bg") or ticket.get("workflow_background"),
-                      ticket.get("workflow_goal"), ticket.get("workflow_impact")):
-            if not contains(normalized, value):
-                return False
-        if not all(option in normalized for option in ("①", "②", "③", "批准当前计划", "微调", "暂缓", "交接")):
-            return False
-        ledger = ticket.get("capability_ledger") or {}
-        if any(not contains(normalized, ledger.get(key)) for key in ("last_online_refresh_at", "local_bench_verified_at")):
-            return False
-        for stream in ticket.get("streams", []):
+    def _matches_full_streams(ticket_streams) -> bool:
+        for stream in ticket_streams:
             matched = False
             for row in rows:
                 if row[0] != normalize(stream.get("stream_id")):
@@ -1070,15 +1074,77 @@ def _workflow_handoff_present(text: str, tickets) -> bool:
                 break
             if not matched:
                 return False
+        return True
+
+    used_overview_indices: set[int] = set()
+
+    def _matches_compact_card_handoff(ticket_obj) -> bool:
+        detail_file = str(ticket_obj.get("card_detail_file") or "").strip()
+        if not detail_file:
+            return False
+        detail_name = user_words.basename_any_os(detail_file)
+        tid = str(ticket_obj.get("ticket_id") or "").strip()
+        if not detail_name or not contains(normalized, detail_name):
+            return False
+        if not tid or not contains(normalized, f"plan --resume-ticket {tid}"):
+            return False
+        claimed_here: List[int] = []
+        for stream in ticket_obj.get("streams", []):
+            matched_idx = None
+            for idx_row, row in enumerate(overview_rows):
+                if idx_row in used_overview_indices or idx_row in claimed_here:
+                    continue
+                if row[0] != normalize(stream.get("stream_id")):
+                    continue
+                if not all(contains(row[1], stream.get(key)) for key in ("channel", "client", "agent_type")):
+                    continue
+                if not contains(row[2], stream.get("model_display") or stream.get("model")):
+                    continue
+                if not contains(row[2], stream.get("tier")):
+                    continue
+                if not boolean(row[3], stream.get("currently_available")):
+                    continue
+                if not all(contains(row[3], stream.get(key)) for key in ("unavailable_reason", "quota_scheme", "quota_summary")):
+                    continue
+                matched_idx = idx_row
+                break
+            if matched_idx is None:
+                return False
+            claimed_here.append(matched_idx)
+        used_overview_indices.update(claimed_here)
+        return True
+
+    for ticket in tickets:
+        for value in (ticket.get("ticket_id"), ticket.get("workflow_bg") or ticket.get("workflow_background"),
+                      ticket.get("workflow_goal"), ticket.get("workflow_impact")):
+            if not contains(normalized, value):
+                return False
+        if not all(option in normalized for option in ("①", "②", "③", "批准当前计划", "微调", "暂缓", "交接")):
+            return False
+        ledger = ticket.get("capability_ledger") or {}
+        if any(not contains(normalized, ledger.get(key)) for key in ("last_online_refresh_at", "local_bench_verified_at")):
+            return False
+        if not (_matches_full_streams(ticket.get("streams", [])) or _matches_compact_card_handoff(ticket)):
+            return False
     return True
 
 
 def _workflow_handoff_notice(tickets) -> str:
     if not tickets:
         return ""
-    return ("\n必须将以下未决重负载工作流的背景、要做什么、预计后果、14项全字段参数表、"
+    all_persisted = all(isinstance(t, dict) and str(t.get("card_detail_file") or "").strip() for t in tickets)
+    if all_persisted:
+        lead = (
+            "\n必须将以下未决重负载工作流的背景、要做什么、预计后果、精简 4 列总览表、"
+            "完整 14 项明细链接、离线性能更新时间、恢复命令及选项卡写入【新对话提示词】，"
+            "由新对话读取磁盘票据再请用户确认（勿在对话中展开 14 项长表）。\n"
+        )
+    else:
+        lead = (
+            "\n必须将以下未决重负载工作流的背景、要做什么、预计后果、14项全字段参数表、"
             "离线性能更新时间及选项卡完整写入【新对话提示词】，由新对话读取磁盘票据再请用户确认。\n"
-            + "\n\n".join(user_words.render_pending_workflow_block(ticket, for_handoff=True) for ticket in tickets))
+        )
+    return lead + "\n\n".join(user_words.render_pending_workflow_block(ticket, for_handoff=True) for ticket in tickets)
 
 
 def _reply_has_handoff_prompt(reply_text: str) -> bool:
@@ -2102,6 +2168,10 @@ def _codex_tool_kind(payload: Dict[str, Any]) -> Tuple[str, List[Path]]:
     if name in CODEX_DELEGATION_TOOLS or name in ("view_image", "imagegen"):
         return "blocked_always", []
     if name in CODEX_READ_TOOLS:
+        if name == "read_file":
+            read_target = str(args.get("path") or args.get("Path") or args.get("file_path") or args.get("AbsolutePath") or "").strip()
+            if read_target and is_image_path(read_target):
+                return "blocked_always", []
         return "readonly_inspect", []
     if name in ("bash", "exec_command", "run_command", "shell", "shell_command"):
         raw_cmd = args.get("command")
@@ -2473,9 +2543,10 @@ def _handle_native_handoff(
         resolved_limit = user_words._coerce_pos_int(client_cfg.get("default_compact_limit"), 0, minimum=0)
 
         is_default_pair = (mode == "advisory" and compact_limit == 0)
+        mode_explicit = (not is_default_pair) if _mode_explicit is None else bool(_mode_explicit)
         limit_explicit = (not is_default_pair) if _limit_explicit is None else bool(_limit_explicit)
 
-        if mode == "advisory" and resolved_mode != "advisory":
+        if (not mode_explicit or is_default_pair) and mode == "advisory" and resolved_mode != "advisory":
             mode = resolved_mode
         if mode == "off":
             return {}

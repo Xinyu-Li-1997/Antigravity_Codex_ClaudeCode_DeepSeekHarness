@@ -171,7 +171,7 @@ def _sanitize_url(raw_url: Any) -> Optional[str]:
     if not stripped:
         return ""
     if not stripped.lower().startswith(("http://", "https://")):
-        return "<redacted-url>" if ("@" in stripped or "?" in stripped) else stripped
+        return "<redacted-url>" if ("@" in stripped or "?" in stripped or "#" in stripped) else stripped
     try:
         parsed = urlsplit(stripped)
         host = parsed.hostname or ""
@@ -252,13 +252,28 @@ def _table_exists(con: sqlite3.Connection, table_name: str) -> bool:
     return row is not None
 
 
+_WIN_LINK_REPARSE_TAGS = frozenset({
+    getattr(stat, "IO_REPARSE_TAG_SYMLINK", 0xA000000C),
+    getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", 0xA0000003),
+})
+
+
+def _quote_sql_ident(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
+
+
 def _is_reparse_or_symlink(path: Path) -> bool:
     try:
         st = path.lstat()
     except OSError:
         return False
+    if stat.S_ISLNK(st.st_mode):
+        return True
     reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
-    return stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_file_attributes", 0) & reparse_flag)
+    if bool(getattr(st, "st_file_attributes", 0) & reparse_flag):
+        tag = getattr(st, "st_reparse_tag", 0)
+        return tag == 0 or tag in _WIN_LINK_REPARSE_TAGS
+    return False
 
 
 def _query_skills_state(con: sqlite3.Connection) -> Tuple[int, List[str], List[Dict[str, Any]]]:
@@ -269,7 +284,7 @@ def _query_skills_state(con: sqlite3.Connection) -> Tuple[int, List[str], List[D
     enabled_cols = [c for c in skill_cols if c.startswith("enabled_")]
     enabled_skills: List[Dict[str, Any]] = []
     if {"id", "name"}.issubset(skill_cols) and enabled_cols:
-        select_cols = ", ".join(['"id"', '"name"', *(f'"{c}"' for c in enabled_cols)])
+        select_cols = ", ".join(['"id"', '"name"', *(_quote_sql_ident(c) for c in enabled_cols)])
         for row in con.execute(f"SELECT {select_cols} FROM skills ORDER BY id").fetchall():
             apps = [
                 c.removeprefix("enabled_")
@@ -468,17 +483,18 @@ def inspect_status(
             if _table_exists(con, "providers"):
                 columns = {r[1] for r in con.execute("PRAGMA table_info(providers)")}
                 quota_columns = ", ".join(
-                    f'"{key}"' if key in columns else "NULL"
+                    _quote_sql_ident(key) if key in columns else "NULL"
                     for key in ("meta", "limit_daily_usd", "limit_monthly_usd")
                 )
+                order_clause = "ORDER BY app_type, sort_index, name" if "sort_index" in columns else "ORDER BY app_type, name"
                 rows = con.execute(
                     "SELECT id, app_type, name, settings_config, is_current, " + quota_columns
-                    + " FROM providers ORDER BY app_type, sort_index, name"
+                    + " FROM providers " + order_clause
                 ).fetchall()
                 for row_id, app_type, name, raw_cfg, is_current, raw_meta, daily_cap, monthly_cap in rows:
                     try:
                         meta = json.loads(raw_meta) if raw_meta else {}
-                    except (ValueError, TypeError):
+                    except (ValueError, TypeError, RecursionError):
                         meta = {}
                     usage = meta.get("usage_script") if isinstance(meta, dict) else None
                     scheme = usage.get("templateType") if isinstance(usage, dict) else None
@@ -489,7 +505,7 @@ def inspect_status(
                         if not isinstance(cfg_obj, dict) or not isinstance(cfg_obj.get("env", {}), dict):
                             invalid_json = True
                             cfg_obj = {}
-                    except ValueError:
+                    except (ValueError, TypeError, RecursionError):
                         invalid_json = True
                         cfg_obj = {}
                     if invalid_json:
@@ -556,36 +572,38 @@ def inspect_status(
             report["skills_dir_entries"] = sorted(p.name for p in skills_dir.iterdir() if p.name != ".DS_Store")
 
     if settings_path and settings_path.is_file():
+        settings_obj: Optional[Dict[str, Any]] = None
         try:
-            settings_obj = json.loads(settings_path.read_text(encoding="utf-8-sig"))
-            if not isinstance(settings_obj, dict):
+            parsed_settings = json.loads(settings_path.read_text(encoding="utf-8-sig"))
+            if not isinstance(parsed_settings, dict):
                 raise ValueError("settings.json root must be an object")
-        except (OSError, UnicodeError, ValueError):
+            settings_obj = parsed_settings
+        except (OSError, UnicodeError, ValueError, RecursionError):
             report["settings_aligned"] = False
             report["warnings"].append("Claude settings.json is unreadable or contains invalid JSON.")
-            return report
-        env_obj = settings_obj.get("env") if isinstance(settings_obj, dict) and isinstance(settings_obj.get("env"), dict) else {}
-        report["effort_level"] = settings_obj.get("effortLevel") if isinstance(settings_obj, dict) else None
-        report["locked_effort_env"] = "CLAUDE_CODE_EFFORT_LEVEL" in env_obj
-        if report["locked_effort_env"]:
-            report["warnings"].append("CLAUDE_CODE_EFFORT_LEVEL is set in settings.json env, locking interactive /effort.")
-        cur = report["current_claude_card"]
-        if claude_current_count > 1 or active_card_invalid_json:
-            report["settings_aligned"] = False
-            if active_card_invalid_json:
-                report["warnings"].append("Current active CC Switch Claude card contains invalid JSON.")
-        elif cur and active_cfg_obj is not None:
-            active_env = active_cfg_obj.get("env") if isinstance(active_cfg_obj.get("env"), dict) else {}
-            try:
-                projected = project_claude_settings(settings_obj, {}, active_cfg_obj)
-                report["settings_aligned"] = (
-                    projected == settings_obj
-                    and env_obj.get("CLAUDE_CODE_SUBAGENT_MODEL_FORCE") == active_env.get("CLAUDE_CODE_SUBAGENT_MODEL_FORCE")
-                )
-            except ValueError:
+        if settings_obj is not None:
+            env_obj = settings_obj.get("env") if isinstance(settings_obj.get("env"), dict) else {}
+            report["effort_level"] = settings_obj.get("effortLevel")
+            report["locked_effort_env"] = "CLAUDE_CODE_EFFORT_LEVEL" in env_obj
+            if report["locked_effort_env"]:
+                report["warnings"].append("CLAUDE_CODE_EFFORT_LEVEL is set in settings.json env, locking interactive /effort.")
+            cur = report["current_claude_card"]
+            if claude_current_count > 1 or active_card_invalid_json:
                 report["settings_aligned"] = False
-            if not report["settings_aligned"]:
-                report["warnings"].append("Claude settings.json env differs from current active CC Switch card.")
+                if active_card_invalid_json:
+                    report["warnings"].append("Current active CC Switch Claude card contains invalid JSON.")
+            elif cur and active_cfg_obj is not None:
+                active_env = active_cfg_obj.get("env") if isinstance(active_cfg_obj.get("env"), dict) else {}
+                try:
+                    projected = project_claude_settings(settings_obj, {}, active_cfg_obj)
+                    report["settings_aligned"] = (
+                        projected == settings_obj
+                        and env_obj.get("CLAUDE_CODE_SUBAGENT_MODEL_FORCE") == active_env.get("CLAUDE_CODE_SUBAGENT_MODEL_FORCE")
+                    )
+                except ValueError:
+                    report["settings_aligned"] = False
+                if not report["settings_aligned"]:
+                    report["warnings"].append("Claude settings.json env differs from current active CC Switch card.")
 
     if router_port is not None:
         url = f"http://127.0.0.1:{router_port}/__router/health"
@@ -600,12 +618,12 @@ def inspect_status(
                 else urllib.request.urlopen
             )
             with open_fn(url, timeout=2.0) as resp:
-                payload = json.loads(resp.read().decode("utf-8"))
+                payload = json.loads(resp.read(65536).decode("utf-8"))
                 report["router_health"] = {
-                    "ok": bool(resp.status == 200 and payload.get("ok") is True),
-                    "port": payload.get("port"),
+                    "ok": bool(resp.status == 200 and isinstance(payload, dict) and payload.get("ok") is True),
+                    "port": payload.get("port") if isinstance(payload, dict) else None,
                 }
-        except (OSError, ValueError, urllib.error.URLError) as exc:
+        except (OSError, ValueError, RecursionError, urllib.error.URLError) as exc:
             report["router_health"] = {"ok": False, "port": router_port, "error": type(exc).__name__}
 
     return report
@@ -691,7 +709,17 @@ def _resolve_card_params(
             pass
     eff_max = str(eff_max_int)
 
-    default_cmp_int = max(65536, int(round(eff_max_int * 0.72)))
+    raw_rule_compact = cl_rules.get("auto_compact_window")
+    rule_compact = (
+        int(raw_rule_compact)
+        if isinstance(raw_rule_compact, int) and not isinstance(raw_rule_compact, bool) and raw_rule_compact > 0
+        else None
+    )
+    default_cmp_int = (
+        rule_compact
+        if (rule_compact is not None and rule_max is not None and rule_max == eff_max_int)
+        else max(65536, int(round(eff_max_int * 0.72)))
+    )
     eff_cmp_int = default_cmp_int
     if compact_window is not None and not isinstance(compact_window, bool) and str(compact_window).strip():
         try:
@@ -874,7 +902,7 @@ def prepare_cards(
                         ("in_failover_queue", 0),
                     ]
                     valid_pairs = [(col, val) for col, val in update_pairs if col in columns]
-                    set_clause = ", ".join(f'"{col}"=?' for col, _ in valid_pairs)
+                    set_clause = ", ".join(f"{_quote_sql_ident(col)}=?" for col, _ in valid_pairs)
                     con.execute(
                         f"UPDATE providers SET {set_clause} WHERE id=? AND app_type='claude'",
                         [val for _, val in valid_pairs] + [record["id"]],
@@ -957,9 +985,51 @@ def switch_card(
     mode_flag = "ro" if dry_run else "rw"
     con = sqlite3.connect(db_path.resolve().as_uri() + f"?mode={mode_flag}", uri=True, timeout=15)
     try:
+        # Probe local router health BEFORE acquiring SQLite BEGIN IMMEDIATE write lock.
+        schema_ver, warnings = _check_schema(con)
+        pre_rows = con.execute(
+            "SELECT id, name, settings_config, is_current FROM providers WHERE app_type='claude'"
+        ).fetchall()
+        pre_targets = [r for r in pre_rows if r[1] == card_name]
+        pre_current = [r for r in pre_rows if r[3]]
+        if len(pre_targets) != 1 or len(pre_current) > 1:
+            raise ValueError(f"Expected exactly one target card ({card_name!r}) and at most one current Claude card")
+        pre_raw_target = pre_targets[0][2]
+        if not isinstance(pre_raw_target, str):
+            raise ValueError("Target card settings_config must be a JSON string")
+        try:
+            pre_target_cfg = json.loads(pre_raw_target)
+        except RecursionError as exc:
+            raise ValueError("Card or settings JSON exceeds recursion limit") from exc
+        pre_base_url = (
+            pre_target_cfg.get("env", {}).get("ANTHROPIC_BASE_URL")
+            if isinstance(pre_target_cfg, dict) and isinstance(pre_target_cfg.get("env"), dict)
+            else None
+        )
+        endpoint = urlsplit(pre_base_url) if isinstance(pre_base_url, str) else None
+        router_health_warning: Optional[str] = None
+        if endpoint and endpoint.hostname and endpoint.hostname.lower() in ("127.0.0.1", "localhost", "::1"):
+            host = "[::1]" if endpoint.hostname == "::1" else endpoint.hostname
+            port = endpoint.port or (443 if endpoint.scheme == "https" else 80)
+            health_url = f"{endpoint.scheme}://{host}:{port}/__router/health"
+            try:
+                opener = urllib.request.build_opener(urllib.request.ProxyHandler({}),
+                                                     urllib.request.HTTPHandler(), urllib.request.HTTPSHandler())
+                with opener.open(health_url, timeout=2.0) as resp:
+                    health = json.loads(resp.read(65536).decode("utf-8"))
+                    alive = resp.status == 200 and isinstance(health, dict) and health.get("ok") is True
+            except (OSError, ValueError, RecursionError, urllib.error.URLError):
+                alive = False
+            if not alive:
+                router_health_warning = "Local router /__router/health is unreachable or unhealthy; switching may leave Claude without a working route"
+                if require_router_alive:
+                    raise RuntimeError(router_health_warning)
+
         if not dry_run:
             con.execute("BEGIN IMMEDIATE")
         schema_ver, warnings = _check_schema(con)
+        if router_health_warning:
+            warnings.append(router_health_warning)
         rows = con.execute(
             "SELECT id, name, settings_config, is_current FROM providers WHERE app_type='claude'"
         ).fetchall()
@@ -989,36 +1059,17 @@ def switch_card(
                 )
         if not isinstance(raw_target, str):
             raise ValueError("Target card settings_config must be a JSON string")
+        original_bytes = settings_path.read_bytes()
         try:
             target_cfg = json.loads(raw_target)
-            original_cfg = json.loads(settings_path.read_bytes().decode("utf-8-sig"))
+            original_cfg = json.loads(original_bytes.decode("utf-8-sig"))
         except RecursionError as exc:
             raise ValueError("Card or settings JSON exceeds recursion limit") from exc
-        original_bytes = settings_path.read_bytes()
         updated = project_claude_settings(
             original_cfg,
             previous,
             target_cfg,
         )
-        base_url = updated.get("env", {}).get("ANTHROPIC_BASE_URL")
-        endpoint = urlsplit(base_url) if isinstance(base_url, str) else None
-        if endpoint and endpoint.hostname and endpoint.hostname.lower() in ("127.0.0.1", "localhost", "::1"):
-            host = "[::1]" if endpoint.hostname == "::1" else endpoint.hostname
-            port = endpoint.port or (443 if endpoint.scheme == "https" else 80)
-            health_url = f"{endpoint.scheme}://{host}:{port}/__router/health"
-            try:
-                opener = urllib.request.build_opener(urllib.request.ProxyHandler({}),
-                                                     urllib.request.HTTPHandler(), urllib.request.HTTPSHandler())
-                with opener.open(health_url, timeout=2.0) as resp:
-                    health = json.loads(resp.read().decode("utf-8"))
-                    alive = resp.status == 200 and isinstance(health, dict) and health.get("ok") is True
-            except (OSError, ValueError, urllib.error.URLError):
-                alive = False
-            if not alive:
-                warning = "Local router /__router/health is unreachable or unhealthy; switching may leave Claude without a working route"
-                if require_router_alive:
-                    raise RuntimeError(warning)
-                warnings.append(warning)
         if dry_run:
             return {
                 "dry_run": True,
@@ -1035,10 +1086,20 @@ def switch_card(
         _validate_nonlink_path(settings_path)
         _validate_nonlink_path(settings_backup)
         backup_sqlite_database(db_path, db_backup)
-        shutil.copy2(settings_path, settings_backup)
-        if os.name == "posix":
-            os.chmod(settings_backup, 0o600)
+        sb_fd = os.open(str(settings_backup), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        try:
+            with os.fdopen(sb_fd, "wb") as sb_handle:
+                sb_fd = -1
+                sb_handle.write(original_bytes)
+                sb_handle.flush()
+                os.fsync(sb_handle.fileno())
+            if os.name == "posix":
+                os.chmod(settings_backup, 0o600)
+        finally:
+            if sb_fd >= 0:
+                os.close(sb_fd)
         published = False
+        restore_ok = True
         try:
             con.execute("UPDATE providers SET is_current=0 WHERE app_type='claude'")
             changed = con.execute(
@@ -1053,15 +1114,20 @@ def switch_card(
         except BaseException:
             try:
                 if published:
-                    atomic_write_bytes(settings_path, original_bytes)
+                    try:
+                        atomic_write_bytes(settings_path, original_bytes)
+                    except BaseException:
+                        restore_ok = False
+                        raise
             finally:
                 con.rollback()
-                for orphan in (db_backup, settings_backup):
-                    if orphan.exists():
-                        try:
-                            orphan.unlink()
-                        except OSError:
-                            pass
+                if restore_ok:
+                    for orphan in (db_backup, settings_backup):
+                        if orphan.exists():
+                            try:
+                                orphan.unlink()
+                            except OSError:
+                                pass
             raise
         return {
             "dry_run": False,
@@ -1231,8 +1297,8 @@ def retire_prompts_and_skills(
                 if disabled_prompts:
                     con.execute("UPDATE prompts SET enabled = 0 WHERE enabled != 0")
                 if disabled_skills and enabled_cols:
-                    set_zero = ", ".join(f'"{c}" = 0' for c in enabled_cols)
-                    where_any = " OR ".join(f'("{c}" IS NOT NULL AND CAST("{c}" AS TEXT) NOT IN (\'0\', \'\'))' for c in enabled_cols)
+                    set_zero = ", ".join(f"{_quote_sql_ident(c)} = 0" for c in enabled_cols)
+                    where_any = " OR ".join(f"({_quote_sql_ident(c)} IS NOT NULL AND CAST({_quote_sql_ident(c)} AS TEXT) NOT IN ('0', ''))" for c in enabled_cols)
                     con.execute(f"UPDATE skills SET {set_zero} WHERE {where_any}")
 
         archived_skills_dir: Optional[Path] = None

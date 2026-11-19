@@ -744,7 +744,7 @@ def _heavy_report_blocked(state_dir, sid, turn_key, payload):
     return state.get("turn") == turn_key and state.get("blocked") is True
 
 
-def _check_heavy_report_locked(payload, state_dir, sid, turn_key, reply, decision):
+def _check_heavy_report_locked(payload, state_dir, sid, turn_key, reply, decision, *, reconcile_only: bool = False):
     if (
         os.environ.get("CAE_HARNESS_DEPTH", "").strip() not in ("", "0")
         or os.environ.get("USER_GUARD_DISABLE_TICKET_GATE") == "1"
@@ -768,7 +768,10 @@ def _check_heavy_report_locked(payload, state_dir, sid, turn_key, reply, decisio
     tokens = bool(re.search(r"tokens?[^\n。；]*\d|\d[\d, ]*\s*tokens?|tokens?[^\n。；]*(?:未.*(?:暴露|提供|统计)|无法|不.*(?:暴露|提供))|未[^\n。；]*(?:暴露|提供)[^\n。；]*tokens?", reply, re.I))
     receipt = bool(re.search(r"receipt|回执|轨迹|日志|[\w-]+\.(?:jsonl|json|log)\b", reply, re.I))
     def has_token(token):
-        return bool(token and re.search(rf"(?<![A-Za-z0-9_.-]){re.escape(token)}(?![A-Za-z0-9_.-])", reply))
+        if not token:
+            return False
+        # 允许词项后紧跟英文句末句点（只要句点后非标识符字符），同时大小写不敏感。
+        return bool(re.search(rf"(?<![A-Za-z0-9_.-]){re.escape(token)}(?!(?:[A-Za-z0-9_-]|\.[A-Za-z0-9_-]))", reply, re.I))
 
     bound = True
     for entry in entries:
@@ -781,7 +784,7 @@ def _check_heavy_report_locked(payload, state_dir, sid, turn_key, reply, decisio
             chinese = {1: "一", 2: "两|二", 3: "三", 4: "四", 5: "五", 6: "六", 7: "七", 8: "八", 9: "九", 10: "十"}.get(count)
             count_pattern = rf"(?<!\d){count}\s*(?:路|个|名|位|agents?\b)"
             if chinese:
-                count_pattern += rf"|(?:{chinese})\s*(?:路|个|名|位)"
+                count_pattern += rf"|(?<![十百千万零一二三四五六七八九两第下另这每])(?:{chinese})\s*(?:路|个|名|位)"
             covered = ids_present or roles_present or bool(re.search(count_pattern, reply, re.I))
             logs = bool(re.search(r"日志|轨迹|[\w-]+\.(?:jsonl|json|log)\b", reply, re.I))
             bound &= covered and logs
@@ -807,7 +810,7 @@ def _check_heavy_report_locked(payload, state_dir, sid, turn_key, reply, decisio
                 row["native_id"] for row in native["streams"]]))
         user_words.atomic_write_json(state_file, state)
         return None
-    if state.get("blocked"):
+    if reconcile_only or state.get("blocked"):
         return None
     repeat = user_words._read_state_json(state_dir / (sid + "_repeat_guard.json")) or {}
     if repeat.get("turns", {}).get(turn_key, {}).get("blockedSignatures"):
@@ -822,7 +825,11 @@ def _check_heavy_report_locked(payload, state_dir, sid, turn_key, reply, decisio
         if (
             turn_key in (handoff.get("stopGateBlockedTurnKeys") or [])
             or handoff.get("stopCorrectionRequested") is True
-            or (handoff.get("mode") == "enforce" and handoff.get("phase") in ("drain", "freeze"))
+            or (
+                handoff.get("mode") == "enforce"
+                and handoff.get("phase") in ("drain", "freeze")
+                and handoff.get("handoffRecorded") is not True
+            )
         ):
             return None
     state["blocked"] = True
@@ -933,8 +940,15 @@ def handle_stop_repeat_guard(payload: Dict[str, Any]) -> Dict[str, Any]:
             or not user_words.valid_session_id(conversation_id)):
         return {"decision": "allow"}
 
-    # 2. 官方防死循环协议规范：若当前回合已处于 Stop 钩子触发的续跑状态（兼容 App camelCase 与 CLI v1.5.6+ snake_case），立即放行
+    # 2. 官方防死循环协议规范：续跑态绝不二次阻断，但若续跑已补齐完工账单则先销账再放行，避免跨回合残留死循环
     if payload.get("continuationActive") is True or payload.get("continuation_active") is True or payload.get("stop_hook_active") is True:
+        state_dir, _ = get_data_dirs()
+        try:
+            with user_words.session_state_lock(state_dir, conversation_id):
+                turn_key, _, latest_reply = extract_current_turn_latest_reply(payload.get("transcriptPath"))
+                _check_heavy_report_locked(payload, state_dir, conversation_id, turn_key, latest_reply, "continue", reconcile_only=True)
+        except (OSError, ValueError):
+            pass
         return {"decision": "allow"}
 
     state_dir, _ = get_data_dirs()
@@ -1049,8 +1063,8 @@ def _claude_turn_reply(payload: Dict[str, Any]) -> Tuple[str, Optional[int], str
                 if not latest_reply:
                     latest_reply = flushed_text
         if step is None and latest_reply:
-            # 宿主可能在助手记录刷盘前调用 Stop；同一快照的重复投递仍须幂等。
-            step = transcript.stat().st_size
+            # 宿主可能在助手记录刷盘前调用 Stop；以负偏移区分未刷盘 EOF 快照与已落盘记录偏移，防游标碰撞。
+            step = -(transcript.stat().st_size + 1)
             message_id = ""
     except OSError:
         return turn_key, None, latest_reply, ""
@@ -1114,18 +1128,18 @@ def _codex_turn_reply(payload):
             if flushed_step is not None:
                 if saw_tool_after_assistant:
                     if supplied:
-                        step = offset
+                        step = -(offset + 1)
                     else:
                         step = None
                         reply = ""
                 elif supplied and supplied != flushed_reply.strip():
-                    step = offset
+                    step = -(offset + 1)
                 else:
                     step = flushed_step
                     if not supplied:
                         reply = flushed_reply
             elif reply:
-                step = offset
+                step = -(offset + 1)
         except OSError:
             pass
     return turn, step, reply, ""
@@ -1134,9 +1148,32 @@ def _codex_turn_reply(payload):
 def handle_claude_stop_repeat_guard(payload: Dict[str, Any], state_dir: Optional[Path] = None,
                                    logs_dir: Optional[Path] = None) -> Dict[str, Any]:
     _sync_repeat_tunables()
-    if payload.get("stop_hook_active") is True or payload.get("continuationActive") is True or payload.get("continuation_active") is True:
-        return {}
+    continuation = (
+        payload.get("stop_hook_active") is True
+        or payload.get("continuationActive") is True
+        or payload.get("continuation_active") is True
+    )
     client = payload.get("_client", "claude")
+    home = Path(os.environ.get("CODEX_HOME" if client == "codex" else "CLAUDE_CONFIG_DIR") or Path.home() / (".codex" if client == "codex" else ".claude")).expanduser()
+    resolved_state_dir = Path(state_dir).expanduser() if state_dir is not None else home / "hooks" / "state"
+    if continuation:
+        if not resolved_state_dir.is_dir():
+            return {}
+        raw_sid = str(payload.get("session_id") or payload.get("sessionId") or "").strip()
+        if not user_words.valid_session_id(raw_sid):
+            return {}
+        has_heavy_state = (resolved_state_dir / f"{raw_sid}_heavy_report_guard.json").is_file() or bool(
+            user_words.load_unreported_heavy_completions(raw_sid, resolved_state_dir)
+        )
+        if not has_heavy_state:
+            return {}
+        turn_key, _, reply, _ = (_codex_turn_reply(payload) if client == "codex" else _claude_turn_reply(payload))
+        try:
+            with user_words.session_state_lock(resolved_state_dir, raw_sid):
+                _check_heavy_report_locked(payload, resolved_state_dir, raw_sid, turn_key, reply, "block", reconcile_only=True)
+        except (OSError, ValueError):
+            pass
+        return {}
     sid, _, _, skip = (
         user_words.codex_hook_session(payload)
         if client == "codex"
@@ -1144,8 +1181,7 @@ def handle_claude_stop_repeat_guard(payload: Dict[str, Any], state_dir: Optional
     )
     if skip or not user_words.valid_session_id(sid):
         return {}
-    home = Path(os.environ.get("CODEX_HOME" if client == "codex" else "CLAUDE_CONFIG_DIR") or Path.home() / (".codex" if client == "codex" else ".claude")).expanduser()
-    state_dir = Path(state_dir).expanduser() if state_dir is not None else home / "hooks" / "state"
+    state_dir = resolved_state_dir
     logs_dir = Path(logs_dir).expanduser() if logs_dir is not None else home / "hooks" / "logs"
     turn_key, step, reply, message_id = (_codex_turn_reply(payload) if client == "codex" else _claude_turn_reply(payload))
     try:

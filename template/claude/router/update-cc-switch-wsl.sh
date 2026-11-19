@@ -61,7 +61,15 @@ else
         echo "Invalid version or missing local .deb file: $arg" >&2
         exit 2
     fi
+    if [ -L "$PKGS" ]; then
+        echo "Refusing symbolic link package directory: $PKGS" >&2
+        exit 1
+    fi
     mkdir -p "$PKGS"
+    if [ -L "$PKGS" ]; then
+        echo "Refusing symbolic link package directory: $PKGS" >&2
+        exit 1
+    fi
     arch_raw="$(uname -m)"
     case "$arch_raw" in
         x86_64|amd64) deb_arch="x86_64" ;;
@@ -124,6 +132,11 @@ else:
         echo "Digest mismatch (expected $want, got $got); aborting." >&2
         exit 1
     fi
+    if [ -L "$deb" ]; then
+        echo "Refusing symbolic link target package path: $deb" >&2
+        exit 1
+    fi
+    chmod 0644 -- "$part"
     mv -- "$part" "$deb"
     part=""
 fi
@@ -174,8 +187,13 @@ if [ "${#TARGET_PIDS[@]}" -gt 0 ]; then
 fi
 if ! sudo apt install -y "$deb"; then
     if [ "$WAS_RUNNING" -eq 1 ] && [ -n "$LAUNCHER" ]; then
-        echo "Installation failed; attempting to restart previous version." >&2
-        run_launcher || echo "Warning: failed to restart previous CC Switch GUI." >&2
+        pkg_st="$(dpkg-query -W -f='${Status}' cc-switch 2>/dev/null || true)"
+        if [ -n "$pkg_st" ] && [[ "$pkg_st" != *"half-"* && "$pkg_st" != *"deinstall"* && "$pkg_st" != *"unpacked"* && "$pkg_st" != *"not-installed"* ]]; then
+            echo "Installation failed; attempting to restart previous version." >&2
+            run_launcher || echo "Warning: failed to restart previous CC Switch GUI." >&2
+        else
+            echo "Installation failed and cc-switch package state is incomplete ($pkg_st); skipping GUI restart." >&2
+        fi
     fi
     exit 1
 fi

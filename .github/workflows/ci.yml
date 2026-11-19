@@ -34,10 +34,12 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Check shell script syntax on Linux
+      - name: Check shell script syntax and entrypoint on Linux
         if: runner.os == 'Linux'
         shell: bash
-        run: bash -n install.sh template/claude/router/*.sh
+        run: |
+          bash -n install.sh template/claude/router/*.sh
+          bash ./install.sh --probe-apps | python3 -B -X utf8 -c 'import json, sys; p = json.load(sys.stdin); assert all(k in p for k in ("antigravity", "codex", "claude", "dsh", "cc_switch")), p'
 
       - name: Check PowerShell entrypoint on Windows
         if: runner.os == 'Windows'
@@ -72,7 +74,7 @@ jobs:
               escaped = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
               print(f"::error::{escaped}", flush=True)
 
-          probe = subprocess.run([*py, "install.py", "--probe-apps"], cwd=repo, check=True, capture_output=True, text=True, encoding="utf-8")
+          probe = subprocess.run([*py, "install.py", "--probe-apps"], cwd=repo, check=True, capture_output=True, text=True, encoding="utf-8", errors="replace")
           payload = json.loads(probe.stdout)
           assert all(name in payload for name in ("antigravity", "codex", "claude", "dsh", "cc_switch")), payload
 
@@ -121,7 +123,7 @@ jobs:
                   [*py, "install.py", "--audit-upgrade", "--target-dir", str(base / "all_agy" / "plugins" / "user-guard"),
                    "--codex-home", str(base / "all_codex"), "--claude-home", str(base / "all_claude"),
                    "--dsh-home", str(base / "all_dsh"), "--with-cc-router"],
-                  cwd=repo, check=True, capture_output=True, text=True, encoding="utf-8",
+                  cwd=repo, check=True, capture_output=True, text=True, encoding="utf-8", errors="replace",
               )
               report = json.loads(audit.stdout)
               assert snapshot() == before_audit, "Upgrade audit changed sandbox files or directories"
@@ -149,7 +151,7 @@ jobs:
 
           git_status = subprocess.run(
               ["git", "status", "--porcelain"],
-              cwd=repo, check=True, capture_output=True, text=True, encoding="utf-8",
+              cwd=repo, check=True, capture_output=True, text=True, encoding="utf-8", errors="replace",
           )
           if git_status.stdout.strip():
               emit_ci_error(f"Repository not clean after CI run: {git_status.stdout.strip()}")

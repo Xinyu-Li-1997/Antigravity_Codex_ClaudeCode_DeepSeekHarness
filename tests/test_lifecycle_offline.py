@@ -3267,6 +3267,106 @@ class TestHeavyWorkflowLifecycle(unittest.TestCase):
         self.assertFalse((outside_lock_target / "deep").exists())
 
 
+    def test_persisted_ticket_uses_compact_card_link_in_recovery_and_handoff(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("lifecycle_compact_card_harness", HOOKS_DIR.parent / "skills/cae-harness/scripts/cae_harness.py")
+        harness = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(harness)
+
+        plan_dir = self.state / "dispatch_plans"
+        plan_dir.mkdir(parents=True, exist_ok=True)
+        _, ticket1 = self.ticket(tid="ticket-compact-1")
+        ticket1["streams"][0]["client"] = "dsh"
+        ticket1["streams"][1]["client"] = "agy"
+        harness._save_plan(ticket1, plan_dir)
+
+        _, ticket2 = self.ticket(tid="ticket-compact-2")
+        ticket2["streams"] = [ticket2["streams"][0]]
+        ticket2["streams"][0]["stream_id"] = "W1"
+        ticket2["streams"][0]["channel"] = "native_workflow"
+        ticket2["streams"][0]["client"] = "agy"
+        harness._save_plan(ticket2, plan_dir)
+
+        # 1) render_pending_workflow_block 输出精简 4 列总览卡与可点击链接，不展开 14 项长表
+        compact_popup = user_words.render_pending_workflow_block(ticket1, for_handoff=False)
+        compact_handoff = user_words.render_pending_workflow_block(ticket1, for_handoff=True)
+        for rendered in (compact_popup, compact_handoff):
+            self.assertIn("| 流号 | 通道与执行端 | 模型与挡位 | 可用性与额度状态 |", rendered)
+            self.assertIn("[ticket-compact-1_card.md](file://", rendered)
+            self.assertIn("恢复命令：plan --resume-ticket ticket-compact-1", rendered)
+            self.assertNotIn("14 项完整参数明细", rendered)
+            self.assertNotIn("| 序号 | 参数项 | 当前值 |", rendered)
+
+        # 2) handoff_gate._workflow_handoff_present 认可精简总览 + 明细链接交接，并拦截缺漏字段
+        prompt_text = "【新对话提示词】\n" + compact_handoff
+        self.assertTrue(handoff_gate._workflow_handoff_present(prompt_text, [ticket1]))
+        self.assertTrue(handoff_gate._workflow_handoff_present(ticket1["compact_handoff_prompt_block"], [ticket1]))
+        self.assertFalse(handoff_gate._workflow_handoff_present(prompt_text.replace("ticket-compact-1_card.md", "other.md"), [ticket1]))
+        self.assertFalse(handoff_gate._workflow_handoff_present(prompt_text.replace("plan --resume-ticket ticket-compact-1", "resume"), [ticket1]))
+        self.assertFalse(handoff_gate._workflow_handoff_present(prompt_text.replace("| S2 |", "| S9 |"), [ticket1]))
+
+        # 3) _workflow_handoff_notice 与 session_context_loader._workflow_recovery_blocks 覆盖多张未决票据且均保持精简
+        notice = handoff_gate._workflow_handoff_notice([ticket1, ticket2])
+        self.assertIn("精简 4 列总览表", notice)
+        self.assertIn("[ticket-compact-1_card.md](file://", notice)
+        self.assertIn("[ticket-compact-2_card.md](file://", notice)
+        self.assertNotIn("14 项完整参数明细", notice)
+
+        blocks = session_context_loader._workflow_recovery_blocks(self.sid, self.state)
+        self.assertEqual(len(blocks), 2)
+        joined = "\n".join(blocks)
+        self.assertIn("[ticket-compact-1_card.md](file://", joined)
+        self.assertIn("[ticket-compact-2_card.md](file://", joined)
+        self.assertNotIn("14 项完整参数明细", joined)
+
+        # 4) 兼容旧版 v1.16.0（有 card_detail_file 但 compact_summary_card 缺少 4 列总览与背景字段）
+        legacy_v116 = dict(ticket1, compact_summary_card="工作流目标：旧版单行\n- S1: dsh | fixture | 64000 tokens | 只读")
+        legacy_v116["status"] = "HANDED_OFF"
+        synthesized = user_words.render_pending_workflow_block(legacy_v116, for_handoff=True)
+        self.assertIn("| 流号 | 通道与执行端 | 模型与挡位 | 可用性与额度状态 |", synthesized)
+        self.assertIn("[ticket-compact-1_card.md](file://", synthesized)
+        self.assertIn("HANDED_OFF", synthesized)
+        self.assertNotIn("14 项完整参数明细", synthesized)
+        self.assertTrue(handoff_gate._workflow_handoff_present("【新对话提示词】\n" + synthesized, [legacy_v116]))
+
+    def test_v1171_collapse_table_blank_line_missing_card_fallback_and_multi_ticket_s1(self):
+        # 1) collapse_historical_cards stops folding at blank line, preserving scientific tables
+        text = (
+            "#### 流 S1（14 项完整参数明细）\n"
+            "| 序号 | 参数项 | 当前值 |\n| --- | --- | --- |\n| 1 | 流号 | S1 |\n\n"
+            "| 网格 | L2 误差 | 收敛阶 |\n| --- | --- | --- |\n| 64 | 1.2e-4 | 2.01 |\n"
+        )
+        folded = user_words.collapse_historical_cards(text)
+        self.assertIn("[已折叠历史确认单/账单明细]", folded)
+        self.assertIn("| 网格 | L2 误差 | 收敛阶 |", folded)
+        self.assertIn("| 64 | 1.2e-4 | 2.01 |", folded)
+
+        # 2) render_pending_workflow_block falls back to 14-item table if card_detail_file is deleted
+        _, tk = self.ticket(tid="ticket-missing-card")
+        tk["card_detail_file"] = str(self.state / "dispatch_plans" / "deleted_card.md")
+        rendered_fb = user_words.render_pending_workflow_block(tk, for_handoff=False)
+        self.assertIn("| 序号 | 参数项 | 当前值 |", rendered_fb)
+
+        # 3) _matches_compact_card_handoff consumes rows per ticket (no multi-ticket S1 aliasing)
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("lifecycle_v1171_harness", HOOKS_DIR.parent / "skills/cae-harness/scripts/cae_harness.py")
+        harness = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(harness)
+        plan_dir = self.state / "dispatch_plans"
+        _, t1 = self.ticket(tid="t-multi-a")
+        t1["streams"] = [t1["streams"][0]]
+        harness._save_plan(t1, plan_dir)
+        _, t2 = self.ticket(tid="t-multi-b")
+        t2["streams"] = [dict(t2["streams"][0], model_display="other-model-b")]
+        harness._save_plan(t2, plan_dir)
+        single_row_spoof = (
+            "【新对话提示词】\n"
+            + user_words.render_pending_workflow_block(t1, for_handoff=True)
+            + "\n票据：t-multi-b，明细文件 t-multi-b_card.md，恢复命令：plan --resume-ticket t-multi-b\n"
+        )
+        self.assertFalse(handoff_gate._workflow_handoff_present(single_row_spoof, [t1, t2]))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

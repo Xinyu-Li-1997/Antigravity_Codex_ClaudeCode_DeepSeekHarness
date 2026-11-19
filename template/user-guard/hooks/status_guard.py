@@ -155,8 +155,9 @@ _COMMIT_MSG_RE = re.compile(
 _GIT_WORKTREE_ADD_RE = re.compile(r"\bgit\b[^\r\n;|&]*?\bworktree\s+add\b([^\r\n;|&]+)", re.IGNORECASE)
 _INSTALLER_INVOKE_RE = re.compile(
     r"(?:^|[;&|\r\n]\s*)(?:[A-Za-z_]\w*=\S+\s+)*"
-    r"(?:(?:wsl(?:\.exe)?|bash|sh|pwsh(?:\.exe)?|powershell(?:\.exe)?|cmd(?:\.exe)?|"
-    r"python[0-9.]*(?:\.exe)?|py(?:\.exe)?\s+-3)\b[^\r\n;|&]*?[\s\"'\\/]+|(?:\.[\\/]))"
+    r"(?:(?:(?:env|sudo|uv\s+run)\b[^\r\n;|&]*?\s+)*"
+    r"""(?:["']?[^\s;|&"']+[\\/])?(?:wsl(?:\.exe)?|bash|sh|pwsh(?:\.exe)?|powershell(?:\.exe)?|cmd(?:\.exe)?|"""
+    r"""python[0-9.]*(?:\.exe)?|py(?:\.exe)?(?:\s+-[0-9.]+)?)\b["']?[^\r\n;|&]*?[\s"'\\/]+|(?:\.[\\/]))"""
     r"(?<![A-Za-z0-9_.-])install\.(?:py|ps1|sh)\b\"?'?([^\r\n;|&]*)",
     re.IGNORECASE,
 )
@@ -181,7 +182,7 @@ _DOTNET_IO_MUTATE_RE = re.compile(
     re.IGNORECASE,
 )
 _SHELL_REDIRECT_RE = re.compile(
-    r"""(?:&>{1,2}|(?<![->=&])(?:\d+)?(?:>{1,2}\|?|<>))(?![>&=(])\s*((?:\$\{[^}\r\n]*\}|\$'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|'(?:''|[^'])*'|\\[\s;|&<>()"']|[^\s;|&<>()"'])+)""",
+    r"""(?:&>{1,2}|(?<![->=&])(?:\d+)?(?:>&(?![0-9-](?:\s|$|[;|&<>()])|[>&=(])|(?:>{1,2}\|?|<>)(?![>&=(])))\s*((?:\$\{[^}\r\n]*\}|\$'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|'(?:''|[^'])*'|\\[\s;|&<>()"']|[^\s;|&<>()"'])+)""",
 )
 _APPLY_PATCH_HEADER_RE = re.compile(r"^\*\*\* (Add File|Update File|Delete File|Move to): (.+)$", re.MULTILINE)
 _PY_FALLBACK_PAIRS = (
@@ -1400,6 +1401,8 @@ _AST_MODULE_CALLS = {
     "tempfile": {"gettempdir", "mkdtemp", "TemporaryDirectory", "mkstemp", "NamedTemporaryFile"},
     "subprocess": {"run", "Popen", "call", "check_call", "check_output", "getoutput", "getstatusoutput"},
     "numpy": {"save", "savez", "savez_compressed", "savetxt"},
+    "builtins": {"open"},
+    "io": {"open"},
 }
 _AST_TEMP_DIR_INDEX = {"mkdtemp": 2, "TemporaryDirectory": 2, "mkstemp": 2, "NamedTemporaryFile": 6}
 _AST_WRITE_CALL_ARGS = {
@@ -1926,7 +1929,7 @@ def _scan_inline_python_code(
     if saw_recursion_error:
         return "内联 Python 语法树嵌套深度超出静态审查上限", "<AST_RECURSION_LIMIT>", _compact_snippet(used_src)
 
-    bindings = {_AST_CWD: frozenset((base_cwd,))}
+    bindings = {_AST_CWD: frozenset((base_cwd,)), "open": frozenset((_AstCallable("builtins.open"),))}
 
     def _bad(target) -> bool:
         return _ast_bad_target(target, bindings, base_cwd, allowed_norm_keys, allowed_resolved_keys,
@@ -1948,7 +1951,13 @@ def _scan_inline_python_code(
             # 模块函数先于同名 Path 方法检查，模块与可调用标识不能作为路径字符串使用。
             qualnames = _ast_call_qualnames(fn, bindings)
             for qualname in qualnames:
-                if qualname == "os.open":
+                if qualname in ("builtins.open", "io.open"):
+                    is_mut, mode_s = _open_mode_is_mutating(node, 1, bindings)
+                    if is_mut:
+                        tgt = _ast_call_arg_candidates(node, 0, ("file",), bindings)
+                        if _bad(tgt):
+                            return f"Python 写入/修改文件 (open mode='{mode_s}')", _format_ast_candidates(tgt), snippet
+                elif qualname == "os.open":
                     flags = _ast_call_arg_candidates(node, 1, ("flags",), bindings)
                     if not all(type(value) is int and value == 0 for value in flags):
                         tgt = _ast_call_arg_candidates(node, 0, ("path",), bindings)
@@ -2370,11 +2379,13 @@ def _unwrap_shell_script_with_tail(cmd: str) -> Optional[Tuple[str, str]]:
         r"(?:(?:eval|exec)\b(?:\s+(?:-[cl]|-a\s+\S+|--))*\s+)*"
         rf"""(?:{_SHELL_BIN_PREFIX_RE}wsl(?:\.exe)?["']?\b(?:\s+(?:-(?:d|u)|--(?:distribution|user|cd))\s+(?:"(?:\\.|[^"\\])*"|'(?:''|[^'])*'|\S+)|\s+(?:--|-e|--exec|-[A-Za-z]+))*\s+)?"""
     )
+    _ps_enc_sw = r"(?:ec|e(?:n(?:c(?:o(?:d(?:e(?:d(?:c(?:o(?:m(?:m(?:a(?:n(?:d)?)?)?)?)?)?)?)?)?)?)?)?)?)"
+    _ps_cmd_sw = r"c(?:o(?:m(?:m(?:a(?:n(?:d)?)?)?)?)?)?"
     m_enc = re.match(
         lead_prefix
         + rf"""{_SHELL_BIN_PREFIX_RE}(?:pwsh(?:\.exe)?|powershell(?:\.exe)?)\b["']?"""
-        + r"(?:\s+(?:-(?:ExecutionPolicy|ep|WindowStyle|w|InputFormat|OutputFormat|ConfigurationName|WorkingDirectory|Version|v)\s+\S+|-(?!(?:EncodedCommand|ec)\b)[A-Za-z]+))*"
-        + r"""\s+["']?-(?:EncodedCommand|ec)["']?(?:\s+|$)""",
+        + rf"(?:\s+(?:-(?:ExecutionPolicy|ep|WindowStyle|w|InputFormat|OutputFormat|ConfigurationName|WorkingDirectory|Version|v)\s+\S+|-(?!{_ps_enc_sw}\b)[A-Za-z]+))*"
+        + rf"""\s+["']?-{_ps_enc_sw}["']?(?:\s+|$)""",
         cmd,
         re.IGNORECASE,
     )
@@ -2422,8 +2433,8 @@ def _unwrap_shell_script_with_tail(cmd: str) -> Optional[Tuple[str, str]]:
     m = re.match(
         lead_prefix
         + rf"""{_SHELL_BIN_PREFIX_RE}(?P<sh>bash|sh|zsh|pwsh(?:\.exe)?|powershell(?:\.exe)?|cmd(?:\.exe)?)\b["']?"""
-        + r"(?:\s+(?:-(?:ExecutionPolicy|ep|WindowStyle|w|InputFormat|OutputFormat|ConfigurationName|WorkingDirectory|Version|v)\s+\S+|-(?!(?:[A-Za-z]*c|Command)\b)[A-Za-z]+|/(?![ck]\b)[A-Za-z](?::[A-Za-z]+)?))*"
-        + r"""\s+(?P<sw>["']?-(?:[A-Za-z]*c|Command)["']?|["']?/[ck]["']?)\s+""",
+        + rf"(?:\s+(?:-(?:ExecutionPolicy|ep|WindowStyle|w|InputFormat|OutputFormat|ConfigurationName|WorkingDirectory|Version|v)\s+\S+|-(?!(?:[A-Za-z]*c|{_ps_cmd_sw})\b)[A-Za-z]+|/(?![ck]\b)[A-Za-z](?::[A-Za-z]+)?))*"
+        + rf"""\s+(?P<sw>["']?-(?:[A-Za-z]*c|{_ps_cmd_sw})["']?|["']?/[ck]["']?)\s+""",
         cmd,
         re.IGNORECASE,
     )
@@ -2433,7 +2444,7 @@ def _unwrap_shell_script_with_tail(cmd: str) -> Optional[Tuple[str, str]]:
     sw_low = m.group("sw").strip("\"'").lower()
     if sh_low in ("bash", "sh", "zsh") and not re.fullmatch(r"-[a-z]*c", sw_low):
         return None
-    if sh_low in ("pwsh", "powershell") and sw_low not in ("-c", "-command"):
+    if sh_low in ("pwsh", "powershell") and not (sw_low.startswith("-c") and "-command".startswith(sw_low)):
         return None
     if sh_low == "cmd" and sw_low not in ("/c", "/k"):
         return None
@@ -2504,6 +2515,8 @@ def _extract_clause_path_targets(tokens: List[str], copy_dest_only: bool = False
             if head_low in ("cp", "ln"):
                 if (tok == "-t" or low_tok == "--target-directory") and idx + 1 < len(tokens):
                     return [tokens[idx + 1]]
+                if tok.startswith("-t") and not tok.startswith("--") and len(tok) > 2:
+                    return [tok[2:]]
                 if low_tok.startswith("--target-directory="):
                     return [tok.split("=", 1)[1]]
 
@@ -2535,6 +2548,10 @@ def _extract_clause_path_targets(tokens: List[str], copy_dest_only: bool = False
                     explicit_paths.append(tokens[idx + 1])
                     idx += 2
                     continue
+                if tok.startswith("-t") and not tok.startswith("--") and len(tok) > 2:
+                    explicit_paths.append(tok[2:])
+                    idx += 1
+                    continue
                 if low.startswith("--target-directory="):
                     explicit_paths.append(tok.split("=", 1)[1])
                     idx += 1
@@ -2545,9 +2562,13 @@ def _extract_clause_path_targets(tokens: List[str], copy_dest_only: bool = False
             if low in _PS_NON_PATH_VALUE_FLAGS:
                 idx += 2
                 continue
-            if low in ("-path", "-literalpath", "-filepath", "-destination", "-newname") and idx + 1 < n:
+            if low in ("-path", "-literalpath", "-filepath", "-destination", "-dest", "-newname") and idx + 1 < n:
                 explicit_paths.append(tokens[idx + 1])
                 idx += 2
+                continue
+            if any(low.startswith(pref) for pref in ("-path:", "-literalpath:", "-filepath:", "-destination:", "-dest:", "-newname:")):
+                explicit_paths.append(tok.split(":", 1)[1])
+                idx += 1
                 continue
             if head_low == "robocopy" and re.match(r"^/(?:MIR|E|S|PURGE|MOVE|MOV|R|W|COPY|DCOPY|MT|LOG|TEE|NFL|NDL)(?::|$)", tok, re.I):
                 idx += 1
@@ -2699,6 +2720,23 @@ def _detect_command_external_mutation(
             inner, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp, depth + 1, distribution,
         )
 
+    # 必须先扫描原命令的命令替换（防止 git commit -m "$(rm -rf /outside)" 被 commit 掩码抹除）
+    for raw_inner in _extract_cmd_substitutions(command_line):
+        raw_hit = _detect_command_external_mutation(
+            raw_inner, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp,
+            depth + 1, wsl_distribution,
+        )
+        if raw_hit:
+            return raw_hit
+    if (r'\"' in command_line or r'\$' in command_line):
+        for ps_inner in _shell_lex.extract_cmd_substitutions(command_line, backslash_escape=False):
+            ps_hit = _detect_command_external_mutation(
+                ps_inner, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp,
+                depth + 1, wsl_distribution,
+            )
+            if ps_hit:
+                return ps_hit
+
     sanitized = (_COMMIT_MSG_RE.sub(r'\1"__COMMIT_MSG__"', command_line)
                  if "commit" in command_line.casefold() else command_line)
 
@@ -2828,6 +2866,11 @@ def _detect_command_external_mutation(
     scanned_py_indices: set[int] = set()
     checked_any_redirect = False
     clauses = _split_shell_clauses(shell_masked)
+    if r'\"' in shell_masked:
+        ps_clauses = _shell_lex.split_shell_clauses(shell_masked, backslash_escape=False)
+        for extra_cl in ps_clauses:
+            if extra_cl not in clauses:
+                clauses.append(extra_cl)
     for raw_clause in clauses:
         clause = raw_clause.strip()
         if not clause:
@@ -3301,7 +3344,12 @@ def _native_turn_snapshot(payload: Dict[str, Any], *, all_turns=False) -> Tuple[
 def _dispatch_commands(command: str, depth: int = 0):
     if depth > MAX_WRAPPER_DEPTH:
         return
-    for raw_clause in _split_shell_clauses(command):
+    clauses = _split_shell_clauses(command)
+    if r'\"' in command:
+        for extra_cl in _shell_lex.split_shell_clauses(command, backslash_escape=False):
+            if extra_cl not in clauses:
+                clauses.append(extra_cl)
+    for raw_clause in clauses:
         clause = raw_clause.strip()
         if not clause:
             continue
@@ -3483,12 +3531,13 @@ def _native_readonly(args):
 
 
 def _dispatch_option(tokens, name):
+    result = None
     for i, token in enumerate(tokens):
         if token.startswith(name + "="):
-            return token.split("=", 1)[1].strip("\"'")
-        if token == name and i + 1 < len(tokens):
-            return tokens[i + 1]
-    return None
+            result = token.split("=", 1)[1].strip("\"'")
+        elif token == name and i + 1 < len(tokens):
+            result = tokens[i + 1]
+    return result
 
 
 _HARNESS_METRICS_CACHE: Dict[str, Tuple[int, Any]] = {}
@@ -3533,7 +3582,10 @@ def _check_dispatch_locked(payload, tool_name, args, sid, state_dir):
     heavy_tickets = []
     if shell:
         for tokens in _dispatch_commands(command):
-            names = [Path(t.replace(chr(92), "/")).name.lower().removesuffix(".exe").removesuffix(".cmd") for t in tokens]
+            names = [
+                re.sub(r"\.(?:exe|cmd|bat|ps1)$", "", Path(t.replace(chr(92), "/")).name.lower())
+                for t in tokens
+            ]
             if "cae_harness.py" in names and (names[0] == "cae_harness.py" or re.fullmatch(r"(?:python(?:[0-9.]+)?|py)", names[0])):
                 tail = tokens[names.index("cae_harness.py") + 1:]
                 code_task = tail[:1] == ["task"] and ("--kind=code" in tail or any(
@@ -3606,9 +3658,26 @@ def _check_dispatch_locked(payload, tool_name, args, sid, state_dir):
             return _ticket_required_reason(sid, state_dir)
         if state.get("turn") != turn:
             state = {"turn": turn, "count": 0, "calls": [], "channel_counts": {}}
-        if type(state.get("count")) is not int or state["count"] < 0 or not isinstance(state.get("calls"), list):
+        raw_cc = state.get("channel_counts")
+        if (
+            type(state.get("count")) is not int
+            or state["count"] < 0
+            or not isinstance(state.get("calls"), list)
+            or (raw_cc is not None and (
+                not isinstance(raw_cc, dict)
+                or any(not isinstance(k, str) or type(v) is not int or v < 0 for k, v in raw_cc.items())
+            ))
+        ):
             return _ticket_required_reason(sid, state_dir)
-        identity = str(payload.get("tool_use_id") or payload.get("call_id") or "")
+        tc_obj = payload.get("toolCall") if isinstance(payload.get("toolCall"), dict) else {}
+        identity = str(
+            payload.get("tool_use_id")
+            or payload.get("call_id")
+            or tc_obj.get("id")
+            or tc_obj.get("call_id")
+            or tc_obj.get("toolCallId")
+            or ""
+        )
         if identity:
             calls = [call for call in calls if call["call_id"] != identity]
         weight = _native_call_stream_weight(tool_name, args)
@@ -3652,14 +3721,14 @@ def _ticket_required_reason(sid, state_dir=None, extra_plan_dirs=()):
     if pending_ticket:
         tid = str(pending_ticket.get("ticket_id") or "<TICKET_ID>")
         detail_file = str(pending_ticket.get("card_detail_file") or "").strip()
-        detail_hint = f"（完整明细见：{detail_file}）" if detail_file else ""
+        detail_hint = f"（完整 14 项明细链接：{user_words.format_card_detail_link(detail_file)}）" if detail_file else ""
         return (
             f"【user-guard 重负载派工门禁】检测到当前会话已有未过期的待确认（PENDING）批次票据 `{tid}`，尚未获得 APPROVED 授权{detail_hint}。"
-            f'请先向用户展示包含内部与外部子代理完整 14 项参数的中文确认单，待用户明确确认后再执行 `python "{harness_script}" plan --session-id {sid} --approve-ticket {tid}` 解锁启动（严禁未经用户确认自行审批或重复建单）；原生调用须在票据中列出原生通道。'
+            f'请先向用户展示精简 4 列总览卡（compact_summary_card）与可点击的完整 14 项参数明细链接（勿把多路 14 项长表全文刷屏对话），待用户明确确认后再执行 `python "{harness_script}" plan --session-id {sid} --approve-ticket {tid}` 解锁启动（严禁未经用户确认自行审批或重复建单）；原生调用须在票据中列出原生通道。'
         )
     return (
         "【user-guard 重负载派工门禁】当前会话尚无有效且未过期的批次票据（未找到 APPROVED 或待确认 PENDING 票据，或票据通道容量不匹配）。"
-        f'请先调用 `python "{harness_script}" plan --session-id {sid} ...` 生成中文确认单，包含内部与外部子代理完整 14 项参数明细；'
+        f'请先调用 `python "{harness_script}" plan --session-id {sid} ...` 生成中文确认单（自动落盘完整 14 项参数明细至 `<ticket_id>_card.md`，对话仅展示精简 4 列总览卡与明细链接）；'
         "获用户确认并执行 `--approve-ticket` 后再启动；原生调用须在票据中列出原生通道。"
     )
 
@@ -4080,7 +4149,10 @@ def _python_tokens_is_safe_inline_readonly(tokens: List[str]) -> bool:
         tree = ast.parse(code_str)
     except (SyntaxError, ValueError, RecursionError):
         return False
-    blocked_imports = {"shutil", "tempfile", "subprocess", "ctypes", "pty", "socket", "urllib", "http"}
+    blocked_imports = {
+        "shutil", "tempfile", "subprocess", "ctypes", "pty", "socket", "urllib", "http",
+        "importlib", "builtins", "sqlite3", "zipfile", "tarfile", "logging",
+    }
     blocked_builtins = {"exec", "eval", "compile", "__import__", "getattr", "setattr", "delattr", "input"}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -4102,6 +4174,7 @@ _READONLY_SUBAGENT_EXPLICIT_MUTATION_VERBS = (
     | _SHELL_LINK_VERBS
     | {"sed", "perl", "python", "python3", "py"}
     | {"apply_patch", "patch", "chmod", "chown", "chgrp", "truncate", "unlink", "shred", "dd", "install"}
+    | {"pytest", "make", "cmake", "ninja", "ctest", "cargo", "npm", "npx", "pnpm", "yarn", "node", "awk", "gawk", "curl", "wget"}
 )
 
 
@@ -4245,7 +4318,7 @@ def handle_claude_pre_tool_use(payload: Dict[str, Any], state_dir: Optional[Path
     hit = None
     if projects:
         allow_temp = not any(_is_standard_os_temp_key(key) for key in projects)
-        if tool_name in ("Write", "Edit", "MultiEdit", "NotebookEdit", "write", "edit", "multiedit", "notebookedit"):
+        if tool_name in ("Write", "Edit", "MultiEdit", "NotebookEdit", "write", "edit", "multiedit", "notebookedit", "write_file", "write_to_file", "edit_file", "replace_file_content", "multi_replace_file_content"):
             target = str(args.get("file_path") or args.get("notebook_path") or args.get("path") or args.get("Path") or "").strip()
             if target and not _is_write_target_allowed(target, base_cwd, allowed, resolved, allow_temp, from_shell=False):
                 hit = (f"{tool_name} 创建或修改文件", target, "")

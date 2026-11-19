@@ -22,9 +22,9 @@
   </g>
   <g><rect x="738" y="112" width="670" height="162" rx="14" fill="#ffffff" stroke="#b5c8e5"/>
     <text x="760" y="146" class="heading">动态配置层：fleet_profile.json</text>
-    <text x="760" y="177" class="body">五个动态角色槽位：orchestrator、math、code、review、fast。</text>
+    <text x="760" y="177" class="body">五角色槽位（roles）与四端内生代理档案（native_agent_profiles）。</text>
     <text x="760" y="203" class="body">runtime_tunables 配合 adaptive_policy.py 动态派生恢复及交接阈值。</text>
-    <text x="760" y="229" class="body">subscription_matrix 与 capability_ledger 分别记录启停和离线性能时间。</text>
+    <text x="760" y="229" class="body">subscription_matrix 与 capability_ledger 记录启停及离线性能更新时间。</text>
   </g>
   <g><rect x="32" y="304" width="1376" height="126" rx="14" fill="#f3efff" stroke="#b8a7dc"/>
     <text x="54" y="338" class="heading">阶段一：独立 fleet-evolve 维护期评估与用户启停确认</text>
@@ -39,26 +39,26 @@
   </g>
   <g><rect x="32" y="640" width="1376" height="166" rx="14" fill="#fff8e9" stroke="#d7b265"/>
     <text x="54" y="674" class="heading">全通道重负载确认：用户明确点名（P0）与动态角色选路并列</text>
-    <text x="54" y="705" class="body">plan 生成背景、目标、预计后果与 compact_summary_card，并将纵向 14 项参数表写入 &lt;ticket_id&gt;_card.md。</text>
-    <text x="54" y="731" class="body">附 last_online_refresh_at 与 local_bench_verified_at；提供批准、微调后批准、暂缓并交接三选项。</text>
-    <text x="54" y="757" class="body">获批后以 --approve-ticket 登记；PreToolUse 门禁核验有效票据并拦截直接调用底层 CLI。</text>
-    <text x="54" y="783" class="body">点名锁定用户指定维度；声明最大窗口、非委派挡位、无头标志、行号内联与快照按通道自动补齐。</text>
+    <text x="54" y="705" class="body">plan 将 14 项明细写入 &lt;ticket_id&gt;_card.md，对话仅发精简 4 列总览卡与可点击链接。</text>
+    <text x="54" y="731" class="body">附离线性能更新时间（last_online_refresh_at / local_bench_verified_at）与三选项。</text>
+    <text x="54" y="757" class="body">获批后以 --approve-ticket 登记；PreToolUse 核验票据、隔离一致性并拦截裸调 CLI。</text>
+    <text x="54" y="783" class="body">点名锁定指定维度；窗口、非委派挡位、--isolation 隔离、行号内联与快照按端补齐。</text>
   </g>
   <g><rect x="32" y="836" width="670" height="132" rx="14" fill="#ffffff" stroke="#b5c8e5"/>
     <text x="54" y="870" class="heading">外部通道：cae-harness 跨端无头子进程</text>
     <text x="54" y="901" class="body">batch 按各后端并发上限执行 cae_harness_headless 通道。</text>
-    <text x="54" y="927" class="body">只读任务带行号内联与前后哈希快照；可写任务锁定范围与验收命令。</text>
+    <text x="54" y="927" class="body">支持 --isolation 四级正交隔离；只读带行号内联与快照，可写锁范围与验收命令。</text>
     <text x="54" y="953" class="body">各客户端按自身 CLI 协议能力适配参数、结构化输出与脱敏。</text>
   </g>
   <g><rect x="738" y="836" width="670" height="132" rx="14" fill="#ffffff" stroke="#b5c8e5"/>
     <text x="760" y="870" class="heading">内部通道：各客户端原生子代理与工作流</text>
-    <text x="760" y="901" class="body">覆盖 native_subagent、native_workflow、native_swarm。</text>
-    <text x="760" y="927" class="body">inherit 展示本地配置解析出的实际模型；多路或可写委派统一纳入确认。</text>
-    <text x="760" y="953" class="body">由当前主会话客户端按获批计划调用，不交给 batch，不套用净室隔离承诺。</text>
+    <text x="760" y="901" class="body">覆盖 native_subagent、native_workflow、native_swarm（swarm add 精确计流）。</text>
+    <text x="760" y="927" class="body">优先解析代理定义显式 model 与 inherit；多路或可写委派统一纳入确认。</text>
+    <text x="760" y="953" class="body">由当前主会话客户端按获批计划调用，不交给 batch，不套用无头隔离承诺。</text>
   </g>
   <g><rect x="32" y="998" width="1376" height="132" rx="14" fill="#eefaf4" stroke="#81bfa0"/>
     <text x="54" y="1032" class="heading">共有会话生命周期门禁与四客户端协议适配</text>
-    <text x="54" y="1063" class="body">Antigravity、Codex、Claude Code 按各自宿主事件协议接入 5 个共用钩子模块；DSH 同步全局规则与技能。</text>
+    <text x="54" y="1063" class="body">Antigravity、Codex、Claude Code 接入 5 个共用钩子模块；DSH 为 soft_rules_only 并由 install.py 探测 hook_protocol。</text>
     <text x="54" y="1089" class="body">压缩后经 collapse_historical_cards 折叠历史明细并与未决确认单分块恢复；强制交接阶段由 Stop 校验提示词。</text>
     <text x="54" y="1115" class="body">重负载完工后由 Stop 按外部与原生规则核验成败词、Token 说明及回执或轨迹标识，主会话逐路复核原文与算术。</text>
   </g>

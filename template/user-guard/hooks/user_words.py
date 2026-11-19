@@ -253,13 +253,16 @@ def collapse_historical_cards(text: str) -> str:
                 collapsed_once = True
             continue
         if in_table:
-            if stripped.startswith("|") or not stripped:
+            if stripped.startswith("|"):
                 continue
             in_table = False
             collapsed_once = False
+            if not stripped:
+                out_lines.append(line)
+                continue
         is_card_table_header = stripped.startswith("|") and (
             ("参数项" in stripped and ("序号" in stripped or "当前值" in stripped))
-            or ("流号" in stripped and "通道" in stripped)
+            or ("流号" in stripped and ("通道与执行端" in stripped or "通道与模型" in stripped or "模型与挡位" in stripped))
         )
         if is_card_table_header:
             in_table = True
@@ -495,7 +498,7 @@ def _session_tickets(session_id, state_dir=None, statuses=("PENDING",), extra_pl
         paths = ([directory / (preferred + ".json")] if valid_session_id(preferred) else [])
         paths += sorted(directory.glob("*.json"))
         for path in paths:
-            key = str(path)
+            key = os.path.normcase(str(path))
             if key in seen:
                 continue
             seen.add(key)
@@ -518,11 +521,61 @@ def find_session_pending_ticket(session_id, state_dir=None):
     return next((ticket for _, ticket in _session_tickets(session_id, state_dir)), None)
 
 
+def find_session_pending_tickets(session_id, state_dir=None):
+    return [ticket for _, ticket in _session_tickets(session_id, state_dir)]
+
+
 def find_session_approved_tickets(session_id, state_dir=None, *, ticket_id=None, channel=None, extra_plan_dirs=()):
     return [ticket for _, ticket in _session_tickets(session_id, state_dir, ("APPROVED",), extra_plan_dirs)
             if (ticket_id is None or ticket.get("ticket_id") == ticket_id)
             and (channel is None or any(isinstance(row, dict) and row.get("channel") == channel
                                         for row in ticket.get("streams", [])))]
+
+
+def basename_any_os(raw_path: str) -> str:
+    clean = str(raw_path or "").strip().rstrip("/\\")
+    if not clean:
+        return ""
+    return re.split(r"[/\\]", clean)[-1]
+
+
+def format_card_detail_link(detail_path: str) -> str:
+    clean = str(detail_path or "").replace("\r\n", "\n").replace("\r", " ").replace("\n", " ").strip()
+    if not clean:
+        return ""
+    name = basename_any_os(clean) or clean
+    if clean.startswith("<"):
+        return clean
+    posix = clean.replace("\\", "/")
+    encoded = (
+        posix.replace("%", "%25")
+        .replace(" ", "%20")
+        .replace("(", "%28")
+        .replace(")", "%29")
+        .replace("[", "%5B")
+        .replace("]", "%5D")
+        .replace("#", "%23")
+        .replace("?", "%3F")
+    )
+    if re.match(r"^[A-Za-z]:/", posix):
+        uri = "file:///" + encoded
+    elif posix.startswith("//"):
+        uri = "file:" + encoded
+    elif posix.startswith("/"):
+        uri = "file://" + encoded
+    else:
+        return clean
+    return f"[{name}]({uri})"
+
+
+def _sync_handed_off_text(raw: str) -> str:
+    updated = str(raw or "").replace(
+        "\n\n选项：① 批准当前计划（推荐）；② 微调引擎、挡位或超时后批准；③ 暂缓并交接。",
+        "\n\n当前状态：已登记交接（HANDED_OFF）；新会话复核后可选：① 批准当前计划；② 微调引擎、挡位或超时后批准；③ 暂缓并交接。",
+    )
+    updated = re.sub(r"(状态\s*[:：]\s*)PENDING\b", r"\1HANDED_OFF", updated)
+    updated = re.sub(r"(?im)^(\s*status\s*:\s*)PENDING\b", r"\1HANDED_OFF", updated)
+    return updated
 
 
 def _sync_handed_off_card_markdown(card_path: Path) -> None:
@@ -532,12 +585,7 @@ def _sync_handed_off_card_markdown(card_path: Path) -> None:
         raw_card = card_path.read_text(encoding="utf-8-sig")
     except (OSError, UnicodeError):
         return
-    updated = raw_card.replace(
-        "\n\n选项：① 批准当前计划（推荐）；② 微调引擎、挡位或超时后批准；③ 暂缓并交接。",
-        "\n\n当前状态：已登记交接（HANDED_OFF）；新会话复核后可选：① 批准当前计划；② 微调引擎、挡位或超时后批准；③ 暂缓并交接。",
-    )
-    updated = re.sub(r"(状态\s*[:：]\s*)PENDING\b", r"\1HANDED_OFF", updated)
-    updated = re.sub(r"(?im)^(\s*status\s*:\s*)PENDING\b", r"\1HANDED_OFF", updated)
+    updated = _sync_handed_off_text(raw_card)
     if updated != raw_card:
         with contextlib.suppress(OSError):
             atomic_write_text(card_path, updated if updated.endswith("\n") else updated + "\n")
@@ -560,10 +608,11 @@ def handoff_session_pending_tickets(session_id, state_dir=None):
             if ticket["status"] == "PENDING":
                 ticket["status"] = "HANDED_OFF"
                 atomic_write_json(path, ticket)
+            if ticket["status"] == "HANDED_OFF":
                 _sync_handed_off_card_markdown(path.parent / f"{ticket['ticket_id']}_card.md")
                 pointer_path = path.parent / f"session_{session_id}_pending.json"
                 pointer = _read_state_json(pointer_path)
-                if isinstance(pointer, dict) and pointer.get("ticket_id") == ticket["ticket_id"]:
+                if isinstance(pointer, dict) and pointer.get("ticket_id") == ticket["ticket_id"] and pointer.get("status") != "HANDED_OFF":
                     pointer["status"] = "HANDED_OFF"
                     atomic_write_json(pointer_path, pointer)
             tickets.append(ticket)
@@ -608,7 +657,7 @@ def mark_heavy_completions_reported(session_id, state_dir=None):
 
 
 def render_pending_workflow_block(ticket, for_handoff=False) -> str:
-    """只渲染磁盘字段；缺失信息明确标注，不重新推断模型或额度。"""
+    """只渲染磁盘字段；有落盘明细文件时优先输出精简总览卡与可点击链接，缺失信息明确标注。"""
     def value(raw):
         if raw is None or raw == "":
             return "未记录"
@@ -621,13 +670,102 @@ def render_pending_workflow_block(ticket, for_handoff=False) -> str:
     def cell(raw):
         return value(raw).replace("|", r"\|").replace("\r", " ").replace("\n", " ")
 
+    detail_file = str(ticket.get("card_detail_file") or "").strip()
+    detail_exists = False
+    if detail_file:
+        try:
+            detail_path = Path(detail_file)
+            detail_exists = (not _is_reparse_or_link(detail_path)) and detail_path.is_file()
+        except OSError:
+            detail_exists = False
+    tid_text = value(ticket.get("ticket_id"))
+    status_text = value(ticket.get("status"))
+    ledger = ticket.get("capability_ledger") or {}
+
+    if detail_file and detail_exists:
+        title = (
+            "【新对话待选重负载工作流精简总览与明细链接块】"
+            if for_handoff
+            else "【未决重负载工作流专项计划（压缩前待确认方案，非回读摘要——请向用户展示精简总览卡与完整 14 项明细链接，勿在对话中展开 14 项长表）】"
+        )
+        lines = [title, "票据：" + tid_text, "状态：" + status_text]
+        detail_name = basename_any_os(detail_file)
+        compact_stored = str(ticket.get("compact_summary_card") or "").strip()
+        if compact_stored and status_text == "HANDED_OFF":
+            compact_stored = _sync_handed_off_text(compact_stored)
+        overview_rows_present = (
+            bool(compact_stored)
+            and "| 流号 | 通道与执行端 | 模型与挡位 | 可用性与额度状态 |" in compact_stored
+        )
+        compact_required = [
+            ticket.get("workflow_bg") or ticket.get("workflow_background"),
+            ticket.get("workflow_goal"),
+            ticket.get("workflow_impact"),
+            ledger.get("last_online_refresh_at"),
+            ledger.get("local_bench_verified_at"),
+            detail_name,
+        ]
+        if status_text in ("PENDING", "HANDED_OFF", "未记录"):
+            compact_required += ["①", "②", "③", "批准当前计划", "微调", "暂缓", "交接"]
+        for stream in ticket.get("streams", []):
+            if isinstance(stream, dict):
+                compact_required.append(stream.get("stream_id"))
+        if overview_rows_present and all(
+            raw is not None and raw != "" and (str(raw) in compact_stored or cell(raw) in compact_stored)
+            for raw in compact_required
+        ):
+            lines.append(compact_stored)
+            if "恢复命令：plan --resume-ticket" not in compact_stored:
+                lines.append("恢复命令：plan --resume-ticket " + tid_text)
+            return "\n".join(lines)
+
+        lines += [
+            "工作流背景：" + value(ticket.get("workflow_bg") or ticket.get("workflow_background")),
+            "要做什么与后续计划：" + value(ticket.get("workflow_goal")),
+            "预计后果与边界影响：" + value(ticket.get("workflow_impact")),
+            "",
+            "| 流号 | 通道与执行端 | 模型与挡位 | 可用性与额度状态 |",
+            "| --- | --- | --- | --- |",
+        ]
+        for stream in ticket.get("streams", []):
+            if not isinstance(stream, dict):
+                continue
+            avail = value(stream.get("currently_available"))
+            if stream.get("unavailable_reason"):
+                avail += "（" + str(stream.get("unavailable_reason")) + "）"
+            lines.append(
+                "| "
+                + " | ".join(
+                    cell(part)
+                    for part in (
+                        stream.get("stream_id"),
+                        value(stream.get("channel")) + "；" + value(stream.get("client")) + "；" + value(stream.get("agent_type")),
+                        value(stream.get("model_display") or stream.get("model")) + "；" + value(stream.get("tier")),
+                        avail + "；" + value(stream.get("quota_scheme")) + "；" + value(stream.get("quota_summary")),
+                    )
+                )
+                + " |"
+            )
+        lines += [
+            "",
+            "离线性能记录更新时间：在线刷新 " + value(ledger.get("last_online_refresh_at"))
+            + "；本机实测 " + value(ledger.get("local_bench_verified_at")),
+            "完整 14 项参数明细：" + format_card_detail_link(detail_file),
+            (
+                "当前状态：已登记交接（HANDED_OFF）；新会话复核后可选：① 批准当前计划；② 微调引擎、挡位或超时后批准；③ 暂缓并交接。"
+                if status_text == "HANDED_OFF"
+                else "选项卡：① 批准当前计划（推荐）；② 微调引擎、挡位或超时后批准；③ 暂缓并交接。"
+            ),
+            "恢复命令：plan --resume-ticket " + tid_text,
+        ]
+        return "\n".join(lines)
+
     title = ("【新对话待选重负载工作流详述与选项卡块】" if for_handoff else
              "【未决重负载工作流专项计划（压缩前待确认方案，非回读摘要——请向用户完整详述工作流背景、要做什么、预计后果、14项全字段参数表及选项卡）】")
-    lines = [title, "票据：" + value(ticket.get("ticket_id")), "状态：" + value(ticket.get("status"))]
+    lines = [title, "票据：" + tid_text, "状态：" + status_text]
     stored = ticket.get("handoff_prompt_block" if for_handoff else "human_popup_markdown")
     if stored:
         lines += [str(stored)]
-        ledger = ticket.get("capability_ledger") or {}
         required = [ticket.get("workflow_bg") or ticket.get("workflow_background"),
                     ticket.get("workflow_goal"), ticket.get("workflow_impact"),
                     ledger.get("last_online_refresh_at"), ledger.get("local_bench_verified_at"), "①", "②", "③"]
@@ -639,7 +777,7 @@ def render_pending_workflow_block(ticket, for_handoff=False) -> str:
         if not old_table and all(raw is not None and raw != "" and (str(raw) in str(stored) or cell(raw) in str(stored))
                                  for raw in required):
             if "恢复命令：plan --resume-ticket" not in str(stored):
-                lines.append("恢复命令：plan --resume-ticket " + value(ticket.get("ticket_id")))
+                lines.append("恢复命令：plan --resume-ticket " + tid_text)
             return "\n".join(lines)
     lines += ["工作流背景：" + value(ticket.get("workflow_bg") or ticket.get("workflow_background")),
               "要做什么与后续计划：" + value(ticket.get("workflow_goal")),
@@ -666,11 +804,10 @@ def render_pending_workflow_block(ticket, for_handoff=False) -> str:
                   "| 序号 | 参数项 | 当前值 |", "| --- | --- | --- |"]
         lines.extend("| " + str(index) + " | " + name + " | " + cell(field) + " |"
                      for index, (name, field) in enumerate(zip(columns, fields), 1))
-    ledger = ticket.get("capability_ledger") or {}
     lines += ["离线性能记录更新时间：在线刷新 " + value(ledger.get("last_online_refresh_at"))
               + "；本机实测 " + value(ledger.get("local_bench_verified_at")),
               "选项卡：① 批准当前计划（推荐）；② 微调引擎、挡位或超时后批准；③ 暂缓并交接。",
-              "恢复命令：plan --resume-ticket " + value(ticket.get("ticket_id"))]
+              "恢复命令：plan --resume-ticket " + tid_text]
     return "\n".join(lines)
 
 

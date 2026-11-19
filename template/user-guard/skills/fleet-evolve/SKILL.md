@@ -51,17 +51,17 @@ description: >
 
 主会话遇到实质性数理推导、多文件编码验证或关键代码与文档审查，应主动核实可用端并组织协作。主动触发与用户点名分别处理：精确标识符和口语点名的客户端、模型简称、挡位或省额度意图一律作为 P0 第一优先级，锁定已指定维度，并用 `--user-prompt` 保存原话。`role:*` 是并列入口，不覆盖点名。未指定的窗口、非委派挡位、无头非交互标志、只读小文件行号内联、快照及脱敏由脚本补齐；轻量卡片承担非 `fast` 角色或所需路由未存活时明确报错，不静默降级。
 
-轻任务按 `runtime_tunables.dispatch_confirmation` 阈值静默执行。外部无头调用及内部 `invoke_subagent`、`run_workflow`、`spawn_agent`、`Agent` 等多路或可写委派属于重负载确认范围。先通过 `plan` 生成背景、要做什么、预计后果、精简摘要 `compact_summary_card` 及写入 `<ticket_id>_card.md` 的分路纵向 14 项完整参数表，再请用户选择批准、微调后批准或暂缓并交接。
+轻任务按 `runtime_tunables.dispatch_confirmation` 阈值静默执行。外部无头调用及内部 `invoke_subagent`、`run_workflow`、`spawn_agent`、`Agent`、`swarm`（`status_guard.py` 对 `swarm add` 按 `tasks` 长度或 `n` 计入通道票据容量）等多路或可写委派属于重负载确认范围。先通过 `plan` 将完整 14 项参数明细写入 `<ticket_id>_card.md` 并生成含可点击明细链接的精简总览卡 `compact_summary_card`，对话中仅呈现精简总览卡与明细链接（勿把多路 14 项长表刷屏上下文），再请用户选择批准、微调后批准或暂缓并交接。
 
-完整参数项和顺序见 [cae-harness 技能](../cae-harness/SKILL.md) 及源码。参数表包含流号与子任务范围、通道、客户端与子代理类型、实际模型及 `inherit` 解析、挡位、窗口、无头与净室状态、访问模式和写入范围及验收命令、内联与超时、可用性、额度、回执位置，并附性能更新时间。未知字段保留未知，不以角色名替代实际模型。
+完整参数项和顺序见 [cae-harness 技能](../cae-harness/SKILL.md) 及源码。参数表包含流号与子任务范围、通道、客户端与子代理类型、实际模型及 `inherit` 解析、挡位、窗口、无头与净室/隔离级别状态、访问模式和写入范围及验收命令、内联与超时、可用性、额度、回执位置，并附性能更新时间。未知字段保留未知，不以角色名替代实际模型。
 
 用户明确选择后，用 `plan --approve-ticket` 登记，执行时绑定 `--ticket`，由 `status_guard.py` 核验票据并拦截裸 CLI 旁路。`batch` 只执行外部无头通道，原生通道由对应客户端按获批计划调用。不得因为本技能已经启动，就跳过其中某个重负载工作流的确认。
 
 ## 确认被打断与完工核验
 
-等待用户确认期间若发生自动压缩，恢复钩子按 `hooks/_lib/adaptive_policy.py` 动态缩放恢复预算并用 `collapse_historical_cards` 折叠历史确认单明细表，同时从磁盘未决票据独立加载工作流背景、目标、预计后果、完整 14 项参数表（或 `<ticket_id>_card.md`）和选项卡。常规用户原话与子代理摘要另成一块；主会话须完整展示未决工作流，缺失内容不能凭摘要猜补。
+等待用户确认期间若发生自动压缩，恢复钩子按 `hooks/_lib/adaptive_policy.py` 动态缩放恢复预算并用 `collapse_historical_cards` 折叠历史确认单明细表，同时从磁盘未决票据独立加载工作流背景、目标、预计后果、精简 4 列总览表、可点击 `<ticket_id>_card.md` 完整明细链接和选项卡（无明细文件时回退 14 项长表）。常规用户原话与子代理摘要另成一块；主会话按精简总览卡与明细链接恢复确认，缺失内容不能凭摘要猜补。
 
-实际模式进入 `drain` 或 `freeze` 强制交接后，`handoff_gate.py` 放行 `check-grounding --strict`，并在 `Stop` 硬门禁要求把工作流详述、14 项全字段参数表、性能更新时间、选项卡和票据放入【新对话提示词】。Codex 和 Claude Code 默认是 `advisory` 提醒，不能把默认配置写成强制停机。
+实际模式进入 `drain` 或 `freeze` 强制交接后，`handoff_gate.py` 放行 `check-grounding --strict`，并在 `Stop` 硬门禁要求把工作流背景/目标/预计后果、精简 4 列总览表、`<ticket_id>_card.md` 明细链接、性能更新时间、选项卡、票据与 `plan --resume-ticket` 命令放入【新对话提示词】（无明细文件时仍要求完整 14 项表）。Codex 和 Claude Code 默认是 `advisory` 提醒，不能把默认配置写成强制停机。
 
 新会话以 `plan --resume-ticket` 读取并复核，恢复不等于批准。该命令不自动转移原票据的 `session_id`；按原流内容和当前会话标识重新生成确认计划，再按用户选择登记批准，具体用法见 cae-harness 技能。
 
@@ -109,7 +109,7 @@ python -B -X utf8 -m unittest discover -s tests -p "test_*.py" -v
 
 Claude 默认随钩子安装 `~/.claude/hooks/ccswitch_admin.py`，不依赖启用路由；`--no-claude-hooks` 跳过该同步，`--with-cc-router` 另行分发路由。CC Switch 旧提示词和技能记录的停用或清理需要相应选项与授权，不能当作默认安装动作。
 
-同步后用 `install.py --audit-upgrade` 核查 `summary.all_aligned`，再对已就绪客户端完成获授权的无头实测。主会话客户端升级或切换需要重启时，先 `record-pass1`，由用户手动重启，再用重启后的会话执行 `verify-pass2`。最后 `clear --verified --readback-done` 通过事实锚定硬门禁后归位。
+同步后用 `install.py --audit-upgrade` 核查 `summary.all_aligned`，再对已就绪客户端完成获授权的无头实测。主会话客户端升级或切换需要重启时，先 `record-pass1`，由用户手动重启，再用重启后的会话执行 `verify-pass2`。最后用 `clear --verified --readback-done --session-id "<重启后会话标识>"`（无活跃重启认领锁时可省略 `--session-id`）通过事实锚定硬门禁后归位。
 
 以下从上游根目录执行，路径和会话标识需替换。示例仅展示接口，运行期阈值由动态配置驱动；WSL2 与 Linux 将 `python` 改为 `python3`。
 
@@ -124,7 +124,7 @@ python -B -X utf8 template/user-guard/skills/fleet-evolve/scripts/fleet_state.py
 python -B -X utf8 template/user-guard/skills/fleet-evolve/scripts/fleet_state.py --repo "<上游根目录>" approve --session-id "<当前会话标识>"
 python -B -X utf8 template/user-guard/skills/fleet-evolve/scripts/fleet_state.py --repo "<上游根目录>" record-pass1 --session-id "<当前会话标识>" --target-master "<目标客户端>"
 python -B -X utf8 template/user-guard/skills/fleet-evolve/scripts/fleet_state.py --repo "<上游根目录>" verify-pass2 --session-id "<重启后会话标识>"
-python -B -X utf8 template/user-guard/skills/fleet-evolve/scripts/fleet_state.py --repo "<上游根目录>" clear --verified --readback-done
+python -B -X utf8 template/user-guard/skills/fleet-evolve/scripts/fleet_state.py --repo "<上游根目录>" clear --verified --readback-done --session-id "<重启后会话标识>"
 ```
 
 `propose` 与 `approve` 校验仓库及配置摘要，方案变化须重新提审，不能通过强制清锁绕过批准或重启复核。最终报告 Git 状态、实际修改范围，并分别说明配置或文档已完成、离线或沙箱检查已通过、本机实际环境或算例实测已通过；仅列当前目标环境和核心验证链路的未验证项。提交与推送遵从用户当前分工，不擅自执行远端推送。

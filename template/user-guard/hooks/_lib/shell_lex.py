@@ -211,7 +211,7 @@ def read_quoted_arg(text: str, start_idx: int) -> Optional[Tuple[str, int, str]]
     return None
 
 
-def pos_inside_quotes(text: str, target_pos: int) -> bool:
+def pos_inside_quotes(text: str, target_pos: int, *, backslash_escape: bool = True) -> bool:
     in_single = False
     in_ansi_single = False
     in_double = False
@@ -219,11 +219,15 @@ def pos_inside_quotes(text: str, target_pos: int) -> bool:
     limit = min(target_pos, len(text))
     while idx < limit:
         ch = text[idx]
-        if ch == "\\" and (in_double or in_ansi_single) and idx + 1 < limit:
+        if ch == "\\" and (in_ansi_single or (in_double and backslash_escape)) and idx + 1 < limit:
+            idx += 2
+            continue
+        if not backslash_escape and ch == "`" and in_double and idx + 1 < limit:
             idx += 2
             continue
         if (
-            ch == "\\"
+            backslash_escape
+            and ch == "\\"
             and not in_single
             and not in_ansi_single
             and not in_double
@@ -249,7 +253,7 @@ def pos_inside_quotes(text: str, target_pos: int) -> bool:
     return in_single or in_ansi_single or in_double
 
 
-def split_shell_clauses(cmd_str: str) -> List[str]:
+def split_shell_clauses(cmd_str: str, *, backslash_escape: bool = True) -> List[str]:
     """切分引号外的命令分组，保留命令替换和函数调用中的内嵌括号。"""
     clauses: List[str] = []
     buf: List[str] = []
@@ -266,7 +270,11 @@ def split_shell_clauses(cmd_str: str) -> List[str]:
                 i += 2
                 continue
             buf.append(ch)
-            if ch == "\\" and quote_ch in ('"', "$'") and i + 1 < n:
+            if ch == "\\" and (quote_ch == "$'" or (quote_ch == '"' and backslash_escape)) and i + 1 < n:
+                buf.append(cmd_str[i + 1])
+                i += 2
+                continue
+            if not backslash_escape and ch == "`" and quote_ch == '"' and i + 1 < n:
                 buf.append(cmd_str[i + 1])
                 i += 2
                 continue
@@ -365,7 +373,7 @@ def split_shell_clauses(cmd_str: str) -> List[str]:
     return clauses
 
 
-def strip_quoted_segments(clause: str) -> str:
+def strip_quoted_segments(clause: str, *, backslash_escape: bool = True) -> str:
     """屏蔽引号（含 ANSI-C $'...'）内字符串文本并保持等长偏移，防止引号内 `>` 触发重定向误判"""
     out: List[str] = []
     quote_ch: Optional[str] = None
@@ -378,7 +386,11 @@ def strip_quoted_segments(clause: str) -> str:
                 out.append("  ")
                 i += 2
                 continue
-            if ch == "\\" and quote_ch in ('"', "$'") and i + 1 < n:
+            if ch == "\\" and (quote_ch == "$'" or (quote_ch == '"' and backslash_escape)) and i + 1 < n:
+                out.append("  ")
+                i += 2
+                continue
+            if not backslash_escape and ch == "`" and quote_ch == '"' and i + 1 < n:
                 out.append("  ")
                 i += 2
                 continue
@@ -392,7 +404,7 @@ def strip_quoted_segments(clause: str) -> str:
             out.append("  ")
             i += 2
             continue
-        if ch == "\\" and i + 1 < n and clause[i + 1] in ("'", '"', "$", "\\", ">", "<"):
+        if backslash_escape and ch == "\\" and i + 1 < n and clause[i + 1] in ("'", '"', "$", "\\", ">", "<"):
             out.append("  ")
             i += 2
             continue
@@ -406,7 +418,7 @@ def strip_quoted_segments(clause: str) -> str:
     return "".join(out)
 
 
-def extract_cmd_substitutions(clause: str) -> List[str]:
+def extract_cmd_substitutions(clause: str, *, backslash_escape: bool = True) -> List[str]:
     """提取非单引号区间的 $(...)、成对反引号及非引号区间的 <(...) / >(...) 进程替换表达式"""
     subs: List[str] = []
     in_single = False
@@ -416,7 +428,10 @@ def extract_cmd_substitutions(clause: str) -> List[str]:
     n = len(clause)
     while i < n:
         ch = clause[i]
-        if ch == "\\" and not in_single and i + 1 < n:
+        if backslash_escape and ch == "\\" and not in_single and i + 1 < n:
+            i += 2
+            continue
+        if not backslash_escape and ch == "`" and in_double and i + 1 < n:
             i += 2
             continue
         if not in_single and not in_ansi_single and not in_double and ch == "$" and i + 1 < n and clause[i + 1] == "'":

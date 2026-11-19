@@ -160,6 +160,12 @@ def infer_context_window(
     norm_target = _strip_ctx_suffix(low_model, strip_1m=has_1m_suffix)
     family_target = _normalize_model_family_base(low_model, strip_1m=has_1m_suffix)
 
+    if low_model == "unknown":
+        low_model = ""
+        has_1m_suffix = False
+        norm_target = ""
+        family_target = ""
+
     if low_model:
         sub = profile.get("subscription_matrix") if isinstance(profile.get("subscription_matrix"), dict) else {}
         models = sub.get("models") if isinstance(sub.get("models"), dict) else {}
@@ -239,6 +245,11 @@ def infer_context_window(
         cw = c_rule.get(cw_key)
         if _valid_window(cw):
             return int(cw)
+
+    native_profiles = profile.get("native_agent_profiles") if isinstance(profile.get("native_agent_profiles"), dict) else {}
+    raw_np = native_profiles.get(c_norm) or native_profiles.get(client) or native_profiles.get(agent_key)
+    if isinstance(raw_np, dict) and _valid_window(raw_np.get("context_window")):
+        return int(raw_np["context_window"])
 
     return _BASELINE_WINDOWS.get(c_norm) or _BASELINE_WINDOWS.get(agent_key, 200_000)
 
@@ -528,7 +539,11 @@ def resolve_adaptive_card_params(
     default_compact_int = (
         fallback_compact
         if (parsed_max is None and fallback_compact is not None)
-        else max(65536, int(round(max_ctx_int * 0.72)))
+        else (
+            cl_rule_compact
+            if (parsed_max is None and cl_rule_compact is not None and cl_rule_max is not None and cl_rule_max == max_ctx_int)
+            else max(65536, int(round(max_ctx_int * 0.72)))
+        )
     )
     parsed_compact = _parse_strict_pos_int(compact_window)
     compact_int = parsed_compact if parsed_compact is not None else default_compact_int

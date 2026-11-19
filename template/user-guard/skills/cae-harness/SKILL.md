@@ -43,11 +43,11 @@ description: >
 
 ## 轻任务、重负载与确认单
 
-轻任务按 `runtime_tunables.dispatch_confirmation` 的流数、文件数、估算 Token 和超时阈值静默执行。多路、可写或超出轻任务阈值的调用进入重负载流程，不能仅凭名称自行判轻。内部 `invoke_subagent`、`run_workflow`、`spawn_agent`、`Agent` 等多路或可写委派与外部无头调用均须纳入确认。
+轻任务按 `runtime_tunables.dispatch_confirmation` 的流数、文件数、估算 Token 和超时阈值静默执行。多路、可写或超出轻任务阈值的调用进入重负载流程，不能仅凭名称自行判轻。内部 `invoke_subagent`、`run_workflow`、`spawn_agent`、`Agent`、`swarm` 等多路或可写委派与外部无头调用均须纳入确认。
 
 `plan` 可接收单流参数，也可通过 `--spec-file` 读取非空对象列表。流内字段覆盖相应公共默认值。通道有 `cae_harness_headless`、`native_subagent`、`native_workflow`、`native_swarm`。原生通道必须指定或识别 `--caller`，默认模型为 `inherit`；确认单按前端配置（含 Codex 代理配置与 Claude/Antigravity 代理前置元数据的显式 `model`）解析实际模型，并独立挂载 `fleet_profile.json` 中可选的 `native_agent_profiles` 元数据，无法解析时保留未解析状态。原生通道不属于无头调用，也不提供净室隔离。`status_guard.py` 对 `swarm` 的 `add` 调用按 `tasks` 列表长度或 `n` 计入通道并发容量，避免单次批量派生绕过票据流数上限。
 
-重负载确认单先说明工作流背景、要做什么和预计后果，再输出 4 列各路总览表与每路纵向展开的 14 项完整参数表（保存票据时先写 `<ticket_id>.json` 再写 `<ticket_id>_card.md` 明细文件，并附精简摘要 `compact_summary_card`）。不能省略未知字段，也不能以角色槽位代替实际模型。
+重负载确认单在落盘文件 `<ticket_id>_card.md` 中完整记录工作流背景、要做什么、预计后果、4 列各路总览表与每路纵向展开的 14 项完整参数表（保存票据时先写 `<ticket_id>.json` 再写 `<ticket_id>_card.md`），同时生成含可点击明细链接的精简总览卡 `compact_summary_card` 与 `compact_handoff_prompt_block`。对话展示默认仅呈现 `compact_summary_card`（背景、目标、预计后果、4 列总览表、性能更新时间、可点击 `<ticket_id>_card.md` 链接与三选项），严禁将多路 14 项长表全文刷屏对话污染主上下文；仅当未保存明细文件或用户明确要求展开时才输出完整 14 项表。不能省略未知字段，也不能以角色槽位代替实际模型。
 
 | 序号 | 参数项 | 应显示的内容 |
 | --- | --- | --- |
@@ -59,7 +59,7 @@ description: >
 | 6 | 挡位 | 本路推理强度。 |
 | 7 | 上下文窗口 | 已解析窗口或未声明状态。 |
 | 8 | 是否无头 | 是否启动无头进程。 |
-| 9 | 是否净室 | 是否使用空上下文隔离。 |
+| 9 | 是否净室与隔离级别 | 是否使用 `clean_room` 空上下文隔离；显式指定任一非净室隔离模式时追加标注 `（隔离：<级别>）`。 |
 | 10 | 访问模式、写入范围与验收命令 | 只读或可写、写入白名单及验证命令。 |
 | 11 | 内联与超时 | 只读内容是否内联及本路超时。 |
 | 12 | 当前是否可用 | 本机判断与不可用原因。 |
@@ -74,9 +74,9 @@ description: >
 
 `status_guard.py` 在工具执行前核验获批票据，拦截未经确认的重负载和裸 CLI 旁路。不要直接启动原始客户端命令绕过窗口、快照、额度或确认检查。`batch` 只执行 `cae_harness_headless`；含原生通道的计划由对应客户端按获批内容调用，不能整份交给 `batch`。在工作流中声明 `kind: gate` 时仍须提供范围与验收命令，不把批处理标签本身当作已完成验证。
 
-等待用户确认期间发生自动压缩，钩子按 `hooks/_lib/adaptive_policy.py` 根据模型与推理强度动态调整恢复预算并用 `collapse_historical_cards` 折叠历史明细表，同时从磁盘未决票据独立加载背景、要做什么、预计后果、完整 14 项参数表（或 `<ticket_id>_card.md`）和选项卡。恢复时分成两块：常规用户原话及子代理摘要；未决重负载工作流与完整确认单。票据缺失时报告缺口，不凭印象补写，也不把压缩或超时当作批准。
+等待用户确认期间发生自动压缩，钩子按 `hooks/_lib/adaptive_policy.py` 根据模型与推理强度动态调整恢复预算并用 `collapse_historical_cards` 折叠历史明细表，同时从磁盘未决票据独立加载背景、要做什么、预计后果、精简 4 列总览表、可点击 `<ticket_id>_card.md` 完整 14 项明细链接和选项卡（仅无落盘明细文件时回退展开 14 项长表）。恢复时分成两块：常规用户原话及子代理摘要；未决重负载工作流精简总览与明细链接。票据缺失时报告缺口，不凭印象补写，也不把压缩或超时当作批准。
 
-进入 `drain` 或 `freeze` 强制交接时，`handoff_gate.py` 放行 `check-grounding --strict`，并在 `Stop` 硬门禁要求把完整工作流、14 项全字段参数表、性能更新时间、选项卡和票据写入【新对话提示词】。Codex 与 Claude Code 默认是 `advisory` 提醒，强制行为以实际模式为准。
+进入 `drain` 或 `freeze` 强制交接时，`handoff_gate.py` 放行 `check-grounding --strict`，并在 `Stop` 硬门禁要求把工作流背景/目标/预计后果、精简 4 列总览表、`<ticket_id>_card.md` 明细链接、性能更新时间、选项卡、票据与 `plan --resume-ticket` 命令写入【新对话提示词】（无落盘明细文件时仍要求完整 14 项参数表）。Codex 与 Claude Code 默认是 `advisory` 提醒，强制行为以实际模式为准。
 
 新会话先用 `plan --resume-ticket` 读取并重新核对完整确认内容。该接口保留原票据的 `session_id`，不会因传入新会话标识自动改绑；跨会话接力应据原流内容和当前会话标识重新生成确认票据，再按用户选择登记批准。内容变化、过期或校验失败时重新形成确认单，恢复本身不代表批准。
 
@@ -123,7 +123,7 @@ python -B -X utf8 "$HARNESS" check-grounding --target "<项目根目录>" --stri
 python -B -X utf8 "$HARNESS" plan --spec-file "<工作流文件路径>" --tier high --session-id "<当前会话标识>" --workflow-bg "核心文档已重写，需要核对实现" --workflow-goal "分路检查指定文件" --workflow-impact "只读核查并生成回执，不修改源文件"
 ```
 
-完整展示参数表及选项，待用户明确批准后登记，再执行外部批处理：
+在对话中呈现精简总览卡 `compact_summary_card`、可点击 `<ticket_id>_card.md` 链接及三选项（勿展开多路 14 项长表），待用户明确批准后登记，再执行外部批处理：
 
 ```powershell
 python -B -X utf8 "$HARNESS" plan --approve-ticket "<票据标识>" --session-id "<当前会话标识>"
@@ -156,12 +156,12 @@ python -B -X utf8 "$HARNESS" gate --worker role:code --target "<项目根目录>
 
 | 隔离级别 | 保留与剥离边界 | 支持后端与读写限制 |
 | --- | --- | --- |
-| `full` | 保留全局规则、安全钩子与全局技能（`agy` 显式放开斜杠命令与技能） | 四端均支持，只读与可写均适用（`codex`、`claude`、`dsh` 默认值） |
-| `no_skills` | 保留全局规则与安全钩子，剥离全局技能与斜杠命令 | 四端均支持，只读与可写均适用（`agy` 未显式指定时默认值） |
+| `full` | 保留全局规则、安全钩子（DSH 当前为 `soft_rules_only`，无硬安全钩子）与全局技能（`agy` 显式放开斜杠命令与技能） | 四端均支持，只读与可写均适用（`codex`、`claude`、`dsh` 默认值） |
+| `no_skills` | 保留全局规则与安全钩子（DSH 为软规则），剥离全局技能与斜杠命令 | 四端均支持，只读与可写均适用（`agy` 未显式指定时默认值） |
 | `hooks_only` | 保留底层凭据与安全钩子，剥离全局规则与技能 | 仅 `codex`、`claude` 支持，只读与可写均适用；`agy` 与当前 `soft_rules_only` 状态的 `dsh` 显式报错 |
 | `clean_room` | 等同 `--clean-room`：仅保留凭据，剥离全局规则、钩子、技能及项目自动说明（`claude` 同时启用 `--bare` 与 `--disable-slash-commands`） | 仅 `codex`、`claude`、`dsh` 支持，且仅限只读任务 |
 
-净室与隔离所需的临时配置及暂存目录同样服从本轮授权，不因默认使用临时目录就获得额外写入许可。非默认隔离模式会在确认单第 9 项标注并在持票执行时校验一致性。
+净室与隔离所需的临时配置及暂存目录同样服从本轮授权，不因默认使用临时目录就获得额外写入许可。显式指定的非净室隔离模式均会在确认单第 9 项标注，并在持票执行时校验一致性。
 
 审查任务禁止修改文件或运行构建测试，前后以文件哈希快照核验零改动。可写任务通过 `--write-scope` 限定白名单；发生 `scope_violation` 时保留现场并报告，不扩大范围掩盖越界。无头子进程设置 `CAE_HARNESS_DEPTH=1` 防止嵌套派工，不得再次调用编排器；只读探测及 `check-grounding` 按脚本规定放行。
 

@@ -86,20 +86,49 @@ PS
     ) 2>/dev/null | tr -d '\r' | grep '^RESULT:' | tail -1 | cut -d: -f2 || true
 }
 
+matching_app_pids() {
+    local pid raw_pids app_real exe_real
+    app_real="$(readlink -f -- "$APP" 2>/dev/null || printf '%s' "$APP")"
+    raw_pids="$(pgrep -u "$UID_CUR" -f "$PAT" 2>/dev/null)" || true
+    for pid in $raw_pids; do
+        if [ "$pid" = "$$" ] || [ "$pid" = "$PPID" ] || [ "$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')" = "$$" ]; then
+            continue
+        fi
+        if [ -e "/proc/$pid/exe" ]; then
+            exe_real="$(readlink -f -- "/proc/$pid/exe" 2>/dev/null || true)"
+            if [ -n "$exe_real" ] && [ "$exe_real" != "$app_real" ]; then
+                continue
+            fi
+        fi
+        printf '%s\n' "$pid"
+    done
+}
+
 start_app() {
+    if [ -L "$LOG_DIR" ] || [ -L "$LOG_FILE" ]; then
+        echo "Refusing symbolic link in log path: $LOG_FILE" >&2
+        exit 1
+    fi
     mkdir -p -m 700 "$LOG_DIR"
+    if [ -L "$LOG_DIR" ] || [ -L "$LOG_FILE" ]; then
+        echo "Refusing symbolic link in log path: $LOG_FILE" >&2
+        exit 1
+    fi
     cd "$HOME" || exit 1
-    setsid nohup env -u LD_LIBRARY_PATH DISPLAY="${DISPLAY:-:0}" LIBGL_ALWAYS_SOFTWARE=1 \
-        WEBKIT_DISABLE_DMABUF_RENDERER=1 WEBKIT_DISABLE_COMPOSITING_MODE=1 \
-        GDK_BACKEND=x11 GDK_SCALE=1 GDK_DPI_SCALE=1 \
-        "$APP" >>"$LOG_FILE" 2>&1 </dev/null &
+    (
+        umask 077
+        setsid nohup env -u LD_LIBRARY_PATH DISPLAY="${DISPLAY:-:0}" LIBGL_ALWAYS_SOFTWARE=1 \
+            WEBKIT_DISABLE_DMABUF_RENDERER=1 WEBKIT_DISABLE_COMPOSITING_MODE=1 \
+            GDK_BACKEND=x11 GDK_SCALE=1 GDK_DPI_SCALE=1 \
+            "$APP" >>"$LOG_FILE" 2>&1 </dev/null &
+    )
 }
 
 wait_visible() {
     local n="$1" i st
     for i in $(seq 1 "$n"); do
         sleep 2
-        if ! pgrep -u "$UID_CUR" -f "$PAT" >/dev/null; then
+        if [ -z "$(matching_app_pids)" ]; then
             echo "CC Switch process exited." >&2
             return 1
         fi
@@ -113,7 +142,7 @@ wait_visible() {
     return 1
 }
 
-RUNNING=$( { pgrep -u "$UID_CUR" -f "$PAT" || true; } | tr '\n' ' ')
+RUNNING=$(matching_app_pids | tr '\n' ' ')
 if [ -n "$RUNNING" ]; then
     echo "CC Switch already running (PID ${RUNNING% }); requesting window restore."
     st=$(window_state)
@@ -143,12 +172,12 @@ else
 fi
 
 echo "Window still hidden; restarting CC Switch once."
-for p in $(pgrep -u "$UID_CUR" -f "$PAT" || true); do [ "$p" = "$$" ] && continue; kill "$p" 2>/dev/null || true; done
+for p in $(matching_app_pids); do kill "$p" 2>/dev/null || true; done
 for i in $(seq 1 10); do
     sleep 1
-    pgrep -u "$UID_CUR" -f "$PAT" >/dev/null || break
+    [ -n "$(matching_app_pids)" ] || break
 done
-for p in $(pgrep -u "$UID_CUR" -f "$PAT" || true); do [ "$p" = "$$" ] && continue; kill -9 "$p" 2>/dev/null || true; done
+for p in $(matching_app_pids); do kill -9 "$p" 2>/dev/null || true; done
 sleep 1
 start_app
 

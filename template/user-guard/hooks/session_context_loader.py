@@ -269,23 +269,28 @@ def _scan_transcript_incrementally(
     identity = [file_stat.st_dev, file_stat.st_ino]
     changed = False
 
-    if (prev_name and prev_name != transcript_path.name) or file_size < offset or (prev_id and prev_id != identity):
-        previous_checkpoint = state["lastInjectedCheckpointStep"] if prev_name != transcript_path.name else -1
-        state.update(_default_compaction_state(state["conversationId"]))
-        state["lastInjectedCheckpointStep"] = previous_checkpoint
-        state.pop("pendingArchive", None)
-        offset = 0
-        changed = True
+    needs_reset = (
+        (prev_name and prev_name != transcript_path.name)
+        or file_size < offset
+        or (prev_id and prev_id != identity)
+    )
 
     parsed_steps: List[Dict[str, Any]] = []
     latest_scanned_step = -1
-    new_offset = offset
+    new_offset = 0 if needs_reset else offset
     try:
         with open(transcript_path, "rb") as stream:
-            # 用打开后的文件身份确定快照，避免轨迹替换时把旧游标用于新文件。
+            # 用打开后的文件身份确定快照，避免轨迹替换时把旧游标或空白重置写回磁盘。
             opened = os.fstat(stream.fileno())
             if [opened.st_dev, opened.st_ino] != identity:
-                return changed
+                return False
+            if needs_reset:
+                previous_checkpoint = state["lastInjectedCheckpointStep"] if prev_name != transcript_path.name else -1
+                state.update(_default_compaction_state(state["conversationId"]))
+                state["lastInjectedCheckpointStep"] = previous_checkpoint
+                state.pop("pendingArchive", None)
+                offset = 0
+                changed = True
             file_size = opened.st_size
             stream.seek(max(0, offset - 128))
             scanned_tail = stream.read(min(128, offset))
@@ -666,9 +671,14 @@ def build_compaction_system_message(
 def _workflow_recovery_blocks(session_id: str, state_dir: Path, ticket=None) -> List[str]:
     """专项计划与未报账单独立于有界原话摘要，不随摘要截断。"""
     blocks = []
-    ticket = ticket or user_words.find_session_pending_ticket(session_id, state_dir)
-    if ticket:
-        blocks.append(user_words.render_pending_workflow_block(ticket))
+    if isinstance(ticket, list):
+        pending_tickets = [item for item in ticket if isinstance(item, dict)]
+    elif isinstance(ticket, dict):
+        pending_tickets = [ticket]
+    else:
+        pending_tickets = user_words.find_session_pending_tickets(session_id, state_dir)
+    for pending_ticket in pending_tickets:
+        blocks.append(user_words.render_pending_workflow_block(pending_ticket))
     completions = user_words.load_unreported_heavy_completions(session_id, state_dir)
     if completions:
         lines = ["【待汇报重负载完工账单】"]
@@ -703,7 +713,7 @@ def _handle_context_locked(conversation_id: str, event_name: str, explicit_sourc
             user_words.atomic_write_json(state_file, state)
         return {"injectSteps": []}
 
-    pending_ticket = user_words.find_session_pending_ticket(conversation_id, state_dir)
+    pending_tickets = user_words.find_session_pending_tickets(conversation_id, state_dir)
     # Antigravity 专属长会话“原子收口 + 交接停机”硬门禁评估（懒加载以保持 --client codex 零依赖隔离）
     _agy_m, _agy_e = _extract_runtime_model_and_effort("antigravity", payload)
     import handoff_gate  # noqa: E402
@@ -794,7 +804,7 @@ def _handle_context_locked(conversation_id: str, event_name: str, explicit_sourc
                 source_paths=[str(transcript_path), str(transcript_path.parent / "transcript_full.jsonl")],
                 subagent_returns=subagent_returns, client="antigravity", policy=agy_policy,
             ))
-            injected_blocks.extend(_workflow_recovery_blocks(conversation_id, state_dir, pending_ticket))
+            injected_blocks.extend(_workflow_recovery_blocks(conversation_id, state_dir, pending_tickets))
             state["lastInjectedAt"] = get_current_iso_time()
             state["lastInjectedWordCount"] = len(words)
         log_event(

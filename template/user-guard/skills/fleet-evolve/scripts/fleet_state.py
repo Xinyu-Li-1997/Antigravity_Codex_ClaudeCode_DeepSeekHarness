@@ -39,13 +39,24 @@ _GIT_ENV_SCRUB = frozenset({
 })
 
 
+_WIN_LINK_REPARSE_TAGS = frozenset({
+    getattr(stat, "IO_REPARSE_TAG_SYMLINK", 0xA000000C),
+    getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", 0xA0000003),
+})
+
+
 def _is_reparse_or_symlink(path: Path) -> bool:
     try:
         st = path.lstat()
     except OSError:
         return False
+    if stat.S_ISLNK(st.st_mode):
+        return True
     reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
-    return stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_file_attributes", 0) & reparse_flag)
+    if bool(getattr(st, "st_file_attributes", 0) & reparse_flag):
+        tag = getattr(st, "st_reparse_tag", 0)
+        return tag == 0 or tag in _WIN_LINK_REPARSE_TAGS
+    return False
 
 
 def _reject_symlink_chain(path: Path) -> Path:
@@ -220,14 +231,28 @@ def _repo_meta(repo_root: Path) -> Dict[str, str]:
 
 
 def _is_aligned_with_repo(saved: Dict[str, Any], meta: Dict[str, str]) -> bool:
+    if not saved:
+        return False
+    strict_v1 = saved.get("schema_version") == 1
     return bool(
-        saved
-        and saved.get("execution_side") == _side()
+        saved.get("execution_side") == _side()
         and saved.get("plugin_version") == meta["plugin_version"]
         and saved.get("skill_sha256") == meta["skill_sha256"]
-        and (not saved.get("profile_sha256") or saved.get("profile_sha256") == meta["profile_sha256"])
-        and (not saved.get("repo_root") or saved.get("repo_root") == meta["repo_root"])
-        and (not saved.get("core_sha256") or saved.get("core_sha256") == meta["core_sha256"])
+        and (
+            saved.get("profile_sha256") == meta["profile_sha256"]
+            if strict_v1 or saved.get("profile_sha256")
+            else True
+        )
+        and (
+            saved.get("repo_root") == meta["repo_root"]
+            if strict_v1 or saved.get("repo_root")
+            else True
+        )
+        and (
+            saved.get("core_sha256") == meta["core_sha256"]
+            if strict_v1 or saved.get("core_sha256")
+            else True
+        )
         and (not meta["repo_commit"] or saved.get("repo_commit") == meta["repo_commit"])
     )
 
@@ -321,6 +346,12 @@ def _atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
             os.chmod(tmp, 0o600)
         if _is_reparse_or_symlink(path) or _is_reparse_or_symlink(path.parent):
             raise ValueError(f"Refusing symbolic link or reparse point in fleet-evolve state path: {path}")
+        try:
+            existing_st = path.lstat()
+        except FileNotFoundError:
+            existing_st = None
+        if existing_st is not None and (not stat.S_ISREG(existing_st.st_mode) or existing_st.st_nlink > 1):
+            raise ValueError(f"Refusing non-regular or hardlinked fleet-evolve state file: {path}")
         for attempt in range(5):
             try:
                 os.replace(tmp, path)
@@ -359,9 +390,21 @@ def _reject_json_constant(_const: str) -> Any:
 def _load_state(path: Path, default_ttl: int = 86400) -> Dict[str, Any]:
     _reject_symlink_chain(path)
     raw = ""
+    open_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
     for attempt in range(3):
         try:
-            raw = path.read_text(encoding="utf-8-sig")
+            fd = os.open(path, open_flags)
+            try:
+                st = os.fstat(fd)
+                if not stat.S_ISREG(st.st_mode) or st.st_nlink > 1:
+                    raise ValueError(f"Refusing non-regular or hardlinked fleet-evolve state file: {path}")
+                with os.fdopen(fd, "rb") as fh:
+                    fd = -1
+                    raw = fh.read().decode("utf-8-sig")
+            finally:
+                if fd >= 0:
+                    with contextlib.suppress(OSError):
+                        os.close(fd)
             break
         except FileNotFoundError:
             return {}
@@ -413,6 +456,7 @@ def main(argv: list[str] | None = None) -> int:
 
     p_clr = sub.add_parser("clear", help="Reset bootstrap state lock to IDLE (optionally recording last_verified metadata)")
     p_clr.add_argument("--verified", action="store_true")
+    p_clr.add_argument("--session-id", default="", help="Pass 2 session id that claimed the active reload lock")
     p_clr.add_argument("--force", action="store_true", help="Allow clearing an active user approval proposal, active Pass 1/Pass 2 reload lock, or corrupt state")
     p_clr.add_argument("--readback-done", action="store_true", help="Confirm cold full-file readback pass completed")
 
@@ -576,8 +620,11 @@ def main(argv: list[str] | None = None) -> int:
                         print(json.dumps({"ok": False, "reason": "corrupt_state", "error": str(exc)}, ensure_ascii=False, indent=2))
                         return 2
                     claimed_by = existing.get("claimed_by_session_id")
-                    if (existing.get("phase") == "AWAITING_USER_APPROVAL"
-                            and now - _int_field(existing, "updated_at_epoch", 0) <= _int_field(existing, "ttl_seconds", default_ttl, positive=True)):
+                    if (
+                        existing.get("phase") == "AWAITING_USER_APPROVAL"
+                        and now - _int_field(existing, "updated_at_epoch", 0) <= _int_field(existing, "ttl_seconds", default_ttl, positive=True)
+                        and _is_aligned_with_repo(existing, meta)
+                    ):
                         print(json.dumps({"ok": False, "reason": "active_user_approval", "saved": existing}, ensure_ascii=False, indent=2))
                         return 2
                     if (
@@ -638,7 +685,7 @@ def main(argv: list[str] | None = None) -> int:
                     and now - _int_field(saved, "updated_at_epoch", 0)
                     <= _int_field(saved, "ttl_seconds", default_ttl, positive=True)
                 )
-                if saved.get("phase") == "AWAITING_USER_APPROVAL" and within_ttl:
+                if saved.get("phase") == "AWAITING_USER_APPROVAL" and within_ttl and _is_aligned_with_repo(saved, meta):
                     print(json.dumps({"ok": False, "reason": "active_user_approval", "error": "An active proposal requires user approval; use --force to explicitly override"}, ensure_ascii=False, indent=2))
                     return 1
                 if (
@@ -646,14 +693,19 @@ def main(argv: list[str] | None = None) -> int:
                     and within_ttl
                     and _is_aligned_with_repo(saved, meta)
                 ):
-                    if saved.get("claimed_by_session_id"):
-                        reason = "active_pass2_claimed"
-                        err_msg = "An active Pass 2 session has claimed the lock; use --force to explicitly override"
+                    claimed_by = saved.get("claimed_by_session_id")
+                    caller_sid = args.session_id.strip()
+                    if claimed_by and caller_sid and caller_sid == claimed_by:
+                        pass
                     else:
-                        reason = "active_master_reload"
-                        err_msg = "An active Pass 1 reload lock is awaiting Master reload; use --force to explicitly override"
-                    print(json.dumps({"ok": False, "reason": reason, "error": err_msg}, ensure_ascii=False, indent=2))
-                    return 1
+                        if claimed_by:
+                            reason = "active_pass2_claimed"
+                            err_msg = "An active Pass 2 session has claimed the lock; pass --session-id <claiming_id> or use --force to explicitly override"
+                        else:
+                            reason = "active_master_reload"
+                            err_msg = "An active Pass 1 reload lock is awaiting Master reload; use --force to explicitly override"
+                        print(json.dumps({"ok": False, "reason": reason, "error": err_msg}, ensure_ascii=False, indent=2))
+                        return 1
             if args.verified and args.readback_done:
                 grounding = _run_repo_grounding_gate(repo_root)
                 if grounding.get("ok") is not True:

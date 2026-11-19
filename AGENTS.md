@@ -6,7 +6,7 @@
 
 [全局规则模板](template/user-guard/rules/AGENTS.md) 是工程规则的唯一来源。本文件说明仓库维护和安装入口；[cae-harness 技能](template/user-guard/skills/cae-harness/SKILL.md) 负责日常派工、确认票据及事实锚定；[fleet-evolve 技能](template/user-guard/skills/fleet-evolve/SKILL.md) 负责全局工具链评估、审批和同步。不要在这些文件中重复维护完整规则。
 
-[fleet_profile.json](template/user-guard/skills/cae-harness/fleet_profile.json) 统一保存 `orchestrator`、`math`、`code`、`review`、`fast` 五个动态角色槽位的候选、声明窗口和推荐挡位，以及 `runtime_tunables`、`subscription_matrix`、`capability_ledger`。常驻文档引用角色与配置键，不写时期性模型名、静态性能日期或插件版本数字。版本以 `template/user-guard/plugin.json` 为准，历史由 Git 和 `CHANGELOG.md` 记录。
+[fleet_profile.json](template/user-guard/skills/cae-harness/fleet_profile.json) 统一保存 `orchestrator`、`math`、`code`、`review`、`fast` 五个动态角色槽位的候选、声明窗口和推荐挡位，以及 `native_agent_profiles`、`runtime_tunables`、`subscription_matrix`、`capability_ledger`。常驻文档引用角色与配置键，不写时期性模型名、静态性能日期或插件版本数字。版本以 `template/user-guard/plugin.json` 为准，历史由 Git 和 `CHANGELOG.md` 记录。
 
 ### 仓库分层与文档治理（宪法总控边界）
 
@@ -58,7 +58,7 @@ python -B -X utf8 install.py --audit-upgrade
 python -B -X utf8 template/user-guard/skills/cae-harness/scripts/cae_harness.py probe --caller auto --redact
 ```
 
-核对 Windows 与 WSL2 运行侧、客户端安装、供应商卡片、凭据配置、配置漂移及编译型科学计算包的二进制接口（ABI）风险。程序存在与登录有效应分别核实。网络、官方登录或 API Key 缺失时列待办，不编造绕过方法。只有单端就绪时，说明先配置该端与补齐其他端后统一配置的差异，供用户选择；单端仍能独立工作。
+核对 Windows 与 WSL2 运行侧、`cross_side_status` 双端同步提示、客户端安装、供应商卡片、凭据配置、`fleet_profile.native_agent_profiles_configured`、配置漂移及编译型科学计算包的二进制接口（ABI）风险。程序存在与登录有效应分别核实。网络、官方登录或 API Key 缺失时列待办，不编造绕过方法。只有单端就绪时，说明先配置该端与补齐其他端后统一配置的差异，供用户选择；单端仍能独立工作。
 
 正式安装前按所需客户端和路由选项执行只读预览：
 
@@ -74,15 +74,15 @@ python -B -X utf8 install.py --dry-run --yes
 
 可用性经过两道门。第一道门由 `fleet-evolve` 在独立维护流程联网评估能力，同时展示本机可用性和额度类型，由用户决定 agent 与 LLM 的启停，写入 `subscription_matrix`；退订项设 `enabled: false` 后全局跳过。第二道门由 `plan` 在生成确认单前纯离线复查当前配置、路由存活及本机可读额度，包括滚动窗口百分比与重置时间、卡片套餐或余额类型、日月限额和冷却记录，过滤不可用或超限通道。本地信息不足时保留未知，不声称已取得服务端实时余额。
 
-轻任务按 `runtime_tunables.dispatch_confirmation` 阈值静默执行。重负载包括外部无头调用，也包括内部 `invoke_subagent`、`run_workflow`、`spawn_agent`、`Agent` 等多路或可写委派。`plan` 先生成背景、要做什么、预计后果及分路纵向展开的 14 项完整参数表，列出通道、客户端与子代理类型、实际模型及 `inherit` 解析、挡位、窗口、无头与净室状态、读写边界、内联与超时、可用性、额度及回执位置。保存票据时先写 `<ticket_id>.json` 再写 `<ticket_id>_card.md` 完整明细文件，并生成精简摘要 `compact_summary_card`；完整参数顺序见 cae-harness 技能和源码。确认单附 `capability_ledger.last_online_refresh_at` 与 `capability_ledger.local_bench_verified_at`；日常派工不联网更新性能，联网刷新归独立的 `fleet-evolve` 流程。
+轻任务按 `runtime_tunables.dispatch_confirmation` 阈值静默执行。重负载包括外部无头调用（支持 `--isolation` 四级正交隔离：`full`/`no_skills`/`hooks_only`/`clean_room`），也包括内部 `invoke_subagent`、`run_workflow`、`spawn_agent`、`Agent`、`swarm`（`swarm add` 按 `tasks` 长度或 `n` 计流）等多路或可写委派。`plan` 生成背景、要做什么、预计后果、4 列各路总览表及分路纵向 14 项完整参数明细（含通道、客户端与子代理类型、实际模型及 `inherit` 解析、挡位、窗口、无头与隔离/净室状态、读写边界、内联与超时、可用性、额度及回执位置）。保存票据时先写 `<ticket_id>.json` 再写 `<ticket_id>_card.md` 完整明细文件，并生成含可点击明细链接的精简总览卡 `compact_summary_card`；对话与恢复默认仅展示精简总览卡与明细链接，避免多路 14 项长表污染上下文（完整参数顺序见 cae-harness 技能和源码）。确认单附 `capability_ledger.last_online_refresh_at` 与 `capability_ledger.local_bench_verified_at`；日常派工不联网更新性能，联网刷新归独立的 `fleet-evolve` 流程。
 
 请用户选择批准当前计划、微调后批准或暂缓并交接。获批后以 `plan --approve-ticket` 登记，执行绑定 `--ticket`，由 `status_guard.py` 核验并拦截直接调用底层无头 CLI。`batch` 只执行外部无头通道；内部原生通道由对应客户端按获批计划调用。
 
 ## 中断恢复与完成回执
 
-等待用户确认期间发生自动压缩时，恢复钩子按当前客户端、模型与推理强度（`hooks/_lib/adaptive_policy.py`）动态缩放恢复预算，并用 `collapse_historical_cards` 折叠历史确认单明细表；同时从磁盘未决票据 `<ticket_id>.json` 独立加载工作流背景、目标、预计后果、14 项完整参数表和选项卡（同目录 `<ticket_id>_card.md` 同步保存完整明细文件供查阅），与常规回读摘要分为两块显示。主会话须完整转述确认内容，不能凭摘要补猜；压缩与恢复都不构成批准。
+等待用户确认期间发生自动压缩时，恢复钩子按当前客户端、模型与推理强度（`hooks/_lib/adaptive_policy.py`）动态缩放恢复预算，并用 `collapse_historical_cards` 折叠历史确认单明细表；同时从磁盘未决票据 `<ticket_id>.json` 独立加载精简 4 列总览卡、可点击 `<ticket_id>_card.md` 完整明细链接与选项卡（仅未落盘明细文件时回退 14 项长表），与常规回读摘要分为两块显示。主会话按精简卡与链接恢复确认，不能凭摘要补猜；压缩与恢复都不构成批准。
 
-当实际交接模式进入 `drain` 或 `freeze` 强制流程时，`handoff_gate.py` 放行 `check-grounding --strict`，并在 `Stop` 硬门禁要求把完整工作流、14 项全字段参数表、性能更新时间、选项卡与票据写入【新对话提示词】。新会话先用 `plan --resume-ticket` 读取复核，再继续确认。当前接口不会自动改绑原票据的会话归属，跨会话执行须按技能说明重新形成当前会话的确认计划。
+当实际交接模式进入 `drain` 或 `freeze` 强制流程时，`handoff_gate.py` 放行 `check-grounding --strict`，并在 `Stop` 硬门禁要求把工作流背景/目标/预计后果、精简 4 列总览表、`<ticket_id>_card.md` 明细链接、性能更新时间、选项卡、票据与 `plan --resume-ticket` 命令写入【新对话提示词】（无明细文件时仍要求完整 14 项表）。新会话先用 `plan --resume-ticket` 读取复核，再继续确认。当前接口不会自动改绑原票据的会话归属，跨会话执行须按技能说明重新形成当前会话的确认计划。
 
 `reply_repeat_guard.py` 在完工 `Stop` 检查回复中是否含有成败词，以及 Token 用量或无法统计说明。外部任务还须覆盖各流标识和账单中的实际回执文件名；单路 `task` 或 `gate` 省略默认流号 `S1` 时须匹配具体模型名，仅在未记录具体模型名时可用任务状态词替代。原生任务须覆盖完成数量、各流标识或各角色名中的一项，并提供日志或轨迹说明。流标识和外部回执文件名按完整词项匹配。漏报时同一回合单次阻断并附上磁盘账单。主会话仍须自行逐路核对具体状态、Token 明细与汇总算术，静态检查不核实这些内容的语义和计算结果。
 

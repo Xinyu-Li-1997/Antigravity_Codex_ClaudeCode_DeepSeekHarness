@@ -59,10 +59,10 @@
 
   <g>
     <rect x="50" y="508" width="624" height="142" rx="12" fill="#ffffff" stroke="#b8cde8"/>
-    <text x="72" y="540" class="heading">3. 轻任务静默执行 · 重负载先生成纵向 14 项确认单</text>
+    <text x="72" y="540" class="heading">3. 轻任务静默执行 · 重负载发精简总览卡与明细链接</text>
     <text x="72" y="568" class="body">小范围单路检查静默执行；内部原生与外部无头重负载统一先运行 plan。</text>
-    <text x="72" y="594" class="body">输出 compact_summary_card，完整 14 项参数写入 &lt;ticket_id&gt;_card.md。</text>
-    <text x="72" y="620" class="body">压缩时按窗口缩放预算并折叠历史确认单明细；获批后凭 --ticket 放行。</text>
+    <text x="72" y="594" class="body">14 项明细写入 &lt;ticket_id&gt;_card.md，对话仅展精简 4 列卡与可点击链接。</text>
+    <text x="72" y="620" class="body">压缩时按窗口缩放预算并折叠历史明细；获批后凭 --ticket 放行。</text>
   </g>
 
   <path class="link" d="M 362 650 L 362 680"/>
@@ -71,7 +71,7 @@
     <rect x="50" y="680" width="624" height="146" rx="12" fill="#eefaf4" stroke="#82bfa0"/>
     <text x="72" y="712" class="heading">4. 定量验证、完成回执检查与主会话原文终审</text>
     <text x="72" y="740" class="body">只读任务比对哈希快照；可写 gate 锁范围并强制跑通 --verify-cmd。</text>
-    <text x="72" y="766" class="body">严禁放宽容差与守恒判据；文档润色配合 --clean-room 与事实锚定。</text>
+    <text x="72" y="766" class="body">严禁放宽容差与守恒判据；文档盲读支持 --isolation 四级隔离与事实锚定。</text>
     <text x="72" y="792" class="body">Stop 检查成败词、Token 说明与回执标识；主会话亲自核对行号与算术。</text>
   </g>
 
@@ -91,9 +91,9 @@
   <g>
     <rect x="766" y="184" width="624" height="122" rx="12" fill="#ffffff" stroke="#c5b6e3"/>
     <text x="788" y="216" class="heading">1. 按维护需求选择 fleet-evolve 三种模式</text>
-    <text x="788" y="244" class="body">全面更新（full）：核查客户端与模型换代，重算五角色与运行参数。</text>
+    <text x="788" y="244" class="body">全面更新（full）：四维盘点客户端、双端、native_agent_profiles 与五角色。</text>
     <text x="788" y="270" class="body">代码与文档整理（hygiene）：选型不变，修复代码问题并同步文档。</text>
-    <text x="788" y="294" class="body">只读检查（audit）：只读检查配置漂移与 ABI 风险，全程零写入。</text>
+    <text x="788" y="294" class="body">只读检查（audit）：只读检查漂移、cross_side_status、DSH 协议与 ABI 风险。</text>
   </g>
 
   <path class="link" d="M 1078 306 L 1078 336"/>
@@ -103,7 +103,7 @@
     <text x="788" y="368" class="heading">2. 联网能力核查与本机可用性探测（full 模式）</text>
     <text x="788" y="396" class="body">结合官方资料、本机报错与实测证据，同时标明模型优势与已知短板。</text>
     <text x="788" y="422" class="body">同步展示本机各端与模型是否就绪、配置的额度类型及退订候选。</text>
-    <text x="788" y="448" class="body">在 capability_ledger 记录评估日期，日常派工无需联网查榜单。</text>
+    <text x="788" y="448" class="body">在 capability_ledger 记录离线性能更新时间，日常派工不联网查榜单。</text>
   </g>
 
   <path class="link" d="M 1078 478 L 1078 508"/>
@@ -120,8 +120,8 @@
 
   <g>
     <rect x="766" y="680" width="624" height="146" rx="12" fill="#eefaf4" stroke="#82bfa0"/>
-    <text x="788" y="712" class="heading">4. 确认同步、主客户端重启核验与文档一致性校验</text>
-    <text x="788" y="740" class="body">确认后由 install.py 同步本机目录并核验 all_aligned。</text>
+    <text x="788" y="712" class="heading">4. 双端确认同步、主客户端重启核验与事实锚定</text>
+    <text x="788" y="740" class="body">确认后按 cross_side_status 在 Win/WSL2 分别同步并核验 all_aligned。</text>
     <text x="788" y="766" class="body">涉及主客户端更新时经 record-pass1 与 verify-pass2 重启核验。</text>
     <text x="788" y="792" class="body">最终运行 clear --verified --readback-done 通过事实锚定后归位。</text>
   </g>

@@ -4656,7 +4656,17 @@ class TestShard3RouterInstallerFixes(OfflineSandbox):
         self.assertIn("票据：T-CARD-01；状态：PENDING", card_text)
         self.assertEqual(card_text, ticket["human_popup_markdown"] + "\n")
         self.assertIn("T-CARD-01_card.md", ticket["card_detail_file"])
+        self.assertIn("工作流背景：测试背景", ticket["compact_summary_card"])
         self.assertIn("工作流目标：测试目标", ticket["compact_summary_card"])
+        self.assertIn("预计后果：无副作用", ticket["compact_summary_card"])
+        self.assertIn("| 流号 | 通道与执行端 | 模型与挡位 | 可用性与额度状态 |", ticket["compact_summary_card"])
+        self.assertIn("[T-CARD-01_card.md](file://", ticket["compact_summary_card"])
+        self.assertIn("2026-01-01", ticket["compact_summary_card"])
+        self.assertNotIn("14 项完整参数明细", ticket["compact_summary_card"])
+        self.assertIn("【新对话提示词】", ticket["compact_handoff_prompt_block"])
+        self.assertIn("[T-CARD-01_card.md](file://", ticket["compact_handoff_prompt_block"])
+        self.assertIn("恢复命令：plan --resume-ticket T-CARD-01", ticket["compact_handoff_prompt_block"])
+        self.assertNotIn("14 项完整参数明细", ticket["compact_handoff_prompt_block"])
 
         # _atomic_text refuses symlink targets
         real_target = plan_dir / "real_note.txt"
@@ -5065,6 +5075,95 @@ class TestShard3RouterInstallerFixes(OfflineSandbox):
         self.assertTrue(rep_host["cross_side_status"]["dual_side_sync_required"])
         self.assertIsNotNone(rep_host["cross_side_status"]["peer_audit_hint"])
         self.assertIsInstance(rep_sbx["fleet_profile"]["native_agent_profiles_configured"], list)
+
+    def test_v1171_fleet_pass2_clear_router_loopback_ssrf_ccswitch_and_installer_fixes(self):
+        # 1) fleet_state clear --session-id unlocks claimed Pass 2 lock without --force; wrong sid still blocked
+        repo = self.project / "upstream_v1171"
+        repo.mkdir()
+        (repo / "install.py").write_text("", encoding="utf-8")
+        user_words.atomic_write_json(repo / "template/user-guard/plugin.json", {"version": "1.17.1"})
+        user_words.atomic_write_json(
+            repo / "template/user-guard/skills/cae-harness/fleet_profile.json",
+            {"runtime_tunables": {"headless_dispatch": {"fleet_state_ttl_sec": 300}}},
+        )
+        sdir = self.root / "v1171_fleet_state"
+        sdir.mkdir()
+
+        def run_fs(*a):
+            buf = io.StringIO()
+            with mock.patch.dict(os.environ, {"CAE_FLEET_STATE_DIR": str(sdir)}), redirect_stdout(buf):
+                rc = fleet_state.main(["--repo", str(repo), *a])
+            return rc, json.loads(buf.getvalue())
+
+        self.assertEqual(run_fs("record-pass1", "--session-id", "p1", "--target-master", "agy")[0], 0)
+        self.assertEqual(run_fs("verify-pass2", "--session-id", "p2")[0], 0)
+        rc_wrong, out_wrong = run_fs("clear", "--verified", "--session-id", "other")
+        self.assertEqual(rc_wrong, 1)
+        self.assertEqual(out_wrong["reason"], "active_pass2_claimed")
+        with mock.patch.object(fleet_state, "_run_repo_grounding_gate", return_value={"ok": True}):
+            rc_ok, out_ok = run_fs("clear", "--verified", "--readback-done", "--session-id", "p2")
+        self.assertEqual(rc_ok, 0)
+        self.assertTrue(out_ok["readback_verified"])
+
+        # 2) router load_config enforces loopback & rejects upstream credentials; _request_target_path blocks @attacker
+        bad_listen = self.root / "bad_listen.json"
+        user_words.atomic_write_json(bad_listen, {"listen": "0.0.0.0", "port": 18299})
+        with self.assertRaisesRegex(ValueError, "loopback"):
+            router.load_config(str(bad_listen))
+        bad_up = self.root / "bad_up.json"
+        user_words.atomic_write_json(bad_up, {"default_upstream": "https://user:pass" + "@127.0.0.1:9999/v1"})
+        with self.assertRaisesRegex(ValueError, "credentials"):
+            router.load_config(str(bad_up))
+        with self.assertRaises(ValueError):
+            router._request_target_path("@attacker.invalid/v1/messages")
+        h_del = object.__new__(router.Handler)
+        h_del.server = SimpleNamespace(cfg=copy.deepcopy(router.DEFAULTS))
+        h_del.path = "/__router/health"
+        h_del.command = "DELETE"
+        h_del.forward = mock.Mock()
+        h_del.do_DELETE()
+        h_del.forward.assert_called_once_with(b"")
+
+        # 3) ccswitch_admin inspect_status still checks router_health on corrupt settings.json
+        bad_settings = self.root / "corrupt_settings.json"
+        bad_settings.write_text("{broken", encoding="utf-8")
+        resp_mock = mock.MagicMock(status=200)
+        resp_mock.__enter__.return_value = resp_mock
+        resp_mock.read.return_value = b'{"ok": true, "port": 8241}'
+        with mock.patch.object(admin.urllib.request, "urlopen", return_value=resp_mock):
+            st = admin.inspect_status(self.root / "missing.db", bad_settings, router_port=8241)
+        self.assertFalse(st["settings_aligned"])
+        self.assertEqual(st["router_health"], {"ok": True, "port": 8241})
+
+        # 4) install.py: Codex window backfill, AGY max generation, fenced tail ignore, IPv6/CGNAT redaction
+        cx_dir = self.root / "v1171_codex"
+        cx_dir.mkdir()
+        (cx_dir / "config.toml").write_text('model = "gpt-6.2-sol"\nmodel_reasoning_effort = "max"\n', encoding="utf-8")
+        user_words.atomic_write_json(cx_dir / "models_cache.json", {
+            "models": [{"slug": "gpt-6.2-sol", "max_context_window": 872000, "supported_reasoning_levels": [{"effort": "max"}]}]
+        })
+        with redirect_stdout(io.StringIO()):
+            installer._sync_codex_frontier_max(cx_dir)
+        self.assertIn("model_context_window = 872000", (cx_dir / "config.toml").read_text(encoding="utf-8"))
+
+        best_agy = installer._select_agy_frontier_max_label([
+            {"slug": "gemini-3.5-neon-high", "display_name": "Gemini 3.5 Neon High"},
+            {"slug": "gemini-4-neon-xhigh", "display_name": "Gemini 4 Neon XHigh"},
+        ])
+        self.assertEqual(best_agy, "Gemini 4 Neon XHigh")
+
+        fenced_rules = "# 规则\n```md\n## 工具与假自定义\n```\n## 工具与运行环境\n- R10.\n\n## 我的扩展\n- L1.\n"
+        idx = installer._find_custom_rules_tail_start(fenced_rules)
+        self.assertIsNotNone(idx)
+        self.assertTrue(fenced_rules[idx:].startswith("## 我的扩展"))
+
+        redacted = installer._audit_redact(
+            "addr fe80::1a2b:3c4d cgnat 100.64.12.34 proxy socks5://alice:pw" + "@127.0.0.1:1080/p?k=1",
+            [], set(),
+        )
+        self.assertNotIn("fe80::1a2b:3c4d", redacted)
+        self.assertNotIn("100.64.12.34", redacted)
+        self.assertNotIn("alice:pw", redacted)
 
 
 if __name__ == "__main__":

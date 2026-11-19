@@ -5897,6 +5897,59 @@ else:
             self.assertEqual(ntk['streams'][0]['model'], 'codex-agent-custom')
             self.assertEqual(ntk['streams'][0]['execution_profile']['native_agent_profile']['max_parallel_subagents'], 3)
 
+    def test_v1171_audit_ticket_verify_cmd_resume_approved_and_redaction(self):
+        engines = self.four_backends()
+        target_py = self.root / 'v1171_mod.py'
+        target_py.write_text('val = 1\n', encoding='utf-8')
+        plans = self.root / 'v1171-plans'
+
+        with patch.object(harness, '_args_backends', return_value=engines):
+            _, tk = self.capture(harness.cmd_plan, self.args(
+                'plan', '--caller', 'antigravity', '--engine', 'codex:fixture-code', '--kind', 'gate',
+                '--target', str(self.root), '--write-scope', 'v1171_mod.py',
+                '--verify-cmd', 'pytest -q', '--plan-dir', str(plans),
+                '--session-id', 'v1171-s', '--user-prompt', '用 codex 写并跑测试', '--save-ticket'))
+            _, app = self.capture(harness.cmd_plan, self.args(
+                'plan', '--caller', 'antigravity', '--plan-dir', str(plans),
+                '--session-id', 'v1171-s', '--approve-ticket', tk['ticket_id']))
+            self.assertEqual(app['status'], 'APPROVED')
+
+            # 1) _check_ticket_execution rejects empty/None/mismatched verify_cmd on writable gate
+            prof = app['streams'][0]['execution_profile']
+            for bad_verify in ('', None, 'echo evil'):
+                gate_args = self.args(
+                    'gate', '--caller', 'antigravity', '--worker', 'codex:fixture-code',
+                    '--target', str(self.root), '--task', app['streams'][0]['subtask'],
+                    '--write-scope', 'v1171_mod.py',
+                    '--verify-cmd', bad_verify or 'pytest -q', '--plan-dir', str(plans),
+                    '--session-id', 'v1171-s', '--ticket', tk['ticket_id'])
+                harness._begin_dispatch(gate_args)
+                with self.subTest(bad_verify=bad_verify), self.assertRaisesRegex(harness.HarnessError, '验收命令'):
+                    harness._check_ticket_execution(
+                        gate_args, prof, self.root, 'gate', app['streams'][0]['subtask'],
+                        write_scope=['v1171_mod.py'], verify_cmd=bad_verify)
+
+            # 2) plan --resume-ticket on APPROVED ticket preserves user_prompt & doesn't rewrite disk
+            disk_before = (plans / f"{tk['ticket_id']}.json").read_bytes()
+            _, resumed = self.capture(harness.cmd_plan, self.args(
+                'plan', '--caller', 'antigravity', '--plan-dir', str(plans),
+                '--resume-ticket', tk['ticket_id']))
+            self.assertEqual(resumed['status'], 'APPROVED')
+            self.assertEqual(resumed['user_prompt'], '用 codex 写并跑测试')
+            self.assertEqual((plans / f"{tk['ticket_id']}.json").read_bytes(), disk_before)
+
+            # 3) _plan_dir_lock does not deadlock with ticket_plan_dir lock namespace
+            with harness._plan_dir_lock(plans), harness._directory_file_lock(plans, 'ticket_plan_dir', label='计划票据'):
+                pass
+
+            # 4) _redact_runtime_secret masks hyphenated headers, Basic auth & proxy URLs
+            red = harness._redact_runtime_secret(
+                'x-api-key: secret_tok_123456 Authorization: Basic dXNlcjpwYXNz socks5://u:p@127.0.0.1:1080'
+            )
+            self.assertNotIn('secret_tok_123456', red)
+            self.assertNotIn('dXNlcjpwYXNz', red)
+            self.assertNotIn('u:p@', red)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

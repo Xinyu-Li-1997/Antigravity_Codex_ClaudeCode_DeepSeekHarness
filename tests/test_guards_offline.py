@@ -3244,6 +3244,13 @@ class TestDispatchAndBillingGuards(unittest.TestCase):
         self.assertIn("ticket-fixture", pending_msg)
         self.assertIn("PENDING", pending_msg)
         self.assertIn("--approve-ticket ticket-fixture", pending_msg)
+        self.assertIn("compact_summary_card", pending_msg)
+        plan_json = self.state / "dispatch_plans" / "ticket-fixture.json"
+        plan_obj = json.loads(plan_json.read_text(encoding="utf-8"))
+        plan_obj["card_detail_file"] = str(self.state / "dispatch_plans" / "ticket-fixture_card.md")
+        user_words.atomic_write_json(plan_json, plan_obj)
+        pending_with_link = status_guard._ticket_required_reason("fixture", self.state)
+        self.assertIn("[ticket-fixture_card.md](file://", pending_with_link)
 
         # 3) --client codex 下 stderr 标签为 Codex，且显式传入沙箱目录避免触碰真实 ~/.codex
         for script_name, expected_tag in (
@@ -3268,6 +3275,36 @@ class TestDispatchAndBillingGuards(unittest.TestCase):
         self.assertEqual(_resolve_hooks_dir(""), expected_hooks)
         self.assertEqual(_resolve_hooks_dir("   "), expected_hooks)
         self.assertEqual(_resolve_hooks_dir(str(self.root / "nonexistent_install_dir")), expected_hooks)
+
+    def test_v1171_powershell_prefix_escape_redirect_colon_and_readonly_verbs(self):
+        import base64
+        outside = self.root / "outside_v1171"
+        outside.mkdir()
+        enc_touch = base64.b64encode(f'Set-Content "{outside / "x.txt"}" "bad"'.encode("utf-16-le")).decode("ascii")
+        for cmd in (
+            f"powershell -e {enc_touch}",
+            f"pwsh -ec {enc_touch}",
+            f'powershell -com "Set-Content {outside / "a.txt"} 1"',
+            f'git commit -m "$(touch {outside / "sub.txt"})"',
+            f"echo hi >&{outside / 'redir.txt'}",
+            f"Set-Content -Path:{outside / 'colon.txt'} hi",
+            f"cp -t{outside} data.txt",
+            f'python -c "f = open; f(r\'{outside / "alias.txt"}\', \'w\').write(\'x\')"',
+        ):
+            with self.subTest(cmd=cmd):
+                res = self.pre("run_command", {"CommandLine": cmd})
+                self.assertIn(res["decision"], ("force_ask", "deny"), cmd)
+
+        # 2>&1 is safe fd duplication, not external file redirect
+        self.assertEqual(self.pre("run_command", {"CommandLine": "git status 2>&1"})["decision"], "allow")
+
+        # Readonly subagent blocks pytest / curl / make
+        for verb_cmd in ("pytest -q", "curl https://example.com", "cmake --build build"):
+            with self.subTest(verb_cmd=verb_cmd):
+                self.assertIsNotNone(
+                    status_guard._detect_readonly_subagent_command_mutation(verb_cmd, str(self.project)),
+                    verb_cmd,
+                )
 
 
 if __name__ == "__main__":

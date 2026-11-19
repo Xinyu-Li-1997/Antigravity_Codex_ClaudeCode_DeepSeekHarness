@@ -950,10 +950,10 @@ def _loopback_router_alive(base_url):
 _DEFAULT_CLAUDE_ROUTER_ROUTES = [{'prefix': 'deepseek', 'key_from_card': 'DeepSeek'}]
 
 
-def _load_claude_router_config(config_home, *, require_valid_file=False):
+def _load_claude_router_config(config_home, *, require_valid_file=False, interop=False):
     router_dir = Path(config_home or Path.home() / '.claude') / 'router'
     primary = router_dir / 'router.json'
-    platform_cfg = router_dir / ('router.windows.json' if os.name == 'nt' else 'router.wsl.json')
+    platform_cfg = router_dir / ('router.windows.json' if (os.name == 'nt' or interop) else 'router.wsl.json')
     cfg_path = primary if primary.exists() else (platform_cfg if platform_cfg.exists() else primary)
     if cfg_path.exists():
         try:
@@ -995,9 +995,22 @@ def _resolve_claude_router_card(cfg, raw_model):
 
 
 def _claude_card_quota(info, model_slug):
-    cfg = _load_claude_router_config(info.get('config_home'))
-    db = Path(os.environ.get('CAE_CCSWITCH_DB') or cfg.get('ccswitch_db')
-              or Path.home() / '.cc-switch' / 'cc-switch.db').expanduser()
+    interop = bool(info.get('windows_interop'))
+    cfg = _load_claude_router_config(info.get('config_home'), interop=interop)
+    raw_db = os.environ.get('CAE_CCSWITCH_DB') or cfg.get('ccswitch_db') or '~/.cc-switch/cc-switch.db'
+    db_str = str(raw_db)
+    try:
+        if interop and not os.environ.get('CAE_CCSWITCH_DB') and info.get('config_home'):
+            if db_str.startswith('~/'):
+                db = Path(info['config_home']).parent / db_str[2:]
+            elif ntpath.isabs(db_str) and not posixpath.isabs(db_str):
+                db = Path(_wsl_path(Path(db_str), windows=False))
+            else:
+                db = Path(db_str).expanduser()
+        else:
+            db = Path(db_str).expanduser()
+    except (OSError, RuntimeError, ValueError):
+        return {}
     if not db.is_file():
         return {}
     card = None
@@ -1059,6 +1072,8 @@ def inspect_backend_quota_and_availability(prefix, info, model_slug=None, redact
                 continue
             plan_type = rate.get('plan_type')
             block = float(_confirmation_tunables().get('quota_block_percent', 100))
+            any_expired_window = False
+            any_active_window = False
             for name in ('primary', 'secondary'):
                 window = rate.get(name)
                 if not isinstance(window, dict):
@@ -1070,11 +1085,12 @@ def inspect_backend_quota_and_availability(prefix, info, model_slug=None, redact
                 except (ValueError, TypeError):
                     resets = None
                 expired = resets is not None and time.time() >= resets
+                any_expired_window |= expired
+                any_active_window |= not expired
                 if not expired and resets is not None:
                     reset = min(reset or resets, resets)
                 exceeded |= not expired and bool(window.get('rate_limit_reached_type')
-                             or window.get('spend_control_reached') or rate.get('rate_limit_reached_type')
-                             or rate.get('spend_control_reached'))
+                             or window.get('spend_control_reached'))
                 try:
                     used = float(window['used_percent'])
                     if not math.isfinite(used) or used < 0:
@@ -1087,7 +1103,8 @@ def inspect_backend_quota_and_availability(prefix, info, model_slug=None, redact
                 percentages.append(f'{label}:{used:g}%')
                 blocked = not expired and used >= block
                 exceeded |= blocked
-            if not percentages and (rate.get('rate_limit_reached_type') or rate.get('spend_control_reached')):
+            top_flag = bool(rate.get('rate_limit_reached_type') or rate.get('spend_control_reached'))
+            if top_flag and (not any_expired_window and (any_active_window or not percentages)):
                 exceeded = True
             break
         quantitative_known = bool(percentages)
@@ -1097,7 +1114,8 @@ def inspect_backend_quota_and_availability(prefix, info, model_slug=None, redact
         exceeded = card.get('quota_exceeded', False)
         quantitative_known = card.get('quantitative_quota_known', False)
         if info.get('uses_local_router') or info.get('llm_source') == 'local_router':
-            if not _loopback_router_alive(info.get('base_url', '')):
+            router_ok = _probe_router_health(info) if info.get('windows_interop') else _loopback_router_alive(info.get('base_url', ''))
+            if not router_ok:
                 reason = reason or 'local_router_unavailable'
     cooldown = None if ignore_cooldown else _active_quota_record(prefix, info)
     if cooldown:
@@ -1128,6 +1146,8 @@ def inspect_backend_quota_and_availability(prefix, info, model_slug=None, redact
 
 def _peer_auto_ready(backends, name, *, ignore_cooldown=False):
     info = backends.get(name, {})
+    if name == 'claude' and info.get('uses_local_router') is True and info.get('router_alive') is False:
+        return False
     return bool(_is_subscription_enabled(name, info.get('model'))
                 and (ignore_cooldown or not _active_quota_record(name, info))
                 and info.get('available') and (name not in ('claude', 'dsh') or info.get('llm_configured')))
@@ -1984,6 +2004,8 @@ def select_task_tier(requested_tier='auto', kind='review', text='', file_count=1
             return 'low', 'economy_trivial_surface_low'
         if (kind in ('math', 'direction') or _has_positive_cue(sample, HIGH_COMPLEXITY_CUES)) and not _has_positive_cue(
                 sample, ('降挡', '降档', '降一挡', '降一档', '适当降挡', '适当降档', '降低挡位', '降低档位', 'lower tier', 'lower effort')):
+            if kind == 'direction' and role_tier and role_tier != 'max':
+                return role_tier, f'role_profile_{role_name}_{role_tier}'
             return 'max', f'task_specialty_{kind}_max' if kind in ('math', 'direction') else 'complexity_high_domain_max'
         return 'high', 'economy_adaptive_high'
     if role_tier and role_tier != 'max':
@@ -1995,12 +2017,12 @@ def select_task_tier(requested_tier='auto', kind='review', text='', file_count=1
     return 'max', 'default_flagship_max'
 
 
-def _resolve_effective_tier(explicit_tier, kind, user_prompt, fallback_text, engine=''):
+def _resolve_effective_tier(explicit_tier, kind, user_prompt, fallback_text, engine='', *, file_count=1, estimated_tokens=0):
     if user_prompt:
-        tier, reason = select_task_tier('auto', kind, user_prompt, engine=engine)
+        tier, reason = select_task_tier('auto', kind, user_prompt, file_count, estimated_tokens, engine=engine)
         if reason.startswith(('user_description_', 'economy_')):
             return tier, reason
-    return select_task_tier(explicit_tier, kind, user_prompt or fallback_text, engine=engine)
+    return select_task_tier(explicit_tier, kind, user_prompt or fallback_text, file_count, estimated_tokens, engine=engine)
 
 
 def _execution_side(info):
@@ -2456,7 +2478,8 @@ def _agy_config(root):
     user_settings = config.get('userSettings') if isinstance(config, dict) else None
     cli_model = settings.get('model') if isinstance(settings, dict) else None
     app_model = user_settings.get('model') if isinstance(user_settings, dict) else None
-    return {'model': cli_model or app_model, 'configured_model_source': str(cli_path if cli_model else app_path) if cli_model or app_model else None,
+    return {'model': cli_model or app_model, 'cli_model': cli_model, 'desktop_model': app_model,
+            'configured_model_source': str(cli_path if cli_model else app_path) if cli_model or app_model else None,
             'config_files': {'cli': {'path': str(cli_path), 'exists': cli_path.is_file()},
                              'desktop': {'path': str(app_path), 'exists': app_path.is_file()}},
             'config_home': str(root)}
@@ -2594,14 +2617,14 @@ def _redact_runtime_secret(text):
     raw = str(text or '')
     if not raw:
         return ''
-    raw = re.sub(r'(?i)https?://[^\s"<>]+', lambda m: _sanitize_endpoint_url(m.group(0)), raw)
+    raw = re.sub(r'(?i)(?:https?|socks5h?|wss?)://[^\s"<>]+', lambda m: _sanitize_endpoint_url(m.group(0)), raw)
+    raw = re.sub(r'(?i)\b(Bearer|Basic|Token|ApiKey)\s+[A-Za-z0-9._~+/=-]{8,}', r'\1 <redacted>', raw)
     raw = re.sub(
-        r'(?i)(?:^|(?<=[\s"\'{,;]))([A-Za-z0-9_]*(?:DEEPSEEK_API_KEY|ANTHROPIC_AUTH_TOKEN|ANTHROPIC_API_KEY|OPENAI_API_KEY|'
-        r'api[_-]?key|auth[_-]?token|access[_-]?token|secret[_-]?key))(["\']?\s*[=:]\s*)(["\']?)[^\s"\',}]+\3',
+        r'(?i)(?:^|(?<=[\s"\'{,;]))([A-Za-z0-9_-]*(?:DEEPSEEK_API_KEY|ANTHROPIC_AUTH_TOKEN|ANTHROPIC_API_KEY|OPENAI_API_KEY|'
+        r'api[_-]?key|auth[_-]?token|access[_-]?token|secret[_-]?key|authorization))(["\']?\s*[=:]\s*)(?:"[^"\r\n]*"|\'[^\'\r\n]*\'|(?:(?:Bearer|Basic|Token|ApiKey)\s+)?[^\s"\',}]+)',
         r'\1\2<redacted>',
         raw,
     )
-    raw = re.sub(r'(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{8,}', 'Bearer <redacted>', raw)
     raw = re.sub(
         r'\b(?:sk-[A-Za-z0-9_-]{12,}|AIza[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|'
         r'github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|hf_[A-Za-z0-9]{20,}|glpat-[A-Za-z0-9_-]{16,})',
@@ -4283,16 +4306,19 @@ def _dsh_dotenv_key(home):
 _DSH_PERMISSION_CACHE = {}
 
 
-def _dsh_supports_cli_permission_flags(binary, env=None):
+def _dsh_supports_cli_permission_flags(binary, env=None, *, interop=False):
     try:
         stamp = Path(binary).stat().st_mtime_ns
     except OSError:
         return False
-    key = (str(binary), stamp)
+    key = (str(binary), stamp, bool(interop))
     if key not in _DSH_PERMISSION_CACHE:
         try:
-            result = run_process([binary, '--profile', 'headless', '--help'], Path.cwd(),
-                                 timeout_sec=1.5, env=env)
+            probe_cmd = [binary, '--profile', 'headless', '--help']
+            if interop and _is_posix() and str(binary).lower().endswith(('.cmd', '.bat')):
+                probe_cmd = ['cmd.exe', '/c', _wsl_path(Path(binary)), '--profile', 'headless', '--help']
+            result = run_process(probe_cmd, Path.cwd(),
+                                 timeout_sec=2.5 if interop else 1.5, env=env)
             output = (result.stdout or '') + (result.stderr or '')
             is_help = bool(re.search(r'(?im)(?:usage:|options:|--help|--profile)', output))
             if result.returncode != 0 or not is_help:
@@ -4596,8 +4622,11 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
                             raw_cfg = json.loads((src_home / 'settings.json').read_text(encoding='utf-8-sig'))
                         except (OSError, ValueError):
                             raw_cfg = {}
-                        if isinstance(raw_cfg, dict) and isinstance(raw_cfg.get('env'), dict):
-                            env_only = {'env': raw_cfg['env']}
+                        if isinstance(raw_cfg, dict):
+                            if isinstance(raw_cfg.get('env'), dict):
+                                env_only['env'] = raw_cfg['env']
+                            if isinstance(raw_cfg.get('apiKeyHelper'), str) and raw_cfg['apiKeyHelper'].strip():
+                                env_only['apiKeyHelper'] = raw_cfg['apiKeyHelper']
                     clean_claude_settings = temp_path / 'clean-claude-settings.json'
                     clean_claude_settings.write_text(json.dumps(env_only, ensure_ascii=False), encoding='utf-8')
                 elif iso_mode == 'hooks_only':
@@ -4610,11 +4639,14 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
                         except (OSError, ValueError):
                             raw_cfg = {}
                         if isinstance(raw_cfg, dict):
-                            for keep_key in ('env', 'hooks', 'effortLevel', 'permissions'):
+                            for keep_key in ('env', 'hooks', 'effortLevel', 'permissions', 'apiKeyHelper', 'model'):
                                 if keep_key in raw_cfg:
                                     hooks_cfg[keep_key] = raw_cfg[keep_key]
                     (iso_claude / 'settings.json').write_text(json.dumps(hooks_cfg, ensure_ascii=False), encoding='utf-8')
                     if src_home:
+                        creds_src = src_home / '.credentials.json'
+                        if creds_src.is_file() and not _is_link(creds_src):
+                            shutil.copy2(creds_src, iso_claude / '.credentials.json')
                         _copy_tree_no_links(src_home / 'hooks', iso_claude / 'hooks')
                     effective_claude_home = str(iso_claude)
             elif prefix == 'dsh' and iso_mode in ('no_skills', 'clean_room'):
@@ -4734,7 +4766,7 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
                     command.extend(['--permission-mode', 'bypassPermissions', '--tools', 'Read,Grep,Glob,Edit,Write,Bash'])
                 input_text = exec_prompt
             else:
-                supports_perm_flags = _dsh_supports_cli_permission_flags(binary, env)
+                supports_perm_flags = _dsh_supports_cli_permission_flags(binary, env, interop=interop)
                 mode_str = 'read-only' if readonly else 'workspace-write'
                 patch_file = temp_path / 'dsh-headless.patch.yml'
                 provider = 'deepseek-official' if info.get('dsh_provider') == 'deepseek-official' else 'deepseek-account'
@@ -4766,10 +4798,14 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
                            command_transport='windows_interop' if interop else 'native')
             if interop:
                 extra_env = {}
-                if prefix == 'claude' and effective_claude_home:
+                if prefix == 'claude' and effective_claude_home and not clean_room:
                     extra_env['CLAUDE_CONFIG_DIR'] = _wsl_path(Path(effective_claude_home))
                 elif prefix == 'dsh' and effective_dsh_home:
                     extra_env = {'DSH_HOME': _wsl_path(Path(effective_dsh_home)), 'DSH_TELEMETRY_DISABLED': '1'}
+                    if env.get('DEEPSEEK_API_KEY'):
+                        extra_env['DEEPSEEK_API_KEY'] = env['DEEPSEEK_API_KEY']
+                    if env.get('DSH_PERMISSION_MODE'):
+                        extra_env['DSH_PERMISSION_MODE'] = env['DSH_PERMISSION_MODE']
                 command, native_pid_file = _interop_command(command, exec_dir, temp_path, input_text,
                                                             effective_codex_home if prefix == 'codex' else None,
                                                             extra_env=extra_env)
@@ -5925,8 +5961,8 @@ def _build_grounding_anchor(root_dir, exclude_rels, allow_files=None, extra_allo
     repo_names = set()
     dynamic_file_globs = set()
     for dirpath, dirs, files in os.walk(root_dir, followlinks=False):
-        dirs[:] = sorted(d for d in dirs if d not in IGNORED_DIRS)
         dpath = Path(dirpath)
+        dirs[:] = sorted(d for d in dirs if d not in IGNORED_DIRS and not _is_link(dpath / d))
         for fname in sorted(files):
             fpath = dpath / fname
             if _is_link(fpath) or not fpath.resolve().is_relative_to(root_dir):
@@ -6353,8 +6389,8 @@ def audit_doc_grounding(target_path, root_dir=None, *, base_ref=None, allow_file
     else:
         skip_rels = {'LICENSE', 'NOTICE'} if is_upstream_repo else {'CHANGELOG.md', 'LICENSE', 'NOTICE'}
         for dirpath, dirs, files in os.walk(target, followlinks=False):
-            dirs[:] = sorted(d for d in dirs if d not in IGNORED_DIRS)
             dpath = Path(dirpath)
+            dirs[:] = sorted(d for d in dirs if d not in IGNORED_DIRS and not _is_link(dpath / d))
             for fname in sorted(files):
                 fpath = dpath / fname
                 if _is_link(fpath):
@@ -6525,8 +6561,19 @@ def cmd_audit(args):
                 backend = _extract_prompt_backend_hint(args.user_prompt)
                 args.left = (f'{backend}:@{slot}' if slot and backend and not _extract_prompt_model_hint(args.user_prompt)
                              else user_engine)
+    raw_audit_iso = _normalize_isolation(getattr(args, 'isolation', ''), clean_room=bool(getattr(args, 'clean_room', False)))
     skipped = []
     records = collect_target_files(target, skipped)
+    if raw_audit_iso == 'clean_room' and target.is_dir():
+        filtered_records = []
+        for rec in records:
+            if Path(rec['rel_path']).name.upper() in _AGENT_INSTRUCTION_FILENAMES:
+                skipped.append({'file': rec['rel_path'], 'reason': 'clean_room_excluded_agent_instruction'})
+            else:
+                filtered_records.append(rec)
+        if records and not filtered_records:
+            raise HarnessError(_CLEAN_ROOM_ONLY_INSTR_ERROR, skipped_files=skipped)
+        records = filtered_records
     if not records:
         raise HarnessError('目标范围没有可审查文件', skipped_files=skipped)
     total_tokens = sum(item['tokens'] for item in records)
@@ -6538,7 +6585,8 @@ def cmd_audit(args):
                 or getattr(args, '_approved_ticket', None)):
             return _dispatch_print(args, {'status': exc.status, 'error': str(exc), **exc.details})
         prefix = exc.details.get('quota_backend') or 'codex'
-        fallback = _local_fallback_engine(caller, prefix + ':default', backends, args.focus)
+        fallback = _local_fallback_engine(caller, prefix + ':default', backends, args.focus,
+                                          clean_room=(raw_audit_iso == 'clean_room'), isolation=raw_audit_iso)
         if not fallback:
             return _dispatch_print(args, {'status': exc.status, 'error': str(exc), **exc.details})
         engines = (fallback, None)
@@ -6546,7 +6594,8 @@ def cmd_audit(args):
 
     audit_engine_hint = (args.left or (engines[0] or '')) if args.single else ''
     eff_audit_user_prompt = '' if (getattr(args, '_approved_ticket', None) and args.tier != 'auto') else getattr(args, 'user_prompt', '')
-    tier, tier_reason = _resolve_effective_tier(args.tier, 'audit', eff_audit_user_prompt, args.focus, audit_engine_hint)
+    tier, tier_reason = _resolve_effective_tier(args.tier, 'audit', eff_audit_user_prompt, args.focus, audit_engine_hint,
+                                                file_count=len(records), estimated_tokens=total_tokens)
     meta = {'caller': caller, 'handoff_to_caller': True, 'requested_tier': args.tier,
             'selected_tier': tier, 'tier_reason': tier_reason, 'target': str(root)}
     if getattr(args, '_selection_fallback', None):
@@ -6558,7 +6607,8 @@ def cmd_audit(args):
         _prepare_execution(backends, engines, batch, dry_run=args.dry_run)
     except HarnessError as exc:
         q_backend = exc.details.get('quota_backend') or ''
-        fb_engine = _local_fallback_engine(caller, f'{q_backend}:default', backends, args.focus) if (
+        fb_engine = _local_fallback_engine(caller, f'{q_backend}:default', backends, args.focus,
+                                           clean_room=(raw_audit_iso == 'clean_room'), isolation=raw_audit_iso) if (
             exc.status == 'quota_exhausted' and q_backend and getattr(args, 'fallback_on_quota', False)
             and not getattr(args, '_approved_ticket', None)
             and _workspace_unchanged(fallback_before, root, ignore_patterns=snap_patterns)
@@ -6570,7 +6620,9 @@ def cmd_audit(args):
         if kept and not args.single:
             kept_prefix = _engine_parts(kept[0])[0]
             alt_fb = _local_fallback_engine(
-                caller, f'{q_backend}:default', backends, args.focus, exclude_prefixes=(q_backend, kept_prefix)
+                caller, f'{q_backend}:default', backends, args.focus,
+                clean_room=(raw_audit_iso == 'clean_room'), isolation=raw_audit_iso,
+                exclude_prefixes=(q_backend, kept_prefix),
             )
             if alt_fb:
                 engines = (alt_fb, engines[1]) if (engines[0] and _engine_parts(engines[0])[0] == q_backend) else (engines[0], alt_fb)
@@ -6589,7 +6641,6 @@ def cmd_audit(args):
         except HarnessError as fb_exc:
             return _dispatch_print(args, {'status': fb_exc.status, **meta, 'error': str(fb_exc), 'requested_engines': list(engines), **fb_exc.details})
     profiles = {}
-    raw_audit_iso = _normalize_isolation(getattr(args, 'isolation', ''), clean_room=bool(getattr(args, 'clean_room', False)))
     for side, engine in zip(('left', 'right'), engines):
         if engine:
             prefix, _ = _engine_parts(engine)
@@ -6662,6 +6713,12 @@ def cmd_audit(args):
                 errors.append({**common, 'status': getattr(exc, 'status', 'failed'),
                                'error': str(exc), **getattr(exc, 'details', {})})
     scope = _safe_changes_report(before, root, [], True, ignore_patterns=snap_patterns)
+    for item in (*completed, *errors):
+        inv = item.get('invocation')
+        if isinstance(inv, dict):
+            staged_scope = inv.pop('staged_scope', None)
+            if isinstance(staged_scope, dict):
+                scope = _merge_staged_scope_report(scope, staged_scope)
     quota_err = next((err for err in errors if err.get('status') == 'quota_exhausted'), None)
     if scope['scope_violations']:
         status = 'scope_violation'
@@ -6672,6 +6729,8 @@ def cmd_audit(args):
     elif not completed:
         statuses = {error['status'] for error in errors}
         status = 'quota_exhausted' if 'quota_exhausted' in statuses else (next(iter(statuses)) if len(statuses) == 1 else 'failed')
+    elif not scope.get('scope_verified', True):
+        status = 'failed'
     else:
         status = 'partial' if errors or plan['skipped_files'] or any(unit['unread_files'] for unit in completed) else 'ok'
     scope_error = {}
@@ -6737,7 +6796,9 @@ def cmd_gate(args):
             return _dispatch_print(args, {'status': exc.status, **meta, 'error': str(exc), **exc.details})
         meta['quota_fallback'] = _quota_fallback_record(engine, fb_engine, exc.details)
         engine = fb_engine
-        meta.update(engine=engine, worker_engine=engine)
+        fb_prefix, _ = _engine_parts(engine)
+        fb_iso, _ = _effective_isolation(fb_prefix, getattr(args, 'isolation', ''))
+        meta.update(engine=engine, worker_engine=engine, isolation=fb_iso)
         try:
             _prepare_execution(backends, (engine,), batch, dry_run=args.dry_run)
             if not _workspace_unchanged(fallback_before, root, ignore_dirs=snap_ignored, ignore_patterns=snap_patterns):
@@ -6830,7 +6891,9 @@ def cmd_task(args):
                            'error': str(exc), **exc.details})
         payload['quota_fallback'] = _quota_fallback_record(engine, fb_engine, exc.details)
         engine = fb_engine
-        payload['engine'] = engine
+        fb_prefix, _ = _engine_parts(engine)
+        fb_iso, _ = _effective_isolation(fb_prefix, raw_iso_arg, clean_room=clean_room)
+        payload.update(engine=engine, isolation=fb_iso)
         try:
             _prepare_execution(backends, (engine,), batch, dry_run=args.dry_run)
             if not _workspace_unchanged(fallback_before, root, ignore_dirs=snap_ignored, ignore_patterns=snap_patterns):
@@ -6901,7 +6964,9 @@ def cmd_task(args):
             _require_execution_profile(fb_profile)
             engine = fb_engine
             prefix, _ = _engine_parts(engine)
+            fb_iso, _ = _effective_isolation(prefix, raw_iso_arg, clean_room=clean_room)
             payload['engine'] = engine
+            payload['isolation'] = fb_iso
             payload.update(_profile_payload(fb_profile))
             invocation = {}
             result = invoke_engine(fb_profile['spec'], root, prompt, backends, TASK_JSON_SCHEMA,
@@ -6913,7 +6978,7 @@ def cmd_task(args):
         status = getattr(exc, 'status', 'failed')
         error = {'error': str(exc), **getattr(exc, 'details', {})}
     finally:
-        staged_scope = invocation.get('staged_scope') if (readonly and invocation.get('staged_readonly_workspace')) else None
+        staged_scope = invocation.pop('staged_scope', None) if (readonly and invocation.get('staged_readonly_workspace')) else None
         scope = dict(staged_scope) if isinstance(staged_scope, dict) else _safe_changes_report(
             before, root, scopes, readonly, ignore_dirs=snap_ignored, ignore_patterns=snap_patterns
         )
@@ -7124,6 +7189,25 @@ def _load_ticket(ticket_id, plan_dir=None, approved=False):
     return ticket
 
 
+def _merge_staged_scope_report(scope, staged_scope):
+    """暂存副本与原工作目录双重核验；任一快照越界或核对失败均不得放行。"""
+    both_verified = bool(scope.get('scope_verified') and staged_scope.get('scope_verified'))
+    c1, c2 = scope.get('changed_files'), staged_scope.get('changed_files')
+    merged_changed = (
+        None if (c1 is None or c2 is None) and not (c1 or c2)
+        else sorted(set(c1 or []) | set(c2 or []))
+    )
+    return {
+        **staged_scope,
+        **scope,
+        'scope_verified': both_verified,
+        'scope_check': scope.get('scope_check') if not scope.get('scope_verified') else staged_scope.get('scope_check', 'post_execution_snapshot'),
+        'changed_files': merged_changed,
+        'scope_violations': sorted(set(scope.get('scope_violations') or [])
+                                   | set(staged_scope.get('scope_violations') or [])),
+    }
+
+
 def _choose_dispatch_engine(args, backends, caller, explicit, text):
     skip_user_prompt = (
         bool(getattr(args, '_approved_ticket', None))
@@ -7141,7 +7225,11 @@ def _choose_dispatch_engine(args, backends, caller, explicit, text):
         if prefix and (getattr(args, 'dry_run', False) or getattr(args, 'retry_quota', False)):
             return prefix + ':default'
         if prefix and getattr(args, 'fallback_on_quota', False) and not getattr(args, '_approved_ticket', None):
-            fallback = _local_fallback_engine(caller, prefix + ':default', backends, text)
+            fallback = _local_fallback_engine(
+                caller, prefix + ':default', backends, text,
+                clean_room=bool(getattr(args, 'clean_room', False)),
+                isolation=getattr(args, 'isolation', ''),
+            )
             if fallback:
                 args._selection_fallback = _quota_fallback_record(prefix + ':default', fallback, exc.details)
                 return fallback
@@ -7190,10 +7278,10 @@ def _check_ticket_execution(args, profile, target, kind, text=None, *, write_sco
                 f'写入范围与获批票据不一致（当前请求：{req_scopes}；票据允许：{allowed_scopes}）',
                 'ticket_invalid', requested_write_scope=req_scopes, approved_write_scopes=allowed_scopes,
             )
-    if verify_cmd is not None:
-        req_verify = str(verify_cmd).strip()
+    if kind in ('code', 'gate') or verify_cmd is not None:
+        req_verify = str(verify_cmd or '').strip()
         allowed_verify = [str(stream.get('verify_cmd') or '').strip() for stream in matches]
-        if not any(not cmd or cmd == req_verify for cmd in allowed_verify):
+        if not any(cmd == req_verify for cmd in allowed_verify):
             raise HarnessError(
                 f'验收命令与获批票据不一致（当前请求：{req_verify!r}；票据要求：{allowed_verify}）',
                 'ticket_invalid', requested_verify_cmd=req_verify, approved_verify_cmds=allowed_verify,
@@ -7552,21 +7640,35 @@ def _native_plan_model(prefix, info, requested_model, agent_type=''):
         return agent_model, f'inherit -> {agent_model} (agent:{safe_agent})', home, config
     sub_model = os.environ.get('CLAUDE_CODE_SUBAGENT_MODEL', '').strip() if prefix == 'claude' else ''
     if prefix == 'claude' and not sub_model:
-        settings = _read_json(home / 'settings.json') or {}
-        sub_model = str((settings.get('env') or {}).get('CLAUDE_CODE_SUBAGENT_MODEL') or '').strip()
+        raw_settings = _read_json(home / 'settings.json')
+        settings = raw_settings if isinstance(raw_settings, dict) else {}
+        env_map = settings.get('env') if isinstance(settings.get('env'), dict) else {}
+        sub_model = str(env_map.get('CLAUDE_CODE_SUBAGENT_MODEL') or '').strip()
     if sub_model.lower() == 'inherit':
         sub_model = ''
+    agy_cli_fallback = ''
     if prefix == 'claude':
         model = sub_model or os.environ.get('ANTHROPIC_MODEL', '').strip() or info.get('model')
     elif prefix == 'codex':
         model = config.get('model') or info.get('model')
     elif prefix == 'agy':
-        model = _agy_config(home).get('model') or info.get('model')
+        agy_cfg = _agy_config(home)
+        model = agy_cfg.get('desktop_model')
+        if not model:
+            agy_cli_fallback = str(agy_cfg.get('cli_model') or info.get('model') or '').strip()
+    elif prefix == 'dsh':
+        dsh_native_cfg = _native_agent_profile('dsh')
+        model = str(dsh_native_cfg.get('main_model') or '').strip() or info.get('model')
     else:
         model = info.get('model')
     if not model or model == 'inherit':
         model = None
-    display = ('inherit -> ' + model if sub_model else 'inherit (' + model + ')') if model else 'inherit (跟随当前前端所选模型)'
+    if model:
+        display = 'inherit -> ' + model if sub_model else 'inherit (' + model + ')'
+    elif agy_cli_fallback:
+        display = f'inherit (跟随 Antigravity IDE 当前会话模型；CLI 默认：{agy_cli_fallback})'
+    else:
+        display = 'inherit (跟随当前前端所选模型)'
     return model, display, home, config
 
 
@@ -7574,6 +7676,13 @@ def _plan_stream_details(args, stream, profile, prefix, channel):
     native = channel != 'cae_harness_headless'
     readonly = stream['kind'] not in ('code', 'gate')
     scopes = _scope_patterns(stream.get('write_scope', getattr(args, 'write_scope', [])))
+    if not readonly and not scopes:
+        try:
+            tgt = Path(stream['target']).expanduser().resolve()
+            if tgt.is_file():
+                scopes = [tgt.name]
+        except OSError:
+            pass
     verify_cmd = stream.get('verify_cmd', getattr(args, 'verify_cmd', '')) or ''
     access = '只读' if readonly else '写入范围：' + (', '.join(scopes) or '未声明') + '；验收命令：' + (verify_cmd or '未声明')
     if native:
@@ -7663,10 +7772,11 @@ def _resolve_plan_streams(args, streams, backends):
                     '' if sub_sample == user_text else sub_sample, count, tokens,
                 )
             else:
-                tier, _ = _resolve_effective_tier(stream.get('tier') or args.tier, kind, user_text, text)
+                tier, _ = _resolve_effective_tier(stream.get('tier') or args.tier, kind, user_text, text,
+                                                  file_count=count, estimated_tokens=tokens)
             record = _exact_model_record(info.get('models', []), model) if model else {}
             capacity = _execution_budget(prefix, info, record or {})
-            if prefix == 'codex' and (requested_model == 'inherit' or requested_model == config.get('model')):
+            if prefix == 'codex' and model and model == config.get('model'):
                 capacity['selected_window_tokens'] = (_positive_int(config.get('model_context_window'))
                                                      or capacity['selected_window_tokens'])
             engine = prefix + ':' + (model or 'default')
@@ -7753,11 +7863,16 @@ def _resolve_plan_streams(args, streams, backends):
                 else:
                     eff_user_tier = '' if override_engine else user_text
                     eff_text_tier = eff_text_engine if override_engine else text
-                    tier, _ = _resolve_effective_tier(stream.get('tier') or args.tier, kind, eff_user_tier, eff_text_tier, engine)
+                    tier, _ = _resolve_effective_tier(stream.get('tier') or args.tier, kind, eff_user_tier, eff_text_tier, engine,
+                                                      file_count=count, estimated_tokens=tokens)
                 profile = resolve_execution_profile(available, engine, tier, eff_text_engine, kind, tokens)
                 _require_execution_profile(profile)
                 eff_profile_tier = profile.get('tier') or tier
                 prefix, _ = _engine_parts(engine)
+                raw_iso_stream = stream.get('isolation', getattr(args, 'isolation', ''))
+                raw_cr_stream = bool(stream.get('clean_room', getattr(args, 'clean_room', False)))
+                stream_iso_mode, _ = _effective_isolation(prefix, raw_iso_stream, clean_room=raw_cr_stream)
+                _validate_isolation(prefix, stream_iso_mode, readonly=(kind not in ('code', 'gate')))
                 quota = inspect_backend_quota_and_availability(prefix, backends[prefix], profile['model'],
                                                                 redact_usage=getattr(args, 'redact', False),
                                                                 ignore_cooldown=getattr(args, 'retry_quota', False))
@@ -7791,6 +7906,35 @@ def _resolve_plan_streams(args, streams, backends):
                                         or profile['model'] != original.get('model'))
         resolved.append(_plan_stream_details(args, chosen, profile, prefix, channel))
     return resolved, switched
+
+
+def _format_card_detail_link(detail_path):
+    clean = str(detail_path or '').replace('\r\n', '\n').replace('\r', ' ').replace('\n', ' ').strip()
+    if not clean:
+        return ''
+    name = re.split(r'[/\\]', clean.rstrip('/\\'))[-1] or clean
+    if clean.startswith('<'):
+        return clean
+    posix = clean.replace('\\', '/')
+    encoded = (
+        posix.replace('%', '%25')
+        .replace(' ', '%20')
+        .replace('(', '%28')
+        .replace(')', '%29')
+        .replace('[', '%5B')
+        .replace(']', '%5D')
+        .replace('#', '%23')
+        .replace('?', '%3F')
+    )
+    if re.match(r'^[A-Za-z]:/', posix):
+        uri = 'file:///' + encoded
+    elif posix.startswith('//'):
+        uri = 'file:' + encoded
+    elif posix.startswith('/'):
+        uri = 'file://' + encoded
+    else:
+        return clean
+    return f'[{name}]({uri})'
 
 
 def _render_plan(ticket):
@@ -7830,6 +7974,7 @@ def _render_plan(ticket):
         details += ['', '#### 流 ' + _clean_text(stream['stream_id']).replace('\n', ' ') + '（14 项完整参数明细）', '',
                     '| 序号 | 参数项 | 当前值 |', '| --- | --- | --- |']
         details.extend(row([index, name, value]) for index, (name, value) in enumerate(zip(columns, values), 1))
+    overview_markdown = '\n'.join(rows)
     rows.extend(details)
     ledger = ticket.get('capability_ledger', {})
     status = _clean_text(ticket.get('status') or 'PENDING').strip() or 'PENDING'
@@ -7842,50 +7987,41 @@ def _render_plan(ticket):
         popup_footer = '\n\n当前状态：已登记交接（HANDED_OFF）；新会话复核后可选：① 批准当前计划；② 微调引擎、挡位或超时后批准；③ 暂缓并交接。'
     else:
         popup_footer = f'\n\n当前状态：{status}。'
+    ledger_line = (
+        'capability_ledger 离线性能记录更新时间：在线刷新 ' + _clean_text(ledger.get('last_online_refresh_at'))
+        + '；本机实测 ' + _clean_text(ledger.get('local_bench_verified_at'))
+    )
     markdown = ('工作流背景：' + _clean_text(ticket['workflow_bg']) + '\n\n要做什么：' + _clean_text(ticket['workflow_goal'])
                 + '\n\n预计后果：' + _clean_text(ticket['workflow_impact']) + '\n\n' + '\n'.join(rows)
-                + '\n\ncapability_ledger 离线性能记录更新时间：在线刷新 ' + _clean_text(ledger.get('last_online_refresh_at'))
-                + '；本机实测 ' + _clean_text(ledger.get('local_bench_verified_at'))
+                + '\n\n' + ledger_line
                 + popup_footer
                 + '\n\n票据：' + tid_clean + '；状态：' + status)
     ticket['human_popup_markdown'] = markdown
-    stream_lines = []
-    for s in ticket.get('streams', []):
-        client_disp = s.get('client') or s.get('engine') or '未声明'
-        model_disp = s.get('model_display') or s.get('model') or '未声明'
-        win_val = s.get('context_window') or s.get('window') or s.get('window_tokens')
-        win_disp = f"{win_val} tokens" if win_val else '未声明'
-        access_disp = s.get('access_mode') or '未声明'
-        stream_lines.append(
-            f"- {_cell(s['stream_id'])}: {_cell(client_disp)} | {_cell(model_disp)} | {_cell(win_disp)} | {_cell(access_disp)}"
-        )
     persisted = bool(ticket.get('card_detail_file'))
-    detail_ref = f"\n完整 14 项明细文件：{_clean_text(ticket['card_detail_file']).replace(chr(10), ' ')}" if persisted else ""
-    if status == 'PENDING':
-        options_line = (
-            f"\n选项：① 批准（--approve-ticket {tid_clean}）；② 微调后批准；③ 暂缓并交接。"
-            if persisted
-            else "\n选项：① 批准当前计划（未保存票据文件，如需持久票据请加 --save-ticket）；② 微调后批准；③ 暂缓并交接。"
-        )
-    elif status == 'APPROVED':
-        options_line = f"\n状态：已批准（APPROVED，可执行 --ticket {tid_clean}）。"
-    elif status == 'HANDED_OFF':
-        options_line = (
-            f"\n状态：已交接（HANDED_OFF）；新会话复核后可 --approve-ticket {tid_clean} 批准、微调后批准或继续暂缓交接。"
-            if persisted
-            else "\n状态：已交接（HANDED_OFF）。"
-        )
-    else:
-        options_line = f"\n状态：{status}。"
+    detail_link = _format_card_detail_link(ticket.get('card_detail_file') or '') if persisted else ''
+    detail_ref = (
+        f'\n完整 14 项参数明细：{detail_link}'
+        if detail_link
+        else '\n完整 14 项参数明细：尚未落盘（如需持久票据与明细链接请加 --save-ticket）'
+    )
     ticket['compact_summary_card'] = (
-        f"工作流目标：{_cell(ticket['workflow_goal'])}\n"
-        + "\n".join(stream_lines)
+        '工作流背景：' + _clean_text(ticket['workflow_bg'])
+        + '\n工作流目标：' + _clean_text(ticket['workflow_goal'])
+        + '\n预计后果：' + _clean_text(ticket['workflow_impact'])
+        + '\n\n' + overview_markdown
+        + '\n\n' + ledger_line
         + detail_ref
-        + options_line
+        + popup_footer
+        + '\n\n票据：' + tid_clean + '；状态：' + status
     )
     resume_ref = ('\n恢复命令：plan --resume-ticket ' + tid_clean) if persisted else ''
     ticket['handoff_prompt_block'] = ('【新对话提示词】\n请接力以下完整工作流，先读取并复核票据，不要推测缺失内容。\n'
                                       + markdown + resume_ref)
+    ticket['compact_handoff_prompt_block'] = (
+        '【新对话提示词】\n请接力以下未决重负载工作流，先读取并复核磁盘票据与完整 14 项明细文件，不要推测缺失内容。\n'
+        + ticket['compact_summary_card']
+        + resume_ref
+    ) if persisted else ticket['handoff_prompt_block']
 
 
 def _save_plan(ticket, plan_dir):
@@ -7930,13 +8066,16 @@ def cmd_plan(args):
     plan_dir = resolve_dispatch_plan_dir(args.plan_dir)
     ticket_id = args.approve_ticket or args.resume_ticket or args.mark_handed_off
     if ticket_id:
-        with _plan_dir_lock(plan_dir), _directory_file_lock(plan_dir, ticket_id, label='计划票据'):
+        with _plan_dir_lock(plan_dir), _directory_file_lock(plan_dir, f'ticket_{ticket_id}', label='计划票据'):
             ticket = _load_ticket(ticket_id, plan_dir)
             if args.approve_ticket or args.mark_handed_off:
                 _verify_ticket_session(ticket, args)
-            args.user_prompt = args.user_prompt or ticket.get('user_prompt', '')
-            ticket['user_prompt'] = args.user_prompt
             forced = bool(getattr(args, 'force', False))
+            if args.resume_ticket and not forced:
+                args.user_prompt = ticket.get('user_prompt', '') or args.user_prompt
+            else:
+                args.user_prompt = args.user_prompt or ticket.get('user_prompt', '')
+                ticket['user_prompt'] = args.user_prompt
             if args.mark_handed_off:
                 if ticket.get('status') == 'APPROVED' and not forced:
                     raise HarnessError('已批准票据不可直接降级为已交接状态，如需强制交接请传 --force', 'ticket_invalid')
@@ -8088,8 +8227,17 @@ def cmd_plan(args):
                             estimated_tokens=stream.get('estimated_tokens', 0),
                         )
                         _require_execution_profile(profile)
+                        ov_prefix, _ = _engine_parts(engine)
+                        ov_quota = inspect_backend_quota_and_availability(
+                            ov_prefix, backends[ov_prefix], profile['model'],
+                            redact_usage=getattr(args, 'redact', False),
+                            ignore_cooldown=getattr(args, 'retry_quota', False),
+                        )
                         core.update(engine=engine, model=profile['model'], tier=profile['tier'],
-                                    context_window=profile['capacity']['selected_window_tokens'])
+                                    context_window=profile['capacity']['selected_window_tokens'],
+                                    currently_available=ov_quota['currently_available'],
+                                    unavailable_reason=ov_quota['unavailable_reason'],
+                                    quota_exceeded=ov_quota['quota_exceeded'])
                         profile_core.update({key: profile.get(key) for key in profile_fields})
                 has_engine_override = any(isinstance(ov, dict) and 'engine' in ov for ov in overrides.values())
                 try:
@@ -8117,6 +8265,26 @@ def cmd_plan(args):
                     for stream, core in zip(streams, expected_profiles))
                 if args.approve_ticket and drift:
                     if ticket.get('status') == 'APPROVED' and not forced:
+                        unavail_streams = [stream for stream in streams if not stream.get('currently_available')]
+                        if unavail_streams:
+                            unavail_desc = '；'.join(
+                                f"{s.get('stream_id', '?')}[{s.get('channel', 'cae_harness_headless')}]"
+                                f"({s.get('unavailable_reason') or 'unavailable'})"
+                                for s in unavail_streams
+                            )
+                            raise HarnessError(
+                                f'二次检查门拒绝批准不可用的工作流：{unavail_desc}',
+                                'quota_exhausted' if any(s.get('quota_exceeded') for s in unavail_streams) else 'failed',
+                                unavailable_streams=[
+                                    {
+                                        'stream_id': s.get('stream_id'),
+                                        'channel': s.get('channel', 'cae_harness_headless'),
+                                        'client': s.get('client'),
+                                        'unavailable_reason': s.get('unavailable_reason'),
+                                    }
+                                    for s in unavail_streams
+                                ],
+                            )
                         raise HarnessError('已批准票据在通道漂移时不可静默降级为待决状态，如需重置请传 --force', 'ticket_invalid')
                     ticket.update(streams=streams, status='PENDING', is_heavy=_is_heavy_streams(streams, switched))
                     _save_plan(ticket, plan_dir)
@@ -8143,20 +8311,41 @@ def cmd_plan(args):
                             ],
                         )
                 changed = orig_streams != streams
-                ticket['streams'] = streams
-                ticket['is_heavy'] = _is_heavy_streams(streams, switched)
-                if args.approve_ticket:
-                    for stream in streams:
-                        ep_tier = (stream.get('execution_profile') or {}).get('tier')
-                        if ep_tier:
-                            stream['tier'] = ep_tier
-                    ticket['status'] = 'APPROVED'
-                elif ticket.get('status') == 'APPROVED':
-                    if forced and changed:
+                if ticket.get('status') == 'APPROVED' and not args.approve_ticket and not forced:
+                    spec_fields = ('engine', 'model', 'tier', 'timeout', 'channel', 'context_window')
+                    spec_drifted = switched or any(
+                        any(stream.get(key) != core.get(key) for key in spec_fields)
+                        for stream, core in zip(streams, expected)
+                    ) or any(
+                        any(stream.get('execution_profile', {}).get(key) != pcore.get(key) for key in profile_fields)
+                        for stream, pcore in zip(streams, expected_profiles)
+                    )
+                    if spec_drifted:
+                        raise HarnessError(
+                            '已批准票据在恢复复核期间发生引擎、模型或挡位漂移，拒绝静默改写；如需重置为待确认请传 --force',
+                            'ticket_changed',
+                        )
+                    # 仅刷新实时可用性/额度视图供展示，绝不改写磁盘已批票据与 plan_hash。
+                    ticket = copy.deepcopy(ticket)
+                    ticket['streams'] = streams
+                    _render_plan(ticket)
+                else:
+                    ticket['streams'] = streams
+                    ticket['is_heavy'] = _is_heavy_streams(streams, switched)
+                    if args.approve_ticket:
+                        for stream in streams:
+                            ep_tier = (stream.get('execution_profile') or {}).get('tier')
+                            if ep_tier:
+                                stream['tier'] = ep_tier
+                        ticket['status'] = 'APPROVED'
+                    elif ticket.get('status') == 'APPROVED':
+                        if forced and changed:
+                            ticket['status'] = 'PENDING'
+                    elif ticket.get('status') != 'HANDED_OFF' and changed:
                         ticket['status'] = 'PENDING'
-                elif ticket.get('status') != 'HANDED_OFF' and changed:
-                    ticket['status'] = 'PENDING'
-            _save_plan(ticket, plan_dir)
+                    _save_plan(ticket, plan_dir)
+            if args.mark_handed_off:
+                _save_plan(ticket, plan_dir)
     else:
         streams = _read_stream_spec(args.spec_file) if args.spec_file else [{
             'stream_id': 'S1', 'subtask': args.workflow_goal or args.user_prompt or '检查目标',
@@ -8173,7 +8362,7 @@ def cmd_plan(args):
         ticket['plan_hash'] = _plan_hash(ticket)
         _render_plan(ticket)
         if ticket['is_heavy'] or args.save_ticket:
-            with _plan_dir_lock(plan_dir), _directory_file_lock(plan_dir, ticket['ticket_id'], label='计划票据'):
+            with _plan_dir_lock(plan_dir), _directory_file_lock(plan_dir, f'ticket_{ticket["ticket_id"]}', label='计划票据'):
                 _save_plan(ticket, plan_dir)
     if args.output:
         _atomic_json(args.output, ticket if args.no_redact_output else _redact_public(ticket))
@@ -8237,11 +8426,19 @@ def cmd_batch(args):
                 raise HarnessError('批处理二次检查门拒绝执行', quota['unavailable_reason'], preflight_blocked=True)
             text = args.user_prompt or stream.get('subtask', '')
             if getattr(args, '_approved_ticket', None):
+                cli_iso = _normalize_isolation(getattr(args, 'isolation', ''), clean_room=bool(getattr(args, 'clean_room', False)))
+                if cli_iso:
+                    approved_iso, _ = _effective_isolation(prefix, stream.get('isolation', ''), clean_room=bool(stream.get('clean_room', False)))
+                    if cli_iso != approved_iso:
+                        raise HarnessError(f'隔离模式（{cli_iso}）与获批票据（{approved_iso}）不一致', 'ticket_invalid')
                 tier = stream['tier']
                 if stream.get('execution_profile', {}).get('profile_source') != 'prompt_fuzzy_model' and _extract_prompt_model_hint(text):
                     text = stream.get('subtask', '') if not _extract_prompt_model_hint(stream.get('subtask', '')) else ''
             else:
-                tier, _ = _resolve_effective_tier(stream['tier'], stream['kind'], args.user_prompt, text, engine)
+                tier, _ = _resolve_effective_tier(
+                    stream['tier'], stream['kind'], args.user_prompt, text, engine,
+                    file_count=stream.get('file_count', 1), estimated_tokens=stream.get('estimated_tokens', 0),
+                )
             profile = resolve_execution_profile(
                 backends, engine, tier, text, stream['kind'],
                 estimated_tokens=stream.get('estimated_tokens', 0),
@@ -8302,22 +8499,7 @@ def cmd_batch(args):
                     )
                     staged_scope = invocation.pop('staged_scope', None)
                     if isinstance(staged_scope, dict):
-                        # 暂存副本与原目录都要检查；任一快照违规或核对失败均不得通过。
-                        both_verified = bool(scope.get('scope_verified') and staged_scope.get('scope_verified'))
-                        c1, c2 = scope.get('changed_files'), staged_scope.get('changed_files')
-                        merged_changed = (
-                            None if (c1 is None or c2 is None) and not (c1 or c2)
-                            else sorted(set(c1 or []) | set(c2 or []))
-                        )
-                        scope = {
-                            **staged_scope,
-                            **scope,
-                            'scope_verified': both_verified,
-                            'scope_check': scope.get('scope_check') if not scope.get('scope_verified') else staged_scope.get('scope_check', 'post_execution_snapshot'),
-                            'changed_files': merged_changed,
-                            'scope_violations': sorted(set(scope.get('scope_violations') or [])
-                                                       | set(staged_scope.get('scope_violations') or [])),
-                        }
+                        scope = _merge_staged_scope_report(scope, staged_scope)
                     result.update(scope)
                     if scope.get('scope_violations'):
                         result['status'] = 'scope_violation'
