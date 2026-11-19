@@ -2160,6 +2160,17 @@ class TestDispatchAndBillingGuards(unittest.TestCase):
         self.assertEqual(self.pre("swarm", {"action": "add"})["decision"], "allow")
         self.assertEqual(self.pre("swarm", {"action": "add"})["decision"], "deny")
 
+    def test_native_swarm_stream_weight_counts_tasks_and_n(self):
+        self.approve(channel="native_swarm", count=2)
+        self.assertEqual(self.pre("swarm", {"action": "add", "name": "w", "tasks": ["a", "b", "c"]})["decision"], "deny")
+        self.assertEqual(self.pre("swarm", {"action": "add", "name": "w", "n": 3})["decision"], "deny")
+        self.assertEqual(self.pre("swarm", {"action": "add", "name": "w", "tasks": ["a", "b"]})["decision"], "allow")
+        self.assertEqual(self.pre("swarm", {"action": "add", "name": "w2"})["decision"], "deny")
+
+        self.approve(channel="native_swarm", sid="swarm-n-sess", count=2)
+        self.assertEqual(self.pre("swarm", {"action": "add", "name": "w", "n": 2}, sid="swarm-n-sess")["decision"], "allow")
+        self.assertEqual(self.pre("swarm", {"action": "add", "name": "w2", "n": 1}, sid="swarm-n-sess")["decision"], "deny")
+
     def test_path_regressions_and_invalid_session(self):
         outside = self.root / "outside"
         outside.mkdir()

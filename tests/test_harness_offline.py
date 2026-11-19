@@ -5721,6 +5721,182 @@ else:
             self.assertIn('--redact', help_txt)
             self.assertIn('脱敏', help_txt)
 
+    def test_orthogonal_isolation_modes_and_native_agent_profiles(self):
+        target_py = self.root / 'iso_mod.py'
+        target_py.write_text('val = 1\n', encoding='utf-8')
+        engines = self.four_backends()
+
+        cx_home = self.root / 'iso-codex-home'
+        (cx_home / 'hooks').mkdir(parents=True)
+        (cx_home / 'agents').mkdir(parents=True)
+        (cx_home / 'skills' / 'demo').mkdir(parents=True)
+        (cx_home / 'auth.json').write_text('{"token":"ok"}', encoding='utf-8')
+        (cx_home / 'models_cache.json').write_text('{"models":[]}', encoding='utf-8')
+        (cx_home / 'config.toml').write_text('model = "fixture-code"\n', encoding='utf-8')
+        (cx_home / 'AGENTS.md').write_text('# global codex rules\n', encoding='utf-8')
+        (cx_home / 'hooks.json').write_text('{"hooks":{}}', encoding='utf-8')
+        (cx_home / 'hooks' / 'status_guard.py').write_text('# guard\n', encoding='utf-8')
+        (cx_home / 'agents' / 'readonly-auditor.toml').write_text('name = "readonly-auditor"\nmodel = "codex-agent-custom"\n', encoding='utf-8')
+        (cx_home / 'skills' / 'demo' / 'SKILL.md').write_text('# skill\n', encoding='utf-8')
+        engines['codex']['config_home'] = str(cx_home)
+
+        cl_home = self.root / 'iso-claude-home'
+        (cl_home / 'hooks').mkdir(parents=True)
+        (cl_home / 'agents').mkdir(parents=True)
+        (cl_home / 'skills' / 'demo').mkdir(parents=True)
+        (cl_home / 'CLAUDE.md').write_text('# global claude rules\n', encoding='utf-8')
+        (cl_home / 'hooks' / 'status_guard.py').write_text('# guard\n', encoding='utf-8')
+        (cl_home / 'agents' / 'readonly-auditor.md').write_text('---\nname: readonly-auditor\nmodel: claude-agent-custom\n---\n', encoding='utf-8')
+        (cl_home / 'skills' / 'demo' / 'SKILL.md').write_text('# skill\n', encoding='utf-8')
+        (cl_home / 'settings.json').write_text(json.dumps({
+            'env': {'ANTHROPIC_BASE_URL': 'http://127.0.0.1:8240', 'ANTHROPIC_AUTH_TOKEN': 'via-router'},
+            'hooks': {'PreToolUse': [{'hooks': [{'command': 'guard'}]}]},
+            'effortLevel': 'xhigh',
+        }), encoding='utf-8')
+        engines['claude']['config_home'] = str(cl_home)
+
+        dsh_home = self.root / 'iso-dsh-home'
+        (dsh_home / 'skills' / 'demo').mkdir(parents=True)
+        (dsh_home / '.credentials.yaml').write_text('provider: deepseek\n', encoding='utf-8')
+        (dsh_home / 'AGENTS.md').write_text('# global dsh rules\n', encoding='utf-8')
+        (dsh_home / 'skills' / 'demo' / 'SKILL.md').write_text('# skill\n', encoding='utf-8')
+        engines['dsh']['config_home'] = str(dsh_home)
+
+        # Fail-closed checks
+        with self.assertRaisesRegex(harness.HarnessError, 'hooks_only'):
+            harness.invoke_engine('agy:default', self.root, 'x', engines, harness.TASK_JSON_SCHEMA, isolation='hooks_only')
+        with self.assertRaisesRegex(harness.HarnessError, 'soft_rules_only'):
+            harness.invoke_engine('dsh:default', self.root, 'x', engines, harness.TASK_JSON_SCHEMA, isolation='hooks_only')
+        with self.assertRaisesRegex(harness.HarnessError, '冲突'):
+            harness.invoke_engine('codex:default', self.root, 'x', engines, harness.TASK_JSON_SCHEMA, clean_room=True, isolation='full')
+
+        # agy full omits --disable-slash-commands; default (no_skills) keeps it
+        seen_agy_cmds = []
+        def fake_agy_run(command, cwd, input_text, timeout_sec, env=None, native_pid_file=None):
+            seen_agy_cmds.append(list(command))
+            line = json.dumps({'type': 'result', 'structured_output': TASK})
+            return subprocess.CompletedProcess(command, 0, line, '')
+
+        with patch.object(harness, 'run_process', side_effect=fake_agy_run):
+            r_def = {}
+            harness.invoke_engine('agy:default', self.root, '默认', engines, harness.TASK_JSON_SCHEMA, receipt=r_def)
+            self.assertEqual(r_def['isolation'], 'no_skills')
+            self.assertIn('--disable-slash-commands', seen_agy_cmds[-1])
+            r_full = {}
+            harness.invoke_engine('agy:default', self.root, '全挂', engines, harness.TASK_JSON_SCHEMA, receipt=r_full, isolation='full')
+            self.assertEqual(r_full['isolation'], 'full')
+            self.assertNotIn('--disable-slash-commands', seen_agy_cmds[-1])
+
+        # codex no_skills (writable) & hooks_only (writable)
+        def check_codex_iso(expected_agents_md):
+            def _run(command, cwd, input_text, timeout_sec, env=None, native_pid_file=None):
+                iso_dir = Path(env['CODEX_HOME'])
+                self.assertNotEqual(iso_dir.resolve(), cx_home.resolve())
+                self.assertTrue((iso_dir / 'auth.json').is_file())
+                self.assertTrue((iso_dir / 'hooks.json').is_file())
+                self.assertTrue((iso_dir / 'hooks' / 'status_guard.py').is_file())
+                self.assertFalse((iso_dir / 'skills').exists())
+                self.assertEqual((iso_dir / 'AGENTS.md').is_file(), expected_agents_md)
+                out_idx = command.index('-o') + 1
+                Path(command[out_idx]).write_text(json.dumps(TASK), encoding='utf-8')
+                return subprocess.CompletedProcess(command, 0, '', '')
+            return _run
+
+        with patch.object(harness, 'run_process', side_effect=check_codex_iso(True)):
+            rc = {}
+            harness.invoke_engine('codex:default', self.root, '写', engines, harness.TASK_JSON_SCHEMA, readonly=False, receipt=rc, isolation='no_skills')
+            self.assertEqual(rc['isolation'], 'no_skills')
+            self.assertFalse(rc['clean_room'])
+        with patch.object(harness, 'run_process', side_effect=check_codex_iso(False)):
+            rc2 = {}
+            harness.invoke_engine('codex:default', self.root, '写', engines, harness.TASK_JSON_SCHEMA, readonly=False, receipt=rc2, isolation='hooks_only')
+            self.assertEqual(rc2['isolation'], 'hooks_only')
+            self.assertFalse(rc2['clean_room'])
+
+        # claude no_skills, hooks_only (writable), and clean_room (--bare + --disable-slash-commands)
+        def fake_cl_no_skills(command, cwd, input_text, timeout_sec, env=None, native_pid_file=None):
+            self.assertIn('--disable-slash-commands', command)
+            self.assertNotIn('--bare', command)
+            return subprocess.CompletedProcess(command, 0, json.dumps({'structured_output': TASK}), '')
+
+        with patch.object(harness, 'run_process', side_effect=fake_cl_no_skills):
+            harness.invoke_engine('claude:default', self.root, '写', engines, harness.TASK_JSON_SCHEMA, readonly=False, isolation='no_skills')
+
+        def fake_cl_hooks_only(command, cwd, input_text, timeout_sec, env=None, native_pid_file=None):
+            self.assertIn('--disable-slash-commands', command)
+            self.assertNotIn('--bare', command)
+            iso_cl = Path(env['CLAUDE_CONFIG_DIR'])
+            self.assertNotEqual(iso_cl.resolve(), cl_home.resolve())
+            self.assertTrue((iso_cl / 'hooks' / 'status_guard.py').is_file())
+            self.assertFalse((iso_cl / 'CLAUDE.md').exists())
+            self.assertFalse((iso_cl / 'skills').exists())
+            cfg = json.loads((iso_cl / 'settings.json').read_text(encoding='utf-8'))
+            self.assertIn('hooks', cfg)
+            self.assertIn('env', cfg)
+            return subprocess.CompletedProcess(command, 0, json.dumps({'structured_output': TASK}), '')
+
+        with patch.object(harness, 'run_process', side_effect=fake_cl_hooks_only):
+            harness.invoke_engine('claude:default', self.root, '写', engines, harness.TASK_JSON_SCHEMA, readonly=False, isolation='hooks_only')
+
+        def fake_cl_clean_room(command, cwd, input_text, timeout_sec, env=None, native_pid_file=None):
+            self.assertIn('--bare', command)
+            self.assertIn('--disable-slash-commands', command)
+            return subprocess.CompletedProcess(command, 0, json.dumps({'structured_output': TASK}), '')
+
+        with patch.object(harness, 'run_process', side_effect=fake_cl_clean_room):
+            harness.invoke_engine('claude:default', self.root, '盲读', engines, harness.TASK_JSON_SCHEMA, readonly=True, isolation='clean_room')
+
+        # dsh no_skills keeps AGENTS.md and drops skills/
+        def fake_dsh_no_skills(command, cwd, input_text, timeout_sec, env=None, native_pid_file=None):
+            iso_dsh = Path(env['DSH_HOME'])
+            self.assertTrue((iso_dsh / '.credentials.yaml').is_file())
+            self.assertTrue((iso_dsh / 'AGENTS.md').is_file())
+            self.assertFalse((iso_dsh / 'skills').exists())
+            return subprocess.CompletedProcess(command, 0, json.dumps({'type': 'final', 'reason': {'kind': 'completed'}, 'text': json.dumps(TASK)}), '')
+
+        with patch.object(harness, 'run_process', side_effect=fake_dsh_no_skills):
+            harness.invoke_engine('dsh:default', self.root, '写', engines, harness.TASK_JSON_SCHEMA, readonly=False, isolation='no_skills')
+
+        # plan card renders explicit isolation & ticket execution rejects mismatched isolation
+        plans = self.root / 'iso-plans'
+        with patch.object(harness, '_args_backends', return_value=engines):
+            _, tk = self.capture(harness.cmd_plan, self.args(
+                'plan', '--caller', 'antigravity', '--engine', 'codex:fixture-code', '--kind', 'review',
+                '--isolation', 'hooks_only', '--target', str(target_py), '--plan-dir', str(plans),
+                '--session-id', 'iso-sess', '--save-ticket', '--workflow-goal', '核对隔离'))
+            self.assertEqual(tk['streams'][0]['isolation'], 'hooks_only')
+            self.assertFalse(tk['streams'][0]['clean_room'])
+            self.assertIn('否（隔离：hooks_only）', tk['human_popup_markdown'])
+            self.capture(harness.cmd_plan, self.args(
+                'plan', '--caller', 'antigravity', '--plan-dir', str(plans),
+                '--session-id', 'iso-sess', '--approve-ticket', tk['ticket_id']))
+            with self.assertRaisesRegex(harness.HarnessError, '隔离模式'):
+                harness.cmd_task(self.args(
+                    'task', '--caller', 'antigravity', '--engine', 'codex:fixture-code', '--kind', 'review',
+                    '--target', str(target_py), '--task', '核对隔离', '--plan-dir', str(plans),
+                    '--session-id', 'iso-sess', '--ticket', tk['ticket_id'], '--dry-run'))
+
+        # Native agent per-file model resolution & native_agent_profiles metadata
+        model_cx, disp_cx, _, _ = harness._native_plan_model('codex', engines['codex'], 'inherit', agent_type='readonly-auditor')
+        self.assertEqual(model_cx, 'codex-agent-custom')
+        self.assertEqual(disp_cx, 'inherit -> codex-agent-custom (agent:readonly-auditor)')
+        model_cl, disp_cl, _, _ = harness._native_plan_model('claude', engines['claude'], 'inherit', agent_type='readonly-auditor')
+        self.assertEqual(model_cl, 'claude-agent-custom')
+        self.assertEqual(disp_cl, 'inherit -> claude-agent-custom (agent:readonly-auditor)')
+
+        custom_pf = self.root / 'native-pf.json'
+        base_pf = json.loads((Path(harness.__file__).resolve().parent.parent / 'fleet_profile.json').read_text(encoding='utf-8'))
+        base_pf['native_agent_profiles'] = {'codex': {'main_model': 'fixture-code', 'max_parallel_subagents': 3}}
+        custom_pf.write_text(json.dumps(base_pf, ensure_ascii=False), encoding='utf-8')
+        with patch.dict(os.environ, {'CAE_FLEET_PROFILE': str(custom_pf)}), \
+             patch.object(harness, '_args_backends', return_value=engines):
+            self.assertIn('native_agent_profiles', harness._fleet_profile_summary())
+            _, ntk = self.capture(harness.cmd_plan, self.args(
+                'plan', '--caller', 'codex', '--channel', 'native_subagent', '--agent-type', 'readonly-auditor',
+                '--target', str(target_py), '--plan-dir', str(plans)))
+            self.assertEqual(ntk['streams'][0]['model'], 'codex-agent-custom')
+            self.assertEqual(ntk['streams'][0]['execution_profile']['native_agent_profile']['max_parallel_subagents'], 3)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

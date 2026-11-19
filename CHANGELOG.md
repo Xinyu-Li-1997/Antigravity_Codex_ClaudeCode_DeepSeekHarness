@@ -2,6 +2,21 @@
 
 本文件记录四客户端共用规则、会话钩子、后台验证工具与上游维护流程的版本演进。当前插件版本以 `template/user-guard/plugin.json` 为准；常驻使用文档只说明机制和配置键，不重复维护版本号与性能日期。
 
+## [1.17.0] - 2026-11-19
+
+补齐多维正交隔离参数 `--isolation`、独立内生代理档案 `native_agent_profiles`、`swarm` 并发流数精确计费与 Windows/WSL2 双端体检，并完成四客户端 `fleet-evolve` 全面更新与本机无头实测：
+
+- **正交隔离级别与内生代理独立建档（`cae_harness.py`、`user_words.py`、`cae-harness/SKILL.md`）**：
+  - 在 `task`、`gate`、`audit`、`plan`、`batch` 及 `--spec-file` 新增 `--isolation`（`full`、`no_skills`、`hooks_only`、`clean_room`），与后端、模型、挡位、读写模式解耦并保持 `--clean-room` 兼容；为 Claude `clean_room` 补齐 `--disable-slash-commands`，对 `agy` 的 `hooks_only`/`clean_room` 及 `dsh` 当前 `soft_rules_only` 状态的 `hooks_only` 显式报错拒绝；确认单第 9 项对非默认隔离模式追加标注并在持票执行时校验一致性；
+  - 新增 `_native_agent_profile` 读取 `fleet_profile.json` 中独立的 `native_agent_profiles`，并在 `_native_plan_model` 解析 `inherit` 时优先识别 Codex `agents/*.toml` 与 Claude/Antigravity 代理前置元数据中的显式 `model`；在 `PHYSICAL_SUBSTANCE_TAGS` 补充 `neon` 以防气体组分提示误触发模型点名。
+- **并发流数计费与双端安装体检加固（`status_guard.py`、`install.py`、`fleet-evolve/SKILL.md`）**：
+  - 在 `status_guard.py` 新增 `_native_call_stream_weight`，对 `swarm` 的 `add` 调用按 `tasks` 列表长度或正整数 `n` 精确计入通道票据容量；
+  - 在 `install.py --audit-upgrade` 保留 `dsh` 的 `hook_protocol`、`hard_hooks_supported`、`meta_update_trigger`，新增 `cross_side_status` 与 `fleet_profile.native_agent_profiles_configured`；对 `antigravity-cli/settings.json` 与 `cae_models_cache.json` 的只读探查放行同步盘临时硬链接（写入目标与符号链接仍严格拦截）；在 `fleet-evolve/SKILL.md` 补齐四端工具、双端同步、内生代理与跨端协同四维盘点规程。
+- **动态能力矩阵全面更新与本机实测（`fleet_profile.json`、`tests/`）**：
+  - 按 `fleet-evolve` 审定结果在 `fleet_profile.json` 新增 `native_agent_profiles`，更新 `client_catalog_rules.agy.family_priority`、`roles` 五槽位与 `subscription_matrix`（新增并启用 `gemini-4-neon`、`gpt-6.2-sol`、`gpt-6.2-astra`，保留 `gemini-4-carbon`、`gpt-6.1-sol`、`gpt-6-astra` 兼容点名，维持 `k3.1-pro[1m]` 停用），并完成四客户端轻量只读无头实测与双端 `unittest` 回归。
+
+---
+
 ## [1.16.0] - 2026-11-17
 
 重构共享钩子基础库 `hooks/_lib/`、实现按客户端与模型/推理强度动态自适应的压缩与交接策略、新增确认单 `<ticket_id>_card.md` 写入与历史确认单折叠（`collapse_historical_cards`），并加固 `cae_harness.py` 票据并发锁与 `fleet_state.py` 锁/序列化边界：

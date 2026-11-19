@@ -3228,6 +3228,17 @@ def _native_dispatch(name: str, args: Dict[str, Any]) -> bool:
         name == "swarm" and str(args.get("action") or args.get("Action")).lower() == "add")
 
 
+def _native_call_stream_weight(name: str, args: Any) -> int:
+    if name == "swarm" and isinstance(args, dict):
+        tasks = args.get("tasks") if "tasks" in args else args.get("Tasks")
+        if isinstance(tasks, list) and tasks:
+            return len(tasks)
+        raw_n = args.get("n") if "n" in args else args.get("N")
+        if isinstance(raw_n, int) and not isinstance(raw_n, bool) and raw_n > 0:
+            return raw_n
+    return 1
+
+
 def _dispatch_transcript(payload: Dict[str, Any]) -> Optional[Path]:
     raw = payload.get("transcriptPath") or payload.get("transcript_path")
     return user_words.resolve_compact_transcript_path(Path(raw).expanduser()) if raw else None
@@ -3600,14 +3611,20 @@ def _check_dispatch_locked(payload, tool_name, args, sid, state_dir):
         identity = str(payload.get("tool_use_id") or payload.get("call_id") or "")
         if identity:
             calls = [call for call in calls if call["call_id"] != identity]
-        prior = max(state["count"], len(calls))
+        weight = _native_call_stream_weight(tool_name, args)
+        prior_transcript_count = sum(_native_call_stream_weight(call["name"], call.get("args")) for call in calls)
+        prior = max(state["count"], prior_transcript_count)
         duplicate = identity and identity in state.get("calls", [])
-        count = prior if duplicate else prior + 1
+        count = prior if duplicate else prior + weight
         channel = {"run_workflow": "native_workflow", "swarm": "native_swarm"}.get(tool_name, "native_subagent")
         channel_counts = state.get("channel_counts", {})
-        channel_prior = max(channel_counts.get(channel, 0), sum(
-            {"run_workflow": "native_workflow", "swarm": "native_swarm"}.get(call["name"], "native_subagent") == channel for call in calls))
-        channel_count = channel_prior if duplicate else channel_prior + 1
+        channel_transcript_prior = sum(
+            _native_call_stream_weight(call["name"], call.get("args"))
+            for call in calls
+            if {"run_workflow": "native_workflow", "swarm": "native_swarm"}.get(call["name"], "native_subagent") == channel
+        )
+        channel_prior = max(channel_counts.get(channel, 0), channel_transcript_prior)
+        channel_count = channel_prior if duplicate else channel_prior + weight
         capacity = max((sum(isinstance(row, dict) and row.get("channel") == channel
                             for row in ticket.get("streams", [])) for ticket in tickets), default=0)
         heavy = tool_name in ("run_workflow", "swarm") or not _native_readonly(args) or count >= _heavy_min_streams()

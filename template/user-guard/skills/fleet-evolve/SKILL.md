@@ -22,13 +22,20 @@ description: >
 | `hygiene`，全量优化 | 基于已审定配置修正代码、钩子及路由问题，整篇重写文档，完成事实核对、脱敏和回归。 | 不自动升级外部工具，不自行改变长期推荐或运行阈值。 |
 | `audit`，只读巡检 | 核对配置漂移、供应商卡片、配额冷却和二进制接口（ABI）风险。 | 不安装、不升级、不刷新缓存、不改变状态。 |
 
-规则、技能、安装器、钩子和派工脚本负责执行机制；[fleet_profile.json](../cae-harness/fleet_profile.json) 是角色与参数的唯一配置来源。评估覆盖 `orchestrator`、`math`、`code`、`review`、`fast` 全部五个槽位，不永久固定某个客户端或模型。候选、推荐挡位、声明最大窗口、短板隔离和 `runtime_tunables` 集中维护，常驻文档不散布时期性模型名、静态日期和运行阈值。
+规则、技能、安装器、钩子和派工脚本负责执行机制；[fleet_profile.json](../cae-harness/fleet_profile.json) 是角色与参数的唯一配置来源。评估覆盖 `orchestrator`、`math`、`code`、`review`、`fast` 全部五个槽位，不永久固定某个客户端或模型；同时按可选的 `native_agent_profiles` 独立管理各客户端自身的主会话、内生子代理模型/挡位与并发策略，不与 `cae-harness` 跨端槽位混写。候选、推荐挡位、声明最大窗口、短板隔离和 `runtime_tunables` 集中维护，常驻文档不散布时期性模型名、静态日期和运行阈值。
 
 `runtime_tunables` 包含压缩恢复、长会话交接、循环与轮询防护、无头派工、本地路由和确认门禁。压缩恢复按 `compaction_recovery` 的客户端配置并由 `hooks/_lib/adaptive_policy.py` 结合当前模型与推理强度动态缩放预算，无条件保留最新返回，同时优先归档候选窗口内达到实质长度阈值的推导与审查。测试可用 `CAE_FLEET_PROFILE` 指向隔离配置，不能让测试配置覆盖正在使用的全局配置。
 
 ## 第一道门：联网评估与启停决策
 
-`full` 同时回答能力是否适合任务、本机目前是否可用、本机配置何种额度三个问题。以官方资料、本机报错、只读探测和已授权实测分别支撑结论。程序存在不能证明登录有效，官方声明可用不能证明本机已配置，订阅记录也不能证明当前尚有额度。
+`full` 同时回答能力是否适合任务、本机目前是否可用、本机配置何种额度三个问题，并按四个独立维度逐项盘点与提审：
+
+1. **四端客户端与配套工具**：分别核查 Antigravity、Codex、Claude Code、DeepSeek Harness 与 CC Switch 的本地版本、上游更新及协议能力（DSH 须核对 `hook_protocol`、`hard_hooks_supported` 与 `meta_update_trigger`，CC Switch 须核对卡片、路由与旧残余提示词）。
+2. **Windows 与 WSL2 双端**：依据 `install.py --audit-upgrade` 输出的 `cross_side_status`，在已检测到对侧客户端或配置时分别对 Windows 与 WSL2 两侧执行只读体检、预览与同步，不以跨端互操作代替对侧原生配置对齐。
+3. **各客户端内生代理维度**：在 `native_agent_profiles` 中独立评估每个客户端自身的主会话默认模型与挡位、内生子代理机制（如 `invoke_subagent`、`swarm`、`spawn_agent`、`Agent`）、只读代理定义与并发上限，与跨端派工解耦。
+4. **跨端协同维度（`cae-harness`）**：独立评估五个角色槽位、`subscription_matrix`、`runtime_tunables`、有头原生与无头跨端通道分工，以及 `--isolation`（`full`、`no_skills`、`hooks_only`、`clean_room`）在各端的实际支持边界。
+
+以官方资料、本机报错、只读探测和已授权实测分别支撑结论。程序存在不能证明登录有效，官方声明可用不能证明本机已配置，订阅记录也不能证明当前尚有额度。
 
 对每个候选 agent 与 LLM 展示全网评估依据、本机当前可用性、额度类型、适合角色、优势和限制。额度按实际配置区分滚动窗口、卡片套餐、余额及日月限额，不能把不同通道合并成一种无限额度。资料或本地信息缺失时明确标为未知。
 

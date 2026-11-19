@@ -1663,13 +1663,13 @@ def _plan_agy_model(
     settings_path = cli_dir / "settings.json"
     desktop_path = gemini_root / "config" / "config.json"
     cache_path = cli_dir / "cache" / "cae_models_cache.json"
-    _validate_path(settings_path, directory=False)
-    settings_raw = _read_optional_bytes(settings_path)
+    _validate_path(settings_path, directory=False, allow_hardlinks=True)
+    settings_raw = _read_optional_bytes(settings_path, allow_hardlinks=True)
     settings = _read_json_object(settings_path, settings_raw)
     current = settings.get("model")
     if not overwrite and not (isinstance(current, str) and current.strip()):
-        _validate_path(desktop_path, directory=False)
-        desktop = _read_json_object(desktop_path, _read_optional_bytes(desktop_path))
+        _validate_path(desktop_path, directory=False, allow_hardlinks=True)
+        desktop = _read_json_object(desktop_path, _read_optional_bytes(desktop_path, allow_hardlinks=True))
         user_settings = desktop.get("userSettings", {})
         if not isinstance(user_settings, dict):
             raise ValueError(f"{desktop_path} 的 userSettings 必须为对象")
@@ -1678,8 +1678,8 @@ def _plan_agy_model(
         print("[*] 保留 Antigravity 已配置的默认模型。")
         return []
 
-    _validate_path(cache_path, directory=False)
-    cache_raw = _read_optional_bytes(cache_path)
+    _validate_path(cache_path, directory=False, allow_hardlinks=True)
+    cache_raw = _read_optional_bytes(cache_path, allow_hardlinks=True)
     models: List[Dict[str, str]] = []
     changes = []
     agy_bin = None if dry_run else _native_cli("agy", gemini_root.parent)
@@ -1694,6 +1694,7 @@ def _plan_agy_model(
         except (OSError, ValueError, subprocess.SubprocessError):
             pass
     if models:
+        _validate_path(cache_path, directory=False)
         snapshot = {
             "source": "agy_models_cli",
             "fetched_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -1714,6 +1715,7 @@ def _plan_agy_model(
         suffix = "。预演不会查询 CLI，正式安装可尝试读取本侧模型目录。" if dry_run else "，保留原配置。"
         print("[*] 未取得 Antigravity 的可用模型目录" + suffix)
     elif settings.get("model") != label:
+        _validate_path(settings_path, directory=False)
         settings["model"] = label
         changes.append(FileChange(settings_path, settings_raw, _preserve_text_format(_json_bytes(settings), settings_raw)))
     return changes
@@ -3088,13 +3090,13 @@ def audit_upgrade_status(
     except (KeyError, IndexError, TypeError, ValueError):
         ag["drift_files"].append("hooks.json")
     gemini_root = target_plugin_dir.parent.parent.parent if target_plugin_dir.parent.name == "plugins" else target_plugin_dir.parent
-    ag_settings = read_json(gemini_root / "antigravity-cli/settings.json")
-    ag_desktop = read_json(gemini_root / "config/config.json").get("userSettings", {})
+    ag_settings = read_json(gemini_root / "antigravity-cli/settings.json", allow_hardlinks=True)
+    ag_desktop = read_json(gemini_root / "config/config.json", allow_hardlinks=True).get("userSettings", {})
     desktop_model = ag_desktop.get("model") if isinstance(ag_desktop, dict) else None
-    ag["configured_model"] = ag_settings.get("model") or desktop_model or read_json(gemini_root / "antigravity/settings.json").get("model")
-    ag_models = read_json(gemini_root / "antigravity-cli/cache/cae_models_cache.json").get("models", [])
+    ag["configured_model"] = ag_settings.get("model") or desktop_model or read_json(gemini_root / "antigravity/settings.json", allow_hardlinks=True).get("model")
+    ag_models = read_json(gemini_root / "antigravity-cli/cache/cae_models_cache.json", allow_hardlinks=True).get("models", [])
     if not ag_models:
-        ag_models = read_json(gemini_root / "antigravity/cache/cae_models_cache.json").get("models", [])
+        ag_models = read_json(gemini_root / "antigravity/cache/cae_models_cache.json", allow_hardlinks=True).get("models", [])
     if not isinstance(ag_models, list):
         ag_models = []
     ag_models = [item for item in ag_models if isinstance(item, dict) and isinstance(item.get("slug"), str)]
@@ -3284,7 +3286,11 @@ def audit_upgrade_status(
                     "static_timeout_override": None,
                     "template_hashes": {relative: hashlib.sha256(source.read_bytes()).hexdigest() for source, relative in router_sources}}
 
-    dsh = _audit_cli(detection.get("dsh", {}))
+    dsh_det = detection.get("dsh", {})
+    dsh = _audit_cli(dsh_det)
+    dsh["hook_protocol"] = dsh_det.get("hook_protocol", "soft_rules_only")
+    dsh["hard_hooks_supported"] = bool(dsh_det.get("hard_hooks_supported", False))
+    dsh["meta_update_trigger"] = dsh_det.get("meta_update_trigger", "awaiting_upstream_dsh_hooks")
     dsh["drift_files"] = drift(dsh_root, [(template / "rules/AGENTS.md", "AGENTS.md"), *skill_sources], core_rules=True)
     for sname in managed_skill_names:
         extend_stale_mirror_drift(dsh["drift_files"], template / "skills" / sname, dsh_root / "skills" / sname, dsh_root)
@@ -3515,15 +3521,51 @@ def audit_upgrade_status(
         actions.append("repair_unreadable_configs")
     toolchain = _audit_host_toolchain(is_sandbox_run=is_sandbox_run, detection=detection)
     eval_policy = fleet_profile.get("evaluation_policy") if isinstance(fleet_profile.get("evaluation_policy"), dict) else {}
+    native_profiles = fleet_profile.get("native_agent_profiles") if isinstance(fleet_profile.get("native_agent_profiles"), dict) else {}
+    wsl_probe_data = detection.get("wsl_probe") if isinstance(detection.get("wsl_probe"), dict) else {}
+    peer_apps_detected: Dict[str, bool] = {}
+    if os.name == "nt" and isinstance(wsl_probe_data.get("apps"), dict):
+        wsl_apps = wsl_probe_data["apps"]
+        wsl_key_map = {
+            "antigravity": ("agy", "antigravity"),
+            "codex": ("codex",),
+            "claude": ("claude",),
+            "dsh": ("dsh",),
+            "cc_switch": ("cc-switch", "cc_switch"),
+        }
+        for app_key, aliases in wsl_key_map.items():
+            entries = next((wsl_apps[k] for k in aliases if k in wsl_apps), [])
+            peer_apps_detected[app_key] = bool(
+                isinstance(entries, list)
+                and any(isinstance(item, dict) and (item.get("binary") or item.get("config_dir_exists")) for item in entries)
+            )
+    elif detection.get("is_wsl"):
+        for app_key in ("antigravity", "codex", "claude", "dsh", "cc_switch"):
+            peer_apps_detected[app_key] = bool((detection.get(app_key) or {}).get("interop_available"))
+    peer_side_present = bool(any(peer_apps_detected.values()))
+    cross_side_status = {
+        "current_side": "windows" if os.name == "nt" else ("wsl" if detection.get("is_wsl") else "posix"),
+        "peer_side": "wsl" if os.name == "nt" else ("windows" if detection.get("is_wsl") else None),
+        "peer_side_present": peer_side_present,
+        "peer_apps_detected": peer_apps_detected,
+        "dual_side_sync_required": bool(not is_sandbox_run and peer_side_present),
+        "peer_audit_hint": (
+            "检测到对侧环境存在客户端或配置，全面更新须在 Windows 与 WSL2 两侧分别执行 install.py --audit-upgrade 与同步（不依赖单侧覆盖）。"
+            if (not is_sandbox_run and peer_side_present)
+            else None
+        ),
+    }
     report = {"plugin_version": repo_version,
               "fleet_profile": {
                   "profile_id": fleet_profile.get("profile_id"),
                   "evaluated_at": fleet_profile.get("evaluated_at"),
                   "all_roles_dynamic": bool(eval_policy.get("all_roles_dynamic", True)),
                   "dynamic_tunables_enabled": bool(eval_policy.get("dynamic_tunables_enabled", isinstance(fleet_profile.get("runtime_tunables"), dict))),
+                  "native_agent_profiles_configured": sorted(k for k in native_profiles if isinstance(k, str)),
               },
               "host": {"platform": sys.platform, "python_version": sys.version.split()[0], "is_wsl": detection.get("is_wsl"),
                        "wsl_probe": detection.get("wsl_probe"), "toolchain": toolchain},
+              "cross_side_status": cross_side_status,
               "antigravity": ag, "codex": cx, "claude": cl, "dsh": dsh, "cc_switch": cc,
               "subscription_candidates": subscription_candidates,
               "summary": {"all_aligned": not actions, "recommended_actions": actions},

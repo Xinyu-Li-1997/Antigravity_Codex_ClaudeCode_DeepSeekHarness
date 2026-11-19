@@ -45,7 +45,7 @@ description: >
 
 轻任务按 `runtime_tunables.dispatch_confirmation` 的流数、文件数、估算 Token 和超时阈值静默执行。多路、可写或超出轻任务阈值的调用进入重负载流程，不能仅凭名称自行判轻。内部 `invoke_subagent`、`run_workflow`、`spawn_agent`、`Agent` 等多路或可写委派与外部无头调用均须纳入确认。
 
-`plan` 可接收单流参数，也可通过 `--spec-file` 读取非空对象列表。流内字段覆盖相应公共默认值。通道有 `cae_harness_headless`、`native_subagent`、`native_workflow`、`native_swarm`。原生通道必须指定或识别 `--caller`，默认模型为 `inherit`；确认单显示配置解析出的实际模型，无法解析时保留未解析状态。原生通道不属于无头调用，也不提供净室隔离。
+`plan` 可接收单流参数，也可通过 `--spec-file` 读取非空对象列表。流内字段覆盖相应公共默认值。通道有 `cae_harness_headless`、`native_subagent`、`native_workflow`、`native_swarm`。原生通道必须指定或识别 `--caller`，默认模型为 `inherit`；确认单按前端配置（含 Codex 代理配置与 Claude/Antigravity 代理前置元数据的显式 `model`）解析实际模型，并独立挂载 `fleet_profile.json` 中可选的 `native_agent_profiles` 元数据，无法解析时保留未解析状态。原生通道不属于无头调用，也不提供净室隔离。`status_guard.py` 对 `swarm` 的 `add` 调用按 `tasks` 列表长度或 `n` 计入通道并发容量，避免单次批量派生绕过票据流数上限。
 
 重负载确认单先说明工作流背景、要做什么和预计后果，再输出 4 列各路总览表与每路纵向展开的 14 项完整参数表（保存票据时先写 `<ticket_id>.json` 再写 `<ticket_id>_card.md` 明细文件，并附精简摘要 `compact_summary_card`）。不能省略未知字段，也不能以角色槽位代替实际模型。
 
@@ -152,7 +152,16 @@ python -B -X utf8 "$HARNESS" gate --worker role:code --target "<项目根目录>
 
 ## 只读隔离与结果验收
 
-`task --clean-room` 只支持 Codex、Claude Code 和 DeepSeek Harness 的只读任务，剥离全局规则、钩子、技能及项目自动说明，用于新读者可读性检查。净室所需配置和暂存目录也须服从本轮授权，不因默认使用临时目录就获得额外写入许可。
+无头执行支持独立的 `--isolation` 参数（`full`、`no_skills`、`hooks_only`、`clean_room`），可与客户端、模型、挡位及读写模式正交组合；流规格 JSON 也可逐流声明 `isolation`：
+
+| 隔离级别 | 保留与剥离边界 | 支持后端与读写限制 |
+| --- | --- | --- |
+| `full` | 保留全局规则、安全钩子与全局技能（`agy` 显式放开斜杠命令与技能） | 四端均支持，只读与可写均适用（`codex`、`claude`、`dsh` 默认值） |
+| `no_skills` | 保留全局规则与安全钩子，剥离全局技能与斜杠命令 | 四端均支持，只读与可写均适用（`agy` 未显式指定时默认值） |
+| `hooks_only` | 保留底层凭据与安全钩子，剥离全局规则与技能 | 仅 `codex`、`claude` 支持，只读与可写均适用；`agy` 与当前 `soft_rules_only` 状态的 `dsh` 显式报错 |
+| `clean_room` | 等同 `--clean-room`：仅保留凭据，剥离全局规则、钩子、技能及项目自动说明（`claude` 同时启用 `--bare` 与 `--disable-slash-commands`） | 仅 `codex`、`claude`、`dsh` 支持，且仅限只读任务 |
+
+净室与隔离所需的临时配置及暂存目录同样服从本轮授权，不因默认使用临时目录就获得额外写入许可。非默认隔离模式会在确认单第 9 项标注并在持票执行时校验一致性。
 
 审查任务禁止修改文件或运行构建测试，前后以文件哈希快照核验零改动。可写任务通过 `--write-scope` 限定白名单；发生 `scope_violation` 时保留现场并报告，不扩大范围掩盖越界。无头子进程设置 `CAE_HARNESS_DEPTH=1` 防止嵌套派工，不得再次调用编排器；只读探测及 `check-grounding` 按脚本规定放行。
 

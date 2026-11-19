@@ -78,6 +78,9 @@ EFFORT_LADDER = ('minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra')
 TIER_CHOICES = ('auto', 'ultra', 'max', 'xhigh', 'high', 'medium', 'low')
 
 
+ISOLATION_CHOICES = ('full', 'no_skills', 'hooks_only', 'clean_room')
+
+
 _DEFAULT_CATALOG_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
 CATALOG_MAX_AGE_SECONDS = _DEFAULT_CATALOG_MAX_AGE_SECONDS
 
@@ -300,7 +303,7 @@ PROMPT_MODEL_HINT_PATTERNS = (
 
 
 PHYSICAL_SUBSTANCE_TAGS = {
-    'hydrogen', 'carbon', 'argon', 'oxygen', 'nitrogen', 'helium', 'methane', 'air', 'water', 'soot',
+    'hydrogen', 'carbon', 'argon', 'neon', 'oxygen', 'nitrogen', 'helium', 'methane', 'air', 'water', 'soot',
 }
 
 
@@ -3254,13 +3257,16 @@ def _enforce_preflight_quota(backends, specs, retry_quota=False, *, batch=None, 
                                **_quota_user_choices(prefix, cooldown))
 
 
-def _local_fallback_engine(caller, engine, backends, prompt_text='', *, clean_room=False, exclude_prefixes=()):
+def _local_fallback_engine(caller, engine, backends, prompt_text='', *, clean_room=False, isolation='', exclude_prefixes=()):
     cur_prefix, _ = _engine_parts(engine)
     if _extract_prompt_backend_hint(prompt_text) or _extract_prompt_model_hint(prompt_text):
         return None
     excluded = set(_extract_negated_backends(prompt_text)) | {str(p).strip().lower() for p in exclude_prefixes if p}
-    if clean_room:
+    norm_iso = _normalize_isolation(isolation, clean_room=clean_room)
+    if norm_iso == 'clean_room':
         excluded.add('agy')
+    elif norm_iso == 'hooks_only':
+        excluded.update({'agy', 'dsh'})
     caller_id = resolve_caller(caller)
     local = {'antigravity': 'agy', 'codex': 'codex', 'claude': 'claude', 'dsh': 'dsh'}.get(caller_id)
     fb_map = _fleet_profile().get('peer_fallback_order')
@@ -4452,19 +4458,72 @@ def _codex_invocation_token_usage(info, started, ended):
     return unknown
 
 
+def _normalize_isolation(raw_isolation='', *, clean_room=False):
+    raw = str(raw_isolation or '').strip().lower()
+    if raw and raw not in ISOLATION_CHOICES:
+        raise HarnessError(f'不支持的隔离模式: {raw!r}（可选：{", ".join(ISOLATION_CHOICES)}）')
+    if clean_room:
+        if raw and raw != 'clean_room':
+            raise HarnessError(f'--clean-room 与 --isolation {raw} 冲突，请仅指定其一')
+        return 'clean_room'
+    return raw
+
+
+def _effective_isolation(prefix, raw_isolation='', *, clean_room=False):
+    norm = _normalize_isolation(raw_isolation, clean_room=clean_room)
+    if norm:
+        return norm, True
+    return ('no_skills' if prefix == 'agy' else 'full'), False
+
+
+def _validate_isolation(prefix, mode, readonly):
+    if mode == 'clean_room':
+        if not readonly:
+            raise HarnessError('--clean-room 仅支持只读任务，写入任务必须保留全局安全钩子')
+        if prefix == 'agy':
+            raise HarnessError('agy 后端不支持剥离全局插件目录，--clean-room 请选用 codex、claude 或 dsh')
+    elif mode == 'hooks_only':
+        if prefix == 'agy':
+            raise HarnessError('agy 后端不支持仅保留钩子并剥离全局规则/技能的 hooks_only 模式，请选用 codex 或 claude')
+        if prefix == 'dsh':
+            raise HarnessError('dsh 当前为软规则模式（soft_rules_only），不支持 hooks_only 隔离，请选用 no_skills、clean_room 或改用 codex/claude')
+
+
+def _copy_tree_no_links(src_dir, dst_dir):
+    src_dir = Path(src_dir)
+    dst_dir = Path(dst_dir)
+    if not src_dir.is_dir() or _is_link(src_dir):
+        return
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    for root, dirs, files in os.walk(src_dir):
+        root_path = Path(root)
+        rel_root = root_path.relative_to(src_dir)
+        kept = []
+        for dirname in sorted(dirs):
+            if dirname == '__pycache__':
+                continue
+            cand = root_path / dirname
+            if not _is_link(cand):
+                kept.append(dirname)
+                (dst_dir / rel_root / dirname).mkdir(parents=True, exist_ok=True)
+        dirs[:] = kept
+        for fname in sorted(files):
+            fsrc = root_path / fname
+            if not _is_link(fsrc) and fsrc.is_file():
+                shutil.copy2(fsrc, dst_dir / rel_root / fname)
+
+
 def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, timeout_sec=600,
                   agent='readonly-collaborator', stage_files=None, effort=None, retry_quota=False,
-                  *, profile=None, batch=None, receipt=None, clean_room=False, inline_readonly=None):
+                  *, profile=None, batch=None, receipt=None, clean_room=False, isolation='', inline_readonly=None):
     wall_start = time.monotonic()
     invoke_start_epoch = time.time()
     wall_deadline = wall_start + timeout_sec
     batch = batch or _QuotaBatch(retry_quota)
     prefix, _ = _engine_parts(spec)
-    if clean_room:
-        if not readonly:
-            raise HarnessError('--clean-room 仅支持只读任务，写入任务必须保留全局安全钩子')
-        if prefix == 'agy':
-            raise HarnessError('agy 后端不支持剥离全局插件目录，--clean-room 请选用 codex、claude 或 dsh')
+    iso_mode, _ = _effective_isolation(prefix, isolation, clean_room=clean_room)
+    clean_room = iso_mode == 'clean_room'
+    _validate_isolation(prefix, iso_mode, readonly)
     info = backends.get(prefix, {})
     if not info.get('available'):
         raise HarnessError(f'未发现所选后端 {prefix}')
@@ -4506,35 +4565,65 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
             env.pop(_scrub_k, None)
         env['CAE_HARNESS_DEPTH'] = '1'
         effective_codex_home = info.get('config_home')
+        effective_claude_home = info.get('config_home')
         effective_dsh_home = info.get('config_home')
         clean_claude_settings = None
-        if clean_room:
+        if iso_mode in ('no_skills', 'hooks_only', 'clean_room'):
             src_home = Path(info['config_home']) if info.get('config_home') else None
             if prefix == 'codex':
-                clean_codex = temp_path / 'clean-codex-home'
-                clean_codex.mkdir(parents=True, exist_ok=True)
+                iso_codex = temp_path / ('clean-codex-home' if clean_room else f'iso-{iso_mode}-codex-home')
+                iso_codex.mkdir(parents=True, exist_ok=True)
                 if src_home and src_home.is_dir():
-                    for fname in ('auth.json', 'models_cache.json'):
+                    copy_files = ('auth.json', 'models_cache.json')
+                    if iso_mode == 'hooks_only':
+                        copy_files = ('auth.json', 'models_cache.json', 'config.toml', 'hooks.json')
+                    elif iso_mode == 'no_skills':
+                        copy_files = ('auth.json', 'models_cache.json', 'config.toml', 'AGENTS.md', 'hooks.json')
+                    for fname in copy_files:
                         fsrc = src_home / fname
                         if fsrc.is_file() and not _is_link(fsrc):
-                            shutil.copy2(fsrc, clean_codex / fname)
-                effective_codex_home = str(clean_codex)
+                            shutil.copy2(fsrc, iso_codex / fname)
+                    if iso_mode in ('hooks_only', 'no_skills'):
+                        _copy_tree_no_links(src_home / 'hooks', iso_codex / 'hooks')
+                    if iso_mode == 'no_skills':
+                        _copy_tree_no_links(src_home / 'agents', iso_codex / 'agents')
+                effective_codex_home = str(iso_codex)
             elif prefix == 'claude':
-                env_only = {}
-                if src_home and (src_home / 'settings.json').is_file() and not _is_link(src_home / 'settings.json'):
-                    try:
-                        raw_cfg = json.loads((src_home / 'settings.json').read_text(encoding='utf-8-sig'))
-                    except (OSError, ValueError):
-                        raw_cfg = {}
-                    if isinstance(raw_cfg, dict) and isinstance(raw_cfg.get('env'), dict):
-                        env_only = {'env': raw_cfg['env']}
-                clean_claude_settings = temp_path / 'clean-claude-settings.json'
-                clean_claude_settings.write_text(json.dumps(env_only, ensure_ascii=False), encoding='utf-8')
-            elif prefix == 'dsh':
-                clean_dsh = temp_path / 'clean-dsh-home'
-                clean_dsh.mkdir(parents=True, exist_ok=True)
+                if clean_room:
+                    env_only = {}
+                    if src_home and (src_home / 'settings.json').is_file() and not _is_link(src_home / 'settings.json'):
+                        try:
+                            raw_cfg = json.loads((src_home / 'settings.json').read_text(encoding='utf-8-sig'))
+                        except (OSError, ValueError):
+                            raw_cfg = {}
+                        if isinstance(raw_cfg, dict) and isinstance(raw_cfg.get('env'), dict):
+                            env_only = {'env': raw_cfg['env']}
+                    clean_claude_settings = temp_path / 'clean-claude-settings.json'
+                    clean_claude_settings.write_text(json.dumps(env_only, ensure_ascii=False), encoding='utf-8')
+                elif iso_mode == 'hooks_only':
+                    iso_claude = temp_path / 'iso-hooks-only-claude-home'
+                    iso_claude.mkdir(parents=True, exist_ok=True)
+                    hooks_cfg = {}
+                    if src_home and (src_home / 'settings.json').is_file() and not _is_link(src_home / 'settings.json'):
+                        try:
+                            raw_cfg = json.loads((src_home / 'settings.json').read_text(encoding='utf-8-sig'))
+                        except (OSError, ValueError):
+                            raw_cfg = {}
+                        if isinstance(raw_cfg, dict):
+                            for keep_key in ('env', 'hooks', 'effortLevel', 'permissions'):
+                                if keep_key in raw_cfg:
+                                    hooks_cfg[keep_key] = raw_cfg[keep_key]
+                    (iso_claude / 'settings.json').write_text(json.dumps(hooks_cfg, ensure_ascii=False), encoding='utf-8')
+                    if src_home:
+                        _copy_tree_no_links(src_home / 'hooks', iso_claude / 'hooks')
+                    effective_claude_home = str(iso_claude)
+            elif prefix == 'dsh' and iso_mode in ('no_skills', 'clean_room'):
+                iso_dsh = temp_path / ('clean-dsh-home' if clean_room else 'iso-no-skills-dsh-home')
+                iso_dsh.mkdir(parents=True, exist_ok=True)
                 if src_home and (src_home / '.credentials.yaml').is_file() and not _is_link(src_home / '.credentials.yaml'):
-                    shutil.copy2(src_home / '.credentials.yaml', clean_dsh / '.credentials.yaml')
+                    shutil.copy2(src_home / '.credentials.yaml', iso_dsh / '.credentials.yaml')
+                if iso_mode == 'no_skills' and src_home and (src_home / 'AGENTS.md').is_file() and not _is_link(src_home / 'AGENTS.md'):
+                    shutil.copy2(src_home / 'AGENTS.md', iso_dsh / 'AGENTS.md')
                 if src_home and not env.get('DEEPSEEK_API_KEY') and (src_home / '.env').is_file() and not _is_link(src_home / '.env'):
                     for line in _optional_text(src_home / '.env').splitlines():
                         if line.strip().startswith('#'):
@@ -4545,11 +4634,11 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
                             if _usable_credential(extracted_key):
                                 env['DEEPSEEK_API_KEY'] = extracted_key
                             break
-                effective_dsh_home = str(clean_dsh)
+                effective_dsh_home = str(iso_dsh)
         if prefix == 'codex' and effective_codex_home and not interop:
             env['CODEX_HOME'] = effective_codex_home
-        if prefix == 'claude' and not interop and (os.environ.get('CAE_CLAUDE_HOME') or os.environ.get('CLAUDE_CONFIG_DIR')):
-            env['CLAUDE_CONFIG_DIR'] = info['config_home']
+        if prefix == 'claude' and not interop and (iso_mode == 'hooks_only' or os.environ.get('CAE_CLAUDE_HOME') or os.environ.get('CLAUDE_CONFIG_DIR')):
+            env['CLAUDE_CONFIG_DIR'] = effective_claude_home
         if prefix == 'dsh':
             src_home = Path(info.get('config_home') or Path.home() / '.dsh')
             if not _usable_credential(env.get('DEEPSEEK_API_KEY')):
@@ -4613,8 +4702,10 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
                 input_text = exec_prompt
             elif prefix == 'agy':
                 command = [binary, '--input-format', 'stream-json', '--output-format', 'stream-json',
-                           '--print-timeout', f'{timeout_sec}s', '--json-schema', translate(schema_file),
-                           '--disable-slash-commands', '--sandbox']
+                           '--print-timeout', f'{timeout_sec}s', '--json-schema', translate(schema_file)]
+                if iso_mode != 'full':
+                    command.append('--disable-slash-commands')
+                command.append('--sandbox')
                 if model:
                     command.extend(['--model', model])
                 if effort and profile.get('effort_option_supported') is not False and not _agy_slug_tier(model)[1]:
@@ -4628,9 +4719,11 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
                 command = [binary, '-p', '--output-format', 'json', '--json-schema', json.dumps(schema, ensure_ascii=False),
                            '--no-session-persistence']
                 if clean_room:
-                    command.append('--bare')
+                    command.extend(['--bare', '--disable-slash-commands'])
                     if clean_claude_settings is not None:
                         command.extend(['--settings', translate(clean_claude_settings)])
+                elif iso_mode in ('no_skills', 'hooks_only'):
+                    command.append('--disable-slash-commands')
                 if model:
                     command.extend(['--model', model])
                 if effort in ('low', 'medium', 'high', 'xhigh', 'max'):
@@ -4669,12 +4762,12 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
                                f'{json.dumps(schema, ensure_ascii=False)}')
                 input_text = exec_prompt
             receipt.update(argv=list(command), work_dir=str(exec_dir), staged_readonly_workspace=stage_dir is not None,
-                           clean_room=bool(clean_room),
+                           clean_room=bool(clean_room), isolation=iso_mode,
                            command_transport='windows_interop' if interop else 'native')
             if interop:
                 extra_env = {}
-                if prefix == 'claude':
-                    extra_env['CLAUDE_CONFIG_DIR'] = _wsl_path(Path(info['config_home']))
+                if prefix == 'claude' and effective_claude_home:
+                    extra_env['CLAUDE_CONFIG_DIR'] = _wsl_path(Path(effective_claude_home))
                 elif prefix == 'dsh' and effective_dsh_home:
                     extra_env = {'DSH_HOME': _wsl_path(Path(effective_dsh_home)), 'DSH_TELEMETRY_DISABLED': '1'}
                 command, native_pid_file = _interop_command(command, exec_dir, temp_path, input_text,
@@ -4786,15 +4879,17 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
 
 
 def invoke_readonly_engine(spec, target_dir, prompt, backends, timeout_sec=600, stage_files=None, effort=None, retry_quota=False,
-                           *, profile=None, batch=None, receipt=None, inline_readonly=True):
+                           *, profile=None, batch=None, receipt=None, inline_readonly=True, isolation='', clean_room=False):
     return invoke_engine(spec, target_dir, prompt, backends, AUDIT_JSON_SCHEMA, True, timeout_sec,
-                         'readonly-auditor', stage_files, effort, retry_quota, profile=profile, batch=batch, receipt=receipt, inline_readonly=inline_readonly)
+                         'readonly-auditor', stage_files, effort, retry_quota, profile=profile, batch=batch, receipt=receipt,
+                         clean_room=clean_room, isolation=isolation, inline_readonly=inline_readonly)
 
 
 def invoke_edit_worker(spec, target_dir, prompt, backends, timeout_sec=600, effort=None, retry_quota=False,
-                       *, profile=None, batch=None, receipt=None):
+                       *, profile=None, batch=None, receipt=None, isolation=''):
     result = invoke_engine(spec, target_dir, prompt, backends, TASK_JSON_SCHEMA, False, timeout_sec,
-                           'readonly-collaborator', None, effort, retry_quota, profile=profile, batch=batch, receipt=receipt)
+                           'readonly-collaborator', None, effort, retry_quota, profile=profile, batch=batch, receipt=receipt,
+                           isolation=isolation)
     return json.dumps(result, ensure_ascii=False)
 
 
@@ -5596,7 +5691,8 @@ def _run_cli_gate(args, root, requested_target, text, caller, engine, backends, 
         entry = {'execution_profile': current, 'invocation': invocation, 'variant_changed': variant_key(current) != variant_key(previous)}
         receipts.append(entry)
         return invoke_edit_worker(current['spec'], root, prompt, backends, args.timeout, current['cli_effort'], args.retry_quota,
-                                  profile=current, batch=batch, receipt=invocation)
+                                  profile=current, batch=batch, receipt=invocation,
+                                  isolation=getattr(args, 'isolation', ''))
 
     result = run_physics_gate_loop(root, f'任务目标 {requested_target}。\n' + text, args.verify_cmd, worker,
                                    max_rounds=args.max_rounds, caller=caller, timeout_sec=args.timeout, write_scope=scopes)
@@ -5633,7 +5729,7 @@ def _run_gate_with_fallback(args, root, requested_target, text, caller, engine, 
             or getattr(args, '_approved_ticket', None) or 'quota_fallback' in meta
             or not _gate_can_replay(result, before, root, ignore_dirs=ignore_dirs, ignore_patterns=ignore_patterns)):
         return result
-    fallback = _local_fallback_engine(caller, engine, backends, text)
+    fallback = _local_fallback_engine(caller, engine, backends, text, isolation=getattr(args, 'isolation', ''))
     if not fallback:
         return result
     meta['quota_fallback'] = _quota_fallback_record(engine, fallback, result)
@@ -5665,7 +5761,7 @@ def _fleet_profile_summary():
     prof = _fleet_profile()
     if not prof:
         return None
-    return {
+    summary = {
         'profile_id': prof.get('profile_id'),
         'evaluated_at': prof.get('evaluated_at'),
         'evaluation_policy': prof.get('evaluation_policy'),
@@ -5673,6 +5769,9 @@ def _fleet_profile_summary():
         'excluded_or_retiring': prof.get('excluded_or_retiring'),
         'runtime_tunables': prof.get('runtime_tunables'),
     }
+    if isinstance(prof.get('native_agent_profiles'), dict):
+        summary['native_agent_profiles'] = prof['native_agent_profiles']
+    return summary
 
 
 _GROUNDING_GENERIC_ACRONYMS = frozenset({
@@ -6490,12 +6589,17 @@ def cmd_audit(args):
         except HarnessError as fb_exc:
             return _dispatch_print(args, {'status': fb_exc.status, **meta, 'error': str(fb_exc), 'requested_engines': list(engines), **fb_exc.details})
     profiles = {}
+    raw_audit_iso = _normalize_isolation(getattr(args, 'isolation', ''), clean_room=bool(getattr(args, 'clean_room', False)))
     for side, engine in zip(('left', 'right'), engines):
         if engine:
             prefix, _ = _engine_parts(engine)
+            side_iso, _ = _effective_isolation(prefix, raw_audit_iso)
+            _validate_isolation(prefix, side_iso, readonly=True)
             estimate = _audit_estimate([record['rel_path'] for record in records], total_tokens, args.focus,
                                        backends[prefix].get('windows_interop', False))
             profiles[side] = _planned_profile(args, backends, engine, tier, tier_reason, args.focus, 'audit', estimate['estimated_tokens'])
+    if raw_audit_iso:
+        meta['isolation'] = raw_audit_iso
     for profile in profiles.values():
         _check_ticket_execution(args, profile, target, 'review')
     plan = select_audit_plan(total_tokens, records, backends, args.strategy, not args.single, args.left, args.right,
@@ -6519,7 +6623,9 @@ def cmd_audit(args):
             receipt = {}
             future = pool.submit(invoke_readonly_engine, profile['spec'], root, _build_audit_prompt(unit, args.focus),
                                  backends, args.timeout, unit['files'], profile['cli_effort'], args.retry_quota,
-                                 profile=profile, batch=batch, receipt=receipt, inline_readonly=getattr(args, 'inline_readonly', True))
+                                 profile=profile, batch=batch, receipt=receipt,
+                                 inline_readonly=getattr(args, 'inline_readonly', True),
+                                 isolation=raw_audit_iso)
             futures[future] = side, unit, receipt
         for future in concurrent.futures.as_completed(futures):
             side, unit, receipt = futures[future]
@@ -6600,6 +6706,9 @@ def cmd_gate(args):
         engine = _choose_dispatch_engine(args, backends, caller, args.worker, text)
     except HarnessError as exc:
         return _dispatch_print(args, {'status': exc.status, 'error': str(exc), **exc.details})
+    gate_prefix, _ = _engine_parts(engine)
+    gate_iso, _ = _effective_isolation(gate_prefix, getattr(args, 'isolation', ''))
+    _validate_isolation(gate_prefix, gate_iso, readonly=False)
     scopes = _scope_patterns(args.write_scope)
     if requested_target.is_file() and not scopes:
         scopes = [requested_target.relative_to(root).as_posix()]
@@ -6608,7 +6717,8 @@ def cmd_gate(args):
     batch = _QuotaBatch(args.retry_quota)
     meta = {'caller': caller, 'handoff_to_caller': True, 'engine': engine, 'worker_engine': engine,
             'requested_tier': args.tier, 'selected_tier': tier, 'tier_reason': tier_reason,
-            'target': str(root), 'requested_target': str(requested_target), 'verification_executed': False}
+            'target': str(root), 'requested_target': str(requested_target), 'verification_executed': False,
+            'isolation': gate_iso}
     snap_ignored = _snapshot_ignore_dirs_for(scopes, include_build=True)
     snap_patterns = read_agentignore_patterns(root) if not args.dry_run else None
     fallback_before = (
@@ -6618,7 +6728,7 @@ def cmd_gate(args):
     try:
         _prepare_execution(backends, (engine,), batch, dry_run=args.dry_run)
     except HarnessError as exc:
-        fb_engine = _local_fallback_engine(caller, engine, backends, text, clean_room=False) if (
+        fb_engine = _local_fallback_engine(caller, engine, backends, text, clean_room=False, isolation=getattr(args, 'isolation', '')) if (
             exc.status == 'quota_exhausted' and getattr(args, 'fallback_on_quota', False)
             and not getattr(args, '_approved_ticket', None)
             and _workspace_unchanged(fallback_before, root, ignore_dirs=snap_ignored, ignore_patterns=snap_patterns)
@@ -6670,11 +6780,15 @@ def cmd_task(args):
     readonly = args.kind != 'code'
     if readonly and (scopes or args.verify_cmd):
         raise HarnessError('只读任务不可声明写入范围或验收命令')
-    clean_room = bool(getattr(args, 'clean_room', False))
+    task_prefix, _ = _engine_parts(engine)
+    raw_iso_arg = getattr(args, 'isolation', '')
+    task_iso, task_iso_explicit = _effective_isolation(task_prefix, raw_iso_arg, clean_room=bool(getattr(args, 'clean_room', False)))
+    clean_room = task_iso == 'clean_room'
     if clean_room and not readonly:
         raise HarnessError('--clean-room 仅支持只读任务（review/direction/polish/math），写入任务不可剥离安全钩子')
     if clean_room and engine.startswith('agy'):
         raise HarnessError('agy 后端不支持剥离全局插件目录，--clean-room 请显式指定 codex、cc 或 dsh')
+    _validate_isolation(task_prefix, task_iso, readonly)
     if clean_room and requested_target.is_dir():
         raw_dir_records = collect_target_files(requested_target)
         if raw_dir_records and all(Path(r['rel_path']).name.upper() in _AGENT_INSTRUCTION_FILENAMES for r in raw_dir_records):
@@ -6693,7 +6807,7 @@ def cmd_task(args):
     payload = {'kind': args.kind, 'caller': caller, 'handoff_to_caller': True, 'engine': engine,
                'requested_tier': args.tier, 'selected_tier': tier, 'tier_reason': tier_reason,
                'target': str(root), 'requested_target': str(requested_target), 'base_commit': base,
-               'readonly': readonly, 'write_scope': scopes}
+               'readonly': readonly, 'write_scope': scopes, 'isolation': task_iso}
     if not readonly:
         payload['verification_executed'] = False
     snap_ignored = None if readonly else _snapshot_ignore_dirs_for(scopes, include_build=bool(args.verify_cmd))
@@ -6705,7 +6819,8 @@ def cmd_task(args):
     try:
         _prepare_execution(backends, (engine,), batch, dry_run=args.dry_run)
     except HarnessError as exc:
-        fb_engine = _local_fallback_engine(caller, engine, backends, text, clean_room=clean_room) if (
+        fb_engine = _local_fallback_engine(caller, engine, backends, text, clean_room=clean_room,
+                                           isolation=task_iso if task_iso_explicit else '') if (
             exc.status == 'quota_exhausted' and getattr(args, 'fallback_on_quota', False)
             and not getattr(args, '_approved_ticket', None)
             and _workspace_unchanged(fallback_before, root, ignore_dirs=snap_ignored, ignore_patterns=snap_patterns)
@@ -6762,9 +6877,11 @@ def cmd_task(args):
             result = invoke_engine(profile['spec'], root, prompt, backends, TASK_JSON_SCHEMA,
                                    readonly, args.timeout, 'readonly-collaborator', stage_files, profile['cli_effort'], args.retry_quota,
                                    profile=profile, batch=batch, receipt=invocation, clean_room=clean_room,
+                                   isolation=task_iso if task_iso_explicit else '',
                                    inline_readonly=getattr(args, 'inline_readonly', True))
         except HarnessError as exc:
-            fb_engine = _local_fallback_engine(caller, engine, backends, text, clean_room=clean_room) if (
+            fb_engine = _local_fallback_engine(caller, engine, backends, text, clean_room=clean_room,
+                                               isolation=task_iso if task_iso_explicit else '') if (
                 getattr(exc, 'status', None) == 'quota_exhausted'
                 and getattr(args, 'fallback_on_quota', False)
                 and not getattr(args, '_approved_ticket', None)
@@ -6790,6 +6907,7 @@ def cmd_task(args):
             result = invoke_engine(fb_profile['spec'], root, prompt, backends, TASK_JSON_SCHEMA,
                                    readonly, args.timeout, 'readonly-collaborator', stage_files, fb_profile['cli_effort'], args.retry_quota,
                                    profile=fb_profile, batch=batch, receipt=invocation, clean_room=clean_room,
+                                   isolation=task_iso if task_iso_explicit else '',
                                    inline_readonly=getattr(args, 'inline_readonly', True))
     except Exception as exc:
         status = getattr(exc, 'status', 'failed')
@@ -7043,6 +7161,15 @@ def _check_ticket_execution(args, profile, target, kind, text=None, *, write_sco
                and stream['tier'] == profile['tier'] and args.timeout <= stream['timeout']]
     if not matches:
         raise HarnessError('执行目标、模型、挡位或超时与获批票据不一致', 'ticket_invalid')
+    req_prefix, _ = _engine_parts(profile['spec'])
+    req_iso, _ = _effective_isolation(req_prefix, getattr(args, 'isolation', ''),
+                                      clean_room=bool(getattr(args, 'clean_room', False)))
+    matches = [
+        stream for stream in matches
+        if (stream.get('isolation') or ('clean_room' if stream.get('clean_room') else ('no_skills' if req_prefix == 'agy' else 'full'))) == req_iso
+    ]
+    if not matches:
+        raise HarnessError(f'隔离模式（{req_iso}）与获批票据不一致', 'ticket_invalid')
     if text is not None:
         accepted_texts = {text.strip()}
         raw_body = _raw_task_body(args)
@@ -7374,7 +7501,31 @@ _PLAN_CHANNEL_LABELS = {
 }
 
 
-def _native_plan_model(prefix, info, requested_model):
+def _native_agent_profile(prefix):
+    profiles = _fleet_profile().get('native_agent_profiles')
+    if not isinstance(profiles, dict):
+        return {}
+    key = 'antigravity' if prefix == 'agy' else prefix
+    entry = profiles.get(key) or profiles.get(prefix)
+    return dict(entry) if isinstance(entry, dict) else {}
+
+
+def _read_agent_frontmatter_model(path):
+    if not path.is_file() or _is_link(path):
+        return ''
+    text = _optional_text(path)
+    match = re.match(r'^---\r?\n(.*?)\r?\n---', text, re.S)
+    if not match:
+        return ''
+    for line in match.group(1).splitlines():
+        m = re.match(r'^\s*model\s*:\s*([^\n#]+)', line)
+        if m:
+            val = m.group(1).strip().strip('"\'')
+            return '' if not val or val.lower() == 'inherit' else val
+    return ''
+
+
+def _native_plan_model(prefix, info, requested_model, agent_type=''):
     """只读解析前端继承模型，不经无头后端重新选模。"""
     home = info.get('config_home')
     if not home:
@@ -7384,6 +7535,21 @@ def _native_plan_model(prefix, info, requested_model):
     config = _top_level_toml(home / 'config.toml') if prefix == 'codex' else {}
     if requested_model and requested_model != 'inherit':
         return requested_model, requested_model, home, config
+    safe_agent = agent_type if isinstance(agent_type, str) and re.fullmatch(r'[A-Za-z0-9._-]+', agent_type) else ''
+    agent_model = ''
+    if safe_agent and safe_agent != 'self':
+        if prefix == 'codex':
+            agent_toml = home / 'agents' / f'{safe_agent}.toml'
+            if agent_toml.is_file() and not _is_link(agent_toml):
+                raw_am = str(_top_level_toml(agent_toml).get('model') or '').strip()
+                if raw_am and raw_am.lower() != 'inherit':
+                    agent_model = raw_am
+        elif prefix == 'claude':
+            agent_model = _read_agent_frontmatter_model(home / 'agents' / f'{safe_agent}.md')
+        elif prefix == 'agy':
+            agent_model = _read_agent_frontmatter_model(home / 'config' / 'plugins' / 'user-guard' / 'agents' / f'{safe_agent}.md')
+    if agent_model:
+        return agent_model, f'inherit -> {agent_model} (agent:{safe_agent})', home, config
     sub_model = os.environ.get('CLAUDE_CODE_SUBAGENT_MODEL', '').strip() if prefix == 'claude' else ''
     if prefix == 'claude' and not sub_model:
         settings = _read_json(home / 'settings.json') or {}
@@ -7410,9 +7576,16 @@ def _plan_stream_details(args, stream, profile, prefix, channel):
     scopes = _scope_patterns(stream.get('write_scope', getattr(args, 'write_scope', [])))
     verify_cmd = stream.get('verify_cmd', getattr(args, 'verify_cmd', '')) or ''
     access = '只读' if readonly else '写入范围：' + (', '.join(scopes) or '未声明') + '；验收命令：' + (verify_cmd or '未声明')
-    clean_room = False if native else bool(stream.get('clean_room', getattr(args, 'clean_room', False)))
-    if clean_room and (not readonly or prefix == 'agy'):
-        raise HarnessError('净室仅支持 codex、claude、dsh 的只读无头任务')
+    if native:
+        clean_room = False
+        explicit_iso = ''
+    else:
+        raw_iso = stream.get('isolation', getattr(args, 'isolation', ''))
+        raw_cr = bool(stream.get('clean_room', getattr(args, 'clean_room', False)))
+        iso_mode, iso_explicit = _effective_isolation(prefix, raw_iso, clean_room=raw_cr)
+        _validate_isolation(prefix, iso_mode, readonly)
+        clean_room = iso_mode == 'clean_room'
+        explicit_iso = iso_mode if iso_explicit else ''
     capacity = profile.get('capacity', {})
     return {**stream, 'channel': channel, 'client': prefix,
             'subtask': stream.get('subtask') or getattr(args, 'workflow_goal', '')
@@ -7420,7 +7593,7 @@ def _plan_stream_details(args, stream, profile, prefix, channel):
             'agent_type': stream.get('agent_type') or getattr(args, 'agent_type', '') or ('self' if native else 'readonly-collaborator'),
             'model': profile.get('model'), 'model_display': stream.get('model_display') if native else str(profile.get('model') or '未声明'),
             'context_window': capacity.get('selected_window_tokens'),
-            'headless': not native, 'clean_room': clean_room, 'access_mode': access,
+            'headless': not native, 'clean_room': clean_room, 'isolation': explicit_iso, 'access_mode': access,
             'write_scope': scopes, 'verify_cmd': verify_cmd,
             'inline_readonly': False if native or not readonly else bool(stream.get('inline_readonly', getattr(args, 'inline_readonly', True))),
             'receipt_location': stream.get('receipt_location') or getattr(args, 'receipt_location', '')
@@ -7451,6 +7624,9 @@ def _resolve_plan_streams(args, streams, backends):
         if 'tier' in stream:
             if not isinstance(stream['tier'], str) or (stream['tier'] and stream['tier'] not in TIER_CHOICES):
                 raise HarnessError(f'工作流 tier 无效: {stream["tier"]!r}')
+        if 'isolation' in stream and stream['isolation'] is not None:
+            if not isinstance(stream['isolation'], str) or (stream['isolation'] and stream['isolation'].strip().lower() not in ISOLATION_CHOICES):
+                raise HarnessError(f'工作流 isolation 无效: {stream["isolation"]!r}')
         sid = str(stream.get('stream_id') or f'S{index}')
         if sid in ids:
             raise HarnessError('工作流 stream_id 不可重复')
@@ -7478,7 +7654,8 @@ def _resolve_plan_streams(args, streams, backends):
                 raise HarnessError('原生通道必须指定或识别 caller 客户端')
             info = backends.get(prefix, {})
             requested_model = requested_model or 'inherit'
-            model, display, home, config = _native_plan_model(prefix, info, requested_model)
+            native_agent_type = stream.get('agent_type') or getattr(args, 'agent_type', '') or 'self'
+            model, display, home, config = _native_plan_model(prefix, info, requested_model, agent_type=native_agent_type)
             if override_tier:
                 sub_sample = stream.get('subtask', '')
                 tier, _ = select_task_tier(
@@ -7495,6 +7672,9 @@ def _resolve_plan_streams(args, streams, backends):
             engine = prefix + ':' + (model or 'default')
             profile = {'spec': engine, 'model': model, 'tier': tier, 'capacity': capacity,
                        'profile_source': 'native_frontend_config'}
+            native_cfg = _native_agent_profile(prefix)
+            if native_cfg:
+                profile['native_agent_profile'] = native_cfg
             quota = inspect_backend_quota_and_availability(prefix, info, model,
                                                             redact_usage=getattr(args, 'redact', False),
                                                             ignore_cooldown=getattr(args, 'retry_quota', False))
@@ -7635,11 +7815,14 @@ def _render_plan(ticket):
         available = yes_no(stream['currently_available'])
         if stream.get('unavailable_reason'):
             available += '（' + stream['unavailable_reason'] + '）'
+        clean_room_cell = yes_no(stream['clean_room'])
+        if not stream['clean_room'] and stream.get('isolation') in ('full', 'no_skills', 'hooks_only'):
+            clean_room_cell += f'（隔离：{stream["isolation"]}）'
         values = [stream['stream_id'], stream.get('subtask', '') + '；范围：' + stream['target'],
                   _PLAN_CHANNEL_LABELS[stream['channel']] + ' (' + stream['channel'] + ')',
                   stream['client'] + '；' + stream['agent_type'], stream['model_display'], stream['tier'],
                   str(stream['context_window']) + ' tokens' if stream['context_window'] else '未声明',
-                  yes_no(stream['headless']), yes_no(stream['clean_room']), stream['access_mode'],
+                  yes_no(stream['headless']), clean_room_cell, stream['access_mode'],
                   '内联：' + yes_no(stream['inline_readonly']) + '；超时：' + str(stream['timeout']) + ' 秒',
                   available, stream['quota_scheme'] + '；' + stream['quota_summary'], stream['receipt_location']]
         rows.append(row([values[0], values[2] + '；' + values[3], values[4] + '；' + values[5],
@@ -8110,6 +8293,7 @@ def cmd_batch(args):
                                                      stage_files=[target.name] if target.is_file() else None,
                                                      profile=profile, receipt=invocation, batch=quota_batch,
                                                      clean_room=stream.get('clean_room', False),
+                                                     isolation=stream.get('isolation', ''),
                                                      inline_readonly=stream.get('inline_readonly', args.inline_readonly))
                     result['status'] = 'ok'
                 finally:
@@ -8287,6 +8471,8 @@ def build_arg_parser():
         command.add_argument('--ticket', default='', help=ticket_help)
         command.add_argument('--inline-readonly', action=argparse.BooleanOptionalAction, default=True,
                              help='为只读无头任务自动内联小文件带行号原文')
+        command.add_argument('--isolation', choices=list(ISOLATION_CHOICES), default='',
+                             help='隔离级别：full 保留规则/钩子/技能；no_skills 仅剥离全局技能与斜杠命令；hooks_only 保留安全钩子并剥离全局规则/技能（仅 codex/claude）；clean_room 等同 --clean-room（仅只读 codex/claude/dsh）')
     return parser
 
 

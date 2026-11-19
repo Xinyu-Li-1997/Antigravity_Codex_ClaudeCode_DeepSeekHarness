@@ -650,10 +650,13 @@ def render_pending_workflow_block(ticket, for_handoff=False) -> str:
     for stream in ticket.get("streams", []):
         if not isinstance(stream, dict):
             continue
+        clean_room_val = value(stream.get("clean_room"))
+        if not stream.get("clean_room") and stream.get("isolation") in ("full", "no_skills", "hooks_only"):
+            clean_room_val += f"（隔离：{stream['isolation']}）"
         fields = [stream.get("stream_id"), value(stream.get("subtask")) + "；范围：" + value(stream.get("target")),
                   stream.get("channel"), value(stream.get("client")) + "；" + value(stream.get("agent_type")),
                   stream.get("model_display") or stream.get("model"), stream.get("tier"), stream.get("context_window"),
-                  stream.get("headless"), stream.get("clean_room"),
+                  stream.get("headless"), clean_room_val,
                   value(stream.get("access_mode")) + "；写入范围：" + value(stream.get("write_scope"))
                   + "；验收命令：" + value(stream.get("verify_cmd")),
                   "内联：" + value(stream.get("inline_readonly")) + "；超时：" + value(stream.get("timeout")),

@@ -5012,6 +5012,60 @@ class TestShard3RouterInstallerFixes(OfflineSandbox):
         self.assertEqual(inst_ptu.returncode, 0, inst_ptu.stderr)
         self.assertEqual(json.loads(inst_ptu.stdout).get("hookSpecificOutput", {}).get("permissionDecision"), "deny")
 
+    def test_audit_upgrade_preserves_dsh_hook_protocol_and_cross_side_status(self):
+        ag_dir = self.root / "audit_ag"
+        cx_dir = self.root / "audit_cx"
+        cl_dir = self.root / "audit_cl"
+        dsh_dir = self.root / "audit_dsh"
+        for d in (ag_dir, cx_dir, cl_dir, dsh_dir):
+            d.mkdir(parents=True, exist_ok=True)
+        fake_det = {
+            "platform": sys.platform,
+            "os_name": os.name,
+            "is_wsl": os.name != "nt",
+            "wsl_probe": {
+                "status": "checked",
+                "apps": {
+                    "agy": [{"distro": "Ubuntu-24.04", "binary": "<home>/.gemini/bin/agy", "config_dir_exists": True}],
+                    "codex": [],
+                    "claude": [],
+                    "dsh": [{"distro": "Ubuntu-24.04", "binary": None, "config_dir_exists": False}],
+                    "cc-switch": [{"distro": "Ubuntu-24.04", "binary": "/usr/bin/cc-switch", "config_dir_exists": True}],
+                },
+            } if os.name == "nt" else None,
+            "antigravity": {"native_installed": True, "interop_available": True},
+            "codex": {"native_installed": False, "interop_available": False},
+            "claude": {"native_installed": False, "interop_available": False},
+            "dsh": {
+                "native_installed": True,
+                "interop_available": False,
+                "hook_protocol": "lifecycle_hooks",
+                "hard_hooks_supported": True,
+                "meta_update_trigger": "ready_for_fleet_evolve_dsh_hooks",
+            },
+            "cc_switch": {"native_installed": False, "interop_available": False},
+        }
+        with mock.patch.object(installer, "detect_installed_apps", return_value=fake_det):
+            rep_sbx = installer.audit_upgrade_status(
+                REPO_ROOT, ag_dir, cx_dir, cl_dir, dsh_home=dsh_dir, is_sandbox_run=True, app_scope="all",
+            )
+            rep_host = installer.audit_upgrade_status(
+                REPO_ROOT, ag_dir, cx_dir, cl_dir, dsh_home=dsh_dir, is_sandbox_run=False, app_scope="all",
+            )
+        self.assertEqual(rep_sbx["dsh"]["hook_protocol"], "lifecycle_hooks")
+        self.assertTrue(rep_sbx["dsh"]["hard_hooks_supported"])
+        self.assertEqual(rep_sbx["dsh"]["meta_update_trigger"], "ready_for_fleet_evolve_dsh_hooks")
+        self.assertIn("cross_side_status", rep_sbx)
+        self.assertTrue(rep_sbx["cross_side_status"]["peer_side_present"])
+        self.assertTrue(rep_sbx["cross_side_status"]["peer_apps_detected"]["antigravity"])
+        self.assertFalse(rep_sbx["cross_side_status"]["peer_apps_detected"]["dsh"])
+        if os.name == "nt":
+            self.assertTrue(rep_sbx["cross_side_status"]["peer_apps_detected"]["cc_switch"])
+        self.assertFalse(rep_sbx["cross_side_status"]["dual_side_sync_required"])
+        self.assertTrue(rep_host["cross_side_status"]["dual_side_sync_required"])
+        self.assertIsNotNone(rep_host["cross_side_status"]["peer_audit_hint"])
+        self.assertIsInstance(rep_sbx["fleet_profile"]["native_agent_profiles_configured"], list)
+
 
 if __name__ == "__main__":
     unittest.main()
