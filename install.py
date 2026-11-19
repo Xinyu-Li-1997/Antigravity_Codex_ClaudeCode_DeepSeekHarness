@@ -675,9 +675,13 @@ def _windows_app_binaries(home: Path, local_app: Path, name: str) -> Tuple[Optio
         cli += [home / "AppData" / "Roaming" / "npm" / "claude.cmd"]
         desktop = []
     elif name == "cc-switch":
-        cli = [local_app / "Programs" / "cc-switch" / "cc-switch.exe",
-               Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "CC Switch" / "cc-switch.exe"]
-        desktop = []
+        program_files = Path("/mnt/c/Program Files") if os.name != "nt" else Path(os.environ.get("ProgramFiles") or "C:/Program Files")
+        cli = []
+        desktop = [
+            local_app / "Programs" / "CC Switch" / "cc-switch.exe",
+            local_app / "Programs" / "cc-switch" / "cc-switch.exe",
+            program_files / "CC Switch" / "cc-switch.exe",
+        ]
     elif name == "dsh":
         program_files = Path("/mnt/c/Program Files") if os.name != "nt" else Path(os.environ.get("ProgramFiles") or "C:/Program Files")
         cli = [local_app / "Programs/DeepSeek Harness/resources/runtime/cli/bin/dsh.cmd",
@@ -951,7 +955,7 @@ def _probe_windows_wsl() -> Dict[str, Any]:
         try:
             probe = subprocess.run(
                 [wsl, "--distribution", distro, "--exec", "/bin/sh", "-c", script],
-                capture_output=True, text=True, encoding="utf-8", timeout=5,
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
             )
             if probe.returncode != 0:
                 complete = False

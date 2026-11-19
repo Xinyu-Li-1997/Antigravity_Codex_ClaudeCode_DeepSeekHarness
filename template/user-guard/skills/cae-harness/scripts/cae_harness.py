@@ -349,8 +349,8 @@ class HarnessError(RuntimeError):
 
 
 class OutputParseError(HarnessError):
-    def __init__(self, message):
-        super().__init__(message, 'invalid_output')
+    def __init__(self, message, **details):
+        super().__init__(message, 'invalid_output', **details)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -3847,6 +3847,83 @@ def _has_unrepaired_latex_escape(text):
     return False
 
 
+def _repair_unclosed_json_tail(text):
+    """保守修补模型在长数组尾部漏写 1~2 个闭合括号（如 `["..."}` 缺 `]`）的情况。"""
+    s = str(text or '').strip()
+    if not s.startswith('{'):
+        return None
+    out = []
+    stack = []
+    in_string = False
+    escaped = False
+    repairs = 0
+    for ch in s:
+        if in_string:
+            out.append(ch)
+            if escaped:
+                escaped = False
+            elif ch == '\\':
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            out.append(ch)
+            continue
+        if ch in ('{', '['):
+            stack.append(ch)
+            out.append(ch)
+            continue
+        if ch == '}':
+            if not stack:
+                return None
+            if stack[-1] == '[':
+                if '{' not in stack:
+                    return None
+                while stack and stack[-1] == '[':
+                    stack.pop()
+                    out.append(']')
+                    repairs += 1
+                    if repairs > 2:
+                        return None
+            if not stack or stack[-1] != '{':
+                return None
+            stack.pop()
+            out.append(ch)
+            continue
+        if ch == ']':
+            if not stack:
+                return None
+            if stack[-1] == '{':
+                if '[' not in stack:
+                    return None
+                while stack and stack[-1] == '{':
+                    stack.pop()
+                    out.append('}')
+                    repairs += 1
+                    if repairs > 2:
+                        return None
+            if not stack or stack[-1] != '[':
+                return None
+            stack.pop()
+            out.append(ch)
+            continue
+        out.append(ch)
+    if in_string:
+        return None
+    if stack:
+        if len(stack) + repairs > 2:
+            return None
+        while stack:
+            opener = stack.pop()
+            out.append('}' if opener == '{' else ']')
+            repairs += 1
+    if repairs == 0:
+        return None
+    return ''.join(out)
+
+
 def _loads_relaxed_dict(candidate):
     attempts = (
         (_repair_json_string_escapes(candidate), candidate)
@@ -3856,6 +3933,16 @@ def _loads_relaxed_dict(candidate):
     for attempt in attempts:
         try:
             parsed = json.loads(attempt, strict=False)
+            if isinstance(parsed, dict):
+                return parsed
+        except (ValueError, RecursionError):
+            continue
+    for attempt in attempts:
+        repaired_tail = _repair_unclosed_json_tail(attempt)
+        if not repaired_tail:
+            continue
+        try:
+            parsed = json.loads(repaired_tail, strict=False)
             if isinstance(parsed, dict):
                 return parsed
         except (ValueError, RecursionError):
@@ -3983,6 +4070,11 @@ def _decode_output_json(raw_text):
                         search_pos = max(search_pos, adv_end)
             if len(schema_candidates) == 1:
                 return schema_candidates[0]
+            first_brace = raw.find('{')
+            if first_brace >= 0:
+                tail_repaired = _loads_relaxed_dict(raw[first_brace:])
+                if tail_repaired is not None:
+                    return tail_repaired
             raise OutputParseError('子任务输出不是合法 JSON') from decode_error
         results = []
         for event in events:
@@ -4304,6 +4396,7 @@ def _dsh_dotenv_key(home):
 
 
 _DSH_PERMISSION_CACHE = {}
+_DSH_PERMISSION_LOCK = threading.Lock()
 
 
 def _dsh_supports_cli_permission_flags(binary, env=None, *, interop=False):
@@ -4312,13 +4405,15 @@ def _dsh_supports_cli_permission_flags(binary, env=None, *, interop=False):
     except OSError:
         return False
     key = (str(binary), stamp, bool(interop))
-    if key not in _DSH_PERMISSION_CACHE:
+    with _DSH_PERMISSION_LOCK:
+        if key in _DSH_PERMISSION_CACHE:
+            return _DSH_PERMISSION_CACHE[key]
         try:
             probe_cmd = [binary, '--profile', 'headless', '--help']
             if interop and _is_posix() and str(binary).lower().endswith(('.cmd', '.bat')):
                 probe_cmd = ['cmd.exe', '/c', _wsl_path(Path(binary)), '--profile', 'headless', '--help']
             result = run_process(probe_cmd, Path.cwd(),
-                                 timeout_sec=2.5 if interop else 1.5, env=env)
+                                 timeout_sec=8.0 if interop else 5.0, env=env)
             output = (result.stdout or '') + (result.stderr or '')
             is_help = bool(re.search(r'(?im)(?:usage:|options:|--help|--profile)', output))
             if result.returncode != 0 or not is_help:
@@ -4327,7 +4422,7 @@ def _dsh_supports_cli_permission_flags(binary, env=None, *, interop=False):
         except (OSError, HarnessError, subprocess.TimeoutExpired):
             return False
         _DSH_PERMISSION_CACHE[key] = supported
-    return _DSH_PERMISSION_CACHE[key]
+        return supported
 
 
 def _inline_readonly_prompt(prompt, root, rel_files=None, *, exclude_agent_instructions=False):
@@ -4424,18 +4519,31 @@ def extract_cli_token_usage(prefix, raw_stdout, raw_stderr=''):
     def normalize(usage):
         def first(*names):
             return next((integer(usage[name]) for name in names if integer(usage.get(name)) is not None), None)
-        inp = first('input_tokens', 'prompt_tokens', 'inputTokens', 'promptTokens')
+        inp = first('input_tokens', 'prompt_tokens', 'inputTokens', 'promptTokens', 'uncachedInputTokens')
         out = first('output_tokens', 'completion_tokens', 'outputTokens', 'completionTokens')
-        cached = first('cached_input_tokens', 'cache_hit_tokens', 'cached_tokens', 'cache_read_input_tokens', 'cachedInputTokens')
+        cached = first(
+            'cached_input_tokens', 'cache_hit_tokens', 'cached_tokens',
+            'cache_read_input_tokens', 'cachedInputTokens',
+            'cacheReadTokens', 'cache_read_tokens', 'prompt_cache_hit_tokens',
+        )
         details = usage.get('prompt_tokens_details') or usage.get('input_tokens_details') or {}
         if cached is None and isinstance(details, dict):
             cached = integer(details.get('cached_tokens'))
+        total = first('total_tokens', 'totalTokens')
         if prefix == 'claude':
-            creation = integer(usage.get('cache_creation_input_tokens'))
+            creation = first('cache_creation_input_tokens', 'cacheCreationInputTokens')
             # Claude's input_tokens excludes both cache categories.
             if inp is not None:
                 inp += (cached or 0) + (creation or 0)
-        total = first('total_tokens', 'totalTokens')
+        elif prefix == 'dsh':
+            creation = first('cacheWriteTokens', 'cache_write_tokens', 'cache_creation_input_tokens')
+            extra_cache = (cached or 0) + (creation or 0)
+            if inp is not None and extra_cache > 0:
+                # DSH 的 inputTokens 仅计未命中缓存输入；当 totalTokens 与之吻合（或缺失）时再计入总输入，避免未来重复计数。
+                if total is None or (out is not None and inp + out + extra_cache == total):
+                    inp += extra_cache
+                elif total is not None and out is None and inp + extra_cache <= total:
+                    inp += extra_cache
         if total is None and inp is not None and out is not None:
             total = inp + out
         return {'input_tokens': inp, 'cached_input_tokens': cached, 'output_tokens': out, 'total_tokens': total}
@@ -4744,6 +4852,10 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
                     command.extend(['--effort', effort])
                 if readonly:
                     command.extend(['--agent', agent])
+                    if not clean_room and stage_dir is None:
+                        repo_anchor = _enclosing_git_root(exec_dir)
+                        if repo_anchor is not None:
+                            command.extend(['--add-dir', translate(repo_anchor)])
                 else:
                     command.extend(['--mode', 'accept-edits', '--dangerously-skip-permissions'])
                 input_text = json.dumps({'event': 'user', 'message': {'content': exec_prompt}}, ensure_ascii=False) + '\n'
@@ -4788,7 +4900,8 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
                     env['DSH_PERMISSION_MODE'] = mode_str
                 command.append('-')
                 req_keys = ', '.join(schema.get('required', ()))
-                exec_prompt = (f'{exec_prompt}\n\n请仅输出一个以 {{ 开头、以 }} 结尾且严格符合以下 JSON Schema 的单行或多行 JSON 对象'
+                exec_prompt = (f'{exec_prompt}\n\n单模型直接完成，严禁在工具内部派生子代理；'
+                               f'请仅输出一个以 {{ 开头、以 }} 结尾且严格符合以下 JSON Schema 的单行或多行 JSON 对象'
                                f'（必含顶层键：{req_keys}；JSON 字符串内的反斜杠如 Windows 路径与 LaTeX 公式必须转义为双反斜杠 \\\\），'
                                f'严禁输出外层 Markdown 代码块围栏或任何额外解释文字：\n'
                                f'{json.dumps(schema, ensure_ascii=False)}')
@@ -4882,6 +4995,18 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
                     raise HarnessError(f'{prefix} 额度不足或已达用量上限，已停止并记录冷却状态',
                                        'quota_exhausted', preflight_blocked=False,
                                        **_quota_user_choices(prefix, cooldown)) from exc
+                if exc.status == 'invalid_output':
+                    redacted_stderr = _redact_runtime_secret(result.stderr or '')[-2000:]
+                    redacted_raw = _redact_runtime_secret(raw or '')[-1500:]
+                    if redacted_stderr and 'stderr' not in exc.details:
+                        exc.details['stderr'] = redacted_stderr
+                    if redacted_raw and 'raw_output_excerpt' not in exc.details:
+                        exc.details['raw_output_excerpt'] = redacted_raw
+                    if prefix == 'agy' and 'soft-denying' in (result.stderr or '').lower():
+                        exc.details.setdefault(
+                            'diagnostic_hint',
+                            'agy 无头只读模式下触发了工具权限软拒绝（soft-denying），通常因尝试读取工作目录外文件所致，请检查目标目录或 --add-dir 范围。',
+                        )
                 raise
             _mark_quota_success(prefix, info, batch)
             if prefix == 'claude':
@@ -5190,24 +5315,71 @@ def _workspace_unchanged(before, root, ignore_dirs=None, ignore_patterns=None):
     return scope['scope_verified'] and not scope['changed_files']
 
 
+def _enclosing_git_root(path):
+    """若 path 位于某 Git 仓库子目录内，返回严格上级仓库根目录；否则返回 None。"""
+    try:
+        resolved = Path(path).expanduser().resolve()
+    except OSError:
+        return None
+    cur = resolved.parent
+    while cur and cur != cur.parent:
+        if _is_link(cur):
+            return None
+        git_marker = cur / '.git'
+        try:
+            if git_marker.exists() and not _is_link(git_marker):
+                return cur
+        except OSError:
+            return None
+        cur = cur.parent
+    return None
+
+
 def estimate_tokens_from_bytes(num_bytes):
     return max(1, (num_bytes + 2) // 3) if num_bytes else 0
 
 
-def collect_target_files(target, skipped_files=None):
+_TARGET_METRICS_MAX_FILES = 20000
+
+
+def collect_target_files(target, skipped_files=None, *, verify_readable=True, respect_agentignore=False, max_files=None):
     target = target.resolve()
     skipped = skipped_files if skipped_files is not None else []
+    patterns = read_agentignore_patterns(target) if (respect_agentignore and target.is_dir()) else []
+
+    def _excluded_by_agentignore(path):
+        if not patterns:
+            return False
+        rel = path.relative_to(target).as_posix()
+        if rel == '.agentignore':
+            return False
+        return any(fnmatch.fnmatchcase(rel, pat) or rel.split('/')[0] == pat for pat in patterns)
+
     candidates = [target] if target.is_file() else []
     if target.is_dir():
         for root, dirs, files in os.walk(target):
-            dirs[:] = sorted(d for d in dirs if d not in IGNORED_DIRS and (d == '.github' or not d.startswith('.')))
+            dirs[:] = sorted(
+                d for d in dirs
+                if d not in IGNORED_DIRS
+                and (d == '.github' or not d.startswith('.'))
+                and not _excluded_by_agentignore(Path(root) / d)
+            )
             for name in list(dirs):
                 directory = Path(root) / name
                 if _is_link(directory):
                     skipped.append({'file': directory.relative_to(target).as_posix(), 'reason': 'directory_link'})
                     dirs.remove(name)
-            candidates.extend(Path(root) / name for name in sorted(files)
-                              if Path(name).suffix.lower() in SOURCE_EXTENSIONS or name in NAMED_TEXT_FILES)
+            for name in sorted(files):
+                if Path(name).suffix.lower() not in SOURCE_EXTENSIONS and name not in NAMED_TEXT_FILES:
+                    continue
+                cand = Path(root) / name
+                if _excluded_by_agentignore(cand):
+                    continue
+                candidates.append(cand)
+                if max_files is not None and len(candidates) >= max_files:
+                    break
+            if max_files is not None and len(candidates) >= max_files:
+                break
     records = []
     for path in candidates:
         rel = path.name if target.is_file() else path.relative_to(target).as_posix()
@@ -5220,8 +5392,9 @@ def collect_target_files(target, skipped_files=None):
                 skipped.append({'file': rel, 'reason': 'special_file'})
                 continue
             size = st.st_size
-            with path.open('rb') as stream:
-                stream.read(1)
+            if verify_readable:
+                with path.open('rb') as stream:
+                    stream.read(1)
         except OSError as exc:
             skipped.append({'file': rel, 'reason': 'unreadable', 'detail': str(exc)})
             continue
@@ -5593,18 +5766,63 @@ def _git_head(root):
     return result.stdout.strip() if result.returncode == 0 else None
 
 
-def _target_metrics(requested_target, text):
+def _target_metrics(requested_target, text, *, write_scope=None, cache=None):
     prompt_tokens = estimate_tokens_from_bytes(len((text or '').encode('utf-8')))
     try:
-        target = Path(requested_target)
+        target = Path(requested_target).expanduser().resolve()
         if target.is_file():
             try:
                 size = target.stat().st_size
             except OSError:
                 size = 0
             return 1, estimate_tokens_from_bytes(size) + prompt_tokens
-        records = collect_target_files(target)
-        return max(1, len(records)), sum(item['tokens'] for item in records) + prompt_tokens
+        scopes = []
+        if write_scope:
+            raw_scopes = [write_scope] if isinstance(write_scope, str) else list(write_scope)
+            scopes = [s.strip().replace('\\', '/') for s in raw_scopes if isinstance(s, str) and s.strip()]
+        cache_key = (str(target), tuple(scopes))
+        if isinstance(cache, dict) and cache_key in cache:
+            base_count, base_tokens = cache[cache_key]
+            return base_count, base_tokens + prompt_tokens
+        # 当可写任务已显式声明具体 write_scope 文件（无通配符）时，按白名单估算，避免对大型算例目录做无关全盘扫描。
+        if scopes and all(not any(ch in pat for ch in '*?[') for pat in scopes):
+            scoped_count, scoped_tokens, any_resolved = 0, 0, False
+            for rel in scopes:
+                cand = (target / rel)
+                try:
+                    resolved_cand = cand.resolve()
+                    resolved_cand.relative_to(target)
+                except (OSError, ValueError):
+                    continue
+                if _is_link(cand) or not cand.exists():
+                    continue
+                any_resolved = True
+                if cand.is_file():
+                    try:
+                        scoped_tokens += estimate_tokens_from_bytes(cand.lstat().st_size)
+                        scoped_count += 1
+                    except OSError:
+                        continue
+                elif cand.is_dir():
+                    sub_recs = collect_target_files(
+                        cand, verify_readable=False, respect_agentignore=True, max_files=_TARGET_METRICS_MAX_FILES
+                    )
+                    scoped_count += len(sub_recs)
+                    scoped_tokens += sum(item['tokens'] for item in sub_recs)
+            if any_resolved:
+                base_count = max(1, scoped_count)
+                if isinstance(cache, dict):
+                    cache[cache_key] = (base_count, scoped_tokens)
+                return base_count, scoped_tokens + prompt_tokens
+        # 目录体量估算仅读元数据（lstat），不逐个 open() 文件，并遵循 .agentignore 避免大结果目录拖垮磁盘 I/O。
+        records = collect_target_files(
+            target, verify_readable=False, respect_agentignore=True, max_files=_TARGET_METRICS_MAX_FILES
+        )
+        base_count = max(1, len(records))
+        base_tokens = sum(item['tokens'] for item in records)
+        if isinstance(cache, dict):
+            cache[cache_key] = (base_count, base_tokens)
+        return base_count, base_tokens + prompt_tokens
     except (HarnessError, OSError):
         return 1, prompt_tokens
 
@@ -7320,7 +7538,31 @@ def _redact_secret_leaves(value):
     return value
 
 
-def _redact_public(value):
+_QUOTA_FIELD_KEY_RE = re.compile(r'(?i)(?:quota|usage|rate.?limit|window|billing|budget|used_pct|remaining_pct)')
+_QUOTA_CONTEXT_RE = re.compile(
+    r'(?i)(?:quota|usage|5h[_ -]?window|7d[_ -]?window|rolling|rate[_ -]?limit|\bused\b|\bremaining\b|'
+    r'reset|额度|配额|已用|剩余|余额|窗口|套餐|限额)'
+)
+_SCIENTIFIC_CONTENT_KEYS = frozenset({
+    'content', 'summary', 'evidence', 'unverified', 'findings', 'description',
+    'subtask', 'workflow_bg', 'workflow_goal', 'workflow_impact', 'verify_output_tail',
+})
+
+
+def _mask_quota_percentages(text, *, force=False):
+    if '%' not in text:
+        return text
+    if force:
+        return re.sub(r'\b\d+(?:\.\d+)?%', '<USAGE>', text)
+    if '\n' not in text:
+        return re.sub(r'\b\d+(?:\.\d+)?%', '<USAGE>', text) if _QUOTA_CONTEXT_RE.search(text) else text
+    return '\n'.join(
+        re.sub(r'\b\d+(?:\.\d+)?%', '<USAGE>', line) if ('%' in line and _QUOTA_CONTEXT_RE.search(line)) else line
+        for line in text.split('\n')
+    )
+
+
+def _redact_public(value, *, _key='', _in_result_payload=False):
     if isinstance(value, dict):
         out = {}
         for k, v in value.items():
@@ -7330,12 +7572,16 @@ def _redact_public(value):
             if isinstance(k, str) and _SECRET_FIELD_KEY_RE.search(k):
                 out[rk] = _redact_secret_leaves(v)
             else:
-                out[rk] = _redact_public(v)
+                out[rk] = _redact_public(
+                    v,
+                    _key=k if isinstance(k, str) else '',
+                    _in_result_payload=_in_result_payload or (k == 'result'),
+                )
         return out
     if isinstance(value, list):
-        return [_redact_public(v) for v in value]
+        return [_redact_public(v, _key=_key, _in_result_payload=_in_result_payload) for v in value]
     if isinstance(value, tuple):
-        return tuple(_redact_public(v) for v in value)
+        return tuple(_redact_public(v, _key=_key, _in_result_payload=_in_result_payload) for v in value)
     if not isinstance(value, str):
         return value
     text = _redact_runtime_secret(value)
@@ -7368,7 +7614,12 @@ def _redact_public(value):
     text = re.sub(r'(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])', mask_ip, text)
     text = re.sub(r'(?i)(?<![\w:])(?:f[cd][0-9a-f]{2}:[0-9a-f:]{2,}|fe80:[0-9a-f:]{2,})(?![\w:])', mask_ip, text)
     text = re.sub(r'cae-harness-[A-Za-z0-9_-]+', '<STAGING>', text)
-    text = re.sub(r'\b\d+(?:\.\d+)?%', '<USAGE>', text)
+    is_quota_key = bool(_key and _QUOTA_FIELD_KEY_RE.search(_key))
+    is_scientific_field = _in_result_payload or (_key in _SCIENTIFIC_CONTENT_KEYS)
+    if is_quota_key:
+        text = _mask_quota_percentages(text, force=True)
+    elif not is_scientific_field:
+        text = _mask_quota_percentages(text, force=False)
     return text
 
 
@@ -7712,6 +7963,7 @@ def _plan_stream_details(args, stream, profile, prefix, channel):
 def _resolve_plan_streams(args, streams, backends):
     resolved, switched = [], False
     ids = set()
+    metrics_cache = {}
     for index, original in enumerate(streams, 1):
         if not isinstance(original, dict):
             raise HarnessError('工作流条目必须为对象')
@@ -7755,7 +8007,13 @@ def _resolve_plan_streams(args, streams, backends):
         text = user_text or stream.get('subtask', '')
         requested = stream.get('requested_engine', stream.get('engine')) or args.engine
         requested_model = stream.get('requested_model', stream.get('model', getattr(args, 'model', ''))) or ''
-        count, tokens = _target_metrics(target, stream.get('subtask', ''))
+        stream_write_scope = stream.get('write_scope', getattr(args, 'write_scope', None))
+        count, tokens = _target_metrics(
+            target,
+            stream.get('subtask', ''),
+            write_scope=stream_write_scope if kind in ('code', 'gate') else None,
+            cache=metrics_cache,
+        )
         if channel != 'cae_harness_headless':
             caller = resolve_caller(stream.get('caller') or args.caller)
             prefix = 'agy' if caller == 'antigravity' else caller
@@ -8024,6 +8282,97 @@ def _render_plan(ticket):
     ) if persisted else ticket['handoff_prompt_block']
 
 
+def _compact_plan_stdout_view(ticket):
+    """生成精简 stdout 视图：置顶 compact_summary_card，省略已落盘的 14 项长表与 execution_profile。"""
+    detail_file = str(ticket.get('card_detail_file') or '')
+    full_ticket_file = str(Path(detail_file).with_name(f"{ticket['ticket_id']}.json")) if detail_file else ''
+    compact_streams = [
+        {k: v for k, v in s.items() if k != 'execution_profile'} if isinstance(s, dict) else s
+        for s in ticket.get('streams', [])
+    ]
+    view = {
+        'ticket_id': ticket.get('ticket_id'),
+        'status': ticket.get('status'),
+        'is_heavy': ticket.get('is_heavy'),
+        'stdout_view': 'compact',
+        'card_detail_file': detail_file,
+        'full_ticket_file': full_ticket_file,
+        'compact_summary_card': ticket.get('compact_summary_card', ''),
+    }
+    if ticket.get('status') not in ('APPROVED', 'CANCELLED', 'SUPERSEDED'):
+        view['compact_handoff_prompt_block'] = ticket.get('compact_handoff_prompt_block', '')
+    for key in (
+        'session_id', 'plan_hash', 'created_at', 'expires_at', 'user_prompt',
+        'workflow_bg', 'workflow_goal', 'workflow_impact', 'capability_ledger',
+        'superseded_ticket_ids',
+    ):
+        if key in ticket:
+            view[key] = ticket[key]
+    view['streams'] = compact_streams
+    return view
+
+
+def _supersede_overlapping_pending_tickets(approved_ticket, plan_dir):
+    """批准票据后，将同会话、更早创建且通道存在交集的旧 PENDING/HANDED_OFF 票据标记为 SUPERSEDED。"""
+    sid = str(approved_ticket.get('session_id') or '').strip()
+    if not sid or sid == 'unknown_session':
+        return []
+    approved_tid = str(approved_ticket.get('ticket_id') or '').strip()
+    try:
+        approved_created = float(approved_ticket.get('created_at') or 0.0)
+    except (TypeError, ValueError):
+        approved_created = 0.0
+    approved_channels = {
+        s.get('channel', 'cae_harness_headless')
+        for s in approved_ticket.get('streams', [])
+        if isinstance(s, dict)
+    }
+    if not approved_channels:
+        return []
+    plan_dir = resolve_dispatch_plan_dir(plan_dir)
+    superseded = []
+    for path in sorted(plan_dir.glob('*.json')):
+        if _is_link(path) or path.name.startswith('session_'):
+            continue
+        other = _read_json(path)
+        if not isinstance(other, dict):
+            continue
+        other_tid = str(other.get('ticket_id') or '').strip()
+        if (
+            not other_tid
+            or other_tid == approved_tid
+            or path.name != other_tid + '.json'
+            or other.get('session_id') != sid
+            or other.get('status') not in ('PENDING', 'HANDED_OFF')
+        ):
+            continue
+        try:
+            other_created = float(other.get('created_at') or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if approved_created > 0 and other_created > approved_created:
+            continue
+        other_channels = {
+            s.get('channel', 'cae_harness_headless')
+            for s in other.get('streams', [])
+            if isinstance(s, dict)
+        }
+        if not (other_channels & approved_channels):
+            continue
+        try:
+            with _directory_file_lock(plan_dir, f'ticket_{other_tid}', label='计划票据'):
+                latest = _read_json(path)
+                if not isinstance(latest, dict) or latest.get('status') not in ('PENDING', 'HANDED_OFF'):
+                    continue
+                latest['status'] = 'SUPERSEDED'
+                latest['superseded_by'] = approved_tid
+                _save_plan(latest, plan_dir)
+                superseded.append(other_tid)
+        except (HarnessError, OSError):
+            continue
+    return superseded
+
+
 def _save_plan(ticket, plan_dir):
     tid = _safe_state_id(ticket.get('ticket_id', ''))
     plan_dir = resolve_dispatch_plan_dir(plan_dir)
@@ -8041,7 +8390,7 @@ def _save_plan(ticket, plan_dir):
         pointer = plan_dir / ('session_' + _safe_state_id(session_id) + '_pending.json')
         if os.path.lexists(pointer) and _is_link(pointer):
             raise HarnessError(f'拒绝操作符号链接会话指针文件: {pointer}', 'ticket_invalid')
-        if ticket['status'] == 'APPROVED':
+        if ticket['status'] in ('APPROVED', 'CANCELLED', 'SUPERSEDED'):
             existing_ptr = _read_json(pointer)
             if isinstance(existing_ptr, dict) and existing_ptr.get('ticket_id') == tid:
                 pointer.unlink(missing_ok=True)
@@ -8055,7 +8404,7 @@ def cmd_plan(args):
         raise HarnessError(
             'plan 子命令不支持 --ticket；批准票据请用 --approve-ticket <ID>，'
             '恢复查看请用 --resume-ticket <ID>，登记交接请用 --mark-handed-off <ID>，'
-            '按已批准票据执行请改用 batch/gate/task/audit --ticket <ID>',
+            '取消待决票据请用 --cancel-ticket <ID>，按已批准票据执行请改用 batch/gate/task/audit --ticket <ID>',
             'ticket_invalid',
         )
     if getattr(args, 'override_json', '') and not getattr(args, 'approve_ticket', ''):
@@ -8064,11 +8413,12 @@ def cmd_plan(args):
             'ticket_invalid',
         )
     plan_dir = resolve_dispatch_plan_dir(args.plan_dir)
-    ticket_id = args.approve_ticket or args.resume_ticket or args.mark_handed_off
+    cancel_tid = getattr(args, 'cancel_ticket', '')
+    ticket_id = args.approve_ticket or args.resume_ticket or args.mark_handed_off or cancel_tid
     if ticket_id:
         with _plan_dir_lock(plan_dir), _directory_file_lock(plan_dir, f'ticket_{ticket_id}', label='计划票据'):
             ticket = _load_ticket(ticket_id, plan_dir)
-            if args.approve_ticket or args.mark_handed_off:
+            if args.approve_ticket or args.mark_handed_off or cancel_tid:
                 _verify_ticket_session(ticket, args)
             forced = bool(getattr(args, 'force', False))
             if args.resume_ticket and not forced:
@@ -8076,7 +8426,12 @@ def cmd_plan(args):
             else:
                 args.user_prompt = args.user_prompt or ticket.get('user_prompt', '')
                 ticket['user_prompt'] = args.user_prompt
-            if args.mark_handed_off:
+            if cancel_tid:
+                if ticket.get('status') == 'APPROVED' and not forced:
+                    raise HarnessError('已批准票据不可直接取消，如需强制取消请传 --force', 'ticket_invalid')
+                ticket['status'] = 'CANCELLED'
+                _save_plan(ticket, plan_dir)
+            elif args.mark_handed_off:
                 if ticket.get('status') == 'APPROVED' and not forced:
                     raise HarnessError('已批准票据不可直接降级为已交接状态，如需强制交接请传 --force', 'ticket_invalid')
                 ticket['status'] = 'HANDED_OFF'
@@ -8344,6 +8699,10 @@ def cmd_plan(args):
                     elif ticket.get('status') != 'HANDED_OFF' and changed:
                         ticket['status'] = 'PENDING'
                     _save_plan(ticket, plan_dir)
+                    if args.approve_ticket:
+                        superseded_ids = _supersede_overlapping_pending_tickets(ticket, plan_dir)
+                        if superseded_ids:
+                            ticket['superseded_ticket_ids'] = superseded_ids
             if args.mark_handed_off:
                 _save_plan(ticket, plan_dir)
     else:
@@ -8366,7 +8725,12 @@ def cmd_plan(args):
                 _save_plan(ticket, plan_dir)
     if args.output:
         _atomic_json(args.output, ticket if args.no_redact_output else _redact_public(ticket))
-    _print(_redact_public(ticket) if args.redact else ticket)
+    stdout_payload = (
+        _compact_plan_stdout_view(ticket)
+        if ticket.get('card_detail_file') and not getattr(args, 'full_json', False)
+        else ticket
+    )
+    _print(_redact_public(stdout_payload) if args.redact else stdout_payload)
     return 0
 
 
@@ -8374,14 +8738,17 @@ def cmd_batch(args):
     _begin_dispatch(args)
     backends = _args_backends(args, refresh_model_cache=False)
     if getattr(args, '_approved_ticket', None):
-        streams = args._approved_ticket['streams']
+        all_streams = args._approved_ticket['streams']
         args.user_prompt = args.user_prompt or args._approved_ticket.get('user_prompt', '')
     elif args.spec_file:
-        streams, _ = _resolve_plan_streams(args, _read_stream_spec(args.spec_file), backends)
+        all_streams, _ = _resolve_plan_streams(args, _read_stream_spec(args.spec_file), backends)
     else:
         raise HarnessError('batch 需要 --spec-file 或已批准的 --ticket')
-    if any(stream.get('channel', 'cae_harness_headless') != 'cae_harness_headless' for stream in streams):
+    streams = [s for s in all_streams if s.get('channel', 'cae_harness_headless') == 'cae_harness_headless']
+    native_streams = [s for s in all_streams if s.get('channel', 'cae_harness_headless') != 'cae_harness_headless']
+    if not streams:
         raise HarnessError('原生通道请在 caller 客户端内部执行，batch 仅执行 cae_harness_headless 通道')
+    caller_label = resolve_caller(args.caller)
     limits = _headless_tunables().get('batch_max_workers_per_backend', {})
     blocked, lock = set(), threading.Lock()
     ws_cond, active_ws = threading.Condition(), []
@@ -8484,10 +8851,25 @@ def cmd_batch(args):
                 snap_patterns = read_agentignore_patterns(root)
                 before = snapshot_files(root, ignore_dirs=snap_ignored, ignore_patterns=snap_patterns)
                 try:
-                    result['result'] = invoke_engine(profile['spec'], root, stream.get('subtask', ''), backends,
+                    batch_polish_guard = (
+                        '【润色防幻觉硬约束】严禁新增原稿与任务说明中不存在的陌生学科术语、虚构算例名称（如未在代码中出现的领域词）、'
+                        '未声明的命令行参数、文件名或无依据的定量数字；仅优化表达清晰度与逻辑结构。\n'
+                        if stream['kind'] == 'polish' else ''
+                    )
+                    batch_prompt = (
+                        f"任务类型 {stream['kind']}。当前总控 {caller_label}。工作目录为当前目录。任务目标 {target}。\n"
+                        + ('只读完成任务，正文通过回执返回。' if readonly else f"允许写入范围 {scopes or '调用方授权的目标工作目录'}。")
+                        + '严禁在目标工作目录外创建、修改或删除任何文件或目录（含严禁向目录外执行 git worktree add）。'
+                        + '不要调用本编排器，不要修改其他会话或全局配置。\n'
+                        + batch_polish_guard + stream.get('subtask', '')
+                        + '\n按给定 JSON Schema 返回正文、证据及未验证事项。'
+                    )
+                    result['result'] = invoke_engine(profile['spec'], root, batch_prompt, backends,
                                                      TASK_JSON_SCHEMA, readonly, stream['timeout'],
                                                      agent=stream.get('agent_type') or 'readonly-collaborator',
                                                      stage_files=[target.name] if target.is_file() else None,
+                                                     effort=profile.get('cli_effort'),
+                                                     retry_quota=args.retry_quota,
                                                      profile=profile, receipt=invocation, batch=quota_batch,
                                                      clean_room=stream.get('clean_room', False),
                                                      isolation=stream.get('isolation', ''),
@@ -8541,7 +8923,19 @@ def cmd_batch(args):
         for group in pool.map(run_backend, groups.items()):
             for index, result in group:
                 results[index] = result
-    return _dispatch_print(args, {'status': 'ok' if all(s['succeeded'] for s in results) else 'partial', 'streams': results})
+    out_payload = {'status': 'ok' if all(s['succeeded'] for s in results) else 'partial', 'streams': results}
+    if native_streams:
+        out_payload['skipped_native_streams'] = [
+            {
+                'stream_id': s.get('stream_id'),
+                'channel': s.get('channel'),
+                'client': s.get('client'),
+                'agent_type': s.get('agent_type'),
+                'note': '原生通道须由 caller 客户端内部按获批票据执行，batch 已跳过',
+            }
+            for s in native_streams
+        ]
+    return _dispatch_print(args, out_payload)
 
 
 def _positive_arg(raw):
@@ -8584,10 +8978,12 @@ def build_arg_parser():
     plan.add_argument('--workflow-goal', default='', help='工作流目标说明')
     plan.add_argument('--workflow-impact', default='', help='预计后果与影响范围说明')
     plan.add_argument('--save-ticket', action='store_true', help='即使未达重负载阈值也强制保存票据文件')
+    plan.add_argument('--full-json', action='store_true', help='标准输出保留完整票据 JSON（含 14 项长表与 execution_profile）；默认仅输出精简视图')
     actions = plan.add_mutually_exclusive_group()
     actions.add_argument('--approve-ticket', default='', help='按票据 ID 经二次可用性检查后登记为已批准状态')
     actions.add_argument('--resume-ticket', default='', help='按票据 ID 读取并刷新待决或已交接工作流状态')
     actions.add_argument('--mark-handed-off', default='', help='按票据 ID 将工作流标记为已交接状态')
+    actions.add_argument('--cancel-ticket', default='', help='按票据 ID 取消待决或已交接工作流（已批准需加 --force）')
     plan.add_argument('--override-json', default='', help='配合 --approve-ticket 按 stream_id 微调 engine、tier 或 timeout 的 JSON 对象')
     plan.add_argument('--force', action='store_true', help='强制允许对已批准票据执行交接或状态重置')
     batch = sub.add_parser('batch', help='按后端限流执行独立工作流')

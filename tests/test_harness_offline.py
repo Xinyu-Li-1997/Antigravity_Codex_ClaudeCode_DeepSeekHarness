@@ -3670,7 +3670,7 @@ else:
             tid = ticket['ticket_id']
             self.assertTrue((plans / 'session_session1_pending.json').is_file())
             self.capture(harness.cmd_plan, self.args('plan', *common, '--mark-handed-off', tid))
-            _, resumed = self.capture(harness.cmd_plan, self.args('plan', *common, '--resume-ticket', tid))
+            _, resumed = self.capture(harness.cmd_plan, self.args('plan', *common, '--resume-ticket', tid, '--full-json'))
             self.assertEqual(resumed['status'], 'HANDED_OFF')
             for key in ('workflow_bg', 'workflow_goal', 'workflow_impact'):
                 self.assertEqual(resumed[key], ticket[key])
@@ -3726,7 +3726,7 @@ else:
              'engine': 'dsh:review', 'agent_type': 'readonly-auditor', 'target': str(target),
              'clean_room': True, 'receipt_location': 'headless-receipt.json'}]), encoding='utf-8')
         args = self.args('plan', '--caller', 'codex', '--spec-file', str(spec), '--target', str(target),
-                         '--plan-dir', str(self.root / 'plans'), '--timeout', '60',
+                         '--plan-dir', str(self.root / 'plans'), '--timeout', '60', '--full-json',
                          '--workflow-bg', '接口调整', '--workflow-goal', '核对实现', '--workflow-impact', '返回只读证据')
         with patch.object(harness, '_args_backends', return_value=engines), \
              patch.object(harness, 'inspect_backend_quota_and_availability', wraps=harness.inspect_backend_quota_and_availability) as inspect:
@@ -3860,7 +3860,7 @@ else:
                     harness.cmd_batch(self.args('batch', *common, '--ticket', ticket['ticket_id']))
                 never.assert_not_called()
             harness._record_quota_exhausted('codex', engines['codex'], 'quota exceeded')
-            _, resumed = self.capture(harness.cmd_plan, self.args('plan', *common, '--resume-ticket', ticket['ticket_id']))
+            _, resumed = self.capture(harness.cmd_plan, self.args('plan', *common, '--resume-ticket', ticket['ticket_id'], '--full-json'))
             self.assertFalse(resumed['streams'][0]['currently_available'])
             self.assertTrue(resumed['streams'][0]['quota_exceeded'])
             self.assertEqual(resumed['streams'][0]['client'], 'codex')
@@ -3884,7 +3884,7 @@ else:
         args = self.args('plan', '--caller', 'antigravity', '--engine', 'codex:default', '--model', 'fixture-code',
             '--channel', 'cae_harness_headless', '--agent-type', 'self', '--kind', 'code', '--target', str(target),
             '--write-scope', 'a.py', '--verify-cmd', 'python -B a.py', '--receipt-location', 'result.json',
-            '--plan-dir', str(self.root / 'plans'))
+            '--plan-dir', str(self.root / 'plans'), '--full-json')
         with patch.object(harness, '_args_backends', return_value=engines):
             _, ticket = self.capture(harness.cmd_plan, args)
         stream = ticket['streams'][0]
@@ -4856,7 +4856,7 @@ else:
             self.assertEqual(agy_ticket['streams'][0]['model'], 'gemini-7-pro-high')
             _, agy_approved = self.capture(harness.cmd_plan, self.args(
                 'plan', '--caller', 'codex', '--plan-dir', str(plans),
-                '--approve-ticket', agy_ticket['ticket_id'],
+                '--approve-ticket', agy_ticket['ticket_id'], '--full-json',
                 '--override-json', json.dumps({'S1': {'tier': 'low'}})))
             self.assertEqual(agy_approved['status'], 'APPROVED')
             self.assertEqual(agy_approved['streams'][0]['model'], 'gemini-7-pro-low')
@@ -5863,7 +5863,7 @@ else:
             _, tk = self.capture(harness.cmd_plan, self.args(
                 'plan', '--caller', 'antigravity', '--engine', 'codex:fixture-code', '--kind', 'review',
                 '--isolation', 'hooks_only', '--target', str(target_py), '--plan-dir', str(plans),
-                '--session-id', 'iso-sess', '--save-ticket', '--workflow-goal', '核对隔离'))
+                '--session-id', 'iso-sess', '--save-ticket', '--full-json', '--workflow-goal', '核对隔离'))
             self.assertEqual(tk['streams'][0]['isolation'], 'hooks_only')
             self.assertFalse(tk['streams'][0]['clean_room'])
             self.assertIn('否（隔离：hooks_only）', tk['human_popup_markdown'])
@@ -5911,7 +5911,7 @@ else:
                 '--session-id', 'v1171-s', '--user-prompt', '用 codex 写并跑测试', '--save-ticket'))
             _, app = self.capture(harness.cmd_plan, self.args(
                 'plan', '--caller', 'antigravity', '--plan-dir', str(plans),
-                '--session-id', 'v1171-s', '--approve-ticket', tk['ticket_id']))
+                '--session-id', 'v1171-s', '--approve-ticket', tk['ticket_id'], '--full-json'))
             self.assertEqual(app['status'], 'APPROVED')
 
             # 1) _check_ticket_execution rejects empty/None/mismatched verify_cmd on writable gate
@@ -5949,6 +5949,190 @@ else:
             self.assertNotIn('secret_tok_123456', red)
             self.assertNotIn('dXNlcjpwYXNz', red)
             self.assertNotIn('u:p@', red)
+
+    def test_v118_compact_plan_cancel_supersede_mixed_batch_redact_dsh_agy_and_fast_metrics(self):
+        engines = self.four_backends()
+        target_py = self.root / 'v118_mod.py'
+        target_py.write_text('val = 1\n', encoding='utf-8')
+        plans = self.root / 'v118-plans'
+
+        with patch.object(harness, '_args_backends', return_value=engines):
+            # 1) 落盘票据默认 stdout 为精简视图（置顶 compact_summary_card，不含 14 项长表与 execution_profile）
+            _, tk_old = self.capture(harness.cmd_plan, self.args(
+                'plan', '--caller', 'antigravity', '--engine', 'codex:fixture-code', '--kind', 'review',
+                '--target', str(target_py), '--plan-dir', str(plans),
+                '--session-id', 'v118-sess', '--save-ticket',
+                '--workflow-bg', '草案1', '--workflow-goal', '初版检查', '--workflow-impact', '只读'))
+            self.assertEqual(tk_old.get('stdout_view'), 'compact')
+            self.assertIn('compact_summary_card', tk_old)
+            self.assertIn('compact_handoff_prompt_block', tk_old)
+            self.assertNotIn('human_popup_markdown', tk_old)
+            self.assertNotIn('handoff_prompt_block', tk_old)
+            self.assertNotIn('execution_profile', tk_old['streams'][0])
+            # 磁盘 JSON 与 _card.md 依然完整落盘
+            disk_old = json.loads((plans / f"{tk_old['ticket_id']}.json").read_text(encoding='utf-8'))
+            self.assertIn('human_popup_markdown', disk_old)
+            self.assertIn('execution_profile', disk_old['streams'][0])
+            self.assertTrue(Path(disk_old['card_detail_file']).is_file())
+
+            # 同会话另建一张不同通道（native_workflow）的并发 PENDING 票据 + 一张同通道（headless）的新票据
+            _, tk_native_concurrent = self.capture(harness.cmd_plan, self.args(
+                'plan', '--caller', 'antigravity', '--channel', 'native_workflow', '--kind', 'review',
+                '--target', str(target_py), '--plan-dir', str(plans),
+                '--session-id', 'v118-sess', '--save-ticket',
+                '--workflow-bg', '并发原生', '--workflow-goal', '原生只读', '--workflow-impact', '只读'))
+            spec_mixed = self.root / 'v118-mixed.json'
+            spec_mixed.write_text(json.dumps([
+                {'stream_id': 'H1', 'channel': 'cae_harness_headless', 'kind': 'review',
+                 'engine': 'codex:fixture-code', 'target': str(target_py), 'subtask': '无头审查', 'timeout': 60},
+                {'stream_id': 'N1', 'channel': 'native_subagent', 'kind': 'review',
+                 'agent_type': 'readonly-reader', 'target': str(target_py), 'subtask': '原生读取', 'timeout': 60},
+            ]), encoding='utf-8')
+            _, tk_new = self.capture(harness.cmd_plan, self.args(
+                'plan', '--caller', 'antigravity', '--spec-file', str(spec_mixed), '--plan-dir', str(plans),
+                '--session-id', 'v118-sess', '--workflow-bg', '定版方案', '--workflow-goal', '混合执行', '--workflow-impact', '只读'))
+
+            # 2) 批准新票据：自动将同通道更早 PENDING 标为 SUPERSEDED，不误伤不同通道并发 PENDING；APPROVED 精简输出省略 compact_handoff_prompt_block
+            _, app_new = self.capture(harness.cmd_plan, self.args(
+                'plan', '--caller', 'antigravity', '--plan-dir', str(plans),
+                '--session-id', 'v118-sess', '--approve-ticket', tk_new['ticket_id']))
+            self.assertEqual(app_new['status'], 'APPROVED')
+            self.assertNotIn('compact_handoff_prompt_block', app_new)
+            self.assertIn(tk_old['ticket_id'], app_new.get('superseded_ticket_ids', []))
+            self.assertEqual(json.loads((plans / f"{tk_old['ticket_id']}.json").read_text(encoding='utf-8'))['status'], 'SUPERSEDED')
+            self.assertEqual(json.loads((plans / f"{tk_native_concurrent['ticket_id']}.json").read_text(encoding='utf-8'))['status'], 'PENDING')
+
+            # 3) --cancel-ticket 可取消待决票据并清理 pending 指针
+            _, cancelled = self.capture(harness.cmd_plan, self.args(
+                'plan', '--caller', 'antigravity', '--plan-dir', str(plans),
+                '--session-id', 'v118-sess', '--cancel-ticket', tk_native_concurrent['ticket_id']))
+            self.assertEqual(cancelled['status'], 'CANCELLED')
+            self.assertEqual(json.loads((plans / f"{tk_native_concurrent['ticket_id']}.json").read_text(encoding='utf-8'))['status'], 'CANCELLED')
+
+            # 4) cmd_batch 混合通道票据：执行无头流并报告 skipped_native_streams，且透传 effort/retry_quota/安全包装 prompt
+            captured_calls = []
+            def fake_batch_invoke(spec, root, prompt, backends, schema, readonly, timeout, *pargs, **kwargs):
+                captured_calls.append({'spec': spec, 'prompt': prompt, 'kwargs': kwargs})
+                return dict(TASK)
+            with patch.object(harness, 'invoke_engine', side_effect=fake_batch_invoke), \
+                 patch.dict(os.environ, {'CAE_DISABLE_HEAVY_COMPLETIONS': '1'}):
+                rc_mix, mix_res = self.capture(harness.cmd_batch, self.args(
+                    'batch', '--caller', 'antigravity', '--plan-dir', str(plans),
+                    '--session-id', 'v118-sess', '--ticket', tk_new['ticket_id'], '--retry-quota'))
+            self.assertEqual(rc_mix, 0)
+            self.assertEqual(len(mix_res['streams']), 1)
+            self.assertEqual(mix_res['streams'][0]['stream_id'], 'H1')
+            self.assertEqual(len(mix_res.get('skipped_native_streams', [])), 1)
+            self.assertEqual(mix_res['skipped_native_streams'][0]['stream_id'], 'N1')
+            self.assertEqual(len(captured_calls), 1)
+            self.assertTrue(captured_calls[0]['kwargs'].get('retry_quota'))
+            self.assertIn('不要调用本编排器', captured_calls[0]['prompt'])
+            self.assertIn('无头审查', captured_calls[0]['prompt'])
+
+        # 5) _redact_public 保留科学百分比，精准脱敏额度百分比
+        sci_payload = {
+            'quota_summary': '5h_window: 42.5% used',
+            'human_popup_markdown': '| 2 | 子任务 | 收敛率 99.5% 与 100% 覆盖 |\n| 13 | 额度状态 | 5h_window: 38% used |',
+            'result': {
+                'summary': '覆盖率达到 100%，误差降至 0.1%',
+                'content': '残差下降 95.2%，已用 20% 显存仍在阈值内',
+                'evidence': ['solver.py:10 (99.8% match)'],
+                'unverified': ['边界 0.5% 扰动未测'],
+            },
+        }
+        red_sci = harness._redact_public(sci_payload)
+        self.assertIn('<USAGE>', red_sci['quota_summary'])
+        self.assertNotIn('42.5%', red_sci['quota_summary'])
+        self.assertIn('99.5%', red_sci['human_popup_markdown'])
+        self.assertIn('100%', red_sci['human_popup_markdown'])
+        self.assertIn('<USAGE>', red_sci['human_popup_markdown'])
+        self.assertNotIn('38%', red_sci['human_popup_markdown'])
+        self.assertIn('100%', red_sci['result']['summary'])
+        self.assertIn('0.1%', red_sci['result']['summary'])
+        self.assertIn('95.2%', red_sci['result']['content'])
+        self.assertIn('20%', red_sci['result']['content'])
+        self.assertIn('99.8%', red_sci['result']['evidence'][0])
+        self.assertIn('0.5%', red_sci['result']['unverified'][0])
+
+        # 6) extract_cli_token_usage 解析 DSH cacheReadTokens（含防重复计数）
+        dsh_usage_raw = json.dumps({
+            'type': 'final',
+            'usage': {'inputTokens': 800, 'cacheReadTokens': 12000, 'cacheWriteTokens': 0, 'outputTokens': 500, 'totalTokens': 13300},
+        })
+        dsh_tok = harness.extract_cli_token_usage('dsh', dsh_usage_raw)
+        self.assertEqual(dsh_tok['input_tokens'], 12800)
+        self.assertEqual(dsh_tok['cached_input_tokens'], 12000)
+        self.assertEqual(dsh_tok['output_tokens'], 500)
+        self.assertEqual(dsh_tok['total_tokens'], 13300)
+        dsh_already_incl = json.dumps({
+            'type': 'final',
+            'usage': {'inputTokens': 12800, 'cacheReadTokens': 12000, 'outputTokens': 500, 'totalTokens': 13300},
+        })
+        self.assertEqual(harness.extract_cli_token_usage('dsh', dsh_already_incl)['input_tokens'], 12800)
+
+        # 7) _extract_json_object 保守修复尾部缺失 ]（复现 df6e061c S1），但不修复截断未闭合字符串
+        missing_bracket = json.dumps({
+            'type': 'final',
+            'reason': {'kind': 'completed'},
+            'text': '{"summary": "完成核查", "content": "正文", "evidence": ["a.py:1"], "unverified": ["未经运行验证。"}',
+        }, ensure_ascii=False)
+        repaired = harness._extract_json_object(missing_bracket, harness.TASK_JSON_SCHEMA)
+        self.assertEqual(repaired['unverified'], ['未经运行验证。'])
+        truncated_str = '{"summary": "完成核查", "content": "未闭合'
+        with self.assertRaises(harness.OutputParseError):
+            harness._extract_json_object(truncated_str, harness.TASK_JSON_SCHEMA)
+
+        # 8) agy 只读在 Git 仓库子目录附带 --add-dir，且空输出附带 stderr/diagnostic_hint
+        git_repo = self.root / 'v118-git-repo'
+        (git_repo / '.git').mkdir(parents=True)
+        sub_dir = git_repo / 'docs' / 'sub'
+        sub_dir.mkdir(parents=True)
+        (sub_dir / 'note.md').write_text('# note\n', encoding='utf-8')
+        seen_agy_cmds = []
+        def fake_agy_soft_deny(cmd, cwd, input_text=None, timeout_sec=60, env=None, native_pid_file=None):
+            seen_agy_cmds.append(list(cmd))
+            return subprocess.CompletedProcess(cmd, 0, '', 'Print mode: soft-denying tool confirmation "ReadFile" at step 2')
+        with patch.object(harness, 'run_process', side_effect=fake_agy_soft_deny):
+            with self.assertRaises(harness.OutputParseError) as parse_ctx:
+                harness.invoke_engine('agy:default', sub_dir, '审查', engines, harness.TASK_JSON_SCHEMA, readonly=True)
+        self.assertTrue(seen_agy_cmds)
+        self.assertIn('--add-dir', seen_agy_cmds[0])
+        self.assertEqual(seen_agy_cmds[0][seen_agy_cmds[0].index('--add-dir') + 1], str(git_repo.resolve()))
+        self.assertIn('soft-denying', parse_ctx.exception.details.get('stderr', ''))
+        self.assertIn('diagnostic_hint', parse_ctx.exception.details)
+
+        # 9) _dsh_supports_cli_permission_flags 并发加锁仅探测 1 次且超时为 5.0s
+        import concurrent.futures
+        fake_dsh_bin = self.root / 'fake_dsh_v118.cmd'
+        fake_dsh_bin.write_text('@echo off\n', encoding='utf-8')
+        probe_calls = []
+        def fake_dsh_help(cmd, cwd, input_text=None, timeout_sec=60, env=None, native_pid_file=None):
+            probe_calls.append(timeout_sec)
+            time.sleep(0.05)
+            return subprocess.CompletedProcess(cmd, 0, 'Usage: dsh --profile headless --permission-mode read-only', '')
+        harness._DSH_PERMISSION_CACHE.clear()
+        with patch.object(harness, 'run_process', side_effect=fake_dsh_help):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+                flags = list(pool.map(lambda _: harness._dsh_supports_cli_permission_flags(str(fake_dsh_bin)), range(4)))
+        self.assertEqual(flags, [True, True, True, True])
+        self.assertEqual(len(probe_calls), 1)
+        self.assertEqual(probe_calls[0], 5.0)
+
+        # 10) _target_metrics 大目录零 open() 读内容、遵循 .agentignore、优先按 write_scope 估算并缓存
+        big_ws = self.root / 'v118-big-ws'
+        (big_ws / 'src').mkdir(parents=True)
+        (big_ws / 'results').mkdir(parents=True)
+        (big_ws / '.agentignore').write_text('results/\n', encoding='utf-8')
+        (big_ws / 'src' / 'a.py').write_text('x = 1\n' * 10, encoding='utf-8')
+        (big_ws / 'src' / 'b.py').write_text('y = 2\n' * 10, encoding='utf-8')
+        for idx in range(5):
+            (big_ws / 'results' / f'out_{idx}.json').write_text('{"v": 1}\n' * 500, encoding='utf-8')
+        cache = {}
+        cnt_dir, tok_dir = harness._target_metrics(big_ws, 'check', cache=cache)
+        self.assertEqual(cnt_dir, 2)  # results/ ignored by .agentignore
+        cnt_scoped, tok_scoped = harness._target_metrics(big_ws, 'edit', write_scope=['src/a.py'], cache=cache)
+        self.assertEqual(cnt_scoped, 1)
+        self.assertLess(tok_scoped, tok_dir)
 
 
 if __name__ == '__main__':

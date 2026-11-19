@@ -5165,6 +5165,62 @@ class TestShard3RouterInstallerFixes(OfflineSandbox):
         self.assertNotIn("100.64.12.34", redacted)
         self.assertNotIn("alice:pw", redacted)
 
+    def test_windows_ccswitch_desktop_binary_detected_without_cli_spawn(self):
+        local_app = self.root / "local_app"
+        exe = local_app / "Programs" / "CC Switch" / "cc-switch.exe"
+        exe.parent.mkdir(parents=True)
+        exe.write_bytes(b"cc-switch desktop fixture\n")
+        cli, desktop = installer._windows_app_binaries(self.home, local_app, "cc-switch")
+        self.assertIsNone(cli)
+        self.assertEqual(desktop, str(exe))
+
+    def test_probe_windows_wsl_uses_errors_replace_for_stderr(self):
+        seen_kwargs = {}
+        output = "agy\t\ttrue\ncodex\t\ttrue\nclaude\t/opt/bin/claude\ttrue\ndsh\t\tfalse\ncc-switch\t/usr/bin/cc-switch\ttrue\n"
+
+        def fake_run(cmd, **kwargs):
+            seen_kwargs.update(kwargs)
+            return subprocess.CompletedProcess(cmd, 0, stdout=output, stderr="wsl utf16-le proxy warning")
+
+        with mock.patch.object(installer.shutil, "which", return_value="wsl.exe"), \
+                mock.patch.object(installer, "_wsl_distro_list", side_effect=[["Ubuntu"], ["Ubuntu"]]), \
+                mock.patch.object(installer.subprocess, "run", side_effect=fake_run):
+            res = installer._probe_windows_wsl()
+        self.assertEqual(res["status"], "checked")
+        self.assertEqual(seen_kwargs.get("errors"), "replace")
+
+    def test_fleet_state_json_nesting_depth_precheck_across_loaders(self):
+        import importlib.util
+        fs_path = REPO_ROOT / "template" / "user-guard" / "skills" / "fleet-evolve" / "scripts" / "fleet_state.py"
+        spec = importlib.util.spec_from_file_location("fleet_state_depth_test", fs_path)
+        fs_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fs_mod)
+
+        # 字符串字面量中的大量括号与转义引号不得误触发深度超限
+        fs_mod._check_json_nesting_depth('{"a": "' + ("{" * 100) + '\\"' + ("[" * 100) + '"}')
+        deep = "[" * 70 + "]" * 70
+        with self.assertRaisesRegex(ValueError, "corrupt state JSON"):
+            fs_mod._check_json_nesting_depth(deep)
+
+        # 1) _load_state 拦截深层嵌套（覆盖 Python 3.14 Linux 8MB 栈行为）
+        st_file = self.root / "deep_state.json"
+        st_file.write_text(deep, encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "corrupt state JSON"):
+            fs_mod._load_state(st_file)
+
+        # 2) _default_ttl_seconds 跳过深层嵌套损坏 profile 并安全回退 86400
+        bad_prof = self.root / "deep_profile.json"
+        bad_prof.write_text(deep, encoding="utf-8")
+        with mock.patch.dict(os.environ, {"CAE_FLEET_PROFILE": str(bad_prof)}):
+            self.assertEqual(fs_mod._default_ttl_seconds(), 86400)
+
+        # 3) _repo_meta 拦截深层嵌套 plugin.json
+        fake_repo = self.root / "deep_repo"
+        (fake_repo / "template" / "user-guard").mkdir(parents=True)
+        (fake_repo / "template" / "user-guard" / "plugin.json").write_text(deep, encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "corrupt plugin.json"):
+            fs_mod._repo_meta(fake_repo)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -562,12 +562,18 @@ def _native_completion_bill(payload, state=None):
     import status_guard
 
     path = status_guard._dispatch_transcript(payload)
-    native_turn, calls = status_guard._native_turn_snapshot(payload, all_turns=True)
+    native_turn, all_calls = status_guard._native_turn_snapshot(payload, all_turns=True)
+    calls = [c for c in all_calls if not c.get("denied")]
     if path is None or not calls:
         return None
     pending = {str(c["call_id"]): c for c in calls if c["call_id"]}
+    unidentified_by_index: Dict[int, List[Dict[str, Any]]] = {}
+    for c in all_calls:
+        if not c["call_id"]:
+            unidentified_by_index.setdefault(int(c["index"]), []).append(c)
+    agy_batch_slots: List[Optional[Dict[str, Any]]] = []
     agents, tasks, wait_calls, completed = {}, {}, {}, {}
-    first_call = min(c["index"] for c in calls)
+    first_call = min(c["index"] for c in all_calls)
 
     def finish(key, call, raw, failed=False, log=""):
         parsed = user_words._parse_codex_json_maybe(raw) if isinstance(raw, str) else raw
@@ -610,6 +616,34 @@ def _native_completion_bill(payload, state=None):
                         explicit_turn = bool(word and user_words._codex_word_from_record(word))
                 if explicit_turn:
                     completed.clear()
+                    agy_batch_slots.clear()
+                if typ == "PLANNER_RESPONSE":
+                    raw_tcs = entry.get("tool_calls")
+                    if isinstance(raw_tcs, list) and raw_tcs:
+                        agy_batch_slots.clear()
+                        step_native_queue = list(unidentified_by_index.get(index, []))
+                        for tc in raw_tcs:
+                            if not isinstance(tc, dict):
+                                continue
+                            if tc.get("call_id") or tc.get("id"):
+                                continue
+                            tc_name = status_guard._native_tool_name(str(tc.get("name") or ""))
+                            tc_args = tc.get("args", tc.get("arguments", tc.get("input", {})))
+                            if isinstance(tc_args, str):
+                                try:
+                                    tc_args = json.loads(tc_args)
+                                except (ValueError, RecursionError):
+                                    tc_args = {}
+                            if isinstance(tc_args, dict) and status_guard._native_dispatch(tc_name, tc_args):
+                                matched_c = next((item for item in step_native_queue if item["name"] == tc_name), None)
+                                if matched_c is not None:
+                                    step_native_queue.remove(matched_c)
+                                    agy_batch_slots.append(matched_c)
+                                else:
+                                    agy_batch_slots.append(None)
+                            else:
+                                agy_batch_slots.append(None)
+                    continue
                 if typ in ("GENERIC", "TOOL_RESULT", "TOOL_RESPONSE"):
                     result = entry.get("tool_result") or entry
                     if not isinstance(result, dict):
@@ -617,13 +651,48 @@ def _native_completion_bill(payload, state=None):
                     key = user_words._tool_call_id(result) or user_words._tool_call_id(entry)
                     raw = entry.get("content") or result.get("output") or ""
                     call = pending.get(key)
-                    if call is None:
+                    if call is None and not key and agy_batch_slots:
+                        raw_str = str(raw)
+                        if "tool call denied by pre-tool hook" in raw_str.lower():
+                            matched_pos = next(
+                                (i for i, s in enumerate(agy_batch_slots) if s is not None and s.get("denied")),
+                                next((i for i, s in enumerate(agy_batch_slots) if s is not None), 0),
+                            )
+                            agy_batch_slots.pop(matched_pos)
+                            continue
+                        if user_words.parse_agy_created_subagent(raw_str) is not None:
+                            matched_pos = next(
+                                (i for i, s in enumerate(agy_batch_slots)
+                                 if s is not None and not s.get("denied") and s["name"] == "invoke_subagent"),
+                                next((i for i, s in enumerate(agy_batch_slots) if s is not None and not s.get("denied")), 0),
+                            )
+                        elif (
+                            re.search(r"running (?:in (?:the )?background|as a background task)", raw_str, re.I)
+                            and not re.search(r"Task Description:[^\n]*(?:cae_harness\.py|python|git|\$)", raw_str, re.I)
+                            and any(s is not None and not s.get("denied") and s["name"] == "run_workflow" for s in agy_batch_slots)
+                        ):
+                            matched_pos = next(
+                                (i for i, s in enumerate(agy_batch_slots)
+                                 if s is not None and not s.get("denied") and s["name"] == "run_workflow"),
+                                0,
+                            )
+                        elif None in agy_batch_slots and re.search(
+                            r"(?:Showing lines|Partial read|Command exited|Created file|Made \d+ replacement|Task Description:[^\n]*(?:cae_harness\.py|python|git|\$))",
+                            raw_str,
+                        ):
+                            matched_pos = agy_batch_slots.index(None)
+                        else:
+                            matched_pos = 0
+                        call = agy_batch_slots.pop(matched_pos)
+                        if call is not None and not call.get("denied"):
+                            key = f"agy-step-{call['index']}-{call['name']}-{index}"
+                    if call is None or call.get("denied"):
                         continue
                     if call["name"] == "run_workflow":
-                        task = re.search(r"running in background.*?(task-[A-Za-z0-9_-]+)", str(raw), re.I | re.S)
+                        task = re.search(r"running (?:in (?:the )?background|as a background task).*?(task-[A-Za-z0-9_-]+)", str(raw), re.I | re.S)
                         if task:
                             tasks[task.group(1)] = call
-                        elif not re.search(r"running in background|Created the following|in_progress", str(raw), re.I):
+                        elif not re.search(r"running (?:in (?:the )?background|as a background task)|Created the following|in_progress", str(raw), re.I):
                             finish(key, call, raw, bool(entry.get("error") or result.get("error")))
                     else:
                         meta = user_words.parse_agy_created_subagent(str(raw))

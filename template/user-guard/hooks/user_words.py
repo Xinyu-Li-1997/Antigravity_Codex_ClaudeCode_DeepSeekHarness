@@ -217,6 +217,9 @@ def _coerce_ratio(raw: Any, fallback: float, low: float = 0.20, high: float = 0.
 _BLOCKQUOTE_PREFIX_RE = re.compile(r"^(\s*(?:>\s*)+)(.*)$")
 
 
+_TEXT_FENCE_LANGS = frozenset({"", "text", "txt", "plain", "markdown", "md"})
+
+
 def collapse_historical_cards(text: str) -> str:
     """折叠历史对话中的多行 14 项确认卡与完工账单表格，避免压缩回读重复污染上下文。"""
     raw = str(text or "")
@@ -227,8 +230,10 @@ def collapse_historical_cards(text: str) -> str:
         return raw
     out_lines: List[str] = []
     in_table = False
+    awaiting_detail_table = False
     collapsed_once = False
     fence = ""
+    fence_is_code = False
     for line in raw.splitlines():
         q_match = _BLOCKQUOTE_PREFIX_RE.match(line)
         quote_prefix = q_match.group(1) if q_match else ""
@@ -237,21 +242,42 @@ def collapse_historical_cards(text: str) -> str:
         if fence:
             if match and match[1][0] == fence[0] and len(match[1]) >= len(fence) and not match[2].strip():
                 fence = ""
-            out_lines.append(line)
-            continue
-        if match:
+                fence_is_code = False
+                in_table = False
+                awaiting_detail_table = False
+                collapsed_once = False
+                out_lines.append(line)
+                continue
+            if fence_is_code:
+                out_lines.append(line)
+                continue
+        elif match:
             in_table = False
+            awaiting_detail_table = False
             collapsed_once = False
             fence = match[1]
+            info_tokens = (match[2] or "").strip().split()
+            fence_lang = info_tokens[0].lower() if info_tokens else ""
+            fence_is_code = fence_lang not in _TEXT_FENCE_LANGS
             out_lines.append(line)
             continue
         stripped = unquoted.strip()
         if stripped.startswith("#### 流 ") and "14 项完整参数明细" in stripped:
-            in_table = True
+            awaiting_detail_table = True
+            in_table = False
             if not collapsed_once:
                 out_lines.append(f"{quote_prefix}[已折叠历史确认单/账单明细]")
                 collapsed_once = True
             continue
+        if awaiting_detail_table:
+            if not stripped:
+                continue
+            if stripped.startswith("|"):
+                awaiting_detail_table = False
+                in_table = True
+                continue
+            awaiting_detail_table = False
+            collapsed_once = False
         if in_table:
             if stripped.startswith("|"):
                 continue
@@ -656,6 +682,44 @@ def mark_heavy_completions_reported(session_id, state_dir=None):
                 atomic_write_json(path, rows)
 
 
+def _resolve_cross_os_detail_file(detail_file: str, ticket_id: str = "") -> Tuple[str, bool]:
+    """解析明细卡文件路径；仅当路径属跨 OS 格式且原路径不可达时，尝试 Windows<->WSL 互转与候选目录核对。"""
+    clean = str(detail_file or "").strip()
+    if not clean:
+        return "", False
+    try:
+        direct = Path(clean)
+        if (not _is_reparse_or_link(direct)) and direct.is_file():
+            return clean, True
+    except OSError:
+        pass
+    is_win_abs = bool(re.match(r"^[A-Za-z]:[/\\]", clean))
+    m_wsl = re.match(r"^/mnt/([A-Za-z])/(.*)$", clean)
+    is_cross_os = (is_win_abs and os.name != "nt") or (bool(m_wsl) and os.name == "nt")
+    if not is_cross_os:
+        return clean, False
+    candidates: List[Path] = []
+    if is_win_abs and os.name != "nt":
+        drive = clean[0].lower()
+        rest = clean[3:].replace("\\", "/")
+        candidates.append(Path(f"/mnt/{drive}/{rest}"))
+    elif m_wsl and os.name == "nt":
+        drive = m_wsl.group(1).upper()
+        rest = m_wsl.group(2).replace("/", "\\")
+        candidates.append(Path(f"{drive}:\\{rest}"))
+    base_name = basename_any_os(clean)
+    if base_name and re.fullmatch(r"[A-Za-z0-9._-]{1,160}", base_name):
+        for plan_dir in candidate_dispatch_plan_dirs():
+            candidates.append(plan_dir / base_name)
+    for cand in candidates:
+        try:
+            if (not _is_reparse_or_link(cand)) and cand.is_file():
+                return str(cand), True
+        except OSError:
+            continue
+    return clean, False
+
+
 def render_pending_workflow_block(ticket, for_handoff=False) -> str:
     """只渲染磁盘字段；有落盘明细文件时优先输出精简总览卡与可点击链接，缺失信息明确标注。"""
     def value(raw):
@@ -670,14 +734,8 @@ def render_pending_workflow_block(ticket, for_handoff=False) -> str:
     def cell(raw):
         return value(raw).replace("|", r"\|").replace("\r", " ").replace("\n", " ")
 
-    detail_file = str(ticket.get("card_detail_file") or "").strip()
-    detail_exists = False
-    if detail_file:
-        try:
-            detail_path = Path(detail_file)
-            detail_exists = (not _is_reparse_or_link(detail_path)) and detail_path.is_file()
-        except OSError:
-            detail_exists = False
+    raw_detail_file = str(ticket.get("card_detail_file") or "").strip()
+    detail_file, detail_exists = _resolve_cross_os_detail_file(raw_detail_file, str(ticket.get("ticket_id") or ""))
     tid_text = value(ticket.get("ticket_id"))
     status_text = value(ticket.get("status"))
     ledger = ticket.get("capability_ledger") or {}

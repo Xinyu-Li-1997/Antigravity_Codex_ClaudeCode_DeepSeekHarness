@@ -276,13 +276,20 @@ def _sync_handoff_tunables(
         "ADVISORY_CP_THRESHOLD": user_words._coerce_pos_int(agy.get("advisory_cp_threshold"), _HANDOFF_BUILTINS["ADVISORY_CP_THRESHOLD"]),
         "ADVISORY_TRANSCRIPT_BYTES": user_words._coerce_pos_int(agy.get("advisory_transcript_mib"), 4) * 1024 * 1024,
         "ADVISORY_THRASH_MIN_CP": user_words._coerce_pos_int(agy.get("advisory_thrash_min_cp"), _HANDOFF_BUILTINS["ADVISORY_THRASH_MIN_CP"]),
-        "ADVISORY_THRASH_AVG_INTERVAL": _pos_float(agy.get("advisory_thrash_avg_interval_sec"), _HANDOFF_BUILTINS["ADVISORY_THRASH_AVG_INTERVAL"]),
+        # 注意：近期压缩频率统计单位为“步数（steps）”；优先读取语义准确的 *_steps，并兼容历史 *_sec 键名。
+        "ADVISORY_THRASH_AVG_INTERVAL": _pos_float(
+            agy.get("advisory_thrash_avg_interval_steps", agy.get("advisory_thrash_avg_interval_sec")),
+            _HANDOFF_BUILTINS["ADVISORY_THRASH_AVG_INTERVAL"],
+        ),
         "ADVISORY_MEDIA_STEPS": user_words._coerce_pos_int(agy.get("advisory_media_steps"), _HANDOFF_BUILTINS["ADVISORY_MEDIA_STEPS"]),
         "ADVISORY_IMAGE_CALLS": user_words._coerce_pos_int(agy.get("advisory_image_calls"), _HANDOFF_BUILTINS["ADVISORY_IMAGE_CALLS"]),
         "ADVISORY_IMAGE_BYTES": user_words._coerce_pos_int(agy.get("advisory_image_mib"), 50) * 1024 * 1024,
         "DRAIN_CP_THRESHOLD": user_words._coerce_pos_int(agy.get("drain_cp_threshold"), _HANDOFF_BUILTINS["DRAIN_CP_THRESHOLD"]),
         "DRAIN_THRASH_MIN_CP": user_words._coerce_pos_int(agy.get("drain_thrash_min_cp"), _HANDOFF_BUILTINS["DRAIN_THRASH_MIN_CP"]),
-        "DRAIN_THRASH_AVG_INTERVAL": _pos_float(agy.get("drain_thrash_avg_interval_sec"), _HANDOFF_BUILTINS["DRAIN_THRASH_AVG_INTERVAL"]),
+        "DRAIN_THRASH_AVG_INTERVAL": _pos_float(
+            agy.get("drain_thrash_avg_interval_steps", agy.get("drain_thrash_avg_interval_sec")),
+            _HANDOFF_BUILTINS["DRAIN_THRASH_AVG_INTERVAL"],
+        ),
         "DRAIN_TRANSCRIPT_BYTES": user_words._coerce_pos_int(agy.get("drain_transcript_mib"), 6) * 1024 * 1024,
         "DRAIN_MEDIA_STEPS": user_words._coerce_pos_int(agy.get("drain_media_steps"), _HANDOFF_BUILTINS["DRAIN_MEDIA_STEPS"]),
         "DRAIN_MEDIA_MIN_CP": user_words._coerce_pos_int(agy.get("drain_media_min_cp"), _HANDOFF_BUILTINS["DRAIN_MEDIA_MIN_CP"]),
@@ -1605,9 +1612,31 @@ def evaluate_pre_invocation_locked(
     elif phase == "freeze":
         mandate_message = _build_freeze_message(gate_state, tel)
 
+    workflow_notice_full = False
     if phase in ("drain", "freeze"):
         tickets = user_words.handoff_session_pending_tickets(conversation_id, state_dir)
-        mandate_message = (mandate_message or "") + _workflow_handoff_notice(tickets)
+        if tickets:
+            ticket_ids = [str(t.get("ticket_id") or "") for t in tickets]
+            cp_now = int(tel["cpCount"])
+            need_full_workflow_notice = (
+                gate_state.get("lastWorkflowNoticePhase") != phase
+                or gate_state.get("lastWorkflowNoticeTicketIds") != ticket_ids
+                or cp_now > int(gate_state.get("lastWorkflowNoticeCp", -1))
+            )
+            if need_full_workflow_notice:
+                mandate_message = (mandate_message or "") + _workflow_handoff_notice(tickets)
+                gate_state["lastWorkflowNoticePhase"] = phase
+                gate_state["lastWorkflowNoticeTicketIds"] = ticket_ids
+                gate_state["lastWorkflowNoticeCp"] = cp_now
+                workflow_notice_full = True
+                changed = True
+            else:
+                mandate_message = (
+                    (mandate_message or "")
+                    + "\n[未决工作流交接提醒] 本会话仍有未决票据 "
+                    + ", ".join(tid for tid in ticket_ids if tid)
+                    + "（精简总览卡与明细链接已在本阶段首次门禁中给出，请完整写入【新对话提示词】并附 `plan --resume-ticket <票据>`）。"
+                )
 
     if changed:
         save_gate_state(state_dir, conversation_id, gate_state)
@@ -1616,6 +1645,7 @@ def evaluate_pre_invocation_locked(
         "phase": phase,
         "advisoryNotice": advisory_notice,
         "mandateMessage": mandate_message,
+        "workflowNoticeFull": workflow_notice_full,
         "telemetry": tel,
     }
 

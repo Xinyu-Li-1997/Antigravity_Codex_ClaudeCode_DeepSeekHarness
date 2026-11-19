@@ -3306,6 +3306,139 @@ class TestDispatchAndBillingGuards(unittest.TestCase):
                     verb_cmd,
                 )
 
+    def test_v118_agy_parallel_subagent_ast_blowup_gzip_open_and_native_bill(self):
+        import time as _time
+
+        # 1) Antigravity 无 call_id 并发 invoke_subagent 计数、轻任务放行与拒绝项排除（Bug P0-1）
+        tp_light = self.root / "agy_light.jsonl"
+        _append_jsonl(tp_light, {"type": "USER_INPUT", "step_index": 0, "content": "读取文档"})
+        _append_jsonl(tp_light, {
+            "type": "PLANNER_RESPONSE", "step_index": 1,
+            "tool_calls": [{"name": "invoke_subagent", "args": {"TypeName": "readonly-reader", "Role": "R1"}}],
+        })
+        res_light = status_guard.handle_pre_tool_use({
+            "conversationId": "v118-light",
+            "cwd": str(self.project),
+            "workspacePaths": [str(self.project)],
+            "transcriptPath": str(tp_light),
+            "toolCall": {"name": "invoke_subagent", "args": {"TypeName": "readonly-reader", "Role": "R1"}},
+        })
+        self.assertEqual(res_light["decision"], "allow")
+
+        tp_unapproved = self.root / "agy_unapproved_2.jsonl"
+        _append_jsonl(tp_unapproved, {"type": "USER_INPUT", "step_index": 0, "content": "并行读两份"})
+        _append_jsonl(tp_unapproved, {
+            "type": "PLANNER_RESPONSE", "step_index": 1,
+            "tool_calls": [
+                {"name": "invoke_subagent", "args": {"TypeName": "readonly-reader", "Role": "R1"}},
+                {"name": "invoke_subagent", "args": {"TypeName": "readonly-reader", "Role": "R2"}},
+            ],
+        })
+        res_unapp = status_guard.handle_pre_tool_use({
+            "conversationId": "v118-unapp",
+            "cwd": str(self.project),
+            "workspacePaths": [str(self.project)],
+            "transcriptPath": str(tp_unapproved),
+            "toolCall": {"name": "invoke_subagent", "args": {"TypeName": "readonly-reader", "Role": "R1"}},
+        })
+        self.assertEqual(res_unapp["decision"], "deny")
+
+        # 获批 4 路并发 + 前序曾有被 deny 记录：4 路应全部 allow
+        self.approve(channel="native_subagent", sid="v118-par4", count=4)
+        tp_par4 = self.root / "agy_par4.jsonl"
+        _append_jsonl(tp_par4, {"type": "USER_INPUT", "step_index": 0, "content": "四路并行读取"})
+        _append_jsonl(tp_par4, {
+            "type": "PLANNER_RESPONSE", "step_index": 1,
+            "tool_calls": [{"name": "invoke_subagent", "args": {"TypeName": "readonly-reader", "Role": "OldDenied"}}],
+        })
+        _append_jsonl(tp_par4, {"type": "GENERIC", "step_index": 2, "content": "tool call denied by pre-tool hook"})
+        _append_jsonl(tp_par4, {
+            "type": "PLANNER_RESPONSE", "step_index": 3,
+            "tool_calls": [
+                {"name": "invoke_subagent", "args": {"TypeName": "readonly-reader", "Role": f"Worker{i}"}}
+                for i in range(1, 5)
+            ],
+        })
+        for i in range(1, 5):
+            r = status_guard.handle_pre_tool_use({
+                "conversationId": "v118-par4",
+                "cwd": str(self.project),
+                "workspacePaths": [str(self.project)],
+                "transcriptPath": str(tp_par4),
+                "toolCall": {"name": "invoke_subagent", "args": {"TypeName": "readonly-reader", "Role": f"Worker{i}"}},
+            })
+            self.assertEqual(r["decision"], "allow", f"stream {i} should be allowed: {r}")
+
+        # 2) AST _AstDict 多分支性能（Bug P0-2）与节点预算防挂死护栏
+        keys = [status_guard._normalize_cross_env_lexical(str(self.project))]
+        outside = self.root / "outside_v118"
+        outside.mkdir(exist_ok=True)
+        out_posix = (outside / "leak.txt").as_posix()
+        branches_code = ["d = {'a': '1', 'b': '2', 'c': '3'}"]
+        for idx in range(18):
+            branches_code.append(
+                f"if cond_{idx}:\n"
+                f"    d['k{idx % 6}'] = 'x{idx}' or 'y{idx}'\n"
+                f"else:\n"
+                f"    d['k{(idx + 1) % 6}'] = 'z{idx}'\n"
+            )
+        safe_code = "\n".join(branches_code) + "\nprint(d.get('a'))\n"
+        t0 = _time.monotonic()
+        self.assertIsNone(status_guard._scan_inline_python_code(safe_code, str(self.project), keys, keys, False))
+        self.assertLess(_time.monotonic() - t0, 1.0)
+        unsafe_code = "\n".join(branches_code) + f"\nopen('{out_posix}', 'w').write('x')\n"
+        self.assertIsNotNone(status_guard._scan_inline_python_code(unsafe_code, str(self.project), keys, keys, False))
+        with unittest.mock.patch.object(status_guard, "_AST_MAX_VISITED_NODES", 20):
+            budget_hit = status_guard._scan_inline_python_code(safe_code, str(self.project), keys, keys, False)
+            self.assertIsNotNone(budget_hit)
+            self.assertEqual(budget_hit[1], "<AST_BUDGET_LIMIT>")
+
+        # 3) gzip/bz2/lzma/codecs/tarfile/Image 只读 open 放行、写入拦截（Bug P1-6）
+        ext_gz = (outside / "events.jsonl.gz").as_posix()
+        ext_tar = (outside / "archive.tar.xz").as_posix()
+        for ro_py in (
+            f"import gzip\nwith gzip.open('{ext_gz}', 'rt', encoding='utf-8') as f: print(f.readline())",
+            f"import bz2\nwith bz2.open('{ext_gz}', 'rb') as f: f.read(8)",
+            f"import lzma\nwith lzma.open('{ext_gz}', 'rt') as f: f.read(8)",
+            f"import codecs\nwith codecs.open('{ext_gz}', 'r', 'utf-8') as f: f.read(8)",
+            f"import tarfile\nwith tarfile.open('{ext_tar}', 'r:xz') as tf: tf.getnames()",
+            f"from PIL import Image\nimg = Image.open('{ext_gz}')",
+        ):
+            with self.subTest(ro_py=ro_py):
+                self.assertIsNone(status_guard._scan_inline_python_code(ro_py, str(self.project), keys, keys, False), ro_py)
+        for rw_py in (
+            f"import gzip\nwith gzip.open('{ext_gz}', 'wt') as f: f.write('x')",
+            f"import tarfile\nwith tarfile.open('{ext_tar}', 'w:gz') as tf: pass",
+        ):
+            with self.subTest(rw_py=rw_py):
+                self.assertIsNotNone(status_guard._scan_inline_python_code(rw_py, str(self.project), keys, keys, False), rw_py)
+
+        # 4) reply_repeat_guard._native_completion_bill 排除 deny 并识别无 call_id 子代理与后台 workflow（Bug P1-5）
+        tp_bill = self.root / "agy_native_bill.jsonl"
+        _append_jsonl(tp_bill, {"type": "USER_INPUT", "step_index": 0, "content": "执行并汇报"})
+        _append_jsonl(tp_bill, {
+            "type": "PLANNER_RESPONSE", "step_index": 1,
+            "tool_calls": [
+                {"name": "invoke_subagent", "args": {"TypeName": "readonly-reader", "Role": "DeniedOne"}},
+                {"name": "invoke_subagent", "args": {"TypeName": "readonly-reader", "Role": "ReaderA"}},
+                {"name": "invoke_subagent", "args": {"TypeName": "readonly-auditor", "Role": "AuditB"}},
+                {"name": "run_workflow", "args": {"Description": "并行扫描"}},
+            ],
+        })
+        _append_jsonl(tp_bill, {"type": "GENERIC", "step_index": 2, "content": "Encountered error in tool execution: tool call denied by pre-tool hook"})
+        _append_jsonl(tp_bill, {"type": "GENERIC", "step_index": 3, "content": 'Created the following subagent: {"conversationId": "conv-a", "logAbsoluteUri": "file:///tmp/conv-a.jsonl"}'})
+        _append_jsonl(tp_bill, {"type": "GENERIC", "step_index": 4, "content": 'Created the following subagent: {"conversationId": "conv-b", "logAbsoluteUri": "file:///tmp/conv-b.jsonl"}'})
+        _append_jsonl(tp_bill, {"type": "GENERIC", "step_index": 5, "content": "Workflow is running as a background task with id: task-99"})
+        _append_jsonl(tp_bill, {"type": "SYSTEM_MESSAGE", "step_index": 6, "content": "[Message] sender=conv-a content=ReaderA 完成摘录"})
+        _append_jsonl(tp_bill, {"type": "SYSTEM_MESSAGE", "step_index": 7, "content": "[Message] sender=conv-b content=AuditB 完成复核"})
+        _append_jsonl(tp_bill, {"type": "SYSTEM_MESSAGE", "step_index": 8, "content": "[Message] sender=v118-bill/task-99 content=Task finished with result: ok"})
+        bill = reply_repeat_guard._native_completion_bill({"transcriptPath": str(tp_bill)}, {})
+        self.assertIsNotNone(bill)
+        self.assertEqual(len(bill["streams"]), 3)
+        native_ids = {s["native_id"] for s in bill["streams"]}
+        self.assertEqual(native_ids, {"conv-a", "conv-b", "task-99"})
+        self.assertTrue(any(s["channel"] == "native_workflow" for s in bill["streams"]))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

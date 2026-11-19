@@ -804,7 +804,10 @@ def _handle_context_locked(conversation_id: str, event_name: str, explicit_sourc
                 source_paths=[str(transcript_path), str(transcript_path.parent / "transcript_full.jsonl")],
                 subagent_returns=subagent_returns, client="antigravity", policy=agy_policy,
             ))
-            injected_blocks.extend(_workflow_recovery_blocks(conversation_id, state_dir, pending_tickets))
+            # 同一步骤若 handoff_gate 已随 mandateMessage 输出完整未决工作流交接块，
+            # 跳过重复的 pending_tickets 恢复块（仍保留未汇报的 heavy_completions 完工账单）。
+            recovery_pending = [] if gate_res.get("workflowNoticeFull") else pending_tickets
+            injected_blocks.extend(_workflow_recovery_blocks(conversation_id, state_dir, recovery_pending))
             state["lastInjectedAt"] = get_current_iso_time()
             state["lastInjectedWordCount"] = len(words)
         log_event(

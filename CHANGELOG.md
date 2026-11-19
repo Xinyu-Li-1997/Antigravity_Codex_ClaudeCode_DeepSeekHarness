@@ -2,6 +2,29 @@
 
 本文件记录四客户端共用规则、会话钩子、后台验证工具与上游维护流程的版本演进。当前插件版本以 `template/user-guard/plugin.json` 为准；常驻使用文档只说明机制和配置键，不重复维护版本号与性能日期。
 
+## [1.17.2] - 2026-11-20
+
+修复运行态子代理并发计数、AST 静态审查指数膨胀、大目录全盘扫盘与多路选项卡重复注入等缺陷，并合入远端跨环境兼容修复（Windows `CC Switch` 桌面识别、WSL2 代理编码容错与 Python 3.14 深层 JSON 嵌套预检）：
+
+- **钩子并发计数、AST 防挂死与完工账单修复（`status_guard.py`、`reply_repeat_guard.py`）**：
+  - 修复 Antigravity 无 `call_id` 并发 `invoke_subagent` 计流与拒绝项排除逻辑：排除已被 `deny` 的历史调用，按当前待决批次投影计数，避免获批多路并行子代理被误拦截或单路轻任务误判超限；
+  - 归并 `_merge_ast_value_sets` 中跨分支 `_AstDict` 候选消除指数膨胀，新增 `_AST_MAX_VISITED_NODES` 与 `_AST_MAX_SCAN_SEC` 硬预算护栏（`_AstScanBudgetExceeded`），杜绝内联脚本审查卡死和内存膨胀；
+  - 注册 `gzip.open`、`bz2.open`、`lzma.open`、`codecs.open`、`tarfile.open` 读写判定并豁免 `Image.open`、`webbrowser.open`，消除只读压缩流误拦截；改为流式遍历 AST 使 `chdir` 追踪即时生效；
+  - 修复 `reply_repeat_guard.py` 在 Antigravity 无 `call_id` 场景下的拒绝槽位对齐与 `run_workflow` 后台任务回执匹配。
+- **无头编排器解析、脱敏、混合批处理与大目录扫盘优化（`cae_harness.py`、`cae-harness/SKILL.md`）**：
+  - `_dsh_supports_cli_permission_flags` 增加线程锁与合理探测超时；`extract_cli_token_usage` 补齐 DSH `cacheReadTokens`、`cacheWriteTokens`、`uncachedInputTokens` 统计并校验总 Token 防重复计数；
+  - 新增保守尾部闭合修补 `_repair_unclosed_json_tail`，在 `OutputParseError` 时附带脱敏 `stderr`、`raw_output_excerpt` 及 `agy` 软拒绝诊断提示；`agy` 只读模式在 Git 仓库子目录自动追加 `--add-dir`；DSH 提示追加单模型直接完成约束；
+  - `_redact_public` 按额度键与局部上下文脱敏用量百分比，保护 `result` 与科学正文中的数值百分比；`cmd_batch` 支持混合通道票据（执行无头流并回报 `skipped_native_streams`），补传 `effort`、`retry_quota` 与安全防递归提示包装；
+  - 优化 `collect_target_files` 与 `_target_metrics`：大目录体量估算仅读 `lstat` 元数据、遵循 `.agentignore`、支持 `max_files` 上限与同批缓存，可写流优先按具体 `write_scope` 估算，消除大算例目录反复打开文件造成的磁盘 I/O 尖峰。
+- **选项卡上下文去重与跨平台恢复闭环（`cae_harness.py`、`session_context_loader.py`、`handoff_gate.py`、`user_words.py`）**：
+  - 已落盘票据的 `plan` 默认输出精简 stdout（置顶 `compact_summary_card`，省略已落盘 14 项长表与 `execution_profile`，需要完整结构时加 `--full-json`）；新增 `plan --cancel-ticket`，`--approve-ticket` 自动将同会话更早且通道重叠的待决票据标为 `SUPERSEDED`；
+  - 消除 `session_context_loader.py` 与 `handoff_gate.py` 在同一步骤的双重卡片注入，连续同阶段 `PreInvocation` 改为单行提醒；修复 `collapse_historical_cards` 空行双占位符并支持折叠文本与 Markdown 围栏内的 14 项表（保留代码围栏与科学表格）；补齐 `render_pending_workflow_block` 的 Windows 与 WSL 跨平台明细卡路径解析，并在 `handoff_gate.py` 兼容 `*_steps` 阈值别名。
+- **跨环境安装探测与 Python 3.14 深度预检（`install.py`、`fleet_state.py`、`tests/`）**：
+  - `install.py` 将 Windows `cc-switch.exe` 归入 `desktop` 列表并兼容含空格的 `Programs/CC Switch` 与 WSL `/mnt/c/Program Files` 路径，避免 `_audit_cli` 拉起桌面程序写入默认提示词；为 `_probe_windows_wsl` 补充 `errors="replace"`；
+  - `fleet_state.py` 新增 `_check_json_nesting_depth` 并在 `_load_state`、`_default_ttl_seconds`、`_repo_meta` 三处 `json.loads` 前统一预检，兼容 Python 3.14 Linux 栈行为；四套离线测试文件补齐全部回归用例。
+
+---
+
 ## [1.17.1] - 2026-11-20
 
 完成精简 4 列总览卡与可点击 `<ticket_id>_card.md` 明细链接闭环，开展多模型全仓深度只读审计与主会话逐行复核，修复调度器、四阶段生命周期钩子、安装器、状态锁、本地分流代理与 WSL2 脚本中的全部已核实 P0/P1/P2 隐患，并全面重写同步主说明、指南、架构文档与三张 SVG 流程图：

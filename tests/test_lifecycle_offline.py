@@ -3366,6 +3366,99 @@ class TestHeavyWorkflowLifecycle(unittest.TestCase):
         )
         self.assertFalse(handoff_gate._workflow_handoff_present(single_row_spoof, [t1, t2]))
 
+    def test_v118_drain_dedup_collapse_blank_and_fenced_and_cross_os_card(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("lifecycle_v118_harness", HOOKS_DIR.parent / "skills/cae-harness/scripts/cae_harness.py")
+        harness = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(harness)
+
+        # 1) collapse_historical_cards: 标题与表头间空行不产生双占位符，且文本/markdown 围栏内 14 项表可折叠，代码围栏与科学表保持原样
+        raw_card_history = (
+            "#### 流 S1（14 项完整参数明细）\n\n"
+            "| 序号 | 参数项 | 当前值 |\n| --- | --- | --- |\n| 1 | 流号 | S1 |\n\n"
+            "| 网格 | L2 误差 | 收敛阶 |\n| --- | --- | --- |\n| 64 | 1.2e-4 | 2.01 |\n\n"
+            "```text\n"
+            "【新对话提示词】\n"
+            "#### 流 S2（14 项完整参数明细）\n\n"
+            "| 序号 | 参数项 | 当前值 |\n| --- | --- | --- |\n| 1 | 流号 | S2 |\n"
+            "```\n\n"
+            "```python\n"
+            "sample = '| 序号 | 参数项 | 当前值 |'\n"
+            "```\n"
+        )
+        folded = user_words.collapse_historical_cards(raw_card_history)
+        self.assertEqual(folded.count("[已折叠历史确认单/账单明细]"), 2)
+        self.assertIn("| 网格 | L2 误差 | 收敛阶 |", folded)
+        self.assertIn("| 64 | 1.2e-4 | 2.01 |", folded)
+        self.assertIn("【新对话提示词】", folded)
+        self.assertNotIn("| 1 | 流号 | S2 |", folded)
+        self.assertIn("sample = '| 序号 | 参数项 | 当前值 |'", folded)
+
+        # 2) session_context_loader + handoff_gate: 同一步 CHECKPOINT+drain 仅注入 1 次完整卡，后续同阶段 PreInvocation 仅 1 行提醒
+        plan_dir = self.state / "dispatch_plans"
+        plan_dir.mkdir(parents=True, exist_ok=True)
+        cid = self.sid
+        _, tk = self.ticket(tid="t-v118-dedup")
+        harness._save_plan(tk, plan_dir)
+        transcript = self.root / "v118_drain_dedup.jsonl"
+        _append_jsonl(transcript, {"type": "USER_INPUT", "step_index": 0, "content": "请立即整理交接并停机"})
+        _append_jsonl(transcript, {"type": "CHECKPOINT", "step_index": 1})
+        payload = {"conversationId": cid, "transcriptPath": str(transcript)}
+        first_res = session_context_loader.handle_pre_invocation(payload)
+        first_msg = first_res["injectSteps"][0]["systemMessage"]["systemMessage"]
+        self.assertEqual(first_msg.count("| 流号 | 通道与执行端 | 模型与挡位 | 可用性与额度状态 |"), 1)
+        self.assertIn("t-v118-dedup_card.md", first_msg)
+
+        # 同阶段无新压缩、票据未变：第二次 PreInvocation 不再灌入完整表格，仅 1 行提醒
+        second_res = session_context_loader.handle_pre_invocation(payload)
+        second_msg = second_res["injectSteps"][0]["systemMessage"]["systemMessage"]
+        self.assertNotIn("| 流号 | 通道与执行端 | 模型与挡位 | 可用性与额度状态 |", second_msg)
+        self.assertIn("[未决工作流交接提醒]", second_msg)
+        self.assertIn("t-v118-dedup", second_msg)
+
+        # 再次发生 CHECKPOINT 压缩后，重新给出 1 次完整精简卡
+        _append_jsonl(transcript, {"type": "CHECKPOINT", "step_index": 2})
+        third_res = session_context_loader.handle_pre_invocation(payload)
+        third_msg = third_res["injectSteps"][0]["systemMessage"]["systemMessage"]
+        self.assertEqual(third_msg.count("| 流号 | 通道与执行端 | 模型与挡位 | 可用性与额度状态 |"), 1)
+
+        # 3) render_pending_workflow_block 跨 OS 路径翻译解析
+        real_card = plan_dir / "t-v118-dedup_card.md"
+        self.assertTrue(real_card.is_file())
+        tk_cross = dict(tk)
+        if os.name == "nt":
+            drive = real_card.drive.rstrip(":").lower()
+            rest = str(real_card)[3:].replace("\\", "/")
+            tk_cross["card_detail_file"] = f"/mnt/{drive}/{rest}"
+        else:
+            tk_cross["card_detail_file"] = r"C:\nonexistent\cross_os\t-v118-dedup_card.md"
+        with unittest.mock.patch.object(user_words, "candidate_dispatch_plan_dirs", return_value=[plan_dir]):
+            rendered_cross = user_words.render_pending_workflow_block(tk_cross, for_handoff=False)
+        self.assertIn("| 流号 | 通道与执行端 | 模型与挡位 | 可用性与额度状态 |", rendered_cross)
+        self.assertNotIn("| 序号 | 参数项 | 当前值 |", rendered_cross)
+
+        # 4) handoff_gate P3-1 *_steps 别名优先于旧 *_sec 键
+        fake_profile = {
+            "runtime_tunables": {
+                "handoff_thresholds": {
+                    "antigravity": {
+                        "advisory_thrash_avg_interval_steps": 42,
+                        "advisory_thrash_avg_interval_sec": 99,
+                        "drain_thrash_avg_interval_steps": 17,
+                        "drain_thrash_avg_interval_sec": 88,
+                    }
+                }
+            }
+        }
+        with unittest.mock.patch.object(user_words, "load_fleet_profile", return_value=fake_profile), \
+             unittest.mock.patch.object(user_words, "get_fleet_profile_cache_token", return_value=("v118-steps-test",)):
+            handoff_gate._LAST_HANDOFF_PROFILE_TOKEN = None
+            handoff_gate._sync_handoff_tunables("antigravity", "", "")
+            self.assertEqual(handoff_gate.ADVISORY_THRASH_AVG_INTERVAL, 42.0)
+            self.assertEqual(handoff_gate.DRAIN_THRASH_AVG_INTERVAL, 17.0)
+        handoff_gate._LAST_HANDOFF_PROFILE_TOKEN = None
+        handoff_gate._sync_handoff_tunables("antigravity", "", "")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

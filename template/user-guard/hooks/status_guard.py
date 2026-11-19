@@ -1403,7 +1403,13 @@ _AST_MODULE_CALLS = {
     "numpy": {"save", "savez", "savez_compressed", "savetxt"},
     "builtins": {"open"},
     "io": {"open"},
+    "gzip": {"open"},
+    "bz2": {"open"},
+    "lzma": {"open"},
+    "codecs": {"open"},
+    "tarfile": {"open"},
 }
+_AST_READONLY_OPEN_RECEIVERS = frozenset({"Image", "webbrowser"})
 _AST_TEMP_DIR_INDEX = {"mkdtemp": 2, "TemporaryDirectory": 2, "mkstemp": 2, "NamedTemporaryFile": 6}
 _AST_WRITE_CALL_ARGS = {
     **{"os." + name: ((0, ("path",)),) for name in
@@ -1659,6 +1665,20 @@ def _open_mode_is_mutating(call_node: ast.Call, mode_pos_idx: int, bindings=None
     return not readonly, _format_ast_candidates(values)
 
 
+def _tarfile_open_mode_is_mutating(call_node: ast.Call, mode_pos_idx: int, bindings=None) -> Tuple[bool, str]:
+    values = _ast_call_arg_candidates(call_node, mode_pos_idx, ("mode",), bindings or {}, "r")
+    if any(isinstance(arg, ast.Starred) for arg in call_node.args):
+        values |= frozenset((_AST_DYNAMIC,))
+    readonly = all(
+        isinstance(v, str) and v and (
+            v == "r"
+            or v.startswith(("r:", "r|"))
+        ) and not any(ch in v.split(":", 1)[0].split("|", 1)[0] for ch in ("w", "a", "x", "+"))
+        for v in values
+    )
+    return not readonly, _format_ast_candidates(values)
+
+
 def _bind_ast_target(target, value, bindings):
     if isinstance(target, ast.Name):
         bindings[target.id] = value
@@ -1677,14 +1697,67 @@ def _bind_ast_target(target, value, bindings):
                     container.uncertain = True
 
 
+_AST_MAX_DICT_KEYS = 64
+_AST_MAX_MERGE_DEPTH = 6
+_AST_MAX_VISITED_NODES = 16000
+_AST_MAX_SCAN_SEC = 2.5
+
+
+class _AstScanBudgetExceeded(RuntimeError):
+    pass
+
+
+def _merge_ast_value_sets(value_sets, depth: int = 0):
+    """保守合并多分支候选值集合：所有 _AstDict 按键归并为单一字典，杜绝跨分支 4^k 指数膨胀。"""
+    dicts = []
+    scalars = set()
+    for vs in value_sets:
+        for item in _ast_values(vs):
+            if isinstance(item, _AstDict):
+                dicts.append(item)
+            else:
+                scalars.add(item)
+    if len(scalars) > _AST_MAX_CANDIDATES:
+        scalars = {_AST_DYNAMIC}
+    if dicts:
+        if depth >= _AST_MAX_MERGE_DEPTH:
+            scalars.add(_AST_DYNAMIC)
+        elif len(dicts) == 1:
+            scalars.add(dicts[0])
+        else:
+            uncertain = any(d.uncertain for d in dicts)
+            all_keys = set().union(*(d.fields.keys() for d in dicts))
+            if uncertain or len(all_keys) > _AST_MAX_DICT_KEYS:
+                scalars.add(_AstDict(uncertain=True))
+            else:
+                merged_fields = {}
+                dyn = frozenset((_AST_DYNAMIC,))
+                for field_key in all_keys:
+                    merged_fields[field_key] = _merge_ast_value_sets(
+                        (d.fields.get(field_key, dyn) for d in dicts),
+                        depth=depth + 1,
+                    )
+                scalars.add(_AstDict(merged_fields, uncertain=False))
+    return frozenset(scalars)
+
+
 def _merge_ast_bindings(bindings, alternatives):
+    dyn = frozenset((_AST_DYNAMIC,))
     for key in set().union(*(set(state) for state in alternatives)):
-        bindings[key] = frozenset().union(*(_ast_values(state.get(key, _AST_DYNAMIC)) for state in alternatives))
+        bindings[key] = _merge_ast_value_sets(
+            (state.get(key, dyn) for state in alternatives),
+            depth=0,
+        )
 
 
-def _iter_ast_calls_in_order(node, bindings, active=()):
+def _iter_ast_calls_in_order(node, bindings, active=(), budget=None):
     """按求值顺序遍历；分支保守合并，函数按每次调用时的绑定重新审查。"""
-    walk = lambda child, scope=bindings: _iter_ast_calls_in_order(child, scope, active)
+    if budget is None:
+        budget = [0, time.monotonic() + _AST_MAX_SCAN_SEC]
+    budget[0] += 1
+    if budget[0] > _AST_MAX_VISITED_NODES or ((budget[0] & 0xFF) == 0 and time.monotonic() > budget[1]):
+        raise _AstScanBudgetExceeded()
+    walk = lambda child, scope=bindings: _iter_ast_calls_in_order(child, scope, active, budget)
     if isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
         if node.value is not None:
             yield from walk(node.value)
@@ -1715,7 +1788,7 @@ def _iter_ast_calls_in_order(node, bindings, active=()):
         for arg in params:
             local[arg.arg] = node._guard_defaults.get(arg.arg, frozenset((_AST_DYNAMIC,)))
         for stmt in node.body if isinstance(node.body, list) else [node.body]:
-            yield from _iter_ast_calls_in_order(stmt, local, active + (node,))
+            yield from _iter_ast_calls_in_order(stmt, local, active + (node,), budget)
         return
     if isinstance(node, ast.ClassDef):
         for expr in list(node.decorator_list) + list(node.bases) + list(node.keywords):
@@ -1757,6 +1830,8 @@ def _iter_ast_calls_in_order(node, bindings, active=()):
         else:
             for field in ("body", "orelse", "handlers"):
                 branch = getattr(node, field, [])
+                if not branch:
+                    continue
                 branches.append(branch if isinstance(branch, list) else [branch])
         alternatives = [_copy_ast_bindings(bindings)]
         for branch in branches:
@@ -1836,7 +1911,7 @@ def _iter_ast_calls_in_order(node, bindings, active=()):
                 for arg in params + list(function.args.kwonlyargs):
                     local[arg.arg] = _ast_values(local[arg.arg]) | frozenset((_AST_DYNAMIC,))
             for stmt in function.body if isinstance(function.body, list) else [function.body]:
-                yield from _iter_ast_calls_in_order(stmt, local, active + (function,))
+                yield from _iter_ast_calls_in_order(stmt, local, active + (function,), budget)
             bindings[_AST_CWD] = local.get(_AST_CWD, bindings.get(_AST_CWD, frozenset(("",))))
             for stmt in ast.walk(function):
                 if isinstance(stmt, (ast.Global, ast.Nonlocal)):
@@ -1937,169 +2012,179 @@ def _scan_inline_python_code(
 
     if tree is not None:
         try:
-            ast_calls = list(_iter_ast_calls_in_order(tree, bindings))
-        except RecursionError:
-            return "内联 Python 语法树嵌套深度超出静态审查上限", "<AST_RECURSION_LIMIT>", _compact_snippet(used_src)
-        for node, bindings in ast_calls:
-            snippet = _compact_snippet(ast.get_source_segment(used_src, node) or "python call")
-            fn = node.func
-            chdir_hit = _track_ast_chdir(node, bindings, base_cwd, allowed_norm_keys, allowed_resolved_keys,
-                                        allow_os_temp, snippet, wsl_distribution)
-            if chdir_hit:
-                return chdir_hit
+            for node, bindings in _iter_ast_calls_in_order(tree, bindings):
+                snippet = _compact_snippet(ast.get_source_segment(used_src, node) or "python call")
+                fn = node.func
+                chdir_hit = _track_ast_chdir(node, bindings, base_cwd, allowed_norm_keys, allowed_resolved_keys,
+                                            allow_os_temp, snippet, wsl_distribution)
+                if chdir_hit:
+                    return chdir_hit
 
-            # 模块函数先于同名 Path 方法检查，模块与可调用标识不能作为路径字符串使用。
-            qualnames = _ast_call_qualnames(fn, bindings)
-            for qualname in qualnames:
-                if qualname in ("builtins.open", "io.open"):
+                # 模块函数先于同名 Path 方法检查，模块与可调用标识不能作为路径字符串使用。
+                qualnames = _ast_call_qualnames(fn, bindings)
+                for qualname in qualnames:
+                    if qualname in ("builtins.open", "io.open", "gzip.open", "bz2.open", "lzma.open", "codecs.open"):
+                        is_mut, mode_s = _open_mode_is_mutating(node, 1, bindings)
+                        if is_mut:
+                            tgt = _ast_call_arg_candidates(node, 0, ("file", "filename"), bindings)
+                            if _bad(tgt):
+                                label = "open" if qualname in ("builtins.open", "io.open") else qualname
+                                return f"Python 写入/修改文件 ({label} mode='{mode_s}')", _format_ast_candidates(tgt), snippet
+                    elif qualname == "tarfile.open":
+                        is_mut, mode_s = _tarfile_open_mode_is_mutating(node, 1, bindings)
+                        if is_mut:
+                            tgt = _ast_call_arg_candidates(node, 0, ("name",), bindings)
+                            if _bad(tgt):
+                                return f"Python 写入/修改归档 (tarfile.open mode='{mode_s}')", _format_ast_candidates(tgt), snippet
+                    elif qualname == "os.open":
+                        flags = _ast_call_arg_candidates(node, 1, ("flags",), bindings)
+                        if not all(type(value) is int and value == 0 for value in flags):
+                            tgt = _ast_call_arg_candidates(node, 0, ("path",), bindings)
+                            if _bad(tgt):
+                                return "Python 系统文件写入 (os.open)", _format_ast_candidates(tgt), snippet
+                    elif qualname in _AST_WRITE_CALL_ARGS:
+                        for index, keywords in _AST_WRITE_CALL_ARGS[qualname]:
+                            default = "." if qualname == "shutil.unpack_archive" else _AST_DYNAMIC
+                            tgt = _ast_call_arg_candidates(node, index, keywords, bindings, default)
+                            if _bad(tgt):
+                                return f"Python 系统文件写删操作 ({qualname})", _format_ast_candidates(tgt), snippet
+                    elif qualname.startswith("tempfile.") and qualname.split(".")[1] in _AST_TEMP_DIR_INDEX:
+                        tgt = _ast_temp_path_candidates(node, qualname.split(".")[1], bindings)
+                        if _bad(tgt):
+                            return f"Python 创建临时目录或文件 ({qualname})", _format_ast_candidates(tgt), snippet
+                    elif qualname in {"numpy." + name for name in _AST_MODULE_CALLS["numpy"]}:
+                        tgt = _ast_call_arg_candidates(node, 0, ("file", "fname"), bindings)
+                        if _bad(tgt):
+                            return f"NumPy 数组落盘 ({qualname})", _format_ast_candidates(tgt), snippet
+                    elif qualname in {"os." + name for name in _AST_OS_EXEC_SPAWN}:
+                        if _AST_DEFINITION not in bindings:
+                            return f"Python 进程替换或派生执行 ({qualname})", "<EXEC_OR_SPAWN>", snippet
+                    elif qualname in ("os.system", "os.popen") or qualname in {
+                        "subprocess." + name for name in _AST_MODULE_CALLS["subprocess"]
+                    }:
+                        if depth >= MAX_WRAPPER_DEPTH:
+                            if _AST_DEFINITION in bindings:
+                                continue
+                            return "深层嵌套命令超出静态目录边界审查上限", "<NESTED_DEPTH_EXCEEDED>", snippet
+                        cwds = _ast_values(bindings.get(_AST_CWD, base_cwd))
+                        if qualname.startswith("subprocess.") and any(kw.arg == "cwd" for kw in node.keywords):
+                            raw_cwds = frozenset().union(*(
+                                _eval_ast_path_candidates(kw.value, bindings) for kw in node.keywords if kw.arg == "cwd"
+                            ))
+                            specified = raw_cwds - frozenset((None,))
+                            if _bad(specified):
+                                return "Python 子进程指定项目外或动态 Cwd", _format_ast_candidates(specified), snippet
+                            resolved = _ast_product([cwds, specified], lambda parts: _ast_resolve_cwd(parts[1], parts[0])) if specified else frozenset()
+                            cwds = resolved | (cwds if None in raw_cwds else frozenset())
+                        commands = _ast_call_arg_candidates(node, 0, ("args", "command", "cmd"), bindings)
+                        for command in commands:
+                            direct_py_code: Optional[str] = None
+                            if isinstance(command, tuple) and all(isinstance(part, str) for part in command):
+                                if command:
+                                    exe_stem = Path(command[0].replace("\\", "/")).name.lower()
+                                    if exe_stem.endswith(".exe"):
+                                        exe_stem = exe_stem[:-4]
+                                    if exe_stem == "py" or exe_stem.startswith("python"):
+                                        idx_arg = 1
+                                        while idx_arg < len(command):
+                                            tok = command[idx_arg]
+                                            if tok == "--":
+                                                break
+                                            if tok in ("-W", "-X", "-Q", "--check-hash-based-pycs"):
+                                                idx_arg += 2
+                                                continue
+                                            if tok == "--safe-path" or tok.startswith(("-W", "-X", "-Q", "--check-hash-based-pycs=")):
+                                                idx_arg += 1
+                                                continue
+                                            m_inline_c = re.fullmatch(r"-[BbIdEisSuqvVxOP]*c(.*)", tok, re.DOTALL)
+                                            if m_inline_c:
+                                                if m_inline_c.group(1):
+                                                    direct_py_code = m_inline_c.group(1)
+                                                elif idx_arg + 1 < len(command):
+                                                    direct_py_code = command[idx_arg + 1]
+                                                break
+                                            if not tok.startswith("-") or tok == "-":
+                                                break
+                                            idx_arg += 1
+                                command = " ".join(shlex.quote(part) for part in command)
+                            if not isinstance(command, str):
+                                if _AST_DEFINITION in bindings:
+                                    continue
+                                return "Python 子进程命令无法静态确定", "<DYNAMIC_UNRESOLVED>", snippet
+                            for cwd in cwds:
+                                if not isinstance(cwd, (str, type(None))):
+                                    if _AST_DEFINITION in bindings:
+                                        continue
+                                    return "Python 子进程工作目录无法静态确定", "<DYNAMIC_UNRESOLVED>", snippet
+                                if direct_py_code is not None:
+                                    py_hit = _scan_inline_python_code(
+                                        direct_py_code, cwd, allowed_norm_keys, allowed_resolved_keys,
+                                        allow_os_temp, depth + 1, wsl_distribution,
+                                    )
+                                    if py_hit:
+                                        return py_hit
+                                sub_hit = _detect_command_external_mutation(
+                                    command, cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp,
+                                    depth + 1, wsl_distribution,
+                                )
+                                if sub_hit:
+                                    return sub_hit
+                if qualnames:
+                    continue
+
+                # 内置 open 与 Path 方法分别检查路径、模式和解包参数。
+                if isinstance(fn, ast.Name) and fn.id == "open":
                     is_mut, mode_s = _open_mode_is_mutating(node, 1, bindings)
                     if is_mut:
                         tgt = _ast_call_arg_candidates(node, 0, ("file",), bindings)
                         if _bad(tgt):
                             return f"Python 写入/修改文件 (open mode='{mode_s}')", _format_ast_candidates(tgt), snippet
-                elif qualname == "os.open":
-                    flags = _ast_call_arg_candidates(node, 1, ("flags",), bindings)
-                    if not all(type(value) is int and value == 0 for value in flags):
-                        tgt = _ast_call_arg_candidates(node, 0, ("path",), bindings)
-                        if _bad(tgt):
-                            return "Python 系统文件写入 (os.open)", _format_ast_candidates(tgt), snippet
-                elif qualname in _AST_WRITE_CALL_ARGS:
-                    for index, keywords in _AST_WRITE_CALL_ARGS[qualname]:
-                        default = "." if qualname == "shutil.unpack_archive" else _AST_DYNAMIC
-                        tgt = _ast_call_arg_candidates(node, index, keywords, bindings, default)
-                        if _bad(tgt):
-                            return f"Python 系统文件写删操作 ({qualname})", _format_ast_candidates(tgt), snippet
-                elif qualname.startswith("tempfile.") and qualname.split(".")[1] in _AST_TEMP_DIR_INDEX:
-                    tgt = _ast_temp_path_candidates(node, qualname.split(".")[1], bindings)
-                    if _bad(tgt):
-                        return f"Python 创建临时目录或文件 ({qualname})", _format_ast_candidates(tgt), snippet
-                elif qualname in {"numpy." + name for name in _AST_MODULE_CALLS["numpy"]}:
-                    tgt = _ast_call_arg_candidates(node, 0, ("file", "fname"), bindings)
-                    if _bad(tgt):
-                        return f"NumPy 数组落盘 ({qualname})", _format_ast_candidates(tgt), snippet
-                elif qualname in {"os." + name for name in _AST_OS_EXEC_SPAWN}:
-                    if _AST_DEFINITION not in bindings:
-                        return f"Python 进程替换或派生执行 ({qualname})", "<EXEC_OR_SPAWN>", snippet
-                elif qualname in ("os.system", "os.popen") or qualname in {
-                    "subprocess." + name for name in _AST_MODULE_CALLS["subprocess"]
-                }:
-                    if depth >= MAX_WRAPPER_DEPTH:
-                        if _AST_DEFINITION in bindings:
+
+                elif isinstance(fn, ast.Attribute):
+                    attr = fn.attr
+
+                    # 2) Path(p).open(mode)
+                    if attr == "open":
+                        if isinstance(fn.value, ast.Name) and fn.value.id in _AST_READONLY_OPEN_RECEIVERS:
                             continue
-                        return "深层嵌套命令超出静态目录边界审查上限", "<NESTED_DEPTH_EXCEEDED>", snippet
-                    cwds = _ast_values(bindings.get(_AST_CWD, base_cwd))
-                    if qualname.startswith("subprocess.") and any(kw.arg == "cwd" for kw in node.keywords):
-                        raw_cwds = frozenset().union(*(
-                            _eval_ast_path_candidates(kw.value, bindings) for kw in node.keywords if kw.arg == "cwd"
-                        ))
-                        specified = raw_cwds - frozenset((None,))
-                        if _bad(specified):
-                            return "Python 子进程指定项目外或动态 Cwd", _format_ast_candidates(specified), snippet
-                        resolved = _ast_product([cwds, specified], lambda parts: _ast_resolve_cwd(parts[1], parts[0])) if specified else frozenset()
-                        cwds = resolved | (cwds if None in raw_cwds else frozenset())
-                    commands = _ast_call_arg_candidates(node, 0, ("args", "command", "cmd"), bindings)
-                    for command in commands:
-                        direct_py_code: Optional[str] = None
-                        if isinstance(command, tuple) and all(isinstance(part, str) for part in command):
-                            if command:
-                                exe_stem = Path(command[0].replace("\\", "/")).name.lower()
-                                if exe_stem.endswith(".exe"):
-                                    exe_stem = exe_stem[:-4]
-                                if exe_stem == "py" or exe_stem.startswith("python"):
-                                    idx_arg = 1
-                                    while idx_arg < len(command):
-                                        tok = command[idx_arg]
-                                        if tok == "--":
-                                            break
-                                        if tok in ("-W", "-X", "-Q", "--check-hash-based-pycs"):
-                                            idx_arg += 2
-                                            continue
-                                        if tok == "--safe-path" or tok.startswith(("-W", "-X", "-Q", "--check-hash-based-pycs=")):
-                                            idx_arg += 1
-                                            continue
-                                        m_inline_c = re.fullmatch(r"-[BbIdEisSuqvVxOP]*c(.*)", tok, re.DOTALL)
-                                        if m_inline_c:
-                                            if m_inline_c.group(1):
-                                                direct_py_code = m_inline_c.group(1)
-                                            elif idx_arg + 1 < len(command):
-                                                direct_py_code = command[idx_arg + 1]
-                                            break
-                                        if not tok.startswith("-") or tok == "-":
-                                            break
-                                        idx_arg += 1
-                            command = " ".join(shlex.quote(part) for part in command)
-                        if not isinstance(command, str):
-                            if _AST_DEFINITION in bindings:
-                                continue
-                            return "Python 子进程命令无法静态确定", "<DYNAMIC_UNRESOLVED>", snippet
-                        for cwd in cwds:
-                            if not isinstance(cwd, (str, type(None))):
-                                if _AST_DEFINITION in bindings:
-                                    continue
-                                return "Python 子进程工作目录无法静态确定", "<DYNAMIC_UNRESOLVED>", snippet
-                            if direct_py_code is not None:
-                                py_hit = _scan_inline_python_code(
-                                    direct_py_code, cwd, allowed_norm_keys, allowed_resolved_keys,
-                                    allow_os_temp, depth + 1, wsl_distribution,
-                                )
-                                if py_hit:
-                                    return py_hit
-                            sub_hit = _detect_command_external_mutation(
-                                command, cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp,
-                                depth + 1, wsl_distribution,
-                            )
-                            if sub_hit:
-                                return sub_hit
-            if qualnames:
-                continue
+                        is_mut, mode_s = _open_mode_is_mutating(node, 0, bindings)
+                        if is_mut:
+                            tgt = _eval_ast_path_candidates(fn.value, bindings)
+                            if _bad(tgt):
+                                return f"Python 写入/修改文件 (.open mode='{mode_s}')", _format_ast_candidates(tgt), snippet
 
-            # 内置 open 与 Path 方法分别检查路径、模式和解包参数。
-            if isinstance(fn, ast.Name) and fn.id == "open":
-                is_mut, mode_s = _open_mode_is_mutating(node, 1, bindings)
-                if is_mut:
-                    tgt = _ast_call_arg_candidates(node, 0, ("file",), bindings)
-                    if _bad(tgt):
-                        return f"Python 写入/修改文件 (open mode='{mode_s}')", _format_ast_candidates(tgt), snippet
-
-            elif isinstance(fn, ast.Attribute):
-                attr = fn.attr
-
-                # 2) Path(p).open(mode)
-                if attr == "open":
-                    is_mut, mode_s = _open_mode_is_mutating(node, 0, bindings)
-                    if is_mut:
+                    # 3) Path(p).write_text / write_bytes / unlink / rmdir / mkdir / touch / chmod / lchmod
+                    elif attr in ("write_text", "write_bytes", "unlink", "rmdir", "mkdir", "touch", "symlink_to", "hardlink_to", "chmod", "lchmod"):
                         tgt = _eval_ast_path_candidates(fn.value, bindings)
                         if _bad(tgt):
-                            return f"Python 写入/修改文件 (.open mode='{mode_s}')", _format_ast_candidates(tgt), snippet
+                            return f"Python 文件写删操作 (.{attr})", _format_ast_candidates(tgt), snippet
 
-                # 3) Path(p).write_text / write_bytes / unlink / rmdir / mkdir / touch / chmod / lchmod
-                elif attr in ("write_text", "write_bytes", "unlink", "rmdir", "mkdir", "touch", "symlink_to", "hardlink_to", "chmod", "lchmod"):
-                    tgt = _eval_ast_path_candidates(fn.value, bindings)
-                    if _bad(tgt):
-                        return f"Python 文件写删操作 (.{attr})", _format_ast_candidates(tgt), snippet
+                    # 4) Path(p).rename(dst) / replace(dst)
+                    elif attr in ("rename", "replace"):
+                        if attr == "replace" and (
+                            (not any(isinstance(arg, ast.Starred) for arg in node.args) and len(node.args) >= 2)
+                            or any(kw.arg in ("old", "new", "count") for kw in node.keywords)
+                        ):
+                            continue
+                        target = _ast_call_arg_candidates(node, 0, ("target",), bindings)
+                        if _ast_has_unpacking(node):
+                            target |= frozenset((_AST_DYNAMIC,))
+                        for tgt in (_eval_ast_path_candidates(fn.value, bindings), target):
+                            if _bad(tgt):
+                                return f"Python 移动/替换文件 (.{attr})", _format_ast_candidates(tgt), snippet
 
-                # 4) Path(p).rename(dst) / replace(dst)
-                elif attr in ("rename", "replace"):
-                    if attr == "replace" and (
-                        (not any(isinstance(arg, ast.Starred) for arg in node.args) and len(node.args) >= 2)
-                        or any(kw.arg in ("old", "new", "count") for kw in node.keywords)
-                    ):
-                        continue
-                    target = _ast_call_arg_candidates(node, 0, ("target",), bindings)
-                    if _ast_has_unpacking(node):
-                        target |= frozenset((_AST_DYNAMIC,))
-                    for tgt in (_eval_ast_path_candidates(fn.value, bindings), target):
+                    elif attr in ("savefig", "to_csv", "to_parquet", "to_excel", "to_feather", "to_pickle"):
+                        keywords = ("fname",) if attr == "savefig" else (("excel_writer",) if attr == "to_excel" else ("path_or_buf", "path"))
+                        default = None if attr in ("to_csv", "to_parquet") else _AST_DYNAMIC
+                        tgt = _ast_call_arg_candidates(node, 0, keywords, bindings, default)
+                        if attr in ("to_csv", "to_parquet"):
+                            tgt -= frozenset((None,))
                         if _bad(tgt):
-                            return f"Python 移动/替换文件 (.{attr})", _format_ast_candidates(tgt), snippet
-
-                elif attr in ("savefig", "to_csv", "to_parquet", "to_excel", "to_feather", "to_pickle"):
-                    keywords = ("fname",) if attr == "savefig" else (("excel_writer",) if attr == "to_excel" else ("path_or_buf", "path"))
-                    default = None if attr in ("to_csv", "to_parquet") else _AST_DYNAMIC
-                    tgt = _ast_call_arg_candidates(node, 0, keywords, bindings, default)
-                    if attr in ("to_csv", "to_parquet"):
-                        tgt -= frozenset((None,))
-                    if _bad(tgt):
-                        return f"Python 数据/图表导出 (.{attr})", _format_ast_candidates(tgt), snippet
+                            return f"Python 数据/图表导出 (.{attr})", _format_ast_candidates(tgt), snippet
+        except RecursionError:
+            return "内联 Python 语法树嵌套深度超出静态审查上限", "<AST_RECURSION_LIMIT>", _compact_snippet(used_src)
+        except _AstScanBudgetExceeded:
+            return "内联 Python 静态审查超出预算上限", "<AST_BUDGET_LIMIT>", _compact_snippet(used_src)
         if has_raw_nul:
             return "内联 Python 含空字节无法静态确证安全", "<NUL_BYTE>", _compact_snippet(py_code.replace("\x00", "\\x00"))
         return None
@@ -2173,91 +2258,96 @@ def _scan_workflow_python_code(
     def _bad(target) -> bool:
         return _ast_bad_target(target, bindings, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp)
 
-    for node, bindings in _iter_ast_calls_in_order(tree, bindings):
-        fn = node.func
-        fn_name = fn.id if isinstance(fn, ast.Name) else (fn.attr if isinstance(fn, ast.Attribute) else "")
-        snippet = _compact_snippet(ast.get_source_segment(py_code, node) or "workflow call")
-        chdir_hit = _track_ast_chdir(node, bindings, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp, snippet)
-        if chdir_hit:
-            return chdir_hit
+    try:
+        for node, bindings in _iter_ast_calls_in_order(tree, bindings):
+            fn = node.func
+            fn_name = fn.id if isinstance(fn, ast.Name) else (fn.attr if isinstance(fn, ast.Attribute) else "")
+            snippet = _compact_snippet(ast.get_source_segment(py_code, node) or "workflow call")
+            chdir_hit = _track_ast_chdir(node, bindings, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp, snippet)
+            if chdir_hit:
+                return chdir_hit
 
-        if fn_name == "call_tool":
-            tool_arguments = _ast_workflow_tool_arguments(node, bindings)
-            if tool_arguments is None:
-                if _AST_DEFINITION in bindings:
-                    continue
-                return "动态工作流 call_tool 解包参数无法静态核验", "<DYNAMIC_UNRESOLVED>", snippet
-            for raw_name, param_values in ((name, params) for names, params in tool_arguments for name in names):
-                if not isinstance(raw_name, str):
+            if fn_name == "call_tool":
+                tool_arguments = _ast_workflow_tool_arguments(node, bindings)
+                if tool_arguments is None:
                     if _AST_DEFINITION in bindings:
                         continue
-                    return "动态工作流 call_tool 工具名无法静态确定", "<DYNAMIC_UNRESOLVED>", snippet
-                tname = handoff_gate.AGY_TOOL_ALIASES.get(raw_name, raw_name)
-                if tname not in (*FILE_MUTATION_TOOLS, "run_command", "run_workflow"):
-                    continue
-                for params in param_values:
-                    if not isinstance(params, _AstDict) or params.uncertain:
+                    return "动态工作流 call_tool 解包参数无法静态核验", "<DYNAMIC_UNRESOLVED>", snippet
+                for raw_name, param_values in ((name, params) for names, params in tool_arguments for name in names):
+                    if not isinstance(raw_name, str):
                         if _AST_DEFINITION in bindings:
                             continue
-                        return f"动态工作流 call_tool({raw_name}) 参数无法静态核验", "<DYNAMIC_UNRESOLVED>", snippet
-                    fields = params.fields
-                    if tname in FILE_MUTATION_TOOLS:
-                        targets = _ast_dict_field(fields, FILE_PATH_KEYS)
-                        if _bad(targets):
-                            return f"动态工作流 call_tool({raw_name}) 修改项目外或动态路径", _format_ast_candidates(targets), snippet
+                        return "动态工作流 call_tool 工具名无法静态确定", "<DYNAMIC_UNRESOLVED>", snippet
+                    tname = handoff_gate.AGY_TOOL_ALIASES.get(raw_name, raw_name)
+                    if tname not in (*FILE_MUTATION_TOOLS, "run_command", "run_workflow"):
                         continue
-                    cwds = _ast_dict_field(fields, ("Cwd", "cwd"), bindings.get(_AST_CWD, base_cwd or ""))
-                    if _bad(cwds):
-                        return f"动态工作流 call_tool({raw_name}) 指定项目外或动态 Cwd", _format_ast_candidates(cwds), snippet
-                    resolved_cwds = _ast_product(
-                        [_ast_values(bindings.get(_AST_CWD, base_cwd or "")), cwds],
-                        lambda parts: _ast_resolve_cwd(parts[1], parts[0]),
-                    )
-                    for cwd in resolved_cwds:
-                        if not isinstance(cwd, str):
-                            if _AST_DEFINITION in bindings:
-                                continue
-                            return "动态工作流工作目录无法静态确定", "<DYNAMIC_UNRESOLVED>", snippet
-                        if tname == "run_command":
-                            commands = _ast_dict_field(fields, ("CommandLine", "command_line", "command"))
-                            for command in commands:
-                                if not isinstance(command, str):
-                                    return "动态工作流 run_command 命令无法静态确定", "<DYNAMIC_UNRESOLVED>", snippet
-                                hit = _detect_command_external_mutation(command, cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp)
-                                if hit:
-                                    return f"动态工作流 call_tool(run_command): {hit[0]}", hit[1], hit[2]
-                        else:
-                            if depth >= 3:
-                                return "动态工作流嵌套超出静态审查上限", "<DYNAMIC_UNRESOLVED>", snippet
-                            for keys, is_path in ((("Script", "script"), False), (("ScriptPath", "scriptPath", "script_path"), True)):
-                                scripts = _ast_dict_field(fields, keys, "")
-                                for script in scripts:
-                                    if not isinstance(script, str):
-                                        return "嵌套动态工作流脚本无法静态确定", "<DYNAMIC_UNRESOLVED>", snippet
-                                    hit = _detect_workflow_external_mutation(
-                                        {"Cwd": cwd, "ScriptPath" if is_path else "Script": script}, cwd, cwd, [],
-                                        allowed_norm_keys, allowed_resolved_keys, allow_os_temp, depth + 1,
-                                    ) if script else None
-                                    if hit:
-                                        return hit
-                            if not any(key in fields for key in ("Script", "script", "ScriptPath", "scriptPath", "script_path")):
-                                return "嵌套动态工作流缺少可核验脚本", "<DYNAMIC_UNRESOLVED>", snippet
-
-        elif fn_name == "agent":
-            for kw in node.keywords:
-                if kw.arg in ("cwd", "Cwd"):
-                    ag_cwd = _eval_ast_path_candidates(kw.value, bindings)
-                    if _bad(ag_cwd):
-                        return "动态工作流 agent() 指定项目外工作目录", _format_ast_candidates(ag_cwd), snippet
-                elif kw.arg is None:
-                    for params in _eval_ast_path_candidates(kw.value, bindings):
+                    for params in param_values:
                         if not isinstance(params, _AstDict) or params.uncertain:
                             if _AST_DEFINITION in bindings:
                                 continue
-                            return "动态工作流 agent() 解包参数无法静态核验", "<DYNAMIC_UNRESOLVED>", snippet
-                        ag_cwd = _ast_dict_field(params.fields, ("cwd", "Cwd"), frozenset())
+                            return f"动态工作流 call_tool({raw_name}) 参数无法静态核验", "<DYNAMIC_UNRESOLVED>", snippet
+                        fields = params.fields
+                        if tname in FILE_MUTATION_TOOLS:
+                            targets = _ast_dict_field(fields, FILE_PATH_KEYS)
+                            if _bad(targets):
+                                return f"动态工作流 call_tool({raw_name}) 修改项目外或动态路径", _format_ast_candidates(targets), snippet
+                            continue
+                        cwds = _ast_dict_field(fields, ("Cwd", "cwd"), bindings.get(_AST_CWD, base_cwd or ""))
+                        if _bad(cwds):
+                            return f"动态工作流 call_tool({raw_name}) 指定项目外或动态 Cwd", _format_ast_candidates(cwds), snippet
+                        resolved_cwds = _ast_product(
+                            [_ast_values(bindings.get(_AST_CWD, base_cwd or "")), cwds],
+                            lambda parts: _ast_resolve_cwd(parts[1], parts[0]),
+                        )
+                        for cwd in resolved_cwds:
+                            if not isinstance(cwd, str):
+                                if _AST_DEFINITION in bindings:
+                                    continue
+                                return "动态工作流工作目录无法静态确定", "<DYNAMIC_UNRESOLVED>", snippet
+                            if tname == "run_command":
+                                commands = _ast_dict_field(fields, ("CommandLine", "command_line", "command"))
+                                for command in commands:
+                                    if not isinstance(command, str):
+                                        return "动态工作流 run_command 命令无法静态确定", "<DYNAMIC_UNRESOLVED>", snippet
+                                    hit = _detect_command_external_mutation(command, cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp)
+                                    if hit:
+                                        return f"动态工作流 call_tool(run_command): {hit[0]}", hit[1], hit[2]
+                            else:
+                                if depth >= 3:
+                                    return "动态工作流嵌套超出静态审查上限", "<DYNAMIC_UNRESOLVED>", snippet
+                                for keys, is_path in ((("Script", "script"), False), (("ScriptPath", "scriptPath", "script_path"), True)):
+                                    scripts = _ast_dict_field(fields, keys, "")
+                                    for script in scripts:
+                                        if not isinstance(script, str):
+                                            return "嵌套动态工作流脚本无法静态确定", "<DYNAMIC_UNRESOLVED>", snippet
+                                        hit = _detect_workflow_external_mutation(
+                                            {"Cwd": cwd, "ScriptPath" if is_path else "Script": script}, cwd, cwd, [],
+                                            allowed_norm_keys, allowed_resolved_keys, allow_os_temp, depth + 1,
+                                        ) if script else None
+                                        if hit:
+                                            return hit
+                                if not any(key in fields for key in ("Script", "script", "ScriptPath", "scriptPath", "script_path")):
+                                    return "嵌套动态工作流缺少可核验脚本", "<DYNAMIC_UNRESOLVED>", snippet
+
+            elif fn_name == "agent":
+                for kw in node.keywords:
+                    if kw.arg in ("cwd", "Cwd"):
+                        ag_cwd = _eval_ast_path_candidates(kw.value, bindings)
                         if _bad(ag_cwd):
                             return "动态工作流 agent() 指定项目外工作目录", _format_ast_candidates(ag_cwd), snippet
+                    elif kw.arg is None:
+                        for params in _eval_ast_path_candidates(kw.value, bindings):
+                            if not isinstance(params, _AstDict) or params.uncertain:
+                                if _AST_DEFINITION in bindings:
+                                    continue
+                                return "动态工作流 agent() 解包参数无法静态核验", "<DYNAMIC_UNRESOLVED>", snippet
+                            ag_cwd = _ast_dict_field(params.fields, ("cwd", "Cwd"), frozenset())
+                            if _bad(ag_cwd):
+                                return "动态工作流 agent() 指定项目外工作目录", _format_ast_candidates(ag_cwd), snippet
+    except RecursionError:
+        return "动态工作流语法树嵌套深度超出静态审查上限", "<AST_RECURSION_LIMIT>", _compact_snippet(py_code)
+    except _AstScanBudgetExceeded:
+        return "动态工作流静态审查超出预算上限", "<AST_BUDGET_LIMIT>", _compact_snippet(py_code)
     return None
 
 
@@ -3287,12 +3377,25 @@ def _dispatch_transcript(payload: Dict[str, Any]) -> Optional[Path]:
     return user_words.resolve_compact_transcript_path(Path(raw).expanduser()) if raw else None
 
 
+def _native_channel(name: str) -> str:
+    return {"run_workflow": "native_workflow", "swarm": "native_swarm"}.get(name, "native_subagent")
+
+
 def _native_turn_snapshot(payload: Dict[str, Any], *, all_turns=False) -> Tuple[str, List[Dict[str, Any]]]:
-    """读取原生调用；派工按当前回合计数，完工核验可保留全部可见回合。"""
+    """读取原生调用；派工按当前回合计数并排除已拒调用与本步重复统计，完工核验可保留全部可见回合。"""
     path = _dispatch_transcript(payload)
     turn, calls = "initial", []
     if path is None:
         return turn, calls
+    calls_by_id: Dict[str, Dict[str, Any]] = {}
+    batch_slots: List[Optional[Dict[str, Any]]] = []
+
+    def _settle_open_batch() -> None:
+        for slot in batch_slots:
+            if slot is not None:
+                slot["pending"] = False
+        batch_slots.clear()
+
     try:
         with path.open("rb") as source:
             for index, line in enumerate(source):
@@ -3314,9 +3417,90 @@ def _native_turn_snapshot(payload: Dict[str, Any], *, all_turns=False) -> Tuple[
                         word["source_path"] = str(path)
                     explicit = bool(word and user_words._codex_word_from_record(word))
                 if explicit:
+                    _settle_open_batch()
                     turn = "turn_" + hashlib.sha256(str(index).encode("ascii") + b":" + line).hexdigest()[:24]
                     if not all_turns:
                         calls = []
+                        calls_by_id.clear()
+                if typ == "PLANNER_RESPONSE":
+                    raw_tcs = entry.get("tool_calls")
+                    if isinstance(raw_tcs, list) and raw_tcs:
+                        _settle_open_batch()
+                        for call in raw_tcs:
+                            if not isinstance(call, dict):
+                                continue
+                            name = _native_tool_name(str(call.get("name") or ""))
+                            args = call.get("args", call.get("arguments", call.get("input", {})))
+                            if isinstance(args, str):
+                                try:
+                                    args = json.loads(args)
+                                except (ValueError, RecursionError):
+                                    args = {}
+                            cid = str(call.get("call_id") or call.get("id") or "")
+                            if isinstance(args, dict) and _native_dispatch(name, args):
+                                item = {"name": name, "args": args, "index": index, "call_id": cid,
+                                        "denied": False, "pending": not bool(cid)}
+                                calls.append(item)
+                                if cid:
+                                    calls_by_id[cid] = item
+                                else:
+                                    batch_slots.append(item)
+                            elif not cid:
+                                batch_slots.append(None)
+                    continue
+                if typ in ("GENERIC", "TOOL_RESULT", "TOOL_RESPONSE"):
+                    result = entry.get("tool_result")
+                    result_dict = result if isinstance(result, dict) else {}
+                    raw_out = str(entry.get("content") or result_dict.get("output") or "")
+                    is_denied = (
+                        "tool call denied by pre-tool hook" in raw_out.lower()
+                        or (entry.get("status") == "ERROR" and "重负载派工门禁" in raw_out)
+                    )
+                    res_cid = user_words._tool_call_id(result_dict) or user_words._tool_call_id(entry)
+                    if res_cid and res_cid in calls_by_id:
+                        calls_by_id[res_cid]["pending"] = False
+                        if is_denied:
+                            calls_by_id[res_cid]["denied"] = True
+                    elif batch_slots:
+                        matched_pos: Optional[int] = None
+                        if is_denied and "重负载派工门禁" in raw_out:
+                            matched_pos = next((i for i, s in enumerate(batch_slots) if s is not None), None)
+                        elif user_words.parse_agy_created_subagent(raw_out) is not None:
+                            matched_pos = next(
+                                (i for i, s in enumerate(batch_slots) if s is not None and s["name"] == "invoke_subagent"),
+                                next((i for i, s in enumerate(batch_slots) if s is not None), None),
+                            )
+                        elif (
+                            re.search(r"running (?:in (?:the )?background|as a background task)", raw_out, re.I)
+                            and not re.search(r"Task Description:[^\n]*(?:cae_harness\.py|python|git|\$)", raw_out, re.I)
+                            and any(s is not None and s["name"] == "run_workflow" for s in batch_slots)
+                        ):
+                            matched_pos = next((i for i, s in enumerate(batch_slots) if s is not None and s["name"] == "run_workflow"), None)
+                        elif None in batch_slots and re.search(
+                            r"(?:Showing lines|Partial read|Command exited|Created file|Made \d+ replacement|Task Description:[^\n]*(?:cae_harness\.py|python|git|\$))",
+                            raw_out,
+                        ):
+                            matched_pos = batch_slots.index(None)
+                        if matched_pos is None:
+                            matched_pos = 0
+                        slot = batch_slots.pop(matched_pos)
+                        if slot is not None:
+                            slot["pending"] = False
+                            if is_denied:
+                                slot["denied"] = True
+                    continue
+                if typ == "user":
+                    msg_u = entry.get("message")
+                    if isinstance(msg_u, dict) and isinstance(msg_u.get("content"), list):
+                        for block in msg_u["content"]:
+                            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                                continue
+                            res_cid = str(block.get("tool_use_id") or "")
+                            if res_cid in calls_by_id:
+                                calls_by_id[res_cid]["pending"] = False
+                                b_content = str(block.get("content") or "")
+                                if block.get("is_error") and ("重负载派工门禁" in b_content or "denied" in b_content.lower()):
+                                    calls_by_id[res_cid]["denied"] = True
                 candidates = list(entry.get("tool_calls") or [])
                 msg = entry.get("message")
                 if typ == "assistant" and isinstance(msg, dict) and isinstance(msg.get("content"), list):
@@ -3334,8 +3518,12 @@ def _native_turn_snapshot(payload: Dict[str, Any], *, all_turns=False) -> Tuple[
                         except (ValueError, RecursionError):
                             args = {}
                     if isinstance(args, dict) and _native_dispatch(name, args):
-                        calls.append({"name": name, "args": args, "index": index,
-                                      "call_id": call.get("call_id") or call.get("id") or ""})
+                        cid = str(call.get("call_id") or call.get("id") or "")
+                        item = {"name": name, "args": args, "index": index, "call_id": cid,
+                                "denied": False, "pending": False}
+                        calls.append(item)
+                        if cid:
+                            calls_by_id[cid] = item
     except OSError:
         pass
     return turn, calls
@@ -3678,30 +3866,56 @@ def _check_dispatch_locked(payload, tool_name, args, sid, state_dir):
             or tc_obj.get("toolCallId")
             or ""
         )
+        calls = [call for call in calls if not call.get("denied")]
         if identity:
             calls = [call for call in calls if call["call_id"] != identity]
         weight = _native_call_stream_weight(tool_name, args)
-        prior_transcript_count = sum(_native_call_stream_weight(call["name"], call.get("args")) for call in calls)
-        prior = max(state["count"], prior_transcript_count)
-        duplicate = identity and identity in state.get("calls", [])
-        count = prior if duplicate else prior + weight
-        channel = {"run_workflow": "native_workflow", "swarm": "native_swarm"}.get(tool_name, "native_subagent")
+        duplicate = bool(identity and identity in state.get("calls", []))
+        channel = _native_channel(tool_name)
         channel_counts = state.get("channel_counts", {})
-        channel_transcript_prior = sum(
-            _native_call_stream_weight(call["name"], call.get("args"))
-            for call in calls
-            if {"run_workflow": "native_workflow", "swarm": "native_swarm"}.get(call["name"], "native_subagent") == channel
-        )
-        channel_prior = max(channel_counts.get(channel, 0), channel_transcript_prior)
-        channel_count = channel_prior if duplicate else channel_prior + weight
+        settled_calls = [call for call in calls if not call.get("pending")]
+        pending_calls = [call for call in calls if call.get("pending")]
+        incoming_in_pending = any(call["name"] == tool_name and not call["call_id"] for call in pending_calls)
+        if incoming_in_pending:
+            settled_count = sum(_native_call_stream_weight(call["name"], call.get("args")) for call in settled_calls)
+            pending_count = sum(_native_call_stream_weight(call["name"], call.get("args")) for call in pending_calls)
+            settled_ch = sum(
+                _native_call_stream_weight(call["name"], call.get("args"))
+                for call in settled_calls
+                if _native_channel(call["name"]) == channel
+            )
+            pending_ch = sum(
+                _native_call_stream_weight(call["name"], call.get("args"))
+                for call in pending_calls
+                if _native_channel(call["name"]) == channel
+            )
+            prior = max(state["count"], settled_count)
+            admitted_count = prior if duplicate else prior + weight
+            projected_count = max(admitted_count, settled_count + pending_count)
+            channel_prior = max(channel_counts.get(channel, 0), settled_ch)
+            admitted_channel_count = channel_prior if duplicate else channel_prior + weight
+            projected_channel_count = max(admitted_channel_count, settled_ch + pending_ch)
+        else:
+            prior_transcript_count = sum(_native_call_stream_weight(call["name"], call.get("args")) for call in calls)
+            prior = max(state["count"], prior_transcript_count)
+            admitted_count = prior if duplicate else prior + weight
+            projected_count = admitted_count
+            channel_transcript_prior = sum(
+                _native_call_stream_weight(call["name"], call.get("args"))
+                for call in calls
+                if _native_channel(call["name"]) == channel
+            )
+            channel_prior = max(channel_counts.get(channel, 0), channel_transcript_prior)
+            admitted_channel_count = channel_prior if duplicate else channel_prior + weight
+            projected_channel_count = admitted_channel_count
         capacity = max((sum(isinstance(row, dict) and row.get("channel") == channel
                             for row in ticket.get("streams", [])) for ticket in tickets), default=0)
-        heavy = tool_name in ("run_workflow", "swarm") or not _native_readonly(args) or count >= _heavy_min_streams()
-        if heavy and channel_count > capacity:
+        heavy = tool_name in ("run_workflow", "swarm") or not _native_readonly(args) or projected_count >= _heavy_min_streams()
+        if heavy and projected_channel_count > capacity:
             return _ticket_required_reason(sid, state_dir)
         if not duplicate:
-            state["count"] = count
-            state.setdefault("channel_counts", {})[channel] = channel_count
+            state["count"] = admitted_count
+            state.setdefault("channel_counts", {})[channel] = admitted_channel_count
             if identity:
                 state.setdefault("calls", []).append(identity)
             user_words.atomic_write_json(file, state)

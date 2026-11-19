@@ -151,6 +151,29 @@ def _run_repo_grounding_gate(repo_root: Path) -> Dict[str, Any]:
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
+def _check_json_nesting_depth(raw: str, max_depth: int = 64, *, label: str = "corrupt state JSON") -> None:
+    depth = 0
+    in_string = False
+    escaped = False
+    for ch in raw:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch in "{[":
+            depth += 1
+            if depth > max_depth:
+                raise ValueError(label)
+        elif ch in "}]":
+            depth = max(0, depth - 1)
+
+
 def _default_ttl_seconds(repo_root: Path | None = None) -> int:
     env_profile = os.environ.get("CAE_FLEET_PROFILE", "").strip()
     if env_profile:
@@ -163,7 +186,9 @@ def _default_ttl_seconds(repo_root: Path | None = None) -> int:
     for candidate in candidates:
         try:
             if candidate.is_file() and not _is_reparse_or_symlink(candidate):
-                raw = json.loads(candidate.read_text(encoding="utf-8-sig"))
+                text = candidate.read_text(encoding="utf-8-sig")
+                _check_json_nesting_depth(text, label="corrupt fleet_profile.json")
+                raw = json.loads(text)
                 if not isinstance(raw, dict):
                     continue
                 if "schema_version" in raw and (isinstance(raw["schema_version"], bool) or raw["schema_version"] != 1):
@@ -184,7 +209,9 @@ def _repo_meta(repo_root: Path) -> Dict[str, str]:
     plugin_version = ""
     if plugin_json.is_file():
         try:
-            parsed_plugin = json.loads(plugin_json.read_text(encoding="utf-8-sig"))
+            plugin_text = plugin_json.read_text(encoding="utf-8-sig")
+            _check_json_nesting_depth(plugin_text, label="corrupt plugin.json")
+            parsed_plugin = json.loads(plugin_text)
         except RecursionError as exc:
             raise ValueError("corrupt plugin.json") from exc
         if not isinstance(parsed_plugin, dict):
@@ -413,6 +440,7 @@ def _load_state(path: Path, default_ttl: int = 86400) -> Dict[str, Any]:
                 raise
             time.sleep(0.02)
     try:
+        _check_json_nesting_depth(raw)
         loaded = json.loads(raw, parse_constant=_reject_json_constant)
     except (ValueError, RecursionError) as exc:
         raise ValueError("corrupt state JSON") from exc
