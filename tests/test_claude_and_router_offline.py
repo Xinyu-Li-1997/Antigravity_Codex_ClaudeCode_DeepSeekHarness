@@ -1,6 +1,6 @@
 """Claude 生命周期、模型路由与 CC Switch 管理的纯离线回归。
 
-临时文件仅写入仓库 .pytest_cache 内的测试沙箱；HTTP、DNS、代理和上游响应均使用本地夹具。
+临时文件优先使用系统临时目录（受限或与仓库重叠时回退至 .pytest_cache/claude_offline）；HTTP、DNS、代理和上游响应均使用本地夹具。
 """
 
 import copy
@@ -24,13 +24,70 @@ from types import SimpleNamespace
 from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-HOOKS_DIR = Path(os.environ.get("USER_GUARD_INSTALLED_DIR", str(REPO_ROOT / "template/user-guard"))) / "hooks"
+
+_INSTALLED_USER_GUARD_ENV_KEYS = frozenset({
+    "USER_GUARD_INSTALLED_DIR",
+    "USER_GUARD_INSTALLED_CODEX_DIR",
+    "USER_GUARD_INSTALLED_CLAUDE_DIR",
+    "USER_GUARD_INSTALLED_DSH_DIR",
+})
+_SCRUBBED_EXACT_ENV_KEYS = frozenset({
+    "PLUGIN_DATA",
+    "OPENAI_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "PYTHONPATH",
+})
+_SCRUBBED_ENV_PREFIXES = (
+    "CAE_",
+    "AGY_",
+    "ANTIGRAVITY_",
+    "CODEX_",
+    "CLAUDE",
+    "ANTHROPIC_",
+    "DSH_",
+    "GIT_",
+    "XDG_",
+)
+_REQUIRED_HOOK_FILES = (
+    "handoff_gate.py",
+    "reply_repeat_guard.py",
+    "session_context_loader.py",
+    "status_guard.py",
+    "user_words.py",
+)
+
+
+def _should_scrub_host_env(key: str, *, keep_installed_dirs: bool = False) -> bool:
+    ku = key.upper()
+    if ku in _SCRUBBED_EXACT_ENV_KEYS or ku.startswith(_SCRUBBED_ENV_PREFIXES):
+        return True
+    if ku.startswith("USER_GUARD_"):
+        if keep_installed_dirs and ku in _INSTALLED_USER_GUARD_ENV_KEYS:
+            return False
+        return True
+    return False
+
+
+def _resolve_hooks_dir(repo_root: Path = REPO_ROOT) -> Path:
+    fallback = (repo_root / "template/user-guard/hooks").resolve()
+    raw = os.environ.get("USER_GUARD_INSTALLED_DIR", "").strip()
+    if not raw:
+        return fallback
+    try:
+        candidate = (Path(raw).expanduser() / "hooks").resolve()
+        if candidate.is_dir() and all((candidate / name).is_file() for name in _REQUIRED_HOOK_FILES):
+            return candidate
+    except (OSError, RuntimeError, ValueError):
+        pass
+    return fallback
+
+
+HOOKS_DIR = _resolve_hooks_dir(REPO_ROOT)
 sys.path.insert(0, str(HOOKS_DIR))
-import handoff_gate
-import reply_repeat_guard
-import session_context_loader
-import status_guard
-import user_words
 
 
 def _load_module(name, path):
@@ -40,10 +97,21 @@ def _load_module(name, path):
     return module
 
 
-router = _load_module("claude_router_offline", REPO_ROOT / "template/claude/router/router.py")
-admin = _load_module("ccswitch_admin_offline", REPO_ROOT / "template/claude/router/ccswitch_admin.py")
-installer = _load_module("claude_installer_offline", REPO_ROOT / "install.py")
-fleet_state = _load_module("fleet_state_offline", REPO_ROOT / "template/user-guard/skills/fleet-evolve/scripts/fleet_state.py")
+with mock.patch.dict(
+    os.environ,
+    {k: v for k, v in os.environ.items() if not _should_scrub_host_env(k, keep_installed_dirs=True)},
+    clear=True,
+):
+    import handoff_gate
+    import reply_repeat_guard
+    import session_context_loader
+    import status_guard
+    import user_words
+
+    router = _load_module("claude_router_offline", REPO_ROOT / "template/claude/router/router.py")
+    admin = _load_module("ccswitch_admin_offline", REPO_ROOT / "template/claude/router/ccswitch_admin.py")
+    installer = _load_module("claude_installer_offline", REPO_ROOT / "install.py")
+    fleet_state = _load_module("fleet_state_offline", REPO_ROOT / "template/user-guard/skills/fleet-evolve/scripts/fleet_state.py")
 
 
 def _append_jsonl(path, entry):
@@ -67,9 +135,29 @@ class OfflineSandbox(unittest.TestCase):
     def setUp(self):
         import time
 
-        cache_dir = REPO_ROOT / ".pytest_cache"
-        cache_dir.mkdir(exist_ok=True)
-        temporary = tempfile.TemporaryDirectory(prefix="claude-offline-", dir=cache_dir)
+        temporary = None
+        cand = None
+        try:
+            cand = tempfile.TemporaryDirectory(prefix="claude-offline-")
+            cand_path = Path(cand.name)
+            installer._validate_path(cand_path, directory=True)
+            resolved_cand = cand_path.resolve()
+            if (
+                resolved_cand == REPO_ROOT
+                or REPO_ROOT in resolved_cand.parents
+                or resolved_cand in REPO_ROOT.parents
+            ):
+                raise ValueError("system temp overlaps REPO_ROOT")
+            probe = cand_path / ".probe"
+            probe.write_bytes(b"ok")
+            probe.unlink()
+            temporary = cand
+        except (OSError, ValueError):
+            if cand is not None:
+                cand.cleanup()
+            cache_dir = (REPO_ROOT / ".pytest_cache" / "claude_offline").resolve()
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            temporary = tempfile.TemporaryDirectory(prefix="claude-offline-", dir=cache_dir)
 
         def _cleanup_tempdir() -> None:
             try:
@@ -96,16 +184,22 @@ class OfflineSandbox(unittest.TestCase):
         self.sid = "claude_sess_alpha"
         self.transcript = self.claude_home / "projects/work" / f"{self.sid}.jsonl"
         self.payload = {"session_id": self.sid, "transcript_path": str(self.transcript), "cwd": str(self.project)}
-        patch = mock.patch.dict(os.environ, {
+        clean_env = {
+            k: v for k, v in os.environ.items()
+            if not _should_scrub_host_env(k, keep_installed_dirs=True)
+        }
+        for _inst_k in list(_INSTALLED_USER_GUARD_ENV_KEYS):
+            if _inst_k in clean_env and not clean_env[_inst_k].strip():
+                clean_env.pop(_inst_k, None)
+        clean_env.update({
             "CLAUDE_CONFIG_DIR": str(self.claude_home), "HOME": str(self.home), "USERPROFILE": str(self.home),
             "PLUGIN_DATA": str(self.root / "plugin-data"), "USER_GUARD_STATE_DIR": str(self.state),
             "USER_GUARD_LOGS_DIR": str(self.logs), "CAE_HARNESS_DEPTH": "0", "PYTHONDONTWRITEBYTECODE": "1",
             "TEMP": str(self.root), "TMP": str(self.root), "TMPDIR": str(self.root),
         })
+        patch = mock.patch.dict(os.environ, clean_env, clear=True)
         patch.start()
         self.addCleanup(patch.stop)
-        os.environ.pop("DSH_HOME", None)
-        os.environ.pop("CAE_FLEET_PROFILE", None)
         patch = mock.patch.object(tempfile, "tempdir", str(self.root))
         patch.start()
         self.addCleanup(patch.stop)
@@ -884,6 +978,7 @@ class TestClaudeRouter(OfflineSandbox):
                     handler.rfile = mock.Mock()
                     handler.rfile.read.side_effect = OSError("fixture")
                 elif case in ("chunked", "bad_chunk"):
+                    del handler.headers["Content-Length"]
                     handler.headers["Transfer-Encoding"] = "chunked"
                     handler.rfile = io.BytesIO(b"2\r\n{}\r\n0\r\n\r\n" if case == "chunked" else b"invalid\r\n")
                 elif case == "forward_error":
@@ -1497,7 +1592,7 @@ class TestClaudeInstallerAndUpgradeAudit(OfflineSandbox):
                 def probe(command, **kwargs):
                     root = Path(kwargs["env"]["HOME"])
                     self.assertTrue(root.is_dir())
-                    self.assertTrue(root.is_relative_to(REPO_ROOT))
+                    self.assertTrue(root.is_relative_to(self.root))
                     (root / "cc-switch.db").write_bytes(b"fixture defaults")
                     isolated.append(root)
                     raise failure
@@ -2135,7 +2230,7 @@ class TestClaudeInstallerAndUpgradeAudit(OfflineSandbox):
                 available.clear()
                 available.update(clients)
                 self.assertEqual(installer.detect_installed_apps()["recommended_app_mode"], mode)
-        output = "agy\t/opt/bin/agy\ttrue\ncodex\t/opt/bin/codex\ttrue\nclaude\t/opt/bin/claude\ttrue\ncc-switch\t\ttrue\n"
+        output = "agy\t/opt/bin/agy\ttrue\ncodex\t/opt/bin/codex\ttrue\nclaude\t/opt/bin/claude\ttrue\ndsh\t/opt/bin/dsh\ttrue\ncc-switch\t\ttrue\n"
         with mock.patch.object(installer.shutil, "which", return_value="wsl.exe"), \
                 mock.patch.object(installer, "_wsl_distro_list", side_effect=[["running"], ["running"]]), \
                 mock.patch.object(installer.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, stdout=output)):
@@ -2858,6 +2953,2064 @@ class TestFleetStateWP3A(OfflineSandbox):
                 self.assertEqual(json.loads(result.stdout)["reason"], "invalid_arguments")
                 self.assertEqual(result.stderr, "")
         self.assertFalse(self.state_file.exists())
+
+    def test_bare_clear_preserves_active_proposal_and_claimed_reload_unless_forced(self):
+        self.run_state("propose", "--session-id", "fixture", "--summary", "fixture approval")
+        original = self.state_file.read_bytes()
+        code, result = self.run_state("clear")
+        self.assertEqual(code, 1)
+        self.assertEqual(result["reason"], "active_user_approval")
+        self.assertEqual(self.state_file.read_bytes(), original)
+
+        self.run_state("record-pass1", "--force", "--session-id", "pass1", "--target-master", "codex")
+        self.run_state("verify-pass2", "--session-id", "pass2")
+        claimed = self.state_file.read_bytes()
+        code2, result2 = self.run_state("clear")
+        self.assertEqual(code2, 1)
+        self.assertEqual(result2["reason"], "active_pass2_claimed")
+        self.assertEqual(self.state_file.read_bytes(), claimed)
+
+        code3, _ = self.run_state("clear", "--force")
+        self.assertEqual(code3, 0)
+        self.assertFalse(self.state_file.exists())
+
+    def test_v1152_audit_upgrade_filters_blocked_and_light_agy_models(self):
+        mixed_models = [
+            {"slug": "gpt-5.4-pro", "display_name": "GPT-5.4 Pro"},
+            {"slug": "prompt-router", "display_name": "Prompt Router"},
+            {"slug": "gemini-3.2-pro-lite", "display_name": "Gemini 3.2 Pro Lite"},
+            {"slug": "gemini-3.1-pro-high", "display_name": "Gemini 3.1 Pro (High)"},
+            {"slug": "gemini-3.1-pro-low", "display_name": "Gemini 3.1 Pro (Low)"},
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            td_root = Path(td).resolve()
+            ag_plugin = td_root / "gemini/config/plugins/user-guard"
+            ag_cache = td_root / "gemini/antigravity-cli/cache/cae_models_cache.json"
+            user_words.atomic_write_json(ag_cache, {"models": mixed_models})
+            rep = installer.audit_upgrade_status(
+                REPO_ROOT, ag_plugin, td_root / "cx", td_root / "cl",
+                detection={}, is_sandbox_run=True, app_scope="antigravity",
+            )
+        self.assertEqual(rep["antigravity"]["recommended_primary_variants"], ["gemini-3.1-pro-high", "gemini-3.1-pro-low"])
+        self.assertEqual(installer._select_agy_frontier_max_label(mixed_models, REPO_ROOT), "Gemini 3.1 Pro (High)")
+
+    def test_v1152_loopback_health_proxy_bypass_and_router_ctype_log_scrub(self):
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        import threading
+        harness_mod = _load_module("cae_harness_proxy_test", REPO_ROOT / "template/user-guard/skills/cae-harness/scripts/cae_harness.py")
+        class OkHealth(BaseHTTPRequestHandler):
+            def log_message(self, *a): pass
+            def do_GET(self):
+                b = b'{"ok": true, "port": 18241}'
+                self.send_response(200); self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+        class HijackProxy(BaseHTTPRequestHandler):
+            def log_message(self, *a): pass
+            def do_GET(self): self.send_error(502, "hijacked")
+        hs = HTTPServer(("127.0.0.1", 0), OkHealth)
+        ps = HTTPServer(("127.0.0.1", 0), HijackProxy)
+        threading.Thread(target=hs.serve_forever, daemon=True).start()
+        threading.Thread(target=ps.serve_forever, daemon=True).start()
+        try:
+            hp, pp = hs.server_address[1], ps.server_address[1]
+            with mock.patch.dict(os.environ, {"HTTP_PROXY": f"http://127.0.0.1:{pp}", "http_proxy": f"http://127.0.0.1:{pp}"}, clear=False):
+                os.environ.pop("NO_PROXY", None); os.environ.pop("no_proxy", None)
+                st = admin.inspect_status(self.root / "none.db", None, router_port=hp)
+                self.assertTrue(st["router_health"]["ok"])
+                self.assertTrue(harness_mod._probe_router_health({"base_url": f"http://127.0.0.1:{hp}", "windows_interop": False}))
+        finally:
+            hs.shutdown(); hs.server_close(); ps.shutdown(); ps.server_close()
+        # router.py: uppercase Application/JSON routing + key-aware _scrub_log_value
+        tok_val = "router_secret_" + "y" * 16
+        scrubbed = router._scrub_log_value({"api_key": tok_val, "err": json.dumps({"auth_token": tok_val}), "ok": "true"})
+        self.assertEqual(scrubbed["api_key"], "<redacted>")
+        self.assertEqual(json.loads(scrubbed["err"]), {"auth_token": "<redacted>"})
+        self.assertEqual(scrubbed["ok"], "true")
+        seen_cards = []
+        h = router.Handler.__new__(router.Handler)
+        h.command = "POST"; h.path = "/v1/messages"; h.headers = {"Content-Type": "Application/JSON; charset=utf-8"}
+        h.server = SimpleNamespace(cfg=copy.deepcopy(router.DEFAULTS))
+        h.send_error = lambda *a: None
+        with mock.patch.object(router, "card_key", side_effect=lambda _c, name: (seen_cards.append(name), (_ for _ in ()).throw(RuntimeError("stop")))[1]), \
+             mock.patch.object(router, "log_line"):
+            h._forward_locked(json.dumps({"model": "deepseek-chat[1M]"}).encode("utf-8"))
+        self.assertEqual(seen_cards, ["DeepSeek"])
+
+    def test_v1152_router_combines_repeated_beta_headers_case_insensitively(self):
+        merged = router._merge_request_headers(
+            router.end_to_end_headers([
+                ("Host", "127.0.0.1:3456"),
+                ("anthropic-beta", "interleaved-thinking-2025-05-14"),
+                ("Anthropic-Beta", "fine-grained-tool-streaming-2025-05-14"),
+                ("x-api-key", "old"),
+                ("X-API-Key", "new"),
+            ])
+        )
+        self.assertEqual(
+            merged["anthropic-beta"],
+            "interleaved-thinking-2025-05-14, fine-grained-tool-streaming-2025-05-14",
+        )
+        self.assertEqual(merged["x-api-key"], "new")
+
+
+class TestShard3RouterInstallerFixes(OfflineSandbox):
+    def _setup_installer_tree(self):
+        source = self.root / "source"
+        source.mkdir()
+        shutil.copy2(REPO_ROOT / "install.py", source / "install.py")
+        shutil.copytree(
+            REPO_ROOT / "template",
+            source / "template",
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+        )
+        plugin = self.root / "target/.gemini/config/plugins/user-guard"
+        codex = self.root / "target/codex"
+
+        def run_install(*args, code=0):
+            res = subprocess.run(
+                [sys.executable, "-B", "-X", "utf8", str(source / "install.py"), *map(str, args), "--no-zotero", "--skip-test"],
+                cwd=source, capture_output=True, text=True, encoding="utf-8", timeout=40,
+            )
+            self.assertEqual(res.returncode, code, res.stdout + res.stderr)
+            return res
+
+        return source, plugin, codex, run_install
+
+    def test_r1_router_truncated_body_400_and_deep_json_recursion_guard(self):
+        import threading
+
+        full_body = json.dumps({
+            "model": "deepseek-chat",
+            "messages": [{"role": "user", "content": "verify truncated body never falls back to default Kimi card"}],
+        }).encode("utf-8")
+        truncated = full_body[:32]
+        self.assertLess(len(truncated), len(full_body))
+
+        h_trunc = object.__new__(router.Handler)
+        cfg = copy.deepcopy(router.DEFAULTS)
+        cfg.update(ccswitch_db=str(self.root / "cards.db"), log=str(self.logs / "router.log"))
+        h_trunc.server = SimpleNamespace(cfg=cfg)
+        h_trunc.path = "/v1/messages"
+        h_trunc.command = "POST"
+        h_trunc.headers = Message()
+        h_trunc.headers["Content-Type"] = "application/json"
+        h_trunc.headers["Content-Length"] = str(len(full_body))
+        h_trunc.rfile = io.BytesIO(truncated)
+        h_trunc.wfile = io.BytesIO()
+        h_trunc.send_error = mock.Mock()
+        with mock.patch.object(router, "card_key") as key_mock, \
+                mock.patch.object(router.http.client, "HTTPSConnection") as conn_mock:
+            h_trunc.do_POST()
+        h_trunc.send_error.assert_called_once_with(400, "truncated request body")
+        key_mock.assert_not_called()
+        conn_mock.assert_not_called()
+
+        deep_body = b"[" * 2500 + b"]" * 2500
+        h_deep = object.__new__(router.Handler)
+        h_deep.server = SimpleNamespace(cfg=cfg, inflight_sem=threading.BoundedSemaphore(2))
+        h_deep.path = "/v1/messages"
+        h_deep.command = "POST"
+        h_deep.headers = Message()
+        h_deep.headers["Content-Type"] = "application/json"
+        h_deep.headers["Content-Length"] = str(len(deep_body))
+        h_deep.rfile = io.BytesIO(deep_body)
+        h_deep.wfile = io.BytesIO()
+        h_deep.send_response = mock.Mock()
+        h_deep.send_header = mock.Mock()
+        h_deep.end_headers = mock.Mock()
+        h_deep.send_error = mock.Mock()
+        upstream_resp = mock.Mock(status=400, reason="Bad Request")
+        upstream_resp.getheaders.return_value = [("Content-Type", "application/json")]
+        upstream_resp.read1.side_effect = [b'{"error":"invalid_json"}', b""]
+        upstream_conn = mock.Mock()
+        upstream_conn.getresponse.return_value = upstream_resp
+        with mock.patch.object(router, "card_key", return_value="tok_kimi_safe"), \
+                mock.patch.object(router.http.client, "HTTPSConnection", return_value=upstream_conn):
+            h_deep.do_POST()
+        self.assertTrue(h_deep.server.inflight_sem.acquire(blocking=False))
+        h_deep.server.inflight_sem.release()
+
+    def test_r2_fleet_state_propose_reload_lock_arg_guards_and_dynamic_ttl(self):
+        import time
+
+        repo = self.project / "upstream_r2"
+        repo.mkdir()
+        (repo / "install.py").write_text("", encoding="utf-8")
+        user_words.atomic_write_json(repo / "template/user-guard/plugin.json", {"version": "1.15.2"})
+        profile = repo / "template/user-guard/skills/cae-harness/fleet_profile.json"
+        user_words.atomic_write_json(profile, {"runtime_tunables": {"headless_dispatch": {"fleet_state_ttl_sec": 120}}})
+        state_dir = self.root / "fleet-state-r2"
+
+        def run_state(*cli_args):
+            buf = io.StringIO()
+            with mock.patch.dict(os.environ, {"CAE_FLEET_STATE_DIR": str(state_dir)}), redirect_stdout(buf):
+                rc = fleet_state.main(["--repo", str(repo), *cli_args])
+            return rc, json.loads(buf.getvalue())
+
+        # R2-2: verify-pass2 empty sid fails before _state_lock (no state dir or lock created)
+        rc, out = run_state("verify-pass2", "--session-id", "   ")
+        self.assertEqual(rc, 2)
+        self.assertEqual(out["reason"], "invalid_arguments")
+        self.assertFalse(state_dir.exists())
+
+        # R2-2: record-pass1 empty target-master fails with invalid_arguments
+        rc, out = run_state("record-pass1", "--session-id", "p1", "--target-master", "   ")
+        self.assertEqual(rc, 2)
+        self.assertEqual(out["reason"], "invalid_arguments")
+        self.assertFalse(state_dir.exists())
+
+        # R2-1: propose refuses to clobber unclaimed and claimed AWAITING_MASTER_RELOAD without --force
+        rc, _ = run_state("record-pass1", "--session-id", "pass1_s", "--target-master", "codex")
+        self.assertEqual(rc, 0)
+        with mock.patch.dict(os.environ, {"CAE_FLEET_STATE_DIR": str(state_dir)}):
+            sf = fleet_state._validated_state_file(repo)
+        unclaimed_bytes = sf.read_bytes()
+        rc, out = run_state("propose", "--session-id", "rogue", "--summary", "attempt wipe")
+        self.assertEqual(rc, 2)
+        self.assertEqual(out["reason"], "active_master_reload")
+        self.assertEqual(sf.read_bytes(), unclaimed_bytes)
+
+        rc, _ = run_state("verify-pass2", "--session-id", "pass2_s")
+        self.assertEqual(rc, 0)
+        claimed_bytes = sf.read_bytes()
+        rc, out = run_state("propose", "--session-id", "rogue", "--summary", "attempt wipe claimed")
+        self.assertEqual(rc, 2)
+        self.assertEqual(out["reason"], "active_pass2_claimed")
+        self.assertEqual(sf.read_bytes(), claimed_bytes)
+
+        rc, out = run_state("propose", "--force", "--session-id", "admin_s", "--summary", "authorized override")
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["state"]["phase"], "AWAITING_USER_APPROVAL")
+
+        # R2-3: approve, record-pass1, verify-pass2 use default_ttl (120s) instead of hardcoded 86400s
+        now_ts = int(time.time())
+        saved = json.loads(sf.read_text(encoding="utf-8"))
+        saved.pop("ttl_seconds", None)
+        saved["updated_at_epoch"] = now_ts - 200  # > 120s default_ttl, but < 86400s
+        user_words.atomic_write_json(sf, saved)
+        rc, out = run_state("approve", "--session-id", "approver")
+        self.assertEqual(rc, 2)
+        self.assertEqual(out["reason"], "expired_ttl")
+
+        # record-pass1 also treats missing ttl_seconds with age 200s > 120s as expired
+        rc, _ = run_state("record-pass1", "--session-id", "p1_new", "--target-master", "claude")
+        self.assertEqual(rc, 0)
+        reload_saved = json.loads(sf.read_text(encoding="utf-8"))
+        reload_saved.pop("ttl_seconds", None)
+        reload_saved["updated_at_epoch"] = now_ts - 200
+        user_words.atomic_write_json(sf, reload_saved)
+        rc, out = run_state("verify-pass2", "--session-id", "p2_new")
+        self.assertEqual(rc, 2)
+        self.assertEqual(out["reason"], "expired_ttl")
+
+        # Fresh proposal without ttl_seconds inherits default_ttl (120s) upon approve
+        rc, _ = run_state("propose", "--force", "--session-id", "prop_ok", "--summary", "fresh")
+        self.assertEqual(rc, 0)
+        fresh_saved = json.loads(sf.read_text(encoding="utf-8"))
+        fresh_saved.pop("ttl_seconds", None)
+        fresh_saved["updated_at_epoch"] = now_ts - 30
+        user_words.atomic_write_json(sf, fresh_saved)
+        rc, out = run_state("approve", "--session-id", "approver_ok")
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["state"]["ttl_seconds"], 120)
+
+    def test_r3_audit_upgrade_agy_hook_prefix_and_four_client_stale_mirror_files(self):
+        source, plugin, codex, run_install = self._setup_installer_tree()
+        dsh = self.root / "target/dsh"
+        all_args = [
+            "--app", "all", "--target-dir", plugin, "--codex-home", codex,
+            "--claude-home", self.claude_home, "--dsh-home", dsh, "--with-cc-router",
+        ]
+        with mock.patch.dict(os.environ, {"CODEX_HOME": str(self.home / ".codex")}):
+            run_install(*all_args)
+            base_report = installer.audit_upgrade_status(
+                source, plugin, codex, self.claude_home,
+                self.root / "none.db", detection={}, is_sandbox_run=True, app_scope="all", dsh_home=dsh,
+            )
+            for peer in ("antigravity", "codex", "claude", "dsh"):
+                self.assertEqual(base_report[peer]["drift_files"], [], peer)
+
+            # R3-1: Antigravity hooks.json prefix must have valid Python interpreter + exact HOOK_PYTHON_FLAGS
+            ag_hooks_path = plugin / "hooks.json"
+            good_ag_bytes = ag_hooks_path.read_bytes()
+            tpl_ag_bytes = (source / "template/user-guard/hooks.json").read_bytes()
+            for bad_prefix in ("sh -X utf8 -I -B", "python3 -I -B", "python3 -B", "python3 -X utf8 -I -B -u", "py.exe -X utf8 -I -B"):
+                ag_hooks_path.write_bytes(installer._agy_hooks_bytes(tpl_ag_bytes, bad_prefix))
+                rep = installer.audit_upgrade_status(
+                    source, plugin, codex, self.claude_home,
+                    self.root / "none.db", detection={}, is_sandbox_run=True, app_scope="antigravity",
+                )
+                self.assertIn("hooks.json", rep["antigravity"]["drift_files"], bad_prefix)
+            with mock.patch.object(installer.shutil, "which", return_value=None):
+                for valid_prefix in ("python3.12 -X utf8 -I -B", "py.exe -3 -X utf8 -I -B"):
+                    ag_hooks_path.write_bytes(installer._agy_hooks_bytes(tpl_ag_bytes, valid_prefix))
+                    rep = installer.audit_upgrade_status(
+                        source, plugin, codex, self.claude_home,
+                        self.root / "none.db", detection={}, is_sandbox_run=True, app_scope="antigravity",
+                    )
+                    self.assertNotIn("hooks.json", rep["antigravity"]["drift_files"], valid_prefix)
+            ag_hooks_path.write_bytes(good_ag_bytes)
+
+            # R3-2: Stale extra files in plugin dir & 4-client managed skill dirs flagged; runtime state/logs/__pycache__ excluded
+            stale_targets = {
+                "antigravity": (plugin / "hooks/retired_old.py", "hooks/retired_old.py"),
+                "codex": (codex / "skills/cae-harness/scripts/retired_cx.py", "skills/cae-harness/scripts/retired_cx.py"),
+                "claude": (self.claude_home / "skills/fleet-evolve/scripts/retired_cl.py", "skills/fleet-evolve/scripts/retired_cl.py"),
+                "dsh": (dsh / "skills/cae-harness/retired_dsh.md", "skills/cae-harness/retired_dsh.md"),
+            }
+            for path, _ in stale_targets.values():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("# stale\n", encoding="utf-8")
+            (plugin / "skills/cae-harness/stale_ag_skill.txt").write_text("stale\n", encoding="utf-8")
+            (plugin / "hooks/state/legacy_stop_gate.json").parent.mkdir(parents=True, exist_ok=True)
+            (plugin / "hooks/state/legacy_stop_gate.json").write_text("{}\n", encoding="utf-8")
+
+            excluded_files = [
+                plugin / "hooks/state/user-words/sess_keep.md",
+                plugin / "hooks/logs/lifecycle.log",
+                plugin / "hooks/__pycache__/status_guard.cpython-311.pyc",
+                codex / "skills/cae-harness/scripts/__pycache__/cae_harness.cpython-311.pyc",
+                self.claude_home / "skills/third-party-custom/SKILL.md",
+            ]
+            for ex in excluded_files:
+                ex.parent.mkdir(parents=True, exist_ok=True)
+                ex.write_text("runtime keep\n", encoding="utf-8")
+
+            rep = installer.audit_upgrade_status(
+                source, plugin, codex, self.claude_home,
+                self.root / "none.db", detection={}, is_sandbox_run=True, app_scope="all", dsh_home=dsh,
+            )
+            for peer, (_, expected_rel) in stale_targets.items():
+                self.assertIn(expected_rel, rep[peer]["drift_files"])
+            self.assertIn("skills/cae-harness/stale_ag_skill.txt", rep["antigravity"]["drift_files"])
+            self.assertIn("hooks/state/legacy_stop_gate.json", rep["antigravity"]["drift_files"])
+            self.assertNotIn("hooks/state/user-words/sess_keep.md", rep["antigravity"]["drift_files"])
+            self.assertNotIn("hooks/logs/lifecycle.log", rep["antigravity"]["drift_files"])
+            self.assertFalse(any("__pycache__" in item for peer in ("antigravity", "codex", "claude", "dsh") for item in rep[peer]["drift_files"]))
+            self.assertNotIn("skills/third-party-custom/SKILL.md", rep["claude"]["drift_files"])
+
+            run_install(*all_args)
+            rep_after = installer.audit_upgrade_status(
+                source, plugin, codex, self.claude_home,
+                self.root / "none.db", detection={}, is_sandbox_run=True, app_scope="all", dsh_home=dsh,
+            )
+            for peer in ("antigravity", "codex", "claude", "dsh"):
+                self.assertEqual(rep_after[peer]["drift_files"], [], peer)
+            self.assertTrue((plugin / "hooks/state/user-words/sess_keep.md").is_file())
+            self.assertTrue((self.claude_home / "skills/third-party-custom/SKILL.md").is_file())
+
+    def test_r4_ccswitch_admin_symlink_guard_live_state_corrupt_cards_and_cli_json_error(self):
+        # R4-1: atomic_write_bytes rejects target symlinks, parent symlinks, and reparse points
+        real_target = self.root / "real_victim.json"
+        real_target.write_text('{"keep": true}\n', encoding="utf-8")
+        sym_file = self.root / "sym_settings.json"
+        symlink_ok = True
+        try:
+            sym_file.symlink_to(real_target)
+        except OSError:
+            symlink_ok = False
+        if symlink_ok:
+            with self.assertRaisesRegex(ValueError, "symbolic link or reparse point"):
+                admin.atomic_write_bytes(sym_file, b"{}\n")
+            self.assertEqual(real_target.read_text(encoding="utf-8"), '{"keep": true}\n')
+
+            outside_dir = self.root / "outside_dir"
+            outside_dir.mkdir()
+            sym_dir = self.root / "sym_parent"
+            sym_dir.symlink_to(outside_dir, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "symbolic link or reparse point"):
+                admin.atomic_write_bytes(sym_dir / "nested/settings.json", b"{}\n")
+            self.assertFalse((outside_dir / "nested").exists())
+
+        plain_target = self.root / "reparse_check.json"
+        reparse_stat = SimpleNamespace(st_mode=0o100644, st_file_attributes=0x400)
+        with mock.patch.object(Path, "lstat", return_value=reparse_stat):
+            with self.assertRaisesRegex(ValueError, "symbolic link or reparse point"):
+                admin.atomic_write_bytes(plain_target, b"{}\n")
+
+        # R4-2: switch_card strict fail-closed validation on live-state.json
+        db, settings = self.database(), self.settings()
+        admin.prepare_cards(db, 8240)
+        live_path = db.with_name("live-state.json")
+        for bad_live in (
+            "[]",
+            '"proxy"',
+            "{}",
+            '{"apps": []}',
+            '{"apps": null}',
+            '{"apps": {}}',
+            '{"apps": {"claude": "direct"}}',
+            '{"apps": {"claude": []}}',
+            '{"apps": {"claude": null}}',
+        ):
+            live_path.write_text(bad_live, encoding="utf-8")
+            with self.subTest(bad_live=bad_live), self.assertRaisesRegex(RuntimeError, "direct mode"):
+                admin.switch_card(db, settings, "Kimi")
+        live_path.write_text('{"apps": {"claude": {"mode": "direct", "attached": false, "pending": null}}}', encoding="utf-8")
+        self.assertEqual(admin.switch_card(db, settings, "Kimi")["card"], "Kimi")
+        live_path.unlink()
+
+        # R4-3: switch_card & prepare_cards tolerate None / corrupt JSON / non-dict in old card settings_config
+        for corrupt_val in (None, "", "broken-json", "[]", '{"env": []}', '{"env": null}'):
+            with self.subTest(corrupt_switch=corrupt_val):
+                with closing(sqlite3.connect(db)) as con:
+                    con.execute("UPDATE providers SET is_current=0 WHERE app_type='claude'")
+                    con.execute("UPDATE providers SET is_current=1, settings_config=? WHERE app_type='claude' AND name='Official'", (corrupt_val,))
+                    con.commit()
+                res = admin.switch_card(db, settings, "DeepSeek")
+                self.assertEqual(res["card"], "DeepSeek")
+                self.assertTrue(any("invalid settings_config" in w for w in res["warnings"]))
+                self.replace_card(db, "Official", {"env": {"ANTHROPIC_AUTH_TOKEN": "tok_official_test"}})
+
+            with self.subTest(corrupt_prepare=corrupt_val):
+                with closing(sqlite3.connect(db)) as con:
+                    con.execute("UPDATE providers SET settings_config=? WHERE app_type='claude' AND name='Kimi'", (corrupt_val,))
+                    con.commit()
+                prep = admin.prepare_cards(db, 8240)
+                self.assertTrue(any("claude:Kimi" in w for w in prep["warnings"]))
+                self.assertIsInstance(self.cards(db)["Kimi"]["env"], dict)
+
+        # R4-4: admin.main() preserves direct exception semantics, while CLI __main__ emits single-line JSON on stderr with exit 1
+        missing_db = self.root / "nonexistent-cc.db"
+        with self.assertRaises(FileNotFoundError):
+            admin.main(["--db", str(missing_db), "switch-card", "Kimi"])
+
+        script = REPO_ROOT / "template/claude/router/ccswitch_admin.py"
+        bad_sqlite = self.root / "not_a_sqlite.db"
+        bad_sqlite.write_bytes(b"corrupt header bytes that are not sqlite3 format")
+        cli_cases = [
+            (["--db", str(missing_db), "switch-card", "Kimi"], "FileNotFoundError"),
+            (["--db", str(db), "--settings", str(settings), "prepare-cards", "--port", "70000"], "ValueError"),
+            (["--db", str(bad_sqlite), "prepare-cards", "--port", "8240"], "DatabaseError"),
+        ]
+        live_path.write_text("[]", encoding="utf-8")
+        cli_cases.append((["--db", str(db), "--settings", str(settings), "switch-card", "Kimi"], "RuntimeError"))
+        for cli_args, expected_type in cli_cases:
+            with self.subTest(expected_type=expected_type):
+                proc = subprocess.run(
+                    [sys.executable, "-B", "-X", "utf8", str(script), *cli_args],
+                    capture_output=True, text=True, encoding="utf-8", cwd=self.project, timeout=20,
+                )
+                self.assertEqual(proc.returncode, 1)
+                self.assertEqual(proc.stdout, "")
+                lines = proc.stderr.splitlines()
+                self.assertEqual(len(lines), 1, proc.stderr)
+                err_obj = json.loads(lines[0])
+                self.assertIs(err_obj["ok"], False)
+                self.assertEqual(err_obj["error_type"], expected_type)
+        live_path.unlink()
+
+    def test_r5_claude_third_party_skill_symlink_preserved_and_handoff_off_leaves_no_empty_events(self):
+        _, _, _, run_install = self._setup_installer_tree()
+        with mock.patch.dict(os.environ, {"CODEX_HOME": str(self.home / ".codex")}):
+            ext_skill = self.root / "external_superpowers"
+            ext_skill.mkdir()
+            (ext_skill / "SKILL.md").write_text("# external skill\n", encoding="utf-8")
+            skills_parent = self.claude_home / "skills"
+            skills_parent.mkdir(parents=True)
+            third_party_link = skills_parent / "superpowers"
+            symlink_ok = True
+            try:
+                third_party_link.symlink_to(ext_skill, target_is_directory=True)
+            except OSError:
+                symlink_ok = False
+            dangling_third_party = skills_parent / "dangling-third-party"
+            if symlink_ok:
+                dangling_third_party.symlink_to(self.root / "missing-target")
+
+            args = ["--app", "claude", "--claude-home", self.claude_home, "--with-cc-router"]
+            run_install(*args, "--claude-handoff-mode", "enforce")
+            if symlink_ok:
+                self.assertTrue(third_party_link.is_symlink())
+                self.assertTrue(dangling_third_party.is_symlink())
+
+                # Symlink inside managed router or hooks/state subtree MUST still fail preflight with exit 2
+                evil_router_link = self.claude_home / "router/evil_link.py"
+                evil_router_link.symlink_to(ext_skill / "SKILL.md")
+                run_install(*args, code=2)
+                evil_router_link.unlink()
+
+                evil_state_link = self.claude_home / "hooks/state/evil_state_link"
+                evil_state_link.parent.mkdir(parents=True, exist_ok=True)
+                evil_state_link.symlink_to(ext_skill, target_is_directory=True)
+                run_install(*args, code=2)
+                evil_state_link.unlink()
+
+            # R5-2: migrating to --claude-handoff-mode off removes empty PostCompact and UserPromptSubmit groups
+            settings_path = self.claude_home / "settings.json"
+            before_off = json.loads(settings_path.read_text(encoding="utf-8"))
+            self.assertIn("PostCompact", before_off["hooks"])
+            self.assertIn("UserPromptSubmit", before_off["hooks"])
+
+            run_install(*args, "--claude-handoff-mode", "off")
+            after_off = json.loads(settings_path.read_text(encoding="utf-8"))
+            self.assertNotIn("PostCompact", after_off["hooks"])
+            self.assertNotIn("UserPromptSubmit", after_off["hooks"])
+            for kept_event in ("SessionStart", "PreToolUse", "Stop"):
+                self.assertIn(kept_event, after_off["hooks"])
+                self.assertTrue(all(group["hooks"] for group in after_off["hooks"][kept_event]))
+
+            audit_rep = json.loads(run_install(*args, "--audit-upgrade").stdout)
+            self.assertEqual(audit_rep["claude"]["drift_files"], [])
+            self.assertTrue(audit_rep["claude"]["hooks_aligned"])
+
+    def test_r6_router_powershell_safe_cwd_case_insensitive_effort_and_nat_loopback_fallback(self):
+        # R6-1: _read_windows_proxy_settings passes an existing safe cwd to powershell.exe
+        fake_ps_dir = self.root / "fake_win_sys32"
+        fake_ps_dir.mkdir()
+        fake_ps = fake_ps_dir / "powershell.exe"
+        fake_ps.write_text("", encoding="utf-8")
+        with mock.patch.object(router.shutil, "which", return_value=str(fake_ps)), \
+                mock.patch.object(router.subprocess, "run", return_value=SimpleNamespace(stdout=b'{"enabled":false,"server":"","pac":"","override":""}')) as run_mock:
+            router._read_windows_proxy_settings()
+        passed_cwd = run_mock.call_args.kwargs.get("cwd")
+        self.assertEqual(passed_cwd, str(fake_ps_dir))
+        self.assertTrue(os.path.isdir(passed_cwd))
+
+        # R6-2: kimi_effort_map case-insensitive matching
+        for raw_effort in ("XHIGH", "XHigh", "xhigh"):
+            h = object.__new__(router.Handler)
+            cfg = copy.deepcopy(router.DEFAULTS)
+            cfg.update(log=str(self.logs / "router_r6.log"), default_key_from_card="Kimi", kimi_effort_map={"xhigh": "max"})
+            h.server = SimpleNamespace(cfg=cfg)
+            h.path = "/v1/messages"
+            h.command = "POST"
+            body = json.dumps({"model": "kimi-k2", "output_config": {"effort": raw_effort}}).encode("utf-8")
+            h.headers = Message()
+            h.headers["Content-Type"] = "application/json"
+            h.headers["Content-Length"] = str(len(body))
+            h.rfile = io.BytesIO(body)
+            h.wfile = io.BytesIO()
+            h.send_response = mock.Mock()
+            h.send_header = mock.Mock()
+            h.end_headers = mock.Mock()
+            h.send_error = mock.Mock()
+            ok_resp = mock.Mock(status=200, reason="OK")
+            ok_resp.getheaders.return_value = [("Content-Type", "application/json")]
+            ok_resp.read1.side_effect = [b"{}", b""]
+            ok_conn = mock.Mock()
+            ok_conn.getresponse.return_value = ok_resp
+            with mock.patch.object(router.http.client, "HTTPSConnection", return_value=ok_conn), \
+                    mock.patch.object(router, "card_key", return_value="tok_kimi_r6"):
+                h.do_POST()
+            forwarded = json.loads(ok_conn.request.call_args.kwargs["body"])
+            self.assertEqual(forwarded["output_config"]["effort"], "max", raw_effort)
+
+        # R6-3: Loopback proxy ConnectionRefusedError falls back to direct when target is NOT Fake-IP
+        log_file = self.logs / "router_nat.log"
+        h_nat = object.__new__(router.Handler)
+        cfg_nat = copy.deepcopy(router.DEFAULTS)
+        cfg_nat.update(follow_windows_proxy=True, log=str(log_file), default_key_from_card="Kimi")
+        h_nat.server = SimpleNamespace(cfg=cfg_nat)
+        h_nat.path = "/v1/messages"
+        h_nat.command = "POST"
+        nat_body = json.dumps({"model": "kimi-k2"}).encode("utf-8")
+        h_nat.headers = Message()
+        h_nat.headers["Content-Type"] = "application/json"
+        h_nat.headers["Content-Length"] = str(len(nat_body))
+        h_nat.rfile = io.BytesIO(nat_body)
+        h_nat.wfile = io.BytesIO()
+        h_nat.send_response = mock.Mock()
+        h_nat.send_header = mock.Mock()
+        h_nat.end_headers = mock.Mock()
+        h_nat.send_error = mock.Mock()
+
+        proxy_conn = mock.Mock()
+        proxy_conn.request.side_effect = ConnectionRefusedError("WSL2 NAT loopback refused")
+        direct_resp = mock.Mock(status=200, reason="OK")
+        direct_resp.getheaders.return_value = [("Content-Type", "application/json")]
+        direct_resp.read1.side_effect = [b'{"id":"msg_ok"}', b""]
+        direct_conn = mock.Mock()
+        direct_conn.getresponse.return_value = direct_resp
+
+        with mock.patch.object(router, "windows_proxy_for", return_value=router.urlsplit("http://127.0.0.1:7890")), \
+                mock.patch.object(router, "_resolves_to_fake_ip", return_value=False), \
+                mock.patch.object(router, "card_key", return_value="tok_kimi_nat"), \
+                mock.patch.object(router.http.client, "HTTPSConnection", side_effect=[proxy_conn, direct_conn]) as https_cls:
+            h_nat.do_POST()
+        self.assertEqual(https_cls.call_count, 2)
+        proxy_conn.close.assert_called_once_with()
+        direct_conn.close.assert_called_once_with()
+        h_nat.send_response.assert_called_once_with(200, "OK")
+        rec = json.loads(log_file.read_text(encoding="utf-8").splitlines()[-1])
+        self.assertEqual(rec["proxy_fallback"], "loopback_proxy_unreachable")
+        self.assertEqual(rec["transport"], "direct")
+
+        # Fake-IP target MUST NOT fall back to direct connection on loopback proxy refusal
+        h_fake = object.__new__(router.Handler)
+        h_fake.server = SimpleNamespace(cfg=cfg_nat)
+        h_fake.path = "/v1/messages"
+        h_fake.command = "POST"
+        h_fake.headers = Message()
+        h_fake.headers["Content-Type"] = "application/json"
+        h_fake.headers["Content-Length"] = str(len(nat_body))
+        h_fake.rfile = io.BytesIO(nat_body)
+        h_fake.wfile = io.BytesIO()
+        h_fake.send_error = mock.Mock()
+        proxy_conn_fake = mock.Mock()
+        proxy_conn_fake.request.side_effect = ConnectionRefusedError("refused")
+        with mock.patch.object(router, "windows_proxy_for", return_value=router.urlsplit("http://127.0.0.1:7890")), \
+                mock.patch.object(router, "_resolves_to_fake_ip", return_value=True), \
+                mock.patch.object(router, "card_key", return_value="tok_kimi_nat"), \
+                mock.patch.object(router.http.client, "HTTPSConnection", return_value=proxy_conn_fake) as https_fake:
+            h_fake.do_POST()
+        self.assertEqual(https_fake.call_count, 1)
+        proxy_conn_fake.close.assert_called_once_with()
+        self.assertEqual(h_fake.send_error.call_args.args[0], 502)
+
+    @unittest.skipIf(os.name == "nt" or shutil.which("bash") is None, "requires POSIX bash")
+    def test_r7_wsl_ccswitch_scripts_syntax_and_sandboxed_update_behaviors(self):
+        update_src = REPO_ROOT / "template/claude/router/update-cc-switch-wsl.sh"
+        launch_src = REPO_ROOT / "template/claude/router/launch-cc-switch-wsl.sh"
+        for sh_script in (update_src, launch_src):
+            chk = subprocess.run(["bash", "-n", str(sh_script)], capture_output=True, text=True, encoding="utf-8", timeout=10)
+            self.assertEqual(chk.returncode, 0, chk.stderr)
+
+        launch_txt = launch_src.read_text(encoding="utf-8")
+        self.assertIn('WINDOWS_POWERSHELL="/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"', launch_txt)
+        self.assertIn("-NoLogo -NoProfile -NonInteractive -EncodedCommand", launch_txt)
+        self.assertIn("timeout 8s", launch_txt)
+
+        sbx = self.root / "wsl_sbx"
+        router_dir = sbx / "router"
+        fake_home = sbx / "home"
+        state_dir = sbx / "state"
+        for d in (router_dir, fake_home, state_dir):
+            d.mkdir(parents=True)
+
+        update_sh = router_dir / "update-cc-switch-wsl.sh"
+        shutil.copy2(update_src, update_sh)
+        update_sh.chmod(0o755)
+        launcher_sh = router_dir / "launch-cc-switch-wsl.sh"
+        launcher_sh.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        launcher_sh.chmod(0o755)
+
+        # Use BASH_ENV function shims so simulation works identically on both exec and noexec mounts
+        bash_env_file = sbx / "bash_stubs.sh"
+        bash_env_file.write_text(
+            'uname() { echo "x86_64"; }\n'
+            'curl() {\n'
+            '  local url="${!#}"\n'
+            '  if [[ "$url" == *"/releases/tags/"* ]]; then\n'
+            '    cat "$SBX_STATE/release.json"\n'
+            '  else\n'
+            '    local out=""\n'
+            '    while [ "$#" -gt 0 ]; do\n'
+            '      if [ "$1" = "-o" ]; then out="$2"; shift 2; else shift; fi\n'
+            '    done\n'
+            '    cp "$SBX_STATE/payload.bin" "$out"\n'
+            '  fi\n'
+            '}\n'
+            'dpkg-deb() {\n'
+            '  local deb="$2" field="$3"\n'
+            '  [ -f "$deb" ] || return 1\n'
+            '  if [ "$#" -eq 3 ] && [ "$field" = "Package" ]; then echo "cc-switch"; else echo "cc-switch 4.0.31"; fi\n'
+            '}\n'
+            'dpkg-query() { echo "4.0.31"; }\n'
+            'sudo() {\n'
+            '  shift; shift; shift\n'
+            '  local deb_arg="$1"\n'
+            '  printf "%s\\n" "$deb_arg" > "$SBX_STATE/apt_arg.txt"\n'
+            '  [[ "$deb_arg" == *.deb ]] || { echo "apt requires .deb suffix: $deb_arg" >&2; return 1; }\n'
+            '  [ -f "$deb_arg" ] || { echo "missing file: $deb_arg" >&2; return 1; }\n'
+            '  return "${SBX_APT_EXIT:-0}"\n'
+            '}\n'
+            'pgrep() {\n'
+            '  if [ -f "$SBX_STATE/gui_running" ]; then echo "4242"; return 0; fi\n'
+            '  return 1\n'
+            '}\n'
+            'pkill() {\n'
+            '  echo "pkill:$*" >> "$SBX_STATE/pkill.calls"\n'
+            '  rm -f "$SBX_STATE/gui_running"\n'
+            '  return 0\n'
+            '}\n'
+            'mock_launcher_fn() {\n'
+            '  echo "launched" >> "$SBX_STATE/launcher.calls"\n'
+            '  return "${SBX_LAUNCHER_EXIT:-0}"\n'
+            '}\n'
+            'mock_win_ps_fn() {\n'
+            '  printf "%s\\n" "$*" > "$SBX_STATE/ps_args.txt"\n'
+            '  echo "RESULT:VISIBLE"\n'
+            '}\n'
+            'export -f uname curl dpkg-deb dpkg-query sudo pgrep pkill mock_launcher_fn mock_win_ps_fn\n',
+            encoding="utf-8",
+        )
+        # Ensure LAUNCHER works even when sandbox resides on a noexec mount
+        if not os.access(launcher_sh, os.X_OK):
+            update_sh.write_text(
+                update_src.read_text(encoding="utf-8").replace(
+                    'LAUNCHER="$(resolve_launcher || true)"',
+                    'LAUNCHER="mock_launcher_fn"',
+                ),
+                encoding="utf-8",
+            )
+        else:
+            launcher_sh.write_text(
+                '#!/usr/bin/env bash\n'
+                'echo "launched" >> "$SBX_STATE/launcher.calls"\n'
+                'exit "${SBX_LAUNCHER_EXIT:-0}"\n',
+                encoding="utf-8",
+            )
+            launcher_sh.chmod(0o755)
+
+        base_env = {
+            **os.environ,
+            "HOME": str(fake_home),
+            "SBX_STATE": str(state_dir),
+            "BASH_ENV": str(bash_env_file),
+        }
+
+        # Verify launch-cc-switch-wsl.sh fallback to WINDOWS_POWERSHELL and timeout/PowerShell flags
+        true_bin = shutil.which("true") or "/bin/true"
+        patched_launch = router_dir / "patched-launch.sh"
+        patched_launch.write_text(
+            launch_txt.replace("APP=/usr/bin/cc-switch", f'APP="{true_bin}"')
+            .replace(
+                'WINDOWS_POWERSHELL="/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"',
+                f'WINDOWS_POWERSHELL="{true_bin}"',
+            )
+            .replace(
+                'timeout 8s "$ps_bin"',
+                'mock_win_ps_fn',
+            ),
+            encoding="utf-8",
+        )
+        (state_dir / "gui_running").write_text("1\n", encoding="utf-8")
+        res_launch = subprocess.run(["bash", str(patched_launch)], env=base_env, capture_output=True, text=True, encoding="utf-8", timeout=15)
+        (state_dir / "gui_running").unlink(missing_ok=True)
+        self.assertEqual(res_launch.returncode, 0, res_launch.stderr)
+        self.assertIn("Window state: VISIBLE", res_launch.stdout)
+        ps_args = (state_dir / "ps_args.txt").read_text(encoding="utf-8")
+        self.assertIn("-NoLogo -NoProfile -NonInteractive -EncodedCommand", ps_args)
+
+        payload_bytes = b"fake-deb-binary-payload-v4.0.31"
+        payload_hash = hashlib.sha256(payload_bytes).hexdigest()
+        (state_dir / "payload.bin").write_bytes(payload_bytes)
+
+        def run_update(*u_args, extra_env=None):
+            env = {**base_env, **(extra_env or {})}
+            return subprocess.run(["bash", str(update_sh), *u_args], env=env, capture_output=True, text=True, encoding="utf-8", timeout=20)
+
+        # 1) Release missing architecture .deb asset -> exit 1 WITHOUT hinting --no-hash (even with --no-hash)
+        (state_dir / "release.json").write_text(
+            json.dumps({"assets": [{"name": "CC-Switch-v4.0.31-Windows-x64.msi", "digest": f"sha256:{payload_hash}"}]}),
+            encoding="utf-8",
+        )
+        for flags in (["4.0.31"], ["4.0.31", "--no-hash"]):
+            res = run_update(*flags)
+            self.assertEqual(res.returncode, 1)
+            self.assertIn("does not contain asset", res.stderr)
+            self.assertNotIn("--no-hash", res.stderr)
+
+        # 2) Asset exists without digest -> prompts --no-hash by default, succeeds with --no-hash (and does NOT launch GUI when not running)
+        (state_dir / "release.json").write_text(
+            json.dumps({"assets": [{"name": "CC-Switch-v4.0.31-Linux-x86_64.deb", "digest": None}]}),
+            encoding="utf-8",
+        )
+        res_no_override = run_update("4.0.31")
+        self.assertEqual(res_no_override.returncode, 1)
+        self.assertIn("--no-hash", res_no_override.stderr)
+
+        res_override = run_update("4.0.31", "--no-hash")
+        self.assertEqual(res_override.returncode, 0, res_override.stderr)
+        self.assertIn("Installed cc-switch: 4.0.31", res_override.stdout)
+        self.assertFalse((state_dir / "launcher.calls").exists())
+
+        # 3) Local package path without .deb suffix gets temporary .deb symlink for apt & cleans up
+        raw_blob = sbx / "downloaded_pkg_blob"
+        raw_blob.write_bytes(payload_bytes)
+        res_blob = run_update(str(raw_blob))
+        self.assertEqual(res_blob.returncode, 0, res_blob.stderr)
+        apt_passed = Path((state_dir / "apt_arg.txt").read_text(encoding="utf-8").strip())
+        self.assertTrue(apt_passed.name.endswith(".deb"))
+        self.assertFalse(apt_passed.exists(), "temporary .deb symlink dir must be cleaned up on exit")
+
+        # 4) GUI running before update -> waits for exit after pkill -TERM, relaunches GUI, and relaunch failure only warns without failing exit 0
+        (state_dir / "gui_running").write_text("1\n", encoding="utf-8")
+        res_relaunch_warn = run_update(str(raw_blob), extra_env={"SBX_LAUNCHER_EXIT": "1"})
+        self.assertEqual(res_relaunch_warn.returncode, 0, res_relaunch_warn.stderr)
+        self.assertIn("Installed cc-switch: 4.0.31", res_relaunch_warn.stdout)
+        self.assertIn("Warning:", res_relaunch_warn.stderr)
+        self.assertTrue((state_dir / "pkill.calls").is_file())
+        self.assertEqual((state_dir / "launcher.calls").read_text(encoding="utf-8").splitlines(), ["launched"])
+
+    def test_r8_install_ps1_encoding_console_guard_and_unauthorized_catch(self):
+        ps1_path = REPO_ROOT / "install.ps1"
+        raw = ps1_path.read_bytes()
+        self.assertTrue(raw.startswith(b"\xef\xbb\xbf"))
+        self.assertEqual(raw.count(b"\r\n"), raw.count(b"\n"))
+        lines = raw.decode("utf-8-sig").splitlines()
+        self.assertIn("try {", lines[4])
+        self.assertIn("[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)", lines[4])
+        self.assertIn("catch [System.IO.IOException] {}", lines[4])
+        self.assertIn("catch [System.Security.SecurityException] {}", lines[4])
+        full_text = "\n".join(lines)
+        self.assertIn("catch [System.UnauthorizedAccessException]", full_text)
+
+    def test_r2_f1_codex_hook_cross_interpreter_legacy_flags_and_policy_migration(self):
+        codex_root = self.root / "codex_f1"
+        hook_dir = codex_root / "hooks"
+        hook_dir.mkdir(parents=True)
+        hooks_path = codex_root / "hooks.json"
+        tpl_path = REPO_ROOT / "template/codex/hooks.json"
+
+        loader_p = (hook_dir / "session_context_loader.py").as_posix()
+        status_p = (hook_dir / "status_guard.py").as_posix()
+        repeat_p = (hook_dir / "reply_repeat_guard.py").as_posix()
+        gate_p = (hook_dir / "handoff_gate.py").as_posix()
+        state_p = (hook_dir / "state").as_posix()
+        logs_p = (hook_dir / "logs").as_posix()
+
+        custom_sh = {"type": "command", "command": f'/bin/sh "{loader_p}" --client codex'}
+        py2_custom = {"type": "command", "command": f'python2.7 -B "{status_p}" --client codex --state-dir "{state_p}" --log-dir "{logs_p}"'}
+        py310_custom = {"type": "command", "command": f'python3.10 -I -B "{status_p}" --client codex --state-dir "{state_p}" --log-dir "{logs_p}"'}
+
+        legacy_doc = {
+            "hooks": {
+                "SessionStart": [{
+                    "matcher": "^(compact|resume)$",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": f'"/opt/removed-py312/bin/python3.12" -B "{loader_p}" --client codex',
+                            "timeout": 29,
+                            "statusMessage": "legacy loader",
+                        },
+                        custom_sh,
+                    ],
+                }],
+                "PreToolUse": [{
+                    "matcher": ".*",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": f'python3.13t "{status_p}" --client codex --state-dir "{state_p}" --log-dir "{logs_p}"',
+                        },
+                        {
+                            "type": "command",
+                            "command": f'"/stale/dup/python3.11" -I -B "{status_p}" --client codex --state-dir "{state_p}" --log-dir "{logs_p}"',
+                        },
+                        py2_custom,
+                        py310_custom,
+                    ],
+                }],
+                "Stop": [{
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": f'"/removed/venv/bin/python3.13t" -I -B "{repeat_p}" --client codex --state-dir "{state_p}" --log-dir "{logs_p}"',
+                        },
+                        {
+                            "type": "command",
+                            "command": f'"/removed/venv/bin/python3.12" -I -B "{gate_p}" --client codex --mode enforce --compact-limit 4 --state-dir "{state_p}/handoff"',
+                            "timeout": 41,
+                        },
+                    ],
+                }],
+            },
+        }
+        user_words.atomic_write_json(hooks_path, legacy_doc)
+        new_py_cmd = f'"{sys.executable}" -X utf8 -I -B' if os.name == "nt" else f"{installer.shlex.quote(sys.executable)} -X utf8 -I -B"
+        candidates = [("", sys.executable, [])]
+        gate_handler = legacy_doc["hooks"]["Stop"][0]["hooks"][1]
+        classified_gate = installer._codex_managed_hook(gate_handler, codex_root, candidates)
+        self.assertIsNotNone(classified_gate)
+        self.assertEqual(classified_gate.kind, "gate")
+        self.assertIsNone(classified_gate.interpreter)
+        self.assertEqual(classified_gate.policy, ("enforce", 4))
+        self.assertEqual(installer._codex_managed_hook(py2_custom, codex_root, candidates).kind, "custom")
+        self.assertEqual(installer._codex_managed_hook(py310_custom, codex_root, candidates).kind, "custom")
+
+        with mock.patch.object(installer, "_hook_python_candidates", return_value=candidates), \
+                redirect_stderr(io.StringIO()):
+            plan = installer._plan_codex_hooks(hooks_path, tpl_path, new_py_cmd)
+        self.assertEqual((plan.mode, plan.compact_limit), ("enforce", 4))
+        self.assertIsNotNone(plan.change)
+        merged = json.loads(plan.change.content)
+
+        ss_hooks = merged["hooks"]["SessionStart"][0]["hooks"]
+        self.assertEqual(len(ss_hooks), 3)
+        self.assertTrue(ss_hooks[0]["command"].startswith(new_py_cmd + " "))
+        self.assertEqual(ss_hooks[0]["timeout"], 29)
+        self.assertIn(custom_sh, ss_hooks)
+        self.assertEqual(sum("handoff_gate.py" in h["command"] for h in ss_hooks), 1)
+
+        pre_hooks = merged["hooks"]["PreToolUse"][0]["hooks"]
+        status_managed = [h for h in pre_hooks if "status_guard.py" in h["command"] and h not in (py2_custom, py310_custom)]
+        self.assertEqual(len(status_managed), 1)
+        self.assertTrue(status_managed[0]["command"].startswith(new_py_cmd + " "))
+
+        stop_hooks = merged["hooks"]["Stop"][0]["hooks"]
+        self.assertEqual(len(stop_hooks), 2)
+        for h in stop_hooks:
+            self.assertTrue(h["command"].startswith(new_py_cmd + " "))
+        migrated_gate = next(h for h in stop_hooks if "handoff_gate.py" in h["command"])
+        self.assertIn("--mode enforce --compact-limit 4", migrated_gate["command"])
+        self.assertEqual(migrated_gate["timeout"], 41)
+
+        # Working interpreter with legacy flags on handoff_gate.py still upgrades flags to HOOK_PYTHON_FLAGS
+        hooks_path.write_bytes(plan.change.content)
+        doc_working_legacy = json.loads(hooks_path.read_text(encoding="utf-8"))
+        for group in doc_working_legacy["hooks"].get("Stop", []):
+            for h in group["hooks"]:
+                if "handoff_gate.py" in h["command"]:
+                    h["command"] = h["command"].replace("-X utf8 -I -B", "-I -B", 1)
+        user_words.atomic_write_json(hooks_path, doc_working_legacy)
+        with mock.patch.object(installer, "_hook_python_candidates", return_value=candidates), \
+                mock.patch.object(installer, "_is_working_python_cmd", return_value=True), \
+                redirect_stderr(io.StringIO()):
+            plan_flag_up = installer._plan_codex_hooks(hooks_path, tpl_path, new_py_cmd)
+        self.assertIsNotNone(plan_flag_up.change)
+        up_stop = json.loads(plan_flag_up.change.content)["hooks"]["Stop"][0]["hooks"]
+        self.assertTrue(all("-X utf8 -I -B" in h["command"] for h in up_stop))
+
+    def test_r2_f2_fleet_state_symlinks_corrupt_json_git_scrub_and_reload_clear_guards(self):
+        repo = self.project / "upstream_f2"
+        repo.mkdir()
+        (repo / "install.py").write_text("", encoding="utf-8")
+        plugin_json = repo / "template/user-guard/plugin.json"
+        user_words.atomic_write_json(plugin_json, {"version": "1.15.2"})
+        profile = repo / "template/user-guard/skills/cae-harness/fleet_profile.json"
+        user_words.atomic_write_json(profile, {"runtime_tunables": {"headless_dispatch": {"fleet_state_ttl_sec": 300}}})
+
+        # 1) Symlink / reparse-point checks on state_dir ancestor, state_dir, state_file, and lock_path
+        real_dir = self.root / "real_f2_dir"
+        real_dir.mkdir()
+        sym_dir = self.root / "sym_f2_dir"
+        symlink_ok = True
+        try:
+            sym_dir.symlink_to(real_dir, target_is_directory=True)
+        except OSError:
+            symlink_ok = False
+        clean_state_dir = self.root / "clean_f2_state"
+        clean_state_dir.mkdir()
+        with mock.patch.dict(os.environ, {"CAE_FLEET_STATE_DIR": str(clean_state_dir)}):
+            expected_sf = fleet_state._validated_state_file(repo)
+        if symlink_ok:
+            for bad_state_dir in (sym_dir, sym_dir / "child_state"):
+                with mock.patch.dict(os.environ, {"CAE_FLEET_STATE_DIR": str(bad_state_dir)}):
+                    with self.assertRaisesRegex(ValueError, "symbolic link or reparse point"):
+                        fleet_state._validated_state_file(repo)
+
+            victim_file = self.root / "victim_state.json"
+            victim_file.write_text("{}\n", encoding="utf-8")
+            with mock.patch.dict(os.environ, {"CAE_FLEET_STATE_DIR": str(clean_state_dir)}):
+                expected_sf.symlink_to(victim_file)
+                with self.assertRaisesRegex(ValueError, "symbolic link or reparse point"):
+                    fleet_state._validated_state_file(repo)
+                expected_sf.unlink()
+
+                lock_path = expected_sf.with_suffix(expected_sf.suffix + ".lock")
+                lock_path.symlink_to(victim_file)
+                with self.assertRaisesRegex(ValueError, "symbolic link or reparse point"):
+                    fleet_state._validated_state_file(repo)
+                with self.assertRaisesRegex(ValueError, "symbolic link or reparse point"):
+                    with fleet_state._state_lock(expected_sf):
+                        pass
+                lock_path.unlink()
+        else:
+            reparse_stat = SimpleNamespace(st_mode=0o040755, st_file_attributes=0x400)
+            with mock.patch.dict(os.environ, {"CAE_FLEET_STATE_DIR": str(real_dir)}), \
+                    mock.patch.object(Path, "lstat", return_value=reparse_stat):
+                with self.assertRaisesRegex(ValueError, "symbolic link or reparse point"):
+                    fleet_state._validated_state_file(repo)
+
+        # 2) _load_state converts RecursionError & NaN/Infinity/-Infinity into ValueError("corrupt state JSON")
+        deep_nest = max(20000, sys.getrecursionlimit() * 10)
+        for corrupt_text in (
+            "[" * deep_nest + "]" * deep_nest,
+            '{"ttl_seconds": 100, "bad": NaN}',
+            '{"ttl_seconds": 100, "bad": Infinity}',
+            '{"ttl_seconds": 100, "bad": -Infinity}',
+        ):
+            expected_sf.write_text(corrupt_text, encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "corrupt state JSON"):
+                fleet_state._load_state(expected_sf)
+        expected_sf.unlink()
+
+        # 3) _repo_meta validates isinstance(parsed_plugin, dict) and scrubs GIT_* env vars
+        plugin_json.write_text("[]\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "JSON object"):
+            fleet_state._repo_meta(repo)
+        user_words.atomic_write_json(plugin_json, {"version": "1.15.2"})
+
+        polluted_git_env = {
+            "GIT_DIR": "/bad/git_dir",
+            "GIT_WORK_TREE": "/bad/work_tree",
+            "GIT_INDEX_FILE": "/bad/index",
+            "GIT_OBJECT_DIRECTORY": "/bad/objects",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES": "/bad/alt",
+            "GIT_COMMON_DIR": "/bad/common",
+            "GIT_CEILING_DIRECTORIES": "/bad/ceiling",
+            "GIT_PREFIX": "bad/prefix",
+        }
+        with mock.patch.dict(os.environ, polluted_git_env), \
+                mock.patch.object(fleet_state.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout="deadbeef\n")) as git_mock:
+            meta = fleet_state._repo_meta(repo)
+        self.assertEqual(meta["repo_commit"], "deadbeef")
+        passed_git_env = git_mock.call_args.kwargs["env"]
+        for gk in polluted_git_env:
+            self.assertNotIn(gk, passed_git_env)
+
+        # 4) clear guards unclaimed & claimed AWAITING_MASTER_RELOAD; propose/record-pass1/clear refuse corrupt state without --force
+        def run_state(*cli_args):
+            buf = io.StringIO()
+            with mock.patch.dict(os.environ, {"CAE_FLEET_STATE_DIR": str(clean_state_dir)}), redirect_stdout(buf):
+                rc = fleet_state.main(["--repo", str(repo), *cli_args])
+            return rc, json.loads(buf.getvalue())
+
+        rc, _ = run_state("record-pass1", "--session-id", "p1_unclaimed", "--target-master", "codex")
+        self.assertEqual(rc, 0)
+        unclaimed_raw = expected_sf.read_bytes()
+        for clr_args in (["clear"], ["clear", "--verified"]):
+            rc, out = run_state(*clr_args)
+            self.assertEqual(rc, 1)
+            self.assertEqual(out["reason"], "active_master_reload")
+            self.assertEqual(expected_sf.read_bytes(), unclaimed_raw)
+
+        rc, _ = run_state("verify-pass2", "--session-id", "p2_claimant")
+        self.assertEqual(rc, 0)
+        for clr_args in (["clear"], ["clear", "--verified"]):
+            rc, out = run_state(*clr_args)
+            self.assertEqual(rc, 1)
+            self.assertEqual(out["reason"], "active_pass2_claimed")
+
+        expected_sf.write_bytes(b'{"phase": "IDLE", "nan": NaN}\n')
+        corrupt_bytes = expected_sf.read_bytes()
+        for blocked_cmd, exp_rc in (
+            (["propose", "--session-id", "s1", "--summary", "sum"], 2),
+            (["record-pass1", "--session-id", "s1", "--target-master", "codex"], 2),
+            (["clear"], 1),
+            (["clear", "--verified"], 1),
+        ):
+            rc, out = run_state(*blocked_cmd)
+            self.assertEqual(rc, exp_rc, blocked_cmd)
+            self.assertEqual(out["reason"], "corrupt_state", blocked_cmd)
+            self.assertEqual(expected_sf.read_bytes(), corrupt_bytes)
+
+        rc, out = run_state("clear", "--force")
+        self.assertEqual(rc, 0)
+        self.assertFalse(expected_sf.exists())
+
+        help_buf = io.StringIO()
+        with self.assertRaises(SystemExit) as cm, redirect_stdout(help_buf):
+            fleet_state.main(["clear", "--help"])
+        self.assertEqual(cm.exception.code, 0)
+        help_txt = help_buf.getvalue()
+        self.assertIn("reload lock", help_txt)
+        self.assertIn("corrupt state", help_txt)
+
+    def test_r2_f3_router_http_smuggling_chunked_uri_incomplete_read_config_and_bind(self):
+        cfg = copy.deepcopy(router.DEFAULTS)
+        cfg.update(log=str(self.logs / "router_f3.log"), default_key_from_card="Kimi")
+
+        def make_post_handler(raw_headers, raw_body=b"{}", path="/v1/messages"):
+            h = object.__new__(router.Handler)
+            h.server = SimpleNamespace(cfg=cfg)
+            h.path = path
+            h.command = "POST"
+            h.headers = Message()
+            for hk, hv in raw_headers:
+                h.headers.add_header(hk, hv)
+            h.rfile = io.BytesIO(raw_body)
+            h.wfile = io.BytesIO()
+            h.send_response = mock.Mock()
+            h.send_header = mock.Mock()
+            h.end_headers = mock.Mock()
+            h.send_error = mock.Mock()
+            return h
+
+        # 1) Smuggling / malformed Content-Length and Transfer-Encoding -> 400
+        bad_header_cases = [
+            ([("Content-Length", "2"), ("Content-Length", "5")], b"{}"),
+            ([("Content-Length", "2, 5")], b"{}"),
+            ([("Content-Length", "+2")], b"{}"),
+            ([("Content-Length", "-2")], b"{}"),
+            ([("Content-Length", "1_0")], b"{}"),
+            ([("Transfer-Encoding", "chunked"), ("Content-Length", "2")], b"2\r\n{}\r\n0\r\n\r\n"),
+            ([("Transfer-Encoding", "gzip")], b"{}"),
+            ([("Transfer-Encoding", "gzip, chunked")], b"2\r\n{}\r\n0\r\n\r\n"),
+            ([("Transfer-Encoding", "")], b"{}"),
+        ]
+        for hdrs, payload in bad_header_cases:
+            with self.subTest(hdrs=hdrs):
+                h = make_post_handler(hdrs, payload)
+                h.do_POST()
+                self.assertEqual(h.send_error.call_args.args[0], 400)
+
+        # 2) Strict _read_chunked_body validation
+        for bad_chunk in (
+            b"0x2\r\n{}\r\n0\r\n\r\n",
+            b"+2\r\n{}\r\n0\r\n\r\n",
+            b"1_0\r\n" + b"a" * 16 + b"\r\n0\r\n\r\n",
+            b"2\r\n{}\r\n0\r\n",  # EOF without terminating blank line
+            b"0",                 # EOF without CRLF
+            b"0\r\n" + b"X-T: 1\r\n" * 65 + b"\r\n",  # > 64 trailers
+            b"0\r\nX-Long: " + b"a" * 65536 + b"\r\n\r\n",  # > 65536 byte trailer line
+        ):
+            with self.subTest(bad_chunk=bad_chunk[:24]):
+                h = make_post_handler([("Transfer-Encoding", "chunked")], bad_chunk)
+                h.do_POST()
+                self.assertEqual(h.send_error.call_args.args[0], 400)
+
+        ok_64_trailers = b"2\r\n{}\r\n0\r\n" + b"X-T: 1\r\n" * 64 + b"\r\n"
+        self.assertEqual(router._read_chunked_body(io.BytesIO(ok_64_trailers), 1024), b"{}")
+
+        # 3) Absolute request URI via urlsplit + upstream IncompleteRead (err_side: upstream)
+        body = json.dumps({"model": "kimi-k2"}).encode("utf-8")
+        h_abs = make_post_handler(
+            [("Content-Type", "application/json"), ("Content-Length", str(len(body)))],
+            body,
+            path="http://127.0.0.1:8241/v1/messages?beta=true",
+        )
+        trunc_resp = mock.Mock(status=200, reason="OK", length=19)
+        trunc_resp.getheaders.return_value = [("Content-Type", "application/json"), ("Content-Length", "25")]
+        trunc_resp.read1.side_effect = [b'{"id":', b""]
+        up_conn = mock.Mock()
+        up_conn.getresponse.return_value = trunc_resp
+        with mock.patch.object(router, "card_key", return_value="tok_kimi_f3"), \
+                mock.patch.object(router.http.client, "HTTPSConnection", return_value=up_conn):
+            h_abs.do_POST()
+        self.assertEqual(up_conn.request.call_args.args[1], "/coding/v1/messages?beta=true")
+        last_log = json.loads(Path(cfg["log"]).read_text(encoding="utf-8").splitlines()[-1])
+        self.assertEqual(last_log["path"], "/v1/messages")
+        self.assertEqual(last_log["err_side"], "upstream")
+        self.assertIn("IncompleteRead", last_log["err"])
+
+        # 4) Client disconnect handling in health check and _safe_send_error
+        for disc_exc in (BrokenPipeError("pipe"), ConnectionResetError("reset"), ConnectionAbortedError("abort")):
+            h_health = object.__new__(router.Handler)
+            h_health.server = SimpleNamespace(cfg={"port": 8241})
+            h_health.path = "http://127.0.0.1:8241/__router/health"
+            h_health.send_response = mock.Mock()
+            h_health.send_header = mock.Mock()
+            h_health.end_headers = mock.Mock()
+            h_health.wfile = mock.Mock()
+            h_health.wfile.write.side_effect = disc_exc
+            h_health.do_GET()  # Must not propagate disconnect
+
+            h_err = object.__new__(router.Handler)
+            h_err.send_error = mock.Mock(side_effect=disc_exc)
+            h_err._safe_send_error(400, "bad request")
+
+        # 5) Explicit missing --config exits 2; load_config aliases + range checks + windows_proxy_ttl_s + bind OSError
+        with self.assertRaises(SystemExit) as cm_cfg, redirect_stderr(io.StringIO()):
+            router.main(["--config", str(self.root / "missing-router.json")])
+        self.assertEqual(cm_cfg.exception.code, 2)
+
+        alias_cfg_file = self.root / "alias_router.json"
+        user_words.atomic_write_json(alias_cfg_file, {
+            "port": 18249,
+            "timeout_sec": 45,
+            "key_cache_ttl_sec": 12,
+            "windows_proxy_ttl_sec": 19,
+        })
+        loaded_cfg = router.load_config(str(alias_cfg_file))
+        self.assertEqual(loaded_cfg["timeout_s"], 45)
+        self.assertEqual(loaded_cfg["key_cache_ttl_s"], 12)
+        self.assertEqual(loaded_cfg["windows_proxy_ttl_s"], 19)
+
+        router._proxy_cache = None
+        clock = [100.0]
+        with mock.patch.object(router.time, "monotonic", side_effect=lambda: clock[0]), \
+                mock.patch.object(router, "_read_windows_proxy_settings", return_value={"enabled": False, "server": "", "pac": "", "override": ""}) as rd_proxy:
+            router.windows_proxy_for("https://api.kimi.com/coding/v1/messages", ttl=loaded_cfg["windows_proxy_ttl_s"])
+            clock[0] = 115.0  # > default 5s, but < configured 19s
+            router.windows_proxy_for("https://api.kimi.com/coding/v1/messages", ttl=loaded_cfg["windows_proxy_ttl_s"])
+            self.assertEqual(rd_proxy.call_count, 1)
+            clock[0] = 120.0
+            router.windows_proxy_for("https://api.kimi.com/coding/v1/messages", ttl=loaded_cfg["windows_proxy_ttl_s"])
+            self.assertEqual(rd_proxy.call_count, 2)
+
+        for invalid_patch in (
+            {"port": 0},
+            {"port": 70000},
+            {"port": True},
+            {"timeout_s": 0},
+            {"timeout_sec": -5},
+            {"max_body_bytes": 0},
+            {"max_inflight": 0},
+            {"key_cache_ttl_sec": 0},
+            {"windows_proxy_ttl_sec": -1},
+        ):
+            bad_cfg_file = self.root / "bad_router.json"
+            user_words.atomic_write_json(bad_cfg_file, invalid_patch)
+            with self.subTest(invalid_patch=invalid_patch), self.assertRaises(ValueError):
+                router.load_config(str(bad_cfg_file))
+
+        bind_err_buf = io.StringIO()
+        with mock.patch.object(router, "ThreadingHTTPServer", side_effect=OSError(98, "Address already in use")), \
+                redirect_stderr(bind_err_buf), self.assertRaises(SystemExit) as cm_bind:
+            router.main(["--config", str(alias_cfg_file)])
+        self.assertEqual(cm_bind.exception.code, 1)
+        err_lines = bind_err_buf.getvalue().splitlines()
+        self.assertEqual(len(err_lines), 1)
+        self.assertIn("http://127.0.0.1:18249/__router/health", err_lines[0])
+
+    def test_r2_f4_ccswitch_admin_symlink_guards_minimal_columns_and_locked_db_hint(self):
+        real_db = self.database()
+        real_settings = self.settings()
+        admin.prepare_cards(real_db, 8240)
+
+        sym_db = self.root / "sym_cc.db"
+        sym_settings = self.root / "sym_claude_settings.json"
+        symlink_ok = True
+        try:
+            sym_db.symlink_to(real_db)
+            sym_settings.symlink_to(real_settings)
+        except OSError:
+            symlink_ok = False
+        if symlink_ok:
+            with self.assertRaisesRegex(ValueError, "symbolic link or reparse point"):
+                admin.prepare_cards(sym_db, 8240)
+            with self.assertRaisesRegex(ValueError, "symbolic link or reparse point"):
+                admin.switch_card(sym_db, real_settings, "Kimi")
+            with self.assertRaisesRegex(ValueError, "symbolic link or reparse point"):
+                admin.switch_card(real_db, sym_settings, "Kimi")
+            with self.assertRaisesRegex(ValueError, "symbolic link or reparse point"):
+                admin.disable_prompts(sym_db)
+            with self.assertRaisesRegex(ValueError, "symbolic link or reparse point"):
+                admin.retire_prompts_and_skills(sym_db)
+            with self.assertRaisesRegex(ValueError, "symbolic link or reparse point"):
+                admin.backup_sqlite_database(sym_db, self.root / "out.bak")
+            self.assertEqual(list(self.root.glob("sym_*bak*")), [])
+        else:
+            reparse_stat = SimpleNamespace(st_mode=0o100644, st_file_attributes=0x400)
+            with mock.patch.object(Path, "lstat", return_value=reparse_stat):
+                with self.assertRaisesRegex(ValueError, "symbolic link or reparse point"):
+                    admin.prepare_cards(real_db, 8240)
+                with self.assertRaisesRegex(ValueError, "symbolic link or reparse point"):
+                    admin.backup_sqlite_database(real_db, self.root / "out.bak")
+
+        # Minimal providers schema without created_at, is_current, or sort_index
+        min_db = self.root / "minimal_cc.db"
+        with closing(sqlite3.connect(min_db)) as con:
+            con.execute(
+                "CREATE TABLE providers (id TEXT PRIMARY KEY, app_type TEXT, name TEXT, settings_config TEXT)"
+            )
+            con.execute(f"PRAGMA user_version={admin.TESTED_MAX_SCHEMA}")
+            con.execute(
+                "INSERT INTO providers (id, app_type, name, settings_config) VALUES (?, ?, ?, ?)",
+                ("k1", "claude", "Kimi", json.dumps({"env": {"ANTHROPIC_AUTH_TOKEN": "sk-real-kimi-token"}})),
+            )
+            con.commit()
+        res_insert_update = admin.prepare_cards(min_db, 8241)
+        by_name = {c["name"]: c for c in res_insert_update["cards"]}
+        self.assertEqual(by_name["Kimi"]["action"], "update")
+        self.assertEqual(by_name["Kimi"]["token"], "present")
+        self.assertFalse(by_name["Kimi"]["current"])
+        self.assertEqual(by_name["DeepSeek"]["action"], "insert")
+
+        # CLI sqlite3.OperationalError("database is locked") appends CC Switch GUI troubleshooting hint
+        locked_runner = (
+            "import runpy, sqlite3, sys\n"
+            "from unittest import mock\n"
+            f"sys.argv = [{str(REPO_ROOT / 'template/claude/router/ccswitch_admin.py')!r}, '--db', {str(real_db)!r}, 'prepare-cards']\n"
+            "orig_connect = sqlite3.connect\n"
+            "def locked_connect(*a, **kw):\n"
+            "    raise sqlite3.OperationalError('database is locked')\n"
+            "with mock.patch.object(sqlite3, 'connect', side_effect=locked_connect):\n"
+            "    runpy.run_path(sys.argv[0], run_name='__main__')\n"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-B", "-X", "utf8", "-c", locked_runner],
+            capture_output=True, text=True, encoding="utf-8", cwd=self.project, timeout=15,
+        )
+        self.assertEqual(proc.returncode, 1)
+        err_lines = proc.stderr.splitlines()
+        self.assertEqual(len(err_lines), 1, proc.stderr)
+        err_payload = json.loads(err_lines[0])
+        self.assertEqual(err_payload["error_type"], "OperationalError")
+        self.assertIn("CC Switch GUI", err_payload["error"])
+
+    def test_r2_f5_f6_wsl_scripts_and_entrypoints_python_probing(self):
+        launch_src = REPO_ROOT / "template/claude/router/launch-cc-switch-wsl.sh"
+        update_src = REPO_ROOT / "template/claude/router/update-cc-switch-wsl.sh"
+        install_sh_src = REPO_ROOT / "install.sh"
+        install_ps1_src = REPO_ROOT / "install.ps1"
+
+        has_posix_bash = os.name != "nt" and shutil.which("bash") is not None
+        if has_posix_bash:
+            for sh in (launch_src, update_src, install_sh_src):
+                chk = subprocess.run(["bash", "-n", str(sh)], capture_output=True, text=True, encoding="utf-8", timeout=10)
+                self.assertEqual(chk.returncode, 0, chk.stderr)
+
+        launch_txt = launch_src.read_text(encoding="utf-8")
+        update_txt = update_src.read_text(encoding="utf-8")
+        self.assertIn("PAT='(^|/)cc-switch( |$)'", launch_txt)
+        self.assertIn('DISPLAY="${DISPLAY:-:0}"', launch_txt)
+        self.assertIn("APP_PAT='(^|/)cc-switch( |$)'", update_txt)
+
+        if has_posix_bash:
+            # update-cc-switch-wsl.sh missing 'assets' list -> stderr + exit 1
+            sbx = self.root / "wsl_f5"
+            sbx.mkdir()
+            update_sh = sbx / "update-cc-switch-wsl.sh"
+            shutil.copy2(update_src, update_sh)
+            bash_stubs = sbx / "stubs.sh"
+            bash_stubs.write_text(
+                'uname() { echo "x86_64"; }\n'
+                'curl() { cat "$SBX_JSON"; }\n'
+                'export -f uname curl\n',
+                encoding="utf-8",
+            )
+            for bad_meta in ('{"message": "API rate limit exceeded"}', '{}', '[]', '{not-json'):
+                meta_file = sbx / "meta.json"
+                meta_file.write_text(bad_meta, encoding="utf-8")
+                res = subprocess.run(
+                    ["bash", str(update_sh), "4.0.31"],
+                    env={**os.environ, "HOME": str(sbx), "BASH_ENV": str(bash_stubs), "SBX_JSON": str(meta_file)},
+                    capture_output=True, text=True, encoding="utf-8", timeout=15,
+                )
+                self.assertEqual(res.returncode, 1, bad_meta)
+                self.assertTrue(res.stderr.strip(), bad_meta)
+                self.assertNotIn("--no-hash", res.stderr)
+
+        # install.py checks sys.version_info < (3, 11) BEFORE import tomllib
+        install_py_txt = (REPO_ROOT / "install.py").read_text(encoding="utf-8")
+        self.assertLess(install_py_txt.index("sys.version_info < (3, 11)"), install_py_txt.index("import tomllib"))
+
+        if has_posix_bash:
+            # install.sh uses type -ap to skip older python3 first in PATH and pick later Python 3.11+
+            bin_old = self.root / "bin_old"
+            bin_new = self.root / "bin_new"
+            fake_repo = self.root / "fake_install_repo"
+            for d in (bin_old, bin_new, fake_repo):
+                d.mkdir()
+            shutil.copy2(install_sh_src, fake_repo / "install.sh")
+            (fake_repo / "install.py").write_text(
+                "import sys; print('LAUNCHED_WITH:' + sys.argv[1])\n",
+                encoding="utf-8",
+            )
+            old_py = bin_old / "python3"
+            old_py.write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+            old_py.chmod(0o755)
+            new_py = bin_new / "python3"
+            new_py.symlink_to(sys.executable)
+            if os.access(old_py, os.X_OK):
+                probe_env = {**os.environ, "PATH": f"{bin_old}{os.pathsep}{bin_new}{os.pathsep}{os.environ.get('PATH', '')}"}
+                res_sh = subprocess.run(
+                    ["bash", str(fake_repo / "install.sh"), "--marker-ok"],
+                    env=probe_env, capture_output=True, text=True, encoding="utf-8", timeout=15,
+                )
+                self.assertEqual(res_sh.returncode, 0, res_sh.stderr)
+                self.assertIn("LAUNCHED_WITH:--marker-ok", res_sh.stdout)
+
+        # install.ps1 UTF-8 BOM + strict CRLF + -3.14..-3.11 fallback + bilingual message
+        ps1_raw = install_ps1_src.read_bytes()
+        self.assertTrue(ps1_raw.startswith(b"\xef\xbb\xbf"))
+        self.assertEqual(ps1_raw.count(b"\r\n"), ps1_raw.count(b"\n"))
+        ps1_txt = ps1_raw.decode("utf-8-sig")
+        for flag in ('"-3"', '"-3.14"', '"-3.13"', '"-3.12"', '"-3.11"'):
+            self.assertIn(flag, ps1_txt)
+        self.assertIn("Python 3.11+ executable not found", ps1_txt)
+
+    def test_r2_f7_install_prefix_freethreaded_stale_mirror_zotero_and_env_scrub(self):
+        # 1) _is_valid_hook_python_prefix & _claude_managed_script free-threaded support and old/missing path rejection
+        existing_abs_py = self.root / "python3.13t"
+        existing_abs_py.write_text("", encoding="utf-8")
+        missing_abs_py = self.root / "no_such_dir/python3.12"
+
+        with mock.patch.object(installer.os, "name", "posix"):
+            self.assertTrue(installer._is_valid_hook_python_prefix("python3.13t -X utf8 -I -B"))
+            if sys.platform != "win32":
+                self.assertTrue(installer._is_valid_hook_python_prefix(f"{installer.shlex.quote(str(existing_abs_py))} -X utf8 -I -B"))
+            self.assertFalse(installer._is_valid_hook_python_prefix("python2 -X utf8 -I -B"))
+            self.assertFalse(installer._is_valid_hook_python_prefix("python2.7 -X utf8 -I -B"))
+            self.assertFalse(installer._is_valid_hook_python_prefix("python3.10 -X utf8 -I -B"))
+            self.assertFalse(installer._is_valid_hook_python_prefix(f"{installer.shlex.quote(str(missing_abs_py))} -X utf8 -I -B"))
+
+        with mock.patch.object(installer.os, "name", "nt"):
+            self.assertTrue(installer._is_valid_hook_python_prefix("python3.13t.exe -X utf8 -I -B"))
+            self.assertFalse(installer._is_valid_hook_python_prefix("python3.10.exe -X utf8 -I -B"))
+            self.assertFalse(installer._is_valid_hook_python_prefix(r'"C:\Python313\python.exe" -X utf8 -I -B'))
+            self.assertFalse(installer._is_valid_hook_python_prefix(f'"{existing_abs_py}" -X utf8 -I -B'))
+
+        script_path = (self.claude_home / "hooks/status_guard.py").as_posix()
+        (self.claude_home / "hooks").mkdir(parents=True, exist_ok=True)
+        self.assertEqual(
+            installer._claude_managed_script({"type": "command", "command": f'python3.13t -X utf8 -I -B "{script_path}"'}, self.claude_home),
+            "status_guard.py",
+        )
+        for rejected_exe in ("python2", "python2.7", "python3.10"):
+            self.assertIsNone(
+                installer._claude_managed_script({"type": "command", "command": f'{rejected_exe} -X utf8 -I -B "{script_path}"'}, self.claude_home)
+            )
+
+        # 2) _stale_mirror_files detects symlinks under hooks/{state,logs} AND stale empty dirs
+        tpl_ug = REPO_ROOT / "template/user-guard"
+        target_ug = self.root / "mirror_f7/plugins/user-guard"
+        py_cmd = installer.detect_hook_python_command()
+        installer.mirror_sync_plugin(
+            tpl_ug, target_ug, hooks_bytes=installer._agy_hooks_bytes((tpl_ug / "hooks.json").read_bytes(), py_cmd)
+        )
+        self.assertEqual(installer._stale_mirror_files(tpl_ug, target_ug), [])
+
+        stale_empty_a = target_ug / "retired_empty_dir/nested"
+        stale_empty_a.mkdir(parents=True)
+        stale_state_empty = target_ug / "hooks/state/retired_state_subdir"
+        stale_state_empty.mkdir(parents=True)
+        kept_runtime_empty = target_ug / "hooks/state/handoff"
+        kept_runtime_empty.mkdir(parents=True, exist_ok=True)
+
+        outside_note = self.root / "outside_note.txt"
+        outside_note.write_text("x\n", encoding="utf-8")
+        sym_state_file = target_ug / "hooks/state/evil_link.json"
+        sym_logs_dir = target_ug / "hooks/logs/evil_dir_link"
+        sym_logs_dir.parent.mkdir(parents=True, exist_ok=True)
+        symlink_ok = True
+        try:
+            sym_state_file.symlink_to(outside_note)
+            sym_logs_dir.symlink_to(self.root, target_is_directory=True)
+        except OSError:
+            symlink_ok = False
+
+        detected_rels = {p.relative_to(target_ug).as_posix() for p in installer._stale_mirror_files(tpl_ug, target_ug)}
+        if symlink_ok:
+            self.assertIn("hooks/state/evil_link.json", detected_rels)
+            self.assertIn("hooks/logs/evil_dir_link", detected_rels)
+        self.assertIn("retired_empty_dir/nested", detected_rels)
+        self.assertIn("hooks/state/retired_state_subdir", detected_rels)
+        self.assertNotIn("hooks/state/handoff", detected_rels)
+
+        if symlink_ok:
+            sym_state_file.unlink()
+            sym_logs_dir.unlink()
+        installer.mirror_sync_plugin(
+            tpl_ug, target_ug, hooks_bytes=installer._agy_hooks_bytes((tpl_ug / "hooks.json").read_bytes(), py_cmd)
+        )
+        self.assertFalse((target_ug / "retired_empty_dir").exists())
+        self.assertFalse(stale_state_empty.exists())
+        self.assertEqual(installer._stale_mirror_files(tpl_ug, target_ug), [])
+
+        # 3) detect_zotero_mcp_executable excludes /mnt/<drive>/... and .exe/.cmd/.bat on non-Windows
+        fake_win_exe = self.root / "zotero-mcp.exe"
+        fake_win_exe.write_text("stub\n", encoding="utf-8")
+        fake_win_exe.chmod(0o755)
+        fake_cmd = self.root / "zotero-mcp.cmd"
+        fake_cmd.write_text("stub\n", encoding="utf-8")
+        codex_cfg_dir = self.root / "zotero_codex"
+        codex_cfg_dir.mkdir()
+        (codex_cfg_dir / "config.toml").write_text(
+            '[mcp_servers.zotero]\ncommand = "/mnt/c/Users/alice/zotero-mcp"\n',
+            encoding="utf-8",
+        )
+        native_path_cls = type(Path())
+        with mock.patch.object(installer, "Path", native_path_cls), \
+                mock.patch.object(installer.os, "name", "posix"), \
+                mock.patch.dict(os.environ, {"CODEX_HOME": str(codex_cfg_dir), "HOME": str(self.root / "empty_home")}), \
+                mock.patch.object(native_path_cls, "home", return_value=self.root / "empty_home"):
+            self.assertIsNone(installer.detect_zotero_mcp_executable(str(fake_win_exe)))
+            self.assertIsNone(installer.detect_zotero_mcp_executable(str(fake_cmd)))
+            with mock.patch.object(installer.shutil, "which", return_value="/mnt/c/Tools/zotero-mcp"):
+                self.assertIsNone(installer.detect_zotero_mcp_executable())
+            with mock.patch.object(installer.shutil, "which", return_value=str(fake_win_exe)):
+                self.assertIsNone(installer.detect_zotero_mcp_executable())
+
+        # 4) _resolve_hooks_dir fallback & host env scrubbing verification
+        for bad_ug in ("", "   ", str(self.root / "missing_ug_dir"), str(outside_note)):
+            with mock.patch.dict(os.environ, {"USER_GUARD_INSTALLED_DIR": bad_ug}):
+                self.assertEqual(_resolve_hooks_dir(REPO_ROOT), (REPO_ROOT / "template/user-guard/hooks").resolve())
+        for scrubbed_key in (
+            "PLUGIN_DATA", "USER_GUARD_STATE_DIR", "AGY_CONVERSATION_ID", "ANTIGRAVITY_TOKEN",
+            "CODEX_HOME", "CLAUDECODE", "CLAUDE_CONFIG_DIR", "ANTHROPIC_API_KEY", "DSH_HOME",
+            "OPENAI_API_KEY", "DEEPSEEK_API_KEY", "GIT_DIR", "HTTP_PROXY", "https_proxy",
+            "ALL_PROXY", "NO_PROXY", "XDG_STATE_HOME", "PYTHONPATH",
+        ):
+            self.assertTrue(_should_scrub_host_env(scrubbed_key, keep_installed_dirs=True), scrubbed_key)
+        self.assertFalse(_should_scrub_host_env("USER_GUARD_INSTALLED_DIR", keep_installed_dirs=True))
+
+    def test_v1160_hooks_lib_shared_modules_synced_and_audited(self):
+        from _lib import fs_safety, shell_lex
+
+        self.assertIs(user_words.session_state_lock, fs_safety.session_state_lock)
+        self.assertIs(user_words._is_reparse_or_link, fs_safety.is_reparse_or_link)
+        self.assertIs(handoff_gate._split_shell_clauses, shell_lex.split_shell_clauses)
+        self.assertIs(status_guard._decode_ansi_c_quotes, shell_lex.decode_ansi_c_quotes)
+        self.assertIs(status_guard._pos_inside_quotes, shell_lex.pos_inside_quotes)
+
+        # Regression: ${foo:-"{"} quoted brace inside parameter expansion & escaped-backtick command substitution
+        self.assertEqual(
+            shell_lex.split_shell_clauses('echo ${foo:-"{"}; rm -rf /outside'),
+            ['echo ${foo:-"{"}', "rm -rf /outside"],
+        )
+        self.assertEqual(
+            shell_lex.split_shell_clauses("echo ${foo:-'{'}; rm -rf /outside"),
+            ["echo ${foo:-'{'}", "rm -rf /outside"],
+        )
+        escaped_bt = r'echo `printf \`uname\`; rm -rf /outside`'
+        self.assertTrue(
+            any("rm -rf /outside" in sub for sub in shell_lex.extract_cmd_substitutions(escaped_bt)),
+            escaped_bt,
+        )
+        escaped_bt_dq = r'echo "`printf \`uname\`; rm -rf /outside`"'
+        self.assertTrue(
+            any("rm -rf /outside" in sub for sub in shell_lex.extract_cmd_substitutions(escaped_bt_dq)),
+            escaped_bt_dq,
+        )
+        self.assertEqual(
+            self.guard("Bash", command='echo ${foo:-"{"}; touch ../business/out.txt')["hookSpecificOutput"]["permissionDecision"],
+            "ask",
+        )
+        self.assertEqual(
+            self.guard("Bash", command=r'echo `printf \`uname\`; touch ../business/out.txt`')["hookSpecificOutput"]["permissionDecision"],
+            "ask",
+        )
+
+        src_root = self.root / "v1160_source"
+        src_root.mkdir()
+        shutil.copy2(REPO_ROOT / "install.py", src_root / "install.py")
+        shutil.copytree(REPO_ROOT / "template", src_root / "template",
+                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"))
+        ag_dir = self.root / "v1160_target/agy/plugins/user-guard"
+        cx_dir = self.root / "v1160_target/codex"
+        cl_dir = self.root / "v1160_target/claude"
+        dsh_dir = self.root / "v1160_target/dsh"
+        res = subprocess.run(
+            [
+                sys.executable, "-B", "-X", "utf8", str(src_root / "install.py"),
+                "--app", "all",
+                "--target-dir", str(ag_dir),
+                "--codex-home", str(cx_dir),
+                "--claude-home", str(cl_dir),
+                "--dsh-home", str(dsh_dir),
+                "--no-zotero", "--skip-test", "--yes",
+            ],
+            cwd=src_root, capture_output=True, text=True, encoding="utf-8", timeout=30,
+        )
+        self.assertEqual(res.returncode, 0, res.stderr + res.stdout)
+        for root_dir in (ag_dir, cx_dir, cl_dir):
+            for lib_name in ("__init__.py", "fs_safety.py", "shell_lex.py", "adaptive_policy.py"):
+                self.assertTrue((root_dir / "hooks" / "_lib" / lib_name).is_file(), str(root_dir / "hooks" / "_lib" / lib_name))
+
+        audit_ok = installer.audit_upgrade_status(
+            src_root, ag_dir, cx_dir, cl_dir, dsh_dir, app_scope="all"
+        )
+        self.assertEqual(audit_ok["antigravity"]["drift_files"], [])
+        self.assertEqual(audit_ok["codex"]["drift_files"], [])
+        self.assertEqual(audit_ok["claude"]["drift_files"], [])
+
+        (cx_dir / "hooks/_lib/shell_lex.py").write_text("# drifted\n", encoding="utf-8")
+        audit_drift = installer.audit_upgrade_status(
+            src_root, ag_dir, cx_dir, cl_dir, dsh_dir, app_scope="all"
+        )
+        self.assertIn("hooks/_lib/shell_lex.py", audit_drift["codex"]["drift_files"])
+
+    def test_v1160_adaptive_per_agent_and_model_meta_policy(self):
+        from _lib import adaptive_policy
+
+        sample_profile = {
+            "schema_version": 1,
+            "runtime_tunables": {
+                "compaction_recovery": {
+                    "defaults": {
+                        "inline_total_chars": 8000,
+                        "inline_user_item_chars": 1200,
+                        "inline_subagent_total_chars": 1400,
+                        "inline_subagent_item_chars": 280,
+                        "archive_subagent_item_chars": 1200,
+                    },
+                    "per_client": {
+                        "codex": {"inline_total_chars": 8000},
+                        "claude": {"inline_total_chars": 7600},
+                    },
+                },
+                "handoff_thresholds": {
+                    "codex": {"default_mode": "advisory", "default_compact_limit": 2},
+                    "claude": {"default_mode": "advisory", "default_compact_limit": 2},
+                },
+                "headless_dispatch": {"router": {"timeout_sec": 720}},
+            },
+            "subscription_matrix": {
+                "models": {
+                    "gpt-6.1-sol": {"agent": "codex", "context_window": 272000, "enabled_in_profile": True},
+                    "deepseek-flash[1M]": {"agent": "claude", "enabled_in_profile": True, "provider_model": "deepseek-chat-1m"},
+                    "kimi-k2.5": {"agent": "claude", "context_window": 262144, "enabled_in_profile": True},
+                    "small-local-model": {"agent": "codex", "context_window": 100000, "handoff_mode": "enforce"},
+                }
+            },
+        }
+
+        c_1m = adaptive_policy.resolve_adaptive_compaction_policy(sample_profile, client="claude", model_name="deepseek-flash[1M]", effort="xhigh")
+        self.assertEqual(c_1m["effective_context_window"], 1_000_000)
+        self.assertGreater(c_1m["inline_total_chars"], 7600)
+
+        h_1m = adaptive_policy.resolve_adaptive_handoff_policy(sample_profile, client="claude", model_name="deepseek-flash[1M]")
+        self.assertEqual(h_1m["effective_context_window"], 1_000_000)
+        self.assertGreaterEqual(h_1m["default_compact_limit"], 2)
+
+        c_small = adaptive_policy.resolve_adaptive_compaction_policy(sample_profile, client="codex", model_name="small-local-model")
+        self.assertEqual(c_small["effective_context_window"], 100_000)
+        self.assertLess(c_small["inline_total_chars"], 8000)
+
+        h_small = adaptive_policy.resolve_adaptive_handoff_policy(sample_profile, client="codex", model_name="small-local-model")
+        self.assertEqual(h_small["default_mode"], "enforce")
+
+        ccswitch_admin_mod = installer._load_ccswitch_admin(REPO_ROOT)
+        card_params = ccswitch_admin_mod.derive_adaptive_card_defaults(sample_profile, port=8241)
+        self.assertEqual(card_params["kimi_model"], "kimi-k2.5")
+        self.assertEqual(card_params["deepseek_model"], "deepseek-chat-1m")
+        self.assertEqual(card_params["max_context"], "1000000")
+        self.assertEqual(card_params["compact_window"], "720000")
+
+        src_root = self.root / "v1160_meta_src"
+        src_root.mkdir()
+        shutil.copy2(REPO_ROOT / "install.py", src_root / "install.py")
+        shutil.copytree(REPO_ROOT / "template", src_root / "template",
+                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"))
+        ag_dir = self.root / "v1160_meta_dst/agy/plugins/user-guard"
+        cx_dir = self.root / "v1160_meta_dst/codex"
+        cl_dir = self.root / "v1160_meta_dst/claude"
+        dsh_dir = self.root / "v1160_meta_dst/dsh"
+        audit = installer.audit_upgrade_status(src_root, ag_dir, cx_dir, cl_dir, dsh_dir, app_scope="all")
+        self.assertIn("adaptive_meta", audit)
+        self.assertEqual(set(audit["adaptive_meta"].keys()), {"antigravity", "codex", "claude"})
+
+        # Verify ccswitch_admin._build_card_templates consumes adaptive defaults when subscription_matrix has enabled claude models
+        prof_path = self.root / "adaptive_card_profile.json"
+        adaptive_prof = dict(sample_profile)
+        adaptive_prof["client_catalog_rules"] = {
+            "claude": {
+                "router_primary_model": "fallback-k",
+                "router_subagent_model": "fallback-d",
+                "max_context_tokens": 128000,
+                "auto_compact_window": 90000,
+                "router_card_name": "router-adaptive",
+            }
+        }
+        user_words.atomic_write_json(prof_path, adaptive_prof)
+        with mock.patch.dict(os.environ, {"CAE_FLEET_PROFILE": str(prof_path)}):
+            cards = ccswitch_admin_mod._build_card_templates(8241)
+            router_env = cards["router-adaptive"][0]()
+            self.assertEqual(router_env["ANTHROPIC_MODEL"], "kimi-k2.5")
+            self.assertEqual(router_env["CLAUDE_CODE_SUBAGENT_MODEL"], "deepseek-chat-1m")
+            self.assertEqual(router_env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "1000000")
+
+        # Verify session_context_loader runtime model extraction & AGENTS.md 3-layer constitutional governance table
+        loader_mod = _load_module("scl_adaptive", REPO_ROOT / "template/user-guard/hooks/session_context_loader.py")
+        m, e = loader_mod._extract_runtime_model_and_effort("claude", {"model": "deepseek-flash[1M]", "effort": "xhigh"})
+        self.assertEqual((m, e), ("deepseek-flash[1M]", "xhigh"))
+        with mock.patch.dict(os.environ, {"ANTHROPIC_MODEL": "kimi-k2.5", "CODEX_MODEL": "gpt-6.1-sol"}, clear=False):
+            self.assertEqual(loader_mod._extract_runtime_model_and_effort("claude", {})[0], "kimi-k2.5")
+            self.assertEqual(loader_mod._extract_runtime_model_and_effort("codex", {})[0], "gpt-6.1-sol")
+        agents_md = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+        for layer_label in ("项目主体代码层", "项目自更新层", "分发给其他 Agent 的配置层"):
+            self.assertIn(layer_label, agents_md)
+
+
+    def test_v1160_card_detail_file_folding_and_dsh_meta_trigger(self):
+        # 1) user_words.collapse_historical_cards folds 14-row tables
+        sample_hist = (
+            "背景\n#### 流 S1（14 项完整参数明细）\n"
+            "| 序号 | 参数项 | 当前值 |\n| --- | --- | --- |\n| 1 | 通道 | codex |\n"
+            "票据：T-123；状态：PENDING"
+        )
+        folded = user_words.collapse_historical_cards(sample_hist)
+        self.assertIn("[已折叠历史确认单/账单明细]", folded)
+        self.assertIn("票据：T-123", folded)
+        self.assertNotIn("| 1 | 通道 | codex |", folded)
+
+        sci_hist = (
+            "背景\n#### 流 S1（14 项完整参数明细）\n"
+            "| 序号 | 参数项 | 当前值 |\n| --- | --- | --- |\n| 1 | 通道 | codex |\n"
+            "票据：T-123；状态：PENDING\n\n"
+            "网格收敛阶实测对比：\n"
+            "| 网格尺度 | L2 误差 | 收敛阶 |\n"
+            "| --- | --- | --- |\n"
+            "| 64 | 1.25e-4 | 3.98 |\n"
+            "| 128 | 7.82e-6 | 4.00 |"
+        )
+        folded_sci = user_words.collapse_historical_cards(sci_hist)
+        self.assertIn("[已折叠历史确认单/账单明细]", folded_sci)
+        self.assertNotIn("| 1 | 通道 | codex |", folded_sci)
+        self.assertIn("| 网格尺度 | L2 误差 | 收敛阶 |", folded_sci)
+        self.assertIn("| 64 | 1.25e-4 | 3.98 |", folded_sci)
+        self.assertIn("| 128 | 7.82e-6 | 4.00 |", folded_sci)
+
+        # 2) cae_harness._save_plan writes <ticket_id>_card.md and populates compact_summary_card
+        harness_mod = _load_module("cae_harness_card_test", REPO_ROOT / "template/user-guard/skills/cae-harness/scripts/cae_harness.py")
+        plan_dir = self.root / "plan_cards"
+        plan_dir.mkdir(parents=True, exist_ok=True)
+        ticket = {
+            "ticket_id": "T-CARD-01",
+            "status": "PENDING",
+            "session_id": "sess-card-01",
+            "workflow_bg": "测试背景",
+            "workflow_goal": "测试目标",
+            "workflow_impact": "无副作用",
+            "capability_ledger": {"last_online_refresh_at": "2026-01-01", "local_bench_verified_at": "2026-01-01"},
+            "streams": [{"stream_id": "S1", "subtask": "check", "target": ".", "channel": "cae_harness_headless",
+                         "client": "codex", "agent_type": "codex", "model_display": "gpt-6.1-sol", "tier": "high",
+                         "context_window": 272000, "headless": True, "clean_room": True, "access_mode": "readonly",
+                         "inline_readonly": True, "timeout": 300, "currently_available": True,
+                         "quota_scheme": "rolling", "quota_summary": "ok", "receipt_location": "S1.json"}],
+        }
+        harness_mod._save_plan(ticket, plan_dir)
+        card_file = plan_dir / "T-CARD-01_card.md"
+        self.assertTrue(card_file.is_file())
+        card_text = card_file.read_text(encoding="utf-8")
+        self.assertIn("工作流背景：测试背景", card_text)
+        self.assertIn("要做什么：测试目标", card_text)
+        self.assertIn("14 项完整参数明细", card_text)
+        self.assertIn("gpt-6.1-sol", card_text)
+        self.assertIn("票据：T-CARD-01；状态：PENDING", card_text)
+        self.assertEqual(card_text, ticket["human_popup_markdown"] + "\n")
+        self.assertIn("T-CARD-01_card.md", ticket["card_detail_file"])
+        self.assertIn("工作流目标：测试目标", ticket["compact_summary_card"])
+
+        # _atomic_text refuses symlink targets
+        real_target = plan_dir / "real_note.txt"
+        real_target.write_text("orig", encoding="utf-8")
+        sym_target = plan_dir / "sym_note.txt"
+        try:
+            sym_target.symlink_to(real_target)
+        except OSError:
+            sym_target = None
+        if sym_target is not None:
+            with self.assertRaises(harness_mod.HarnessError):
+                harness_mod._atomic_text(sym_target, "hijacked")
+            self.assertEqual(real_target.read_text(encoding="utf-8"), "orig")
+
+        # 3) install._probe_dsh_hook_capability & probe_apps dsh native_binary probe
+        self.assertEqual(installer._probe_dsh_hook_capability(None)["hook_protocol"], "soft_rules_only")
+        fake_res = mock.Mock(stdout="Usage: dsh [OPTIONS] --hooks PreToolUse SessionStart", stderr="")
+        with mock.patch.object(installer.subprocess, "run", return_value=fake_res):
+            up = installer._probe_dsh_hook_capability("/usr/local/bin/dsh")
+            self.assertTrue(up["hard_hooks_supported"])
+            self.assertEqual(up["meta_update_trigger"], "ready_for_fleet_evolve_dsh_hooks")
+        fake_bin = self.root / "fake_dsh_bin"
+        fake_bin.mkdir(parents=True, exist_ok=True)
+        dsh_exe = fake_bin / "dsh"
+        dsh_exe.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        fake_home = self.root / "probe_home"
+        fake_home.mkdir(parents=True, exist_ok=True)
+        with mock.patch.object(installer.Path, "home", return_value=fake_home), \
+             mock.patch.object(installer.shutil, "which", side_effect=lambda name: str(dsh_exe) if name == "dsh" else None), \
+             mock.patch.object(installer, "_windows_app_binaries", return_value=(None, None)), \
+             mock.patch.object(installer.subprocess, "run", return_value=fake_res):
+            probed = installer.detect_installed_apps()
+            self.assertEqual(probed["dsh"]["native_binary"], str(dsh_exe))
+            self.assertTrue(probed["dsh"]["hard_hooks_supported"])
+            self.assertEqual(probed["dsh"]["meta_update_trigger"], "ready_for_fleet_evolve_dsh_hooks")
+
+
+    def test_v1160_approved_holistic_policy_and_runtime_handoff_override(self):
+        # 1 & 2 & 6: fleet_profile.json explicit context_window across all 4 clients, 0.72 compact buffer, no dead quota_warn_percent
+        live_pf = json.loads((REPO_ROOT / "template/user-guard/skills/cae-harness/fleet_profile.json").read_text(encoding="utf-8"))
+        self.assertEqual(live_pf["client_catalog_rules"]["claude"]["auto_compact_window"], 754975)
+        self.assertNotIn("quota_warn_percent", live_pf["runtime_tunables"]["dispatch_confirmation"])
+        sub_models = live_pf["subscription_matrix"]["models"]
+        self.assertEqual({m["agent"] for m in sub_models.values()}, {"agy", "codex", "claude", "dsh"})
+        for slug, meta in sub_models.items():
+            self.assertIsInstance(meta.get("context_window"), int, slug)
+            self.assertGreaterEqual(meta["context_window"], 272000, slug)
+
+        # 3: router.*.json templates omit static timeout_s so router.load_config inherits fleet_profile timeout_sec
+        for tpl_name in ("router.windows.json", "router.wsl.json"):
+            tpl_doc = json.loads((REPO_ROOT / "template/claude/router" / tpl_name).read_text(encoding="utf-8"))
+            self.assertNotIn("timeout_s", tpl_doc)
+            cfg_copy = self.root / f"inherit_{tpl_name}"
+            cfg_copy.write_bytes((REPO_ROOT / "template/claude/router" / tpl_name).read_bytes())
+            custom_pf = self.root / f"pf_{tpl_name}"
+            user_words.atomic_write_json(custom_pf, {"schema_version": 1, "runtime_tunables": {"headless_dispatch": {"router": {"timeout_sec": 615}}}})
+            with mock.patch.dict(os.environ, {"CAE_FLEET_PROFILE": str(custom_pf)}):
+                loaded_r = router.load_config(cfg_copy)
+                self.assertEqual(loaded_r["timeout_s"], 615)
+
+        # 4: default CLI (--mode advisory --compact-limit 0) dynamically upgrades at runtime for model-level handoff_mode, while --mode off stays off
+        dyn_pf = self.root / "dyn_handoff_pf.json"
+        user_words.atomic_write_json(dyn_pf, {
+            "schema_version": 1,
+            "runtime_tunables": {"handoff_thresholds": {"claude": {"default_mode": "advisory", "default_compact_limit": 0, "enforce_drain_actions": 4}}},
+            "subscription_matrix": {"models": {"small-strict": {"agent": "claude", "context_window": 100000, "handoff_mode": "enforce", "compact_limit_override": 1}}},
+        })
+        self.boundaries(1)
+        with mock.patch.dict(os.environ, {"CAE_FLEET_PROFILE": str(dyn_pf)}):
+            proc_adv = self.cli(
+                "handoff_gate.py",
+                {**self.payload, "hook_event_name": "PostCompact", "model": "small-strict"},
+                "--state-dir", self.state / "handoff", "--mode", "advisory", "--compact-limit", 0,
+            )
+            self.assertEqual(proc_adv.returncode, 0, proc_adv.stderr)
+            self.assertIn("systemMessage", json.loads(proc_adv.stdout))
+            gstate = self.gate_state()
+            self.assertEqual(gstate["mode"], "enforce")
+            self.assertEqual(gstate["compactLimit"], 1)
+            self.assertEqual(gstate["phase"], "drain")
+
+            proc_off = self.cli(
+                "handoff_gate.py",
+                {**self.payload, "hook_event_name": "PostCompact", "model": "small-strict"},
+                "--state-dir", self.root / "off_state", "--mode", "off", "--compact-limit", 0,
+            )
+            self.assertEqual(proc_off.returncode, 0, proc_off.stderr)
+            self.assertEqual(json.loads(proc_off.stdout), {})
+
+        # 5: ci.yml checks Windows install.ps1 --probe-apps and retains dual unittest passes
+        ci_body = (REPO_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        self.assertIn("install.ps1 --probe-apps", ci_body)
+
+    def test_v1160_postcompact_model_persistence_and_installed_profile_resolution(self):
+        # 1) PostCompact (with model) followed by model-less PreToolUse & Stop keeps dynamic enforce/drain gate
+        dyn_pf = self.root / "persist_handoff_pf.json"
+        user_words.atomic_write_json(dyn_pf, {
+            "schema_version": 1,
+            "runtime_tunables": {
+                "handoff_thresholds": {
+                    "claude": {"default_mode": "advisory", "default_compact_limit": 0, "enforce_drain_actions": 3},
+                    "codex": {"default_mode": "advisory", "default_compact_limit": 0, "enforce_drain_actions": 3},
+                }
+            },
+            "subscription_matrix": {
+                "models": {
+                    "small-strict-cl": {
+                        "agent": "claude", "context_window": 100000,
+                        "handoff_mode": "enforce", "compact_limit_override": 1,
+                    },
+                    "small-strict-cx": {
+                        "agent": "codex", "context_window": 100000,
+                        "handoff_mode": "enforce", "compact_limit_override": 1,
+                    },
+                }
+            },
+        })
+        self.boundaries(1)
+        with mock.patch.dict(os.environ, {"CAE_FLEET_PROFILE": str(dyn_pf)}):
+            os.environ.pop("ANTHROPIC_MODEL", None)
+            os.environ.pop("CODEX_MODEL", None)
+            p_compact = self.cli(
+                "handoff_gate.py",
+                {**self.payload, "hook_event_name": "PostCompact", "model": "small-strict-cl"},
+                "--state-dir", self.state / "handoff", "--mode", "advisory", "--compact-limit", 0,
+            )
+            self.assertEqual(p_compact.returncode, 0, p_compact.stderr)
+            st_after_compact = self.gate_state()
+            self.assertEqual(st_after_compact["mode"], "enforce")
+            self.assertEqual(st_after_compact["phase"], "drain")
+
+            # Follow-up PreToolUse omits "model" field completely -> must remain enforce/drain and deny git push
+            p_pre = self.cli(
+                "handoff_gate.py",
+                {
+                    **self.payload,
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "Bash",
+                    "tool_input": {"command": "git push origin main"},
+                },
+                "--state-dir", self.state / "handoff", "--mode", "advisory", "--compact-limit", 0,
+            )
+            self.assertEqual(p_pre.returncode, 0, p_pre.stderr)
+            pre_out = json.loads(p_pre.stdout)
+            self.assertEqual(pre_out.get("hookSpecificOutput", {}).get("permissionDecision"), "deny", pre_out)
+            st_after_pre = self.gate_state()
+            self.assertEqual(st_after_pre["mode"], "enforce")
+            self.assertEqual(st_after_pre["phase"], "drain")
+
+            # Follow-up Stop omits "model" field completely -> must remain enforce/drain and block incomplete reply
+            p_stop_bad = self.cli(
+                "handoff_gate.py",
+                {
+                    **self.payload,
+                    "hook_event_name": "Stop",
+                    "last_assistant_message": "仅普通收尾说明，未提供四项交接要素。",
+                },
+                "--state-dir", self.state / "handoff", "--mode", "advisory", "--compact-limit", 0,
+            )
+            self.assertEqual(p_stop_bad.returncode, 0, p_stop_bad.stderr)
+            stop_bad_out = json.loads(p_stop_bad.stdout)
+            self.assertEqual(stop_bad_out.get("decision"), "block", stop_bad_out)
+            self.assertEqual(self.gate_state()["mode"], "enforce")
+
+            # Follow-up Stop with complete handoff text (still without "model") records handoff & transitions to freeze
+            p_stop_ok = self.cli(
+                "handoff_gate.py",
+                {
+                    **self.payload,
+                    "hook_event_name": "Stop",
+                    "last_assistant_message": HANDOFF_TEXT,
+                },
+                "--state-dir", self.state / "handoff", "--mode", "advisory", "--compact-limit", 0,
+            )
+            self.assertEqual(p_stop_ok.returncode, 0, p_stop_ok.stderr)
+            self.assertEqual(json.loads(p_stop_ok.stdout), {})
+            st_after_stop = self.gate_state()
+            self.assertEqual(st_after_stop["mode"], "enforce")
+            self.assertEqual(st_after_stop["phase"], "freeze")
+            self.assertTrue(st_after_stop["handoffRecorded"])
+
+            # Codex CLI symmetry: PostCompact (with model) -> model-less PreToolUse & Stop keep enforce/drain
+            cx_sid = "codex_persist_alpha"
+            cx_tp = self.root / "codex_sessions" / f"{cx_sid}.jsonl"
+            _append_jsonl(cx_tp, {"type": "session_meta", "payload": {"id": cx_sid, "source": "cli", "cwd": str(self.project)}})
+            _append_jsonl(cx_tp, {"type": "compacted", "payload": {"message": "compacted-1"}})
+            cx_state_dir = self.root / "codex_handoff_state"
+            cx_base = {"session_id": cx_sid, "transcript_path": str(cx_tp), "cwd": str(self.project)}
+
+            def run_codex_gate(ev_payload):
+                return subprocess.run(
+                    [
+                        sys.executable, "-B", "-X", "utf8", str(HOOKS_DIR / "handoff_gate.py"),
+                        "--client", "codex", "--state-dir", str(cx_state_dir),
+                        "--mode", "advisory", "--compact-limit", "0",
+                    ],
+                    input=json.dumps(ev_payload, ensure_ascii=False),
+                    capture_output=True, text=True, encoding="utf-8", cwd=self.project, timeout=20,
+                )
+
+            cx_c = run_codex_gate({**cx_base, "hook_event_name": "PostCompact", "model": "small-strict-cx"})
+            self.assertEqual(cx_c.returncode, 0, cx_c.stderr)
+            cx_p = run_codex_gate({
+                **cx_base, "hook_event_name": "PreToolUse",
+                "tool_name": "exec_command", "tool_input": {"cmd": "git push origin main"},
+            })
+            self.assertEqual(cx_p.returncode, 0, cx_p.stderr)
+            self.assertEqual(json.loads(cx_p.stdout).get("hookSpecificOutput", {}).get("permissionDecision"), "deny")
+            cx_s = run_codex_gate({**cx_base, "hook_event_name": "Stop", "last_assistant_message": "普通结束语"})
+            self.assertEqual(cx_s.returncode, 0, cx_s.stderr)
+            self.assertEqual(json.loads(cx_s.stdout).get("decision"), "block")
+
+        # 2) Installed-mode config resolution outside REPO_ROOT with CAE_FLEET_PROFILE unset
+        src_repo = self.root / "isolated_src_repo"
+        src_repo.mkdir()
+        shutil.copy2(REPO_ROOT / "install.py", src_repo / "install.py")
+        shutil.copytree(
+            REPO_ROOT / "template",
+            src_repo / "template",
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+        )
+        src_pf_path = src_repo / "template/user-guard/skills/cae-harness/fleet_profile.json"
+        src_pf = json.loads(src_pf_path.read_text(encoding="utf-8"))
+        src_pf["runtime_tunables"]["headless_dispatch"]["router"]["timeout_sec"] = 642
+        src_pf["runtime_tunables"]["handoff_thresholds"]["claude"]["enforce_drain_actions"] = 3
+        src_pf["client_catalog_rules"]["claude"]["router_card_name"] = "InstalledRouterCard"
+        src_pf["subscription_matrix"]["models"]["installed-strict-cl"] = {
+            "agent": "claude",
+            "enabled": True,
+            "context_window": 100000,
+            "handoff_mode": "enforce",
+            "compact_limit_override": 1,
+        }
+        user_words.atomic_write_json(src_pf_path, src_pf)
+
+        inst_home = self.root / "inst_home"
+        ag_dir = inst_home / ".gemini/config/plugins/user-guard"
+        cx_dir = inst_home / ".codex"
+        cl_dir = inst_home / ".claude"
+        dsh_dir = inst_home / ".dsh"
+        outside_work = self.root / "outside_general_project"
+        outside_work.mkdir()
+
+        inst_res = subprocess.run(
+            [
+                sys.executable, "-B", "-X", "utf8", str(src_repo / "install.py"),
+                "--app", "all",
+                "--target-dir", str(ag_dir),
+                "--codex-home", str(cx_dir),
+                "--claude-home", str(cl_dir),
+                "--dsh-home", str(dsh_dir),
+                "--no-claude-skill",
+                "--with-cc-router",
+                "--no-zotero", "--skip-test", "--yes",
+            ],
+            cwd=src_repo, capture_output=True, text=True, encoding="utf-8", timeout=30,
+        )
+        self.assertEqual(inst_res.returncode, 0, inst_res.stderr + inst_res.stdout)
+        self.assertFalse((cl_dir / "skills/cae-harness/fleet_profile.json").exists())
+
+        inst_env = {
+            k: v for k, v in os.environ.items()
+            if k != "CAE_FLEET_PROFILE" and not k.startswith("USER_GUARD_")
+        }
+        inst_env.update({
+            "HOME": str(inst_home),
+            "USERPROFILE": str(inst_home),
+            "CLAUDE_CONFIG_DIR": str(cl_dir),
+            "CODEX_HOME": str(cx_dir),
+            "DSH_HOME": str(dsh_dir),
+            "PYTHONDONTWRITEBYTECODE": "1",
+        })
+
+        # 2a) Installed ccswitch_admin.py outside repo without CAE_FLEET_PROFILE resolves peer installed fleet_profile.json
+        inst_db = inst_home / ".cc-switch/cc-switch.db"
+        inst_db.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(self.database(), inst_db)
+        inst_settings = cl_dir / "settings.json"
+        prep_proc = subprocess.run(
+            [
+                sys.executable, "-B", "-X", "utf8", str(cl_dir / "hooks/ccswitch_admin.py"),
+                "--db", str(inst_db), "prepare-cards", "--port", "18241",
+            ],
+            cwd=outside_work, env=inst_env, capture_output=True, text=True, encoding="utf-8", timeout=20,
+        )
+        self.assertEqual(prep_proc.returncode, 0, prep_proc.stderr + prep_proc.stdout)
+        prep_cards = self.cards(inst_db)
+        self.assertIn("InstalledRouterCard", prep_cards)
+        status_proc = subprocess.run(
+            [
+                sys.executable, "-B", "-X", "utf8", str(cl_dir / "hooks/ccswitch_admin.py"),
+                "--db", str(inst_db), "--settings", str(inst_settings), "status",
+            ],
+            cwd=outside_work, env=inst_env, capture_output=True, text=True, encoding="utf-8", timeout=20,
+        )
+        self.assertEqual(status_proc.returncode, 0, status_proc.stderr + status_proc.stdout)
+
+        # 2b) Installed router.py outside repo without CAE_FLEET_PROFILE inherits timeout_sec=642 from peer installed profile
+        tpl_router_cfg = cl_dir / "router" / ("router.windows.json" if os.name == "nt" else "router.wsl.json")
+        router_probe = subprocess.run(
+            [
+                sys.executable, "-B", "-X", "utf8", "-c",
+                (
+                    "import importlib.util, json, sys; "
+                    "spec = importlib.util.spec_from_file_location('inst_router', sys.argv[1]); "
+                    "mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod); "
+                    "print(json.dumps(mod.load_config(sys.argv[2])))"
+                ),
+                str(cl_dir / "router/router.py"),
+                str(tpl_router_cfg),
+            ],
+            cwd=outside_work, env=inst_env, capture_output=True, text=True, encoding="utf-8", timeout=20,
+        )
+        self.assertEqual(router_probe.returncode, 0, router_probe.stderr + router_probe.stdout)
+        self.assertEqual(json.loads(router_probe.stdout)["timeout_s"], 642)
+
+        # 2c) Installed handoff_gate.py outside repo without CAE_FLEET_PROFILE resolves installed-strict-cl & preserves enforce
+        inst_sid = "inst_cl_sess_01"
+        inst_tp = cl_dir / "projects/work" / f"{inst_sid}.jsonl"
+        _append_jsonl(inst_tp, {"type": "system", "subtype": "compact_boundary", "uuid": "inst_b0"})
+        inst_hstate = cl_dir / "hooks/state/handoff"
+        inst_pc = subprocess.run(
+            [
+                sys.executable, "-B", "-X", "utf8", str(cl_dir / "hooks/handoff_gate.py"),
+                "--client", "claude", "--state-dir", str(inst_hstate),
+                "--mode", "advisory", "--compact-limit", "0",
+            ],
+            input=json.dumps({
+                "session_id": inst_sid, "transcript_path": str(inst_tp), "cwd": str(outside_work),
+                "hook_event_name": "PostCompact", "model": "installed-strict-cl",
+            }, ensure_ascii=False),
+            cwd=outside_work, env=inst_env, capture_output=True, text=True, encoding="utf-8", timeout=20,
+        )
+        self.assertEqual(inst_pc.returncode, 0, inst_pc.stderr)
+        inst_saved = json.loads((inst_hstate / f"{inst_sid}_handoff_gate.json").read_text(encoding="utf-8"))
+        self.assertEqual(inst_saved["mode"], "enforce")
+        self.assertEqual(inst_saved["phase"], "drain")
+        self.assertEqual(inst_saved["drainActionsRemaining"], 3)
+
+        inst_ptu = subprocess.run(
+            [
+                sys.executable, "-B", "-X", "utf8", str(cl_dir / "hooks/handoff_gate.py"),
+                "--client", "claude", "--state-dir", str(inst_hstate),
+                "--mode", "advisory", "--compact-limit", "0",
+            ],
+            input=json.dumps({
+                "session_id": inst_sid, "transcript_path": str(inst_tp), "cwd": str(outside_work),
+                "hook_event_name": "PreToolUse", "tool_name": "Bash",
+                "tool_input": {"command": "git push origin main"},
+            }, ensure_ascii=False),
+            cwd=outside_work, env=inst_env, capture_output=True, text=True, encoding="utf-8", timeout=20,
+        )
+        self.assertEqual(inst_ptu.returncode, 0, inst_ptu.stderr)
+        self.assertEqual(json.loads(inst_ptu.stdout).get("hookSpecificOutput", {}).get("permissionDecision"), "deny")
 
 
 if __name__ == "__main__":

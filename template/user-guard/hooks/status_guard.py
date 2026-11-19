@@ -39,6 +39,7 @@ HOOKS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(HOOKS_DIR))
 import handoff_gate  # noqa: E402
 import user_words  # noqa: E402
+from _lib import shell_lex as _shell_lex  # noqa: E402
 
 user_words.ensure_utf8_stdio()
 
@@ -146,7 +147,6 @@ DENY_REASON_TEXT = (
 # 项目目录外文件改动硬边界门禁 (Workspace Boundary Hard Guard - R4)
 
 _NULL_SINKS = {"/dev/null", "nul", "$null"}
-_LOCAL_VAR_TOKEN_RE = re.compile(r"(?:\$\{?(?:tmp|temp|tmpdir|out|dst|work|stage)\w*\}?|%(?:tmp|temp)\w*%)", re.IGNORECASE)
 # 引号内的转义与普通字符分支互斥；命令头限定在子句起点，避免长串失败匹配反复回扫。
 _COMMIT_MSG_RE = re.compile(
     r"""((?:^|[\r\n;|&])\s*\bgit\b[^\r\n;|&]*?\bcommit\b[^\r\n;|&]*?(?:\s-(?:m|am)|--message(?:=|\s+)))(?:"(?:\\.|[^"\\])*"|'(?:''|[^'])*'|\S+)""",
@@ -161,10 +161,11 @@ _INSTALLER_INVOKE_RE = re.compile(
     re.IGNORECASE,
 )
 
+_PY_OPT_VAL_RE = r"""(?:"(?:\\.|[^"\\])*"|'(?:''|[^'])*'|\$'(?:\\.|[^'\\])*'|[^\s"';|&()])+"""
 _PY_INLINE_HEAD_RE = re.compile(
-    r"""(?<![^\s;|&()])(?:"[^"\r\n]*[\\/]|'[^'\r\n]*[\\/]|[^\s"';|&()]+[\\/]|["'])?\b(?:python[0-9.]*|py)(?:\.exe)?\b["']?"""
-    r"""(?:\s+(?:-[0-9][0-9.]*|-[BIuEsSqvVOP]+|-X\s+\S+|-W\s+\S+))*\s+-(?:[BIuEsSqvVOP]+)?c(?:\s+|(?=['"]))""",
-    re.IGNORECASE,
+    r"""(?<![^\s;|&()])(?:"[^"\r\n]*[\\/]|'[^'\r\n]*[\\/]|[^\s"';|&()]+[\\/]|["'])?\b(?i:(?:python[0-9.]*|py)(?:\.exe)?)\b["']?"""
+    rf"""(?:\s+(?:["']?-[0-9][0-9.]*["']?|["']?-[BbIdEisSuqvVxOP]+["']?|["']?(?i:--safe-path)["']?|-[WXQ](?:\s+{_PY_OPT_VAL_RE}|{_PY_OPT_VAL_RE})|(?i:--check-hash-based-pycs)(?:={_PY_OPT_VAL_RE}|\s+{_PY_OPT_VAL_RE})))*"""
+    r"""(?:\s+(?:"-(?:[BbIdEisSuqvVxOP]+)?c"|'-(?:[BbIdEisSuqvVxOP]+)?c'|-(?:[BbIdEisSuqvVxOP]+)?c)(?:\s+|(?=['"]|\$'|[A-Za-z_0-9\\]))|\s+(?=(?:"|'|\$')-(?:[BbIdEisSuqvVxOP]+)?c\S))"""
 )
 _PS_HERESTRING_PY_RE = re.compile(
     r"@(['\"])\r?\n([\s\S]*?)\r?\n\1@\s*\|\s*[^\r\n|]*\bpython[0-9.]*(?:\.exe)?\b",
@@ -180,15 +181,16 @@ _DOTNET_IO_MUTATE_RE = re.compile(
     re.IGNORECASE,
 )
 _SHELL_REDIRECT_RE = re.compile(
-    r"""(?:&>{1,2}|(?<![->=&])(?:\d+)?(?:>{1,2}\|?|<>))(?![>&=])\s*("(?:\\.|[^"\\])+"|'(?:''|[^'])+'|[^\s;|&<>()]+)""",
+    r"""(?:&>{1,2}|(?<![->=&])(?:\d+)?(?:>{1,2}\|?|<>))(?![>&=(])\s*((?:\$\{[^}\r\n]*\}|\$'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|'(?:''|[^'])*'|\\[\s;|&<>()"']|[^\s;|&<>()"'])+)""",
 )
+_APPLY_PATCH_HEADER_RE = re.compile(r"^\*\*\* (Add File|Update File|Delete File|Move to): (.+)$", re.MULTILINE)
 _PY_FALLBACK_PAIRS = (
     ("Python 写入文件 (open)", re.compile(
         r"""\bopen\s*\(\s*(['"][^'"]+['"])\s*,\s*['"][^'"]*[wax+][^'"]*['"]""")),
     ("Python 文件写删 (Path)", re.compile(
-        r"""\bPath\s*\(\s*(['"][^'"]+['"])\s*\)\s*\.\s*(?:write_text|write_bytes|unlink|rmdir|mkdir|touch)\b""")),
+        r"""\bPath\s*\(\s*(['"][^'"]+['"])\s*\)\s*\.\s*(?:write_text|write_bytes|unlink|rmdir|mkdir|touch|chmod|lchmod)\b""")),
     ("Python 系统删除/建目录", re.compile(
-        r"""\b(?:shutil\.rmtree|os\.(?:remove|unlink|rmdir|makedirs|mkdir))\s*\(\s*(['"][^'"]+['"])""")),
+        r"""\b(?:shutil\.rmtree|os\.(?:remove|unlink|rmdir|makedirs|mkdir|chmod|lchmod|chown|lchown|utime))\s*\(\s*(['"][^'"]+['"])""")),
     ("Python 复制写入外部路径", re.compile(
         r"""\bshutil\.copy\w*\s*\([^,]+,\s*(['"][^'"]+['"])""")),
 )
@@ -211,6 +213,7 @@ _SHELL_CREATE_WRITE_VERBS = {
 }
 _SHELL_MOVE_VERBS = {"mv", "move", "ren", "rename", "move-item", "mi", "rename-item", "rni"}
 _SHELL_COPY_VERBS = {"cp", "copy", "xcopy", "robocopy", "copy-item", "cpi"}
+_SHELL_LINK_VERBS = {"ln", "mklink"}
 _PS_NON_PATH_VALUE_FLAGS = {
     "-value",
     "-itemtype",
@@ -251,12 +254,18 @@ def get_current_iso_time() -> str:
     return user_words.current_iso_time()
 
 
-def log_event(event_name: str, conversation_id: str, message: str, logs_dir: Optional[Path] = None) -> None:
+def log_event(
+    event_name: str,
+    conversation_id: str,
+    message: str,
+    logs_dir: Optional[Path] = None,
+    client: str = "claude",
+) -> None:
     if logs_dir is None:
         user_words.append_lifecycle_log(HOOKS_DIR, event_name, conversation_id, message)
     else:
         user_words.append_jsonl_log(logs_dir / "lifecycle.log", {
-            "timestamp": get_current_iso_time(), "event": event_name, "client": "claude",
+            "timestamp": get_current_iso_time(), "event": event_name, "client": client,
             "conversationId": conversation_id, "message": message,
         })
 
@@ -282,7 +291,12 @@ def _canonical_path_key(p: Path) -> str:
     return user_words._canonical_path_key(p)
 
 
-def _load_guard_state(state_file: Path, conversation_id: str, logs_dir: Optional[Path] = None) -> Dict[str, Any]:
+def _load_guard_state(
+    state_file: Path,
+    conversation_id: str,
+    logs_dir: Optional[Path] = None,
+    client: str = "claude",
+) -> Dict[str, Any]:
     if state_file.exists():
         try:
             data = json.loads(state_file.read_text(encoding="utf-8-sig"))
@@ -291,7 +305,7 @@ def _load_guard_state(state_file: Path, conversation_id: str, logs_dir: Optional
                 return data
             raise ValueError("轮询状态格式或会话身份错误")
         except (ValueError, OSError, RecursionError) as exc:
-            log_event("PreToolUse:poll_state_error", conversation_id, f"轮询状态读取失败（{exc}），保留原文件", logs_dir)
+            log_event("PreToolUse:poll_state_error", conversation_id, f"轮询状态读取失败（{exc}），保留原文件", logs_dir, client=client)
             raise
     return {"version": 2, "conversationId": conversation_id, "records": {}}
 
@@ -329,12 +343,23 @@ def is_evidence_file(file_path_str: str) -> bool:
     return False
 
 
-def _safe_split_tokens(segment: str) -> List[str]:
-    try:
-        tokens = shlex.split(segment, posix=(os.name != "nt"))
-    except ValueError:
-        tokens = segment.split()
-    return [t.strip("\"'") for t in tokens if t.strip("\"'")]
+_safe_split_tokens = _shell_lex.safe_split_tokens
+_split_shell_clauses = _shell_lex.split_shell_clauses
+_extract_cmd_substitutions = _shell_lex.extract_cmd_substitutions
+
+
+def _unquote_split_string_payload(inner: str) -> str:
+    """剥离 Windows shlex(posix=False) 拆解 --split-string="..." 后残留的开头或成对引号。"""
+    s = inner.strip()
+    if not s or s[0] not in ("'", '"'):
+        return s
+    q = s[0]
+    if len(s) >= 2 and s[-1] == q:
+        return s[1:-1]
+    end = s.find(q, 1)
+    if end != -1:
+        return s[1:end] + s[end + 1 :]
+    return s[1:]
 
 
 def _unwrap_inner_command(tokens: List[str]) -> Tuple[List[str], bool]:
@@ -350,6 +375,93 @@ def _unwrap_inner_command(tokens: List[str]) -> Tuple[List[str], bool]:
         head_raw = tokens[idx]
         head_name = Path(head_raw.replace("\\", "/")).name.lower()
 
+        if head_raw == "&":
+            idx += 1
+            continue
+
+        if head_name == "command":
+            idx += 1
+            while idx < n and tokens[idx].startswith("-"):
+                fl = tokens[idx]
+                idx += 1
+                if fl == "--":
+                    break
+                if fl in ("-v", "-V") or (not fl.startswith("--") and any(c in fl[1:] for c in ("v", "V"))):
+                    return [], used_subsystem
+            continue
+
+        if head_name == "env":
+            idx += 1
+            while idx < n and tokens[idx].startswith("-"):
+                fl = tokens[idx]
+                idx += 1
+                if fl == "--":
+                    break
+                if fl.startswith("--split-string="):
+                    split_sub = _unquote_split_string_payload(
+                        fl.split("=", 1)[1] + (" " + " ".join(tokens[idx:]) if idx < n else "")
+                    )
+                    tokens = _safe_split_tokens(split_sub)
+                    idx = 0
+                    n = len(tokens)
+                    break
+                if fl in ("-u", "--unset", "-C", "--chdir", "-S", "--split-string") and idx < n:
+                    if fl in ("-S", "--split-string"):
+                        tokens = _safe_split_tokens(" ".join(tokens[idx:]))
+                        idx = 0
+                        n = len(tokens)
+                        break
+                    idx += 1
+            continue
+
+        if head_name == "nohup":
+            idx += 1
+            continue
+
+        if head_name == "nice":
+            idx += 1
+            while idx < n and tokens[idx].startswith("-"):
+                fl = tokens[idx]
+                idx += 1
+                if fl == "--":
+                    break
+                if fl in ("-n", "--adjustment") and idx < n:
+                    idx += 1
+            continue
+
+        if head_name == "uv" and idx + 1 < n:
+            j = idx + 1
+            while j < n and tokens[j].startswith("-"):
+                j += 2 if tokens[j] in ("--directory", "--project", "--config-file") and j + 1 < n else 1
+            if j < n and tokens[j].lower() == "run":
+                j += 1
+                uv_vals = ("--python", "-p", "--with", "--with-editable", "--with-requirements",
+                           "--directory", "--project", "--env-file", "--package")
+                while j < n and tokens[j].startswith("-"):
+                    fl = tokens[j]
+                    j += 1
+                    if fl == "--":
+                        break
+                    if fl in uv_vals and j < n:
+                        j += 1
+                idx = j
+                continue
+
+        if head_name == "sudo":
+            idx += 1
+            while idx < n and tokens[idx].startswith("-"):
+                fl = tokens[idx]
+                idx += 1
+                if fl == "--":
+                    break
+                if fl in (
+                    "-u", "--user", "-g", "--group", "-h", "--host", "-p", "--prompt",
+                    "-r", "--role", "-t", "--type", "-C", "--close-from",
+                    "-T", "--command-timeout", "-D", "--chdir", "-R", "--chroot",
+                ) and idx < n:
+                    idx += 1
+            continue
+
         # 跳过形如 KEY=VALUE 的环境变量前缀
         if "=" in head_raw and not head_raw.startswith("-") and "/" not in head_raw and "\\" not in head_raw:
             idx += 1
@@ -360,6 +472,8 @@ def _unwrap_inner_command(tokens: List[str]) -> Tuple[List[str], bool]:
             while idx < n and tokens[idx].startswith("-"):
                 flag_low = tokens[idx].lower()
                 idx += 1
+                if flag_low == "--":
+                    break
                 if flag_low in ("-k", "--kill-after", "-s", "--signal") and idx < n:
                     idx += 1
             if idx < n:
@@ -372,6 +486,8 @@ def _unwrap_inner_command(tokens: List[str]) -> Tuple[List[str], bool]:
             while idx < n and tokens[idx].startswith("-"):
                 flag = tokens[idx]
                 idx += 1
+                if flag in ("--", "-e", "--exec"):
+                    break
                 if flag in ("-d", "--distribution", "-u", "--user", "--cd") and idx < n:
                     idx += 1
             continue
@@ -414,7 +530,7 @@ def parse_run_command_evidence(command_line: str) -> Tuple[Optional[str], bool, 
     if re.search(r"(?:>>|>|\btee\b|\brm\b|\bmv\b|\bcp\b|\bsed\s+-i\b)", command_line):
         return None, False, norm_cmd_sig
 
-    segments = [(seg, 0) for seg in reversed(handoff_gate._split_shell_clauses(command_line))]
+    segments = [(seg, 0) for seg in reversed(_split_shell_clauses(command_line))]
     any_subsystem = False
     evidence = None
 
@@ -431,7 +547,7 @@ def parse_run_command_evidence(command_line: str) -> Tuple[Optional[str], bool, 
         if inner is not None:
             if depth >= 12:
                 return None, False, norm_cmd_sig
-            segments.extend((part, depth + 1) for part in reversed(handoff_gate._split_shell_clauses(inner)))
+            segments.extend((part, depth + 1) for part in reversed(_split_shell_clauses(inner)))
             continue
         if not tokens:
             continue
@@ -713,30 +829,51 @@ def _check_polling_locked(tool_name: str, args: Dict[str, Any], conversation_id:
 
 # ④ 跨系统路径归一化与目录边界
 
-def _expand_host_vars(raw_str: str) -> str:
-    s = raw_str.strip().strip("\"'")
+def _expand_host_vars(
+    raw_str: str, base_cwd: Optional[str] = None, *, from_shell: bool = True
+) -> str:
+    s = raw_str.strip()
+    if from_shell and len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+        s = s[1:-1]
     if not s:
         return ""
     home_str = str(Path.home())
+    tmp_dir = tempfile.gettempdir()
+    tmpdir_val = os.environ.get("TMPDIR") or tmp_dir
     env_map = {
         "$env:userprofile": os.environ.get("USERPROFILE") or home_str,
+        "${env:userprofile}": os.environ.get("USERPROFILE") or home_str,
         "%userprofile%": os.environ.get("USERPROFILE") or home_str,
         "$env:home": home_str,
+        "${env:home}": home_str,
         "$home": home_str,
         "${home}": home_str,
         "$env:appdata": os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming"),
         "%appdata%": os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming"),
         "$env:localappdata": os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local"),
         "%localappdata%": os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local"),
-        "$env:temp": tempfile.gettempdir(),
-        "%temp%": tempfile.gettempdir(),
-        "$env:tmp": tempfile.gettempdir(),
-        "%tmp%": tempfile.gettempdir(),
-        "$tmpdir": os.environ.get("TMPDIR") or tempfile.gettempdir(),
-        "${tmpdir}": os.environ.get("TMPDIR") or tempfile.gettempdir(),
+        "$env:temp": tmp_dir,
+        "${env:temp}": tmp_dir,
+        "%temp%": tmp_dir,
+        "$temp": tmp_dir,
+        "${temp}": tmp_dir,
+        "$env:tmp": tmp_dir,
+        "${env:tmp}": tmp_dir,
+        "%tmp%": tmp_dir,
+        "$tmp": tmp_dir,
+        "${tmp}": tmp_dir,
+        "$env:tmpdir": tmpdir_val,
+        "${env:tmpdir}": tmpdir_val,
+        "$tmpdir": tmpdir_val,
+        "${tmpdir}": tmpdir_val,
         "$xdg_cache_home": os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache"),
         "${xdg_cache_home}": os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache"),
     }
+    if isinstance(base_cwd, str) and base_cwd.strip():
+        env_map["$pwd"] = base_cwd
+        env_map["${pwd}"] = base_cwd
+        env_map["$env:pwd"] = base_cwd
+        env_map["${env:pwd}"] = base_cwd
     low = s.lower()
     for prefix, val in env_map.items():
         if low == prefix:
@@ -744,6 +881,19 @@ def _expand_host_vars(raw_str: str) -> str:
         if low.startswith(prefix + "/") or low.startswith(prefix + "\\"):
             return val.rstrip("/\\") + "/" + s[len(prefix) + 1 :]
     return os.path.expanduser(s)
+
+
+_SHELL_DYN_VAR_RE = re.compile(r"\$(?:\{|\(|[0-9@#?!*$]|[A-Za-z_][A-Za-z_0-9]*)")
+_WIN_PCT_VAR_RE = re.compile(r"%[A-Za-z_][A-Za-z_0-9]*%")
+
+
+def _has_unexpanded_dynamic_var(s: str, *, is_cmd_or_win: bool = False) -> bool:
+    if not s or s.lower() in _NULL_SINKS:
+        return False
+    if _SHELL_DYN_VAR_RE.search(s):
+        return True
+    pct_target = s if (os.name == "nt" or is_cmd_or_win) else re.sub(r"%[0-9A-Fa-f]{2}", "", s)
+    return bool(_WIN_PCT_VAR_RE.search(pct_target))
 
 
 def _win_expand_short_path(win_path: str) -> str:
@@ -774,23 +924,42 @@ def _win_expand_short_path(win_path: str) -> str:
 
 
 def _normalize_win_mount_key(drv: str, rest: str) -> str:
-    norm = posixpath.normpath(f"/mnt/{drv}/{rest}")
+    rel_norm = posixpath.normpath("/" + rest.lstrip("/")).lstrip("/")
+    norm = f"/mnt/{drv}" + (f"/{rel_norm}" if rel_norm else "")
     prefix = f"/mnt/{drv}"
     if "~" in norm and os.name == "nt" and (norm == prefix or norm.startswith(prefix + "/")):
         sub = norm[len(prefix):].lstrip("/")
         expanded = _win_expand_short_path(f"{drv.upper()}:\\" + sub.replace("/", "\\"))
         m_exp = re.match(r"^([A-Za-z]):(?:[\\/](.*))?$", expanded)
         if m_exp:
-            norm = posixpath.normpath(f"/mnt/{m_exp.group(1).lower()}/{(m_exp.group(2) or '').replace(chr(92), '/')}")
+            exp_rel = posixpath.normpath("/" + (m_exp.group(2) or "").replace(chr(92), "/").lstrip("/")).lstrip("/")
+            norm = f"/mnt/{m_exp.group(1).lower()}" + (f"/{exp_rel}" if exp_rel else "")
     return norm.casefold()
 
 
-def _normalize_cross_env_lexical(raw_str: str, base_dir: Optional[str] = None) -> str:
-    """盘符与 /mnt/<drive> 共用规范键；本机 POSIX 路径保留大小写，物理路径另查软链接。"""
-    expanded = user_words.strip_win_extended_prefix(_expand_host_vars(raw_str))
+def _normalize_cross_env_lexical(
+    raw_str: str, base_dir: Optional[str] = None, *, from_shell: bool = True
+) -> str:
+    r"""盘符与 /mnt/<drive> 共用规范键；兼容 Windows 盘符相对路径（如 D:out.txt、C:..\out.txt）。"""
+    expanded = user_words.strip_win_extended_prefix(
+        _expand_host_vars(raw_str, base_cwd=base_dir, from_shell=from_shell)
+    )
     if not expanded:
         return ""
     slashes = expanded.replace("\\", "/")
+
+    m_rel_drive = re.match(r"^([A-Za-z]):([^/].*)$", slashes)
+    if m_rel_drive:
+        drv = m_rel_drive.group(1).lower()
+        rel_part = m_rel_drive.group(2)
+        if base_dir:
+            base_norm = _normalize_cross_env_lexical(base_dir, None)
+            drv_prefix = f"/mnt/{drv}"
+            if base_norm == drv_prefix or base_norm.startswith(drv_prefix + "/"):
+                base_sub = base_norm[len(drv_prefix) :].lstrip("/")
+                combined = f"{base_sub}/{rel_part}" if base_sub else rel_part
+                return _normalize_win_mount_key(drv, combined)
+        return _normalize_win_mount_key(drv, rel_part)
 
     is_win_drive = bool(re.match(r"^[A-Za-z]:(?:/|$)", slashes))
     is_unc = slashes.startswith("//")
@@ -844,8 +1013,12 @@ def _is_under_norm_key(target_key: str, root_key: str) -> bool:
 
 
 def _is_standard_os_temp_key(norm_key: str) -> bool:
-    root = _normalize_cross_env_lexical(tempfile.gettempdir())
-    return _is_under_norm_key(norm_key, root)
+    raw = tempfile.gettempdir()
+    roots = [_normalize_cross_env_lexical(raw)]
+    rp = _resolve_nearest_existing(raw, None)
+    if rp is not None:
+        roots.append(_normalize_cross_env_lexical(str(rp)))
+    return any(_is_under_norm_key(norm_key, r) for r in roots if r)
 
 
 def _is_wsl_standard_temp_path(target: str, distribution: str) -> bool:
@@ -900,9 +1073,13 @@ def _outer_shell_operators(command: str) -> bool:
     return bool(quote or escaped)
 
 
-def _host_path_string(raw_str: str) -> Optional[str]:
+def _host_path_string(
+    raw_str: str, base_dir: Optional[str] = None, *, from_shell: bool = True
+) -> Optional[str]:
     """将盘符或 WSL 挂载路径还原为当前宿主可解析的路径字符串。"""
-    expanded = user_words.strip_win_extended_prefix(_expand_host_vars(raw_str))
+    expanded = user_words.strip_win_extended_prefix(
+        _expand_host_vars(raw_str, base_cwd=base_dir, from_shell=from_shell)
+    )
     if not expanded:
         return None
     if os.name == "nt" and expanded.startswith("/") and not expanded.startswith("//"):
@@ -911,6 +1088,21 @@ def _host_path_string(raw_str: str) -> Optional[str]:
             expanded = f"{m_mnt.group(1).upper()}:/{m_mnt.group(2) or ''}"
         else:
             return None
+    elif re.match(r"^([A-Za-z]):(?![\\/])(.+)$", expanded):
+        drv = expanded[0].lower()
+        rel_part = expanded[2:].replace("\\", "/")
+        same_drive_base = None
+        if base_dir:
+            b_norm = _normalize_cross_env_lexical(base_dir, None)
+            drv_prefix = f"/mnt/{drv}"
+            if b_norm == drv_prefix or b_norm.startswith(drv_prefix + "/"):
+                b_sub = b_norm[len(drv_prefix) :].lstrip("/")
+                same_drive_base = f"{b_sub}/{rel_part}" if b_sub else rel_part
+        target_rel = same_drive_base if same_drive_base is not None else rel_part
+        if os.name == "nt":
+            expanded = f"{drv.upper()}:/{target_rel}"
+        else:
+            expanded = f"/mnt/{drv}/{target_rel}"
     elif os.name != "nt" and re.match(r"^[A-Za-z]:[\\/]", expanded):
         drv = expanded[0].lower()
         rest = expanded[2:].replace("\\", "/").lstrip("/")
@@ -919,9 +1111,11 @@ def _host_path_string(raw_str: str) -> Optional[str]:
     return expanded
 
 
-def _resolve_nearest_existing(raw_str: str, base_dir: Optional[str]) -> Optional[Path]:
+def _resolve_nearest_existing(
+    raw_str: str, base_dir: Optional[str], *, from_shell: bool = True
+) -> Optional[Path]:
     """解析真实物理位置；相对路径与基准目录必须使用同一种宿主路径格式。"""
-    expanded = _host_path_string(raw_str)
+    expanded = _host_path_string(raw_str, base_dir=base_dir, from_shell=from_shell)
     if expanded is None:
         return None
     p = Path(expanded)
@@ -1034,6 +1228,12 @@ def _collect_boundary_context(
     return project_norm_keys, allowed_norm_keys, allowed_resolved_keys, project_display, base_cwd
 
 
+_decode_ansi_c_quotes = _shell_lex.decode_ansi_c_quotes
+
+
+_unquote_shell_word = _shell_lex.unquote_shell_word
+
+
 def _is_write_target_allowed(
     raw_target: str,
     base_cwd: Optional[str],
@@ -1041,14 +1241,22 @@ def _is_write_target_allowed(
     allowed_resolved_keys: List[str],
     allow_os_temp: bool = True,
     wsl_distribution: Optional[str] = None,
+    from_shell: bool = True,
 ) -> bool:
-    cleaned = raw_target.strip().strip("\"'`;,)")
+    cleaned = (
+        _unquote_shell_word(raw_target.strip()).strip("`;,)")
+        if from_shell
+        else raw_target.strip()
+    )
     if not cleaned or cleaned.lower() in _NULL_SINKS:
         return True
-    if _LOCAL_VAR_TOKEN_RE.fullmatch(cleaned):
-        return True
+    expanded_check = _expand_host_vars(cleaned, base_cwd=base_cwd, from_shell=from_shell)
+    if _has_unexpanded_dynamic_var(
+        expanded_check, is_cmd_or_win=(wsl_distribution is not None)
+    ):
+        return False
 
-    lex_key = _normalize_cross_env_lexical(cleaned, base_cwd)
+    lex_key = _normalize_cross_env_lexical(cleaned, base_cwd, from_shell=from_shell)
     if not lex_key:
         return True
     if not any(_is_under_norm_key(lex_key, rk) for rk in allowed_norm_keys):
@@ -1056,10 +1264,10 @@ def _is_write_target_allowed(
                 and _is_wsl_standard_temp_path(cleaned, wsl_distribution))
 
     # 若本地文件系统可解析真实路径，校验是否存在软链接/目录联接逃逸到允许目录外
-    resolved_p = _resolve_nearest_existing(cleaned, base_cwd)
+    resolved_p = _resolve_nearest_existing(cleaned, base_cwd, from_shell=from_shell)
     if resolved_p is None:
         # 仅保留当前进程无法物理访问的原生 POSIX 项目路径的跨端词法比较。
-        expanded = _expand_host_vars(cleaned)
+        expanded = _expand_host_vars(cleaned, base_cwd=base_cwd, from_shell=from_shell)
         if os.name != "nt" or not expanded.startswith("/") or re.match(r"^/mnt/[A-Za-z](?:/|$)", expanded):
             return False
     if resolved_p is not None and allowed_resolved_keys:
@@ -1071,46 +1279,10 @@ def _is_write_target_allowed(
 
 # ⑤ 内联 Python / 动态工作流提取与 AST 写入目标分析
 
-def _read_quoted_arg(text: str, start_idx: int) -> Optional[Tuple[str, int, str]]:
-    """从 start_idx 读取单引号或双引号包裹的参数内容，返回 (inner_content, end_idx, quote_char)"""
-    n = len(text)
-    if start_idx >= n or text[start_idx] not in ("'", '"'):
-        return None
-    q = text[start_idx]
-    idx = start_idx + 1
-    buf: List[str] = []
-    while idx < n:
-        ch = text[idx]
-        if q == '"':
-            if ch == "\\" and idx + 1 < n:
-                nxt = text[idx + 1]
-                if nxt in ('"', "\\", "$", "`"):
-                    buf.append(nxt)
-                elif nxt == "n":
-                    buf.append("\n")
-                elif nxt == "t":
-                    buf.append("\t")
-                else:
-                    buf.append("\\" + nxt)
-                idx += 2
-                continue
-            if ch == '"':
-                return "".join(buf), idx + 1, q
-        else:
-            # POSIX bash '\'' 与 shlex.quote 生成的 '"'"' 转义兼容
-            if ch == "'" and idx + 4 < n and text[idx : idx + 5] == "'\"'\"'":
-                buf.append("'")
-                idx += 5
-                continue
-            if ch == "'" and idx + 3 < n and text[idx : idx + 4] == "'\\''":
-                buf.append("'")
-                idx += 4
-                continue
-            if ch == "'":
-                return "".join(buf), idx + 1, q
-        buf.append(ch)
-        idx += 1
-    return None
+_read_quoted_arg = _shell_lex.read_quoted_arg
+
+
+_UNCLOSED_INLINE_PY_SENTINEL = "\x00__UNCLOSED_INLINE_PYTHON__"
 
 
 def _extract_and_mask_inline_python(command_line: str) -> Tuple[List[str], str]:
@@ -1125,6 +1297,48 @@ def _extract_and_mask_inline_python(command_line: str) -> Tuple[List[str], str]:
     masked = _PS_HERESTRING_PY_RE.sub(lambda m_ps: _alloc_marker(m_ps.group(2)), command_line)
     masked = _SH_HEREDOC_PY_RE.sub(lambda m_hd: _alloc_marker(m_hd.group(2)), masked)
 
+    def _read_inline_py_word(text: str, start_idx: int, allow_concat: bool) -> Optional[Tuple[str, int]]:
+        n = len(text)
+        idx = start_idx
+        while idx < n and text[idx] in (" ", "\t"):
+            idx += 1
+        if idx >= n or text[idx] in "\r\n;|&<>()":
+            return None
+        if not allow_concat:
+            q_single = _read_quoted_arg(text, idx)
+            return (q_single[0], q_single[1]) if q_single is not None else None
+        parts: List[str] = []
+        start_word = idx
+        while idx < n and text[idx] not in " \t\r\n;|&<>()":
+            if text[idx : idx + 2] == "$'":
+                ansi = _decode_ansi_c_quotes(text, idx)
+                if ansi is None:
+                    return _UNCLOSED_INLINE_PY_SENTINEL, n
+                parts.append(ansi[0])
+                idx = ansi[1]
+                continue
+            if text[idx] == '"':
+                dq = _read_quoted_arg(text, idx)
+                if dq is None:
+                    return _UNCLOSED_INLINE_PY_SENTINEL, n
+                parts.append(dq[0])
+                idx = dq[1]
+                continue
+            if text[idx] == "'":
+                end_sq = text.find("'", idx + 1)
+                if end_sq == -1:
+                    return _UNCLOSED_INLINE_PY_SENTINEL, n
+                parts.append(text[idx + 1 : end_sq])
+                idx = end_sq + 1
+                continue
+            if text[idx] == "\\" and idx + 1 < n:
+                parts.append(text[idx + 1])
+                idx += 2
+                continue
+            parts.append(text[idx])
+            idx += 1
+        return ("".join(parts), idx) if idx > start_word else None
+
     out_parts: List[str] = []
     pos = 0
     while True:
@@ -1132,12 +1346,16 @@ def _extract_and_mask_inline_python(command_line: str) -> Tuple[List[str], str]:
         if not m:
             out_parts.append(masked[pos:])
             break
-        q_res = _read_quoted_arg(masked, m.end())
+        in_outer_quotes = _pos_inside_quotes(masked, m.start())
+        q_res = _read_inline_py_word(masked, m.end(), allow_concat=not in_outer_quotes)
         if not q_res:
             out_parts.append(masked[pos : m.end()])
             pos = m.end()
             continue
-        code_str, end_pos, _ = q_res
+        code_str, end_pos = q_res
+        head_stripped = m.group(0).rstrip()
+        if code_str != _UNCLOSED_INLINE_PY_SENTINEL and not head_stripped.endswith(("c", 'c"', "c'")):
+            code_str = re.sub(r"^-[BbIdEisSuqvVxOP]*c", "", code_str, count=1)
         out_parts.append(masked[pos : m.start()])
         out_parts.append(_alloc_marker(code_str))
         pos = end_pos
@@ -1168,19 +1386,26 @@ _AST_DYNAMIC = object()
 _AST_CWD = object()
 _AST_DEFINITION = object()
 _AST_MAX_CANDIDATES = 64
+_AST_OS_EXEC_SPAWN = {
+    "execl", "execle", "execlp", "execlpe", "execv", "execve", "execvp", "execvpe",
+    "spawnl", "spawnle", "spawnlp", "spawnlpe", "spawnv", "spawnve", "spawnvp", "spawnvpe",
+    "posix_spawn", "posix_spawnp",
+}
 _AST_MODULE_CALLS = {
     "os": {"chdir", "getcwd", "open", "remove", "unlink", "rmdir", "removedirs", "mkdir", "makedirs", "rename",
-           "replace", "renames", "truncate", "symlink", "link", "system"},
+           "replace", "renames", "truncate", "symlink", "link", "chmod", "lchmod", "chown", "lchown", "utime",
+           "system", "popen", *_AST_OS_EXEC_SPAWN},
     "sys": {"executable"},
     "shutil": {"rmtree", "move", "copy", "copy2", "copyfile", "copytree", "make_archive", "unpack_archive"},
     "tempfile": {"gettempdir", "mkdtemp", "TemporaryDirectory", "mkstemp", "NamedTemporaryFile"},
-    "subprocess": {"run", "Popen", "call", "check_call", "check_output"},
+    "subprocess": {"run", "Popen", "call", "check_call", "check_output", "getoutput", "getstatusoutput"},
     "numpy": {"save", "savez", "savez_compressed", "savetxt"},
 }
 _AST_TEMP_DIR_INDEX = {"mkdtemp": 2, "TemporaryDirectory": 2, "mkstemp": 2, "NamedTemporaryFile": 6}
 _AST_WRITE_CALL_ARGS = {
     **{"os." + name: ((0, ("path",)),) for name in
-       ("remove", "unlink", "rmdir", "removedirs", "mkdir", "makedirs", "truncate")},
+       ("remove", "unlink", "rmdir", "removedirs", "mkdir", "makedirs", "truncate",
+        "chmod", "lchmod", "chown", "lchown", "utime")},
     **{"os." + name: ((0, ("src",)), (1, ("dst",))) for name in ("rename", "replace", "renames")},
     **{"os." + name: ((1, ("dst",)),) for name in ("symlink", "link")},
     "shutil.rmtree": ((0, ("path",)),),
@@ -1630,7 +1855,9 @@ def _ast_bad_target(values, bindings, base_cwd, allowed_norm_keys, allowed_resol
         if isinstance(value, _AstTempPath):
             root = tempfile.gettempdir()
             normalized = [_normalize_cross_env_lexical(root)]
-            if _is_write_target_allowed(value, base_cwd, normalized, normalized):
+            rp = _resolve_nearest_existing(root, None)
+            resolved = [_normalize_cross_env_lexical(str(rp))] if rp is not None else normalized
+            if _is_write_target_allowed(value, base_cwd, normalized, resolved):
                 continue
         if any(not isinstance(cwd, (str, type(None))) or not _is_write_target_allowed(
             value, cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp, wsl_distribution
@@ -1647,10 +1874,18 @@ def _track_ast_chdir(node, bindings, base_cwd, allowed_norm_keys, allowed_resolv
     if _ast_bad_target(values, bindings, base_cwd, allowed_norm_keys, allowed_resolved_keys,
                        allow_os_temp, wsl_distribution):
         return "Python 越界或动态切换工作目录 (os.chdir)", _format_ast_candidates(values), snippet
-    bindings[_AST_CWD] = _ast_product(
-        [_ast_values(bindings.get(_AST_CWD, base_cwd or "")), values],
-        lambda parts: _ast_resolve_cwd(parts[1], parts[0]),
-    )
+    next_cwds = set()
+    for cur_c in _ast_values(bindings.get(_AST_CWD, base_cwd)):
+        for target_c in values:
+            if not isinstance(target_c, str):
+                next_cwds.add(_AST_DYNAMIC)
+            elif isinstance(cur_c, str):
+                next_cwds.add(_ast_resolve_cwd(target_c, cur_c))
+            elif cur_c is None and _is_anchored_path_str(target_c):
+                next_cwds.add(_ast_resolve_cwd(target_c, None))
+            else:
+                next_cwds.add(_AST_DYNAMIC)
+    bindings[_AST_CWD] = frozenset(next_cwds) or frozenset((_AST_DYNAMIC,))
     return None
 
 
@@ -1665,28 +1900,44 @@ def _scan_inline_python_code(
     tree: Optional[ast.AST] = None,
 ) -> Optional[Tuple[str, str, str]]:
     """使用 AST 精确识别内联 Python 脚本中真正发生写/删/改的外部路径（忽略一切只读 open 与数组 .copy()）"""
+    if py_code == _UNCLOSED_INLINE_PY_SENTINEL:
+        return "内联 Python 参数引号未闭合，无法静态确证安全", "<UNCLOSED_INLINE_PYTHON>", "python -c <unclosed>"
+    has_raw_nul = "\x00" in py_code
+    clean_code = py_code.split("\x00", 1)[0] if has_raw_nul else py_code
     candidates = [py_code]
-    if '\\"' in py_code or "\\'" in py_code or "\\n" in py_code:
-        candidates.append(py_code.replace('\\"', '"').replace("\\'", "'").replace("\\n", "\n"))
+    if has_raw_nul and clean_code not in candidates:
+        candidates.append(clean_code)
+    if '\\"' in clean_code or "\\'" in clean_code or "\\n" in clean_code:
+        candidates.append(clean_code.replace('\\"', '"').replace("\\'", "'").replace("\\n", "\n"))
 
-    used_src = py_code
+    used_src = clean_code
+    saw_recursion_error = False
     if tree is None:
         for cand_src in candidates:
             try:
                 tree = ast.parse(cand_src)
                 used_src = cand_src
                 break
-            except SyntaxError:
+            except RecursionError:
+                saw_recursion_error = True
+                break
+            except (SyntaxError, ValueError):
                 continue
+    if saw_recursion_error:
+        return "内联 Python 语法树嵌套深度超出静态审查上限", "<AST_RECURSION_LIMIT>", _compact_snippet(used_src)
 
-    bindings = {_AST_CWD: frozenset((base_cwd or "",))}
+    bindings = {_AST_CWD: frozenset((base_cwd,))}
 
     def _bad(target) -> bool:
         return _ast_bad_target(target, bindings, base_cwd, allowed_norm_keys, allowed_resolved_keys,
                                allow_os_temp, wsl_distribution)
 
     if tree is not None:
-        for node, bindings in _iter_ast_calls_in_order(tree, bindings):
+        try:
+            ast_calls = list(_iter_ast_calls_in_order(tree, bindings))
+        except RecursionError:
+            return "内联 Python 语法树嵌套深度超出静态审查上限", "<AST_RECURSION_LIMIT>", _compact_snippet(used_src)
+        for node, bindings in ast_calls:
             snippet = _compact_snippet(ast.get_source_segment(used_src, node) or "python call")
             fn = node.func
             chdir_hit = _track_ast_chdir(node, bindings, base_cwd, allowed_norm_keys, allowed_resolved_keys,
@@ -1717,9 +1968,16 @@ def _scan_inline_python_code(
                     tgt = _ast_call_arg_candidates(node, 0, ("file", "fname"), bindings)
                     if _bad(tgt):
                         return f"NumPy 数组落盘 ({qualname})", _format_ast_candidates(tgt), snippet
-                elif depth < MAX_WRAPPER_DEPTH and (qualname == "os.system" or qualname in {
+                elif qualname in {"os." + name for name in _AST_OS_EXEC_SPAWN}:
+                    if _AST_DEFINITION not in bindings:
+                        return f"Python 进程替换或派生执行 ({qualname})", "<EXEC_OR_SPAWN>", snippet
+                elif qualname in ("os.system", "os.popen") or qualname in {
                     "subprocess." + name for name in _AST_MODULE_CALLS["subprocess"]
-                }):
+                }:
+                    if depth >= MAX_WRAPPER_DEPTH:
+                        if _AST_DEFINITION in bindings:
+                            continue
+                        return "深层嵌套命令超出静态目录边界审查上限", "<NESTED_DEPTH_EXCEEDED>", snippet
                     cwds = _ast_values(bindings.get(_AST_CWD, base_cwd))
                     if qualname.startswith("subprocess.") and any(kw.arg == "cwd" for kw in node.keywords):
                         raw_cwds = frozenset().union(*(
@@ -1730,7 +1988,7 @@ def _scan_inline_python_code(
                             return "Python 子进程指定项目外或动态 Cwd", _format_ast_candidates(specified), snippet
                         resolved = _ast_product([cwds, specified], lambda parts: _ast_resolve_cwd(parts[1], parts[0])) if specified else frozenset()
                         cwds = resolved | (cwds if None in raw_cwds else frozenset())
-                    commands = _ast_call_arg_candidates(node, 0, ("args", "command"), bindings)
+                    commands = _ast_call_arg_candidates(node, 0, ("args", "command", "cmd"), bindings)
                     for command in commands:
                         direct_py_code: Optional[str] = None
                         if isinstance(command, tuple) and all(isinstance(part, str) for part in command):
@@ -1739,10 +1997,27 @@ def _scan_inline_python_code(
                                 if exe_stem.endswith(".exe"):
                                     exe_stem = exe_stem[:-4]
                                 if exe_stem == "py" or exe_stem.startswith("python"):
-                                    for idx_arg, tok in enumerate(command[1:-1], start=1):
-                                        if re.fullmatch(r"-[BIuEsSqvVOP]*c", tok):
-                                            direct_py_code = command[idx_arg + 1]
+                                    idx_arg = 1
+                                    while idx_arg < len(command):
+                                        tok = command[idx_arg]
+                                        if tok == "--":
                                             break
+                                        if tok in ("-W", "-X", "-Q", "--check-hash-based-pycs"):
+                                            idx_arg += 2
+                                            continue
+                                        if tok == "--safe-path" or tok.startswith(("-W", "-X", "-Q", "--check-hash-based-pycs=")):
+                                            idx_arg += 1
+                                            continue
+                                        m_inline_c = re.fullmatch(r"-[BbIdEisSuqvVxOP]*c(.*)", tok, re.DOTALL)
+                                        if m_inline_c:
+                                            if m_inline_c.group(1):
+                                                direct_py_code = m_inline_c.group(1)
+                                            elif idx_arg + 1 < len(command):
+                                                direct_py_code = command[idx_arg + 1]
+                                            break
+                                        if not tok.startswith("-") or tok == "-":
+                                            break
+                                        idx_arg += 1
                             command = " ".join(shlex.quote(part) for part in command)
                         if not isinstance(command, str):
                             if _AST_DEFINITION in bindings:
@@ -1788,8 +2063,8 @@ def _scan_inline_python_code(
                         if _bad(tgt):
                             return f"Python 写入/修改文件 (.open mode='{mode_s}')", _format_ast_candidates(tgt), snippet
 
-                # 3) Path(p).write_text / write_bytes / unlink / rmdir / mkdir / touch
-                elif attr in ("write_text", "write_bytes", "unlink", "rmdir", "mkdir", "touch", "symlink_to", "hardlink_to"):
+                # 3) Path(p).write_text / write_bytes / unlink / rmdir / mkdir / touch / chmod / lchmod
+                elif attr in ("write_text", "write_bytes", "unlink", "rmdir", "mkdir", "touch", "symlink_to", "hardlink_to", "chmod", "lchmod"):
                     tgt = _eval_ast_path_candidates(fn.value, bindings)
                     if _bad(tgt):
                         return f"Python 文件写删操作 (.{attr})", _format_ast_candidates(tgt), snippet
@@ -1816,6 +2091,8 @@ def _scan_inline_python_code(
                         tgt -= frozenset((None,))
                     if _bad(tgt):
                         return f"Python 数据/图表导出 (.{attr})", _format_ast_candidates(tgt), snippet
+        if has_raw_nul:
+            return "内联 Python 含空字节无法静态确证安全", "<NUL_BYTE>", _compact_snippet(py_code.replace("\x00", "\\x00"))
         return None
 
     # AST 无法解析时（如混入未展开的 Shell 语法），仅使用严格“写函数-目标参数”配对正则兜底
@@ -1824,6 +2101,8 @@ def _scan_inline_python_code(
             cand = m.group(1).strip("\"'")
             if _bad(cand):
                 return label, cand, _compact_snippet(m.group(0))
+    if has_raw_nul:
+        return "内联 Python 含空字节无法静态确证安全", "<NUL_BYTE>", _compact_snippet(py_code.replace("\x00", "\\x00"))
     return None
 
 
@@ -1872,7 +2151,7 @@ def _scan_workflow_python_code(
     """审查 run_workflow 动态工作流脚本中的直接 Python 越界写入及 call_tool / agent 越界调用"""
     try:
         tree = ast.parse(py_code)
-    except SyntaxError:
+    except (SyntaxError, ValueError, RecursionError):
         return "动态工作流脚本语法错误，无法静态核验", "<INVALID_WORKFLOW>", _compact_snippet(py_code)
     direct_hit = _scan_inline_python_code(
         py_code, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp, depth, tree=tree,
@@ -2050,59 +2329,167 @@ _INVALID_ENCODED_SENTINEL = "\x00__INVALID_ENCODED_COMMAND__"
 _INLINE_PY_MARKER_RE = re.compile(r"__INLINE_PY_(\d+)__")
 
 
-def _unwrap_shell_script_layer(cmd: str) -> Optional[str]:
-    """若整条命令是 wsl/bash/powershell -c '<inner>' 或 -EncodedCommand 包装，提取内层脚本递归审查"""
+_SHELL_BIN_PREFIX_RE = r"""(?:"[^"\r\n]*[\\/]|'[^'\r\n]*[\\/]|[^\s"';|&()]+[\\/]|["'])?"""
+
+
+def _read_unquoted_shell_word(text: str, start_idx: int) -> Optional[Tuple[str, int]]:
+    """读取首个非空白 Shell 词元（兼容拼接引号与反斜杠转义），返回 (unquoted_word, end_idx)。"""
+    n = len(text)
+    idx = start_idx
+    while idx < n and text[idx] in " \t":
+        idx += 1
+    if idx >= n or text[idx] in "\r\n;|&<>()":
+        return None
+    word_start = idx
+    while idx < n and text[idx] not in " \t\r\n;|&<>()":
+        if text[idx : idx + 2] == "$'":
+            ansi = _decode_ansi_c_quotes(text, idx)
+            if ansi is None:
+                return None
+            idx = ansi[1]
+            continue
+        if text[idx] in ("'", '"'):
+            q = _read_quoted_arg(text, idx)
+            if q is None:
+                return None
+            idx = q[1]
+            continue
+        if text[idx] == "\\" and idx + 1 < n:
+            idx += 2
+            continue
+        idx += 1
+    if idx <= word_start:
+        return None
+    return _unquote_shell_word(text[word_start:idx]), idx
+
+
+def _unwrap_shell_script_with_tail(cmd: str) -> Optional[Tuple[str, str]]:
+    """提取壳包装的内层脚本及外层同子句尾随部分（重定向或位置参数），返回 (inner_script, outer_tail)。"""
+    lead_prefix = (
+        r"^\s*(?:&\s+)?(?:[A-Za-z_]\w*=\S+\s+)*"
+        r"(?:(?:eval|exec)\b(?:\s+(?:-[cl]|-a\s+\S+|--))*\s+)*"
+        rf"""(?:{_SHELL_BIN_PREFIX_RE}wsl(?:\.exe)?["']?\b(?:\s+(?:-(?:d|u)|--(?:distribution|user|cd))\s+(?:"(?:\\.|[^"\\])*"|'(?:''|[^'])*'|\S+)|\s+(?:--|-e|--exec|-[A-Za-z]+))*\s+)?"""
+    )
     m_enc = re.match(
-        r"^\s*(?:[A-Za-z_]\w*=\S+\s+)*"
-        r"""(?:wsl(?:\.exe)?\b(?:\s+(?:-(?:d|u)|--(?:distribution|user|cd))\s+(?:"(?:\\.|[^"\\])*"|'(?:''|[^'])*'|\S+)|\s+(?:--|-e|--exec|-[A-Za-z]+))*\s+)?"""
-        r"(?:pwsh(?:\.exe)?|powershell(?:\.exe)?)\b"
-        r"(?:\s+(?:-(?:ExecutionPolicy|ep|WindowStyle|w|InputFormat|OutputFormat)\s+\S+|-[A-Za-z]+))*"
-        r"\s+-(?:EncodedCommand|ec)\s+",
+        lead_prefix
+        + rf"""{_SHELL_BIN_PREFIX_RE}(?:pwsh(?:\.exe)?|powershell(?:\.exe)?)\b["']?"""
+        + r"(?:\s+(?:-(?:ExecutionPolicy|ep|WindowStyle|w|InputFormat|OutputFormat|ConfigurationName|WorkingDirectory|Version|v)\s+\S+|-(?!(?:EncodedCommand|ec)\b)[A-Za-z]+))*"
+        + r"""\s+["']?-(?:EncodedCommand|ec)["']?(?:\s+|$)""",
         cmd,
         re.IGNORECASE,
     )
     if m_enc:
         rest = cmd[m_enc.end() :].strip()
         if not rest:
-            return _INVALID_ENCODED_SENTINEL
-        if rest[0] in ("'", '"'):
+            return _INVALID_ENCODED_SENTINEL, ""
+        if rest[0] in ("'", '"') or rest.startswith("$'"):
             q_enc = _read_quoted_arg(rest, 0)
-            if not q_enc or rest[q_enc[1] :].strip():
-                return _INVALID_ENCODED_SENTINEL
+            if not q_enc:
+                return _INVALID_ENCODED_SENTINEL, ""
+            raw_b64_seg = rest[: q_enc[1]]
             b64_raw = q_enc[0].strip()
+            enc_tail = rest[q_enc[1] :].strip()
         else:
-            parts = rest.split()
-            if len(parts) != 1:
-                return _INVALID_ENCODED_SENTINEL
-            b64_raw = parts[0]
-        if not b64_raw or b64_raw.startswith(("$", "%")):
-            return _INVALID_ENCODED_SENTINEL
+            m_b64 = re.match(r"^([^\s;|&<>()]+)(.*)$", rest, re.DOTALL)
+            if not m_b64:
+                return _INVALID_ENCODED_SENTINEL, ""
+            raw_b64_seg = m_b64.group(1)
+            b64_raw = raw_b64_seg.strip()
+            enc_tail = m_b64.group(2).strip()
+        if enc_tail:
+            if enc_tail.startswith((";", "|")) or (enc_tail.startswith("&") and not enc_tail.startswith("&>")):
+                return None
+            if len(_split_shell_clauses("true " + enc_tail)) > 1:
+                return None
+        if (
+            not b64_raw
+            or "$" in b64_raw
+            or (not raw_b64_seg.startswith("'") and "$" in raw_b64_seg)
+            or _has_unexpanded_dynamic_var(b64_raw, is_cmd_or_win=True)
+        ):
+            return _INVALID_ENCODED_SENTINEL, ""
         try:
             raw_bytes = base64.b64decode(b64_raw, validate=True)
             if not raw_bytes or len(raw_bytes) % 2 != 0:
-                return _INVALID_ENCODED_SENTINEL
-            return raw_bytes.decode("utf-16-le")
+                return _INVALID_ENCODED_SENTINEL, ""
+            decoded = raw_bytes.decode("utf-16-le")
+            if not decoded.strip() or "\x00" in decoded:
+                return _INVALID_ENCODED_SENTINEL, ""
+            return decoded, enc_tail
         except (binascii.Error, ValueError, UnicodeDecodeError):
-            return _INVALID_ENCODED_SENTINEL
+            return _INVALID_ENCODED_SENTINEL, ""
 
     m = re.match(
-        r"^\s*(?:[A-Za-z_]\w*=\S+\s+)*"
-        r"""(?:wsl(?:\.exe)?\b(?:\s+(?:-(?:d|u)|--(?:distribution|user|cd))\s+(?:"(?:\\.|[^"\\])*"|'(?:''|[^'])*'|\S+)|\s+(?:--|-e|--exec|-[A-Za-z]+))*\s+)?"""
-        r"(?:bash|sh|zsh|pwsh(?:\.exe)?|powershell(?:\.exe)?|cmd(?:\.exe)?)\b"
-        r"(?:\s+(?:-(?:ExecutionPolicy|ep|WindowStyle|w|InputFormat|OutputFormat)\s+\S+|-[A-Za-z]+|/c))*\s+",
+        lead_prefix
+        + rf"""{_SHELL_BIN_PREFIX_RE}(?P<sh>bash|sh|zsh|pwsh(?:\.exe)?|powershell(?:\.exe)?|cmd(?:\.exe)?)\b["']?"""
+        + r"(?:\s+(?:-(?:ExecutionPolicy|ep|WindowStyle|w|InputFormat|OutputFormat|ConfigurationName|WorkingDirectory|Version|v)\s+\S+|-(?!(?:[A-Za-z]*c|Command)\b)[A-Za-z]+|/(?![ck]\b)[A-Za-z](?::[A-Za-z]+)?))*"
+        + r"""\s+(?P<sw>["']?-(?:[A-Za-z]*c|Command)["']?|["']?/[ck]["']?)\s+""",
         cmd,
         re.IGNORECASE,
     )
     if not m:
         return None
-    # 确认最后一个开关包含 -c / -lc / -command / /c
-    prefix = cmd[: m.end()].lower()
-    if not re.search(r"(?:\s-[a-z]*c|\s-command|\s/c)\s+$", prefix):
+    sh_low = m.group("sh").lower().removesuffix(".exe")
+    sw_low = m.group("sw").strip("\"'").lower()
+    if sh_low in ("bash", "sh", "zsh") and not re.fullmatch(r"-[a-z]*c", sw_low):
         return None
-    q_res = _read_quoted_arg(cmd, m.end())
-    if q_res and not cmd[q_res[1] :].strip():
-        return q_res[0]
-    return None
+    if sh_low in ("pwsh", "powershell") and sw_low not in ("-c", "-command"):
+        return None
+    if sh_low == "cmd" and sw_low not in ("/c", "/k"):
+        return None
+
+    arg_idx = m.end()
+    while arg_idx < len(cmd) and cmd[arg_idx] in " \t":
+        arg_idx += 1
+    if arg_idx >= len(cmd):
+        return None
+
+    q_res = _read_quoted_arg(cmd, arg_idx)
+    if q_res is None:
+        if sh_low in ("pwsh", "powershell", "cmd"):
+            rest = cmd[arg_idx:].strip()
+            return (rest, "") if rest else None
+        word_res = _read_unquoted_shell_word(cmd, arg_idx)
+        if word_res is None:
+            return None
+        first_word, end_w = word_res
+        tail = cmd[end_w:].strip()
+        if tail:
+            if tail.startswith((";", "|")) or (tail.startswith("&") and not tail.startswith("&>")):
+                return None
+            if len(_split_shell_clauses("true " + tail)) > 1:
+                return None
+        return (first_word, tail) if first_word else None
+
+    inner_parts = [q_res[0]]
+    end_q = q_res[1]
+    while end_q < len(cmd) and cmd[end_q] not in " \t\r\n;|&<>()":
+        nxt_q = _read_quoted_arg(cmd, end_q)
+        if nxt_q is not None:
+            inner_parts.append(nxt_q[0])
+            end_q = nxt_q[1]
+            continue
+        if cmd[end_q] == "\\" and end_q + 1 < len(cmd):
+            inner_parts.append(cmd[end_q + 1])
+            end_q += 2
+            continue
+        inner_parts.append(cmd[end_q])
+        end_q += 1
+    tail = cmd[end_q:].strip()
+    if tail:
+        if tail.startswith((";", "|")) or (tail.startswith("&") and not tail.startswith("&>")):
+            return None
+        if len(_split_shell_clauses("true " + tail)) > 1:
+            return None
+    return "".join(inner_parts), tail
+
+
+def _unwrap_shell_script_layer(cmd: str) -> Optional[str]:
+    """若整条命令是 wsl/bash/powershell -c '<inner>' 或 -EncodedCommand 包装，提取内层脚本递归审查"""
+    unwrapped = _unwrap_shell_script_with_tail(cmd)
+    if unwrapped is None:
+        return None
+    return unwrapped[0]
 
 
 def _extract_clause_path_targets(tokens: List[str], copy_dest_only: bool = False, head_low: str = "") -> List[str]:
@@ -2114,7 +2501,7 @@ def _extract_clause_path_targets(tokens: List[str], copy_dest_only: bool = False
                 return [tokens[idx + 1]]
             if low_tok.startswith("-destination:"):
                 return [tok.split(":", 1)[1]]
-            if head_low == "cp":
+            if head_low in ("cp", "ln"):
                 if (tok == "-t" or low_tok == "--target-directory") and idx + 1 < len(tokens):
                     return [tokens[idx + 1]]
                 if low_tok.startswith("--target-directory="):
@@ -2123,50 +2510,76 @@ def _extract_clause_path_targets(tokens: List[str], copy_dest_only: bool = False
     positional: List[str] = []
     explicit_paths: List[str] = []
     has_explicit_script = False
+    after_ddash = False
     idx = 1
     n = len(tokens)
     while idx < n:
         tok = tokens[idx]
         low = tok.lower()
-        if head_low in ("sed", "perl"):
-            if low in ("-e", "--expression", "-f", "--file"):
-                has_explicit_script = True
+        if not after_ddash and tok == "--":
+            after_ddash = True
+            idx += 1
+            continue
+        if not after_ddash:
+            if head_low in ("sed", "perl"):
+                if low in ("-e", "--expression", "-f", "--file"):
+                    has_explicit_script = True
+                    idx += 2
+                    continue
+                if tok.startswith(("-e", "-f")) and not tok.startswith("--") and len(tok) > 2:
+                    has_explicit_script = True
+                    idx += 1
+                    continue
+            if head_low in ("cp", "mv", "ln"):
+                if (tok == "-t" or low == "--target-directory") and idx + 1 < n:
+                    explicit_paths.append(tokens[idx + 1])
+                    idx += 2
+                    continue
+                if low.startswith("--target-directory="):
+                    explicit_paths.append(tok.split("=", 1)[1])
+                    idx += 1
+                    continue
+                if head_low == "ln" and (tok == "-S" or low == "--suffix") and idx + 1 < n:
+                    idx += 2
+                    continue
+            if low in _PS_NON_PATH_VALUE_FLAGS:
                 idx += 2
                 continue
-            if tok.startswith(("-e", "-f")) and not tok.startswith("--") and len(tok) > 2:
-                has_explicit_script = True
-                idx += 1
-                continue
-        if head_low in ("cp", "mv"):
-            if (tok == "-t" or low == "--target-directory") and idx + 1 < n:
+            if low in ("-path", "-literalpath", "-filepath", "-destination", "-newname") and idx + 1 < n:
                 explicit_paths.append(tokens[idx + 1])
                 idx += 2
                 continue
-            if low.startswith("--target-directory="):
-                explicit_paths.append(tok.split("=", 1)[1])
+            if head_low == "robocopy" and re.match(r"^/(?:MIR|E|S|PURGE|MOVE|MOV|R|W|COPY|DCOPY|MT|LOG|TEE|NFL|NDL)(?::|$)", tok, re.I):
                 idx += 1
                 continue
-        if low in _PS_NON_PATH_VALUE_FLAGS:
-            idx += 2
-            continue
-        if low in ("-path", "-literalpath", "-filepath", "-destination", "-newname") and idx + 1 < n:
-            explicit_paths.append(tokens[idx + 1])
-            idx += 2
-            continue
-        if head_low == "robocopy" and re.match(r"^/(?:MIR|E|S|PURGE|MOVE|MOV|R|W|COPY|DCOPY|MT|LOG|TEE|NFL|NDL)(?::|$)", tok, re.I):
-            idx += 1
-            continue
-        if tok.startswith("-"):
-            idx += 1
-            continue
-        if os.name == "nt" and re.fullmatch(r"/[A-Za-z0-9?]", tok):
-            idx += 1
-            continue
+            if head_low == "mklink" and re.fullmatch(r"/[DdHhJj?]", tok):
+                idx += 1
+                continue
+            if tok.startswith("-"):
+                idx += 1
+                continue
+            if (
+                os.name == "nt"
+                or head_low in ("rd", "del", "erase", "md", "move", "ren", "rename", "copy", "xcopy", "mklink")
+            ) and re.fullmatch(r"/[A-Za-z0-9?]", tok):
+                idx += 1
+                continue
         positional.append(tok)
         idx += 1
 
     if head_low in ("sed", "perl") and not has_explicit_script and positional:
         positional = positional[1:]
+
+    if head_low == "mklink":
+        return [positional[0]] if positional else []
+    if head_low == "ln":
+        if explicit_paths:
+            return explicit_paths
+        if len(positional) >= 2:
+            return [positional[-1]]
+        if len(positional) == 1:
+            return ["."]
+        return []
 
     all_paths = explicit_paths + positional
     if not copy_dest_only:
@@ -2182,29 +2595,83 @@ def _looks_like_explicit_or_escaped_path(tok: str) -> bool:
     s = tok.strip().strip("\"'")
     if not s or s == "__INLINE_PY__" or s.startswith("__INLINE_PY_"):
         return False
-    if re.match(r"^[A-Za-z]:[\\/]", s) or s.startswith(("\\\\", "//", "~", "..", "$HOME", "${HOME}", "$env:", "%")):
+    if re.match(r"^[A-Za-z]:", s) or s.startswith(("\\\\", "//", "~", "..", "$HOME", "${HOME}", "$env:", "%")):
         return True
     if s.startswith("/") and not re.fullmatch(r"/[A-Za-z0-9?]", s):
         return True
     return False
 
 
-def _pos_inside_quotes(text: str, target_pos: int) -> bool:
-    in_single = False
-    in_double = False
-    idx = 0
-    limit = min(target_pos, len(text))
-    while idx < limit:
-        ch = text[idx]
-        if ch == "\\" and in_double and idx + 1 < limit:
-            idx += 2
+_pos_inside_quotes = _shell_lex.pos_inside_quotes
+
+
+def _extract_git_worktree_add_target(cmd_tokens: List[str], effective_cwd: Optional[str]) -> Optional[Tuple[str, Optional[str], bool]]:
+    """解析 git [-C dir] [--work-tree dir] worktree add <path>，返回 (wt_path, resolved_git_cwd, cwd_is_dynamic)。"""
+    git_cwd = effective_cwd
+    cwd_dynamic = effective_cwd is None
+    j = 1
+    n = len(cmd_tokens)
+
+    def _apply_git_dir(raw_dir: str) -> None:
+        nonlocal git_cwd, cwd_dynamic
+        c_dir = _expand_host_vars(_unquote_shell_word(raw_dir), base_cwd=git_cwd)
+        if _has_unexpanded_dynamic_var(c_dir) or (git_cwd is None and not _is_anchored_path_str(c_dir)):
+            cwd_dynamic = True
+            git_cwd = None
+        else:
+            git_cwd = _ast_resolve_cwd(c_dir, git_cwd)
+            cwd_dynamic = False
+
+    while j < n:
+        gtok = cmd_tokens[j]
+        if gtok == "-C" and j + 1 < n:
+            _apply_git_dir(cmd_tokens[j + 1])
+            j += 2
             continue
-        if ch == "'" and not in_double:
-            in_single = not in_single
-        elif ch == '"' and not in_single:
-            in_double = not in_double
-        idx += 1
-    return in_single or in_double
+        if gtok.startswith("-C") and len(gtok) > 2:
+            _apply_git_dir(gtok[2:])
+            j += 1
+            continue
+        if gtok == "--work-tree" and j + 1 < n:
+            _apply_git_dir(cmd_tokens[j + 1])
+            j += 2
+            continue
+        if gtok.startswith("--work-tree="):
+            _apply_git_dir(gtok.split("=", 1)[1])
+            j += 1
+            continue
+        if gtok in ("-c", "--git-dir", "--namespace", "--exec-path", "--super-prefix", "--config-env") and j + 1 < n:
+            j += 2
+            continue
+        if gtok == "--":
+            j += 1
+            break
+        if gtok.startswith("-"):
+            j += 1
+            continue
+        break
+    if j + 1 >= n or cmd_tokens[j].lower() != "worktree" or cmd_tokens[j + 1].lower() != "add":
+        return None
+    wt_args = cmd_tokens[j + 2 :]
+    k = 0
+    wt_path: Optional[str] = None
+    while k < len(wt_args):
+        tok = wt_args[k]
+        if tok in ("-b", "-B", "--reason"):
+            k += 2
+            continue
+        if tok == "--":
+            if k + 1 < len(wt_args):
+                wt_path = wt_args[k + 1]
+            break
+        if tok.startswith("-"):
+            k += 1
+            continue
+        wt_path = tok
+        break
+    if not wt_path:
+        return None
+    return wt_path, git_cwd, cwd_dynamic
 
 
 def _detect_command_external_mutation(
@@ -2235,35 +2702,29 @@ def _detect_command_external_mutation(
     sanitized = (_COMMIT_MSG_RE.sub(r'\1"__COMMIT_MSG__"', command_line)
                  if "commit" in command_line.casefold() else command_line)
 
-    # 先拆壳并隔离内联 Python，再扫描 Shell；Python 字符串中的命令只是数据。
-    unwrapped = _unwrap_shell_script_layer(sanitized)
-    if unwrapped == _INVALID_ENCODED_SENTINEL:
-        return "PowerShell 编码命令无法静态解码审查 (-EncodedCommand)", "<ENCODED_COMMAND>", _compact_snippet(command_line)
-    if unwrapped:
-        return _detect_command_external_mutation(
+    # 先拆壳并隔离内联 Python，再扫描 Shell；若外层存在尾随重定向或位置参数，同时扫描内层与外层剩余部分。
+    unwrapped_pair = _unwrap_shell_script_with_tail(sanitized)
+    if unwrapped_pair is not None:
+        unwrapped, outer_tail = unwrapped_pair
+        if unwrapped == _INVALID_ENCODED_SENTINEL:
+            return "PowerShell 编码命令无法静态解码审查 (-EncodedCommand)", "<ENCODED_COMMAND>", _compact_snippet(command_line)
+        inner_hit = _detect_command_external_mutation(
             unwrapped, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp,
             depth + 1, wsl_distribution,
         )
-    # 先处理明确的目录切换；后续相对写入应以切换后的目录为基准。
-    first_clauses = handoff_gate._split_shell_clauses(sanitized)
-    if len(first_clauses) > 1:
-        first = first_clauses[0]
-        first_tokens = _safe_split_tokens(first)
-        if first_tokens and first_tokens[0].casefold() in ("cd", "chdir", "set-location"):
-            targets = _extract_clause_path_targets(first_tokens)
-            if targets:
-                targets[0] = _expand_host_vars(targets[0])
-            if len(targets) == 1 and not targets[0].startswith(("$", "%")) and not _SHELL_REDIRECT_RE.search(first):
-                end = sanitized.find(first) + len(first)
-                separator = re.match(r"\s*(?:&&|;|\r?\n)\s*", sanitized[end:])
-                if separator:
-                    return _detect_command_external_mutation(
-                        sanitized[end + separator.end():], _ast_resolve_cwd(targets[0], base_cwd),
-                        allowed_norm_keys, allowed_resolved_keys, allow_os_temp, depth + 1, wsl_distribution,
-                    )
+        if inner_hit:
+            return inner_hit
+        if outer_tail:
+            tail_hit = _detect_command_external_mutation(
+                "true " + outer_tail, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp,
+                depth + 1, wsl_distribution,
+            )
+            if tail_hit:
+                return tail_hit
+        return None
     py_blocks, shell_masked = _extract_and_mask_inline_python(sanitized)
 
-    for inner in handoff_gate._extract_cmd_substitutions(shell_masked):
+    for inner in _extract_cmd_substitutions(shell_masked):
         hit = _detect_command_external_mutation(
             inner, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp,
             depth + 1, wsl_distribution,
@@ -2271,27 +2732,23 @@ def _detect_command_external_mutation(
         if hit:
             return hit
 
-    # 1. 专项拦截: git worktree add 指向项目目录外 (如 ../.codex-worktrees 或父目录)
-    for m_wt in _GIT_WORKTREE_ADD_RE.finditer(shell_masked):
-        if _pos_inside_quotes(shell_masked, m_wt.start()):
-            continue
-        wt_tokens = _safe_split_tokens(m_wt.group(1))
-        idx = 0
-        wt_path: Optional[str] = None
-        while idx < len(wt_tokens):
-            tok = wt_tokens[idx]
-            if tok in ("-b", "-B", "--reason"):
-                idx += 2
+    # 1. 专项拦截: 单子句顶层 git worktree add 指向项目目录外 (多子句 cd 与 git -C/--work-tree 同时由第 4 步精确复核)
+    if len(_split_shell_clauses(shell_masked)) <= 1:
+        for m_wt in _GIT_WORKTREE_ADD_RE.finditer(shell_masked):
+            if _pos_inside_quotes(shell_masked, m_wt.start()):
                 continue
-            if tok.startswith("-"):
-                idx += 1
-                continue
-            wt_path = tok
-            break
-        if wt_path and not _is_write_target_allowed(
-            wt_path, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp, wsl_distribution
-        ):
-            return "创建项目外 Git 工作树 (git worktree add)", wt_path, _compact_snippet(m_wt.group(0))
+            parsed_wt = _extract_git_worktree_add_target(_safe_split_tokens(m_wt.group(0)), base_cwd)
+            if parsed_wt is not None:
+                wt_path, wt_cwd, wt_cwd_dyn = parsed_wt
+                exp_wt = _expand_host_vars(_unquote_shell_word(wt_path), base_cwd=wt_cwd)
+                if (
+                    (wt_cwd_dyn and not _is_anchored_path_str(exp_wt))
+                    or _has_unexpanded_dynamic_var(exp_wt, is_cmd_or_win=(wsl_distribution is not None))
+                    or not _is_write_target_allowed(
+                        exp_wt, wt_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp, wsl_distribution
+                    )
+                ):
+                    return "创建项目外 Git 工作树 (git worktree add)", wt_path, _compact_snippet(m_wt.group(0))
 
     # 2. 专项拦截: 执行生产级全局安装脚本 (默认改写四端全局配置或 ~/.cc-switch)
     for m_inst in _INSTALLER_INVOKE_RE.finditer(shell_masked):
@@ -2370,7 +2827,7 @@ def _detect_command_external_mutation(
     clause_cwd = base_cwd
     scanned_py_indices: set[int] = set()
     checked_any_redirect = False
-    clauses = handoff_gate._split_shell_clauses(shell_masked)
+    clauses = _split_shell_clauses(shell_masked)
     for raw_clause in clauses:
         clause = raw_clause.strip()
         if not clause:
@@ -2382,6 +2839,7 @@ def _detect_command_external_mutation(
         idx = 0
         n_tok = len(tokens)
         lookup_only = False
+        eval_sub: Optional[str] = None
         while idx < n_tok:
             t = tokens[idx]
             tl = Path(t.replace("\\", "/")).name.lower()
@@ -2393,6 +2851,8 @@ def _detect_command_external_mutation(
                 while idx < n_tok and tokens[idx].startswith("-"):
                     fl = tokens[idx]
                     idx += 1
+                    if fl == "--":
+                        break
                     if fl in ("-v", "-V") or (not fl.startswith("--") and any(c in fl[1:] for c in ("v", "V"))):
                         lookup_only = True
                         break
@@ -2401,25 +2861,96 @@ def _detect_command_external_mutation(
                 continue
             if tl == "env":
                 idx += 1
+                split_sub = None
                 while idx < n_tok and tokens[idx].startswith("-"):
                     fl = tokens[idx]
                     idx += 1
+                    if fl == "--":
+                        break
                     if fl in ("-u", "--unset") and idx < n_tok:
                         idx += 1
                     elif fl in ("-C", "--chdir") and idx < n_tok:
-                        effective_cwd = _ast_resolve_cwd(_expand_host_vars(tokens[idx]), effective_cwd)
+                        c_arg = _expand_host_vars(_unquote_shell_word(tokens[idx]), base_cwd=effective_cwd)
+                        effective_cwd = (
+                            None
+                            if _has_unexpanded_dynamic_var(c_arg) or (effective_cwd is None and not _is_anchored_path_str(c_arg))
+                            else _ast_resolve_cwd(c_arg, effective_cwd)
+                        )
                         idx += 1
                     elif fl.startswith("--chdir="):
-                        effective_cwd = _ast_resolve_cwd(_expand_host_vars(fl.split("=", 1)[1]), effective_cwd)
+                        c_arg = _expand_host_vars(_unquote_shell_word(fl.split("=", 1)[1]), base_cwd=effective_cwd)
+                        effective_cwd = (
+                            None
+                            if _has_unexpanded_dynamic_var(c_arg) or (effective_cwd is None and not _is_anchored_path_str(c_arg))
+                            else _ast_resolve_cwd(c_arg, effective_cwd)
+                        )
+                    elif fl in ("-S", "--split-string") and idx < n_tok:
+                        split_sub = " ".join(tokens[idx:])
+                        break
+                    elif fl.startswith("--split-string="):
+                        split_sub = _unquote_split_string_payload(
+                            fl.split("=", 1)[1] + (" " + " ".join(tokens[idx:]) if idx < n_tok else "")
+                        )
+                        break
+                if split_sub is not None:
+                    sub_hit = _detect_command_external_mutation(
+                        split_sub, effective_cwd, allowed_norm_keys, allowed_resolved_keys,
+                        allow_os_temp, depth + 1, wsl_distribution,
+                    )
+                    if sub_hit:
+                        return sub_hit
+                    idx = n_tok
+                    break
                 continue
+            if tl == "nohup":
+                idx += 1
+                continue
+            if tl == "nice":
+                idx += 1
+                while idx < n_tok and tokens[idx].startswith("-"):
+                    fl = tokens[idx]
+                    idx += 1
+                    if fl == "--":
+                        break
+                    if fl in ("-n", "--adjustment") and idx < n_tok:
+                        idx += 1
+                continue
+            if tl == "uv" and idx + 1 < n_tok:
+                j = idx + 1
+                while j < n_tok and tokens[j].startswith("-"):
+                    j += 2 if tokens[j] in ("--directory", "--project", "--config-file") and j + 1 < n_tok else 1
+                if j < n_tok and tokens[j].lower() == "run":
+                    j += 1
+                    uv_vals = ("--python", "-p", "--with", "--with-editable", "--with-requirements",
+                               "--directory", "--project", "--env-file", "--package")
+                    while j < n_tok and tokens[j].startswith("-"):
+                        fl = tokens[j]
+                        j += 1
+                        if fl == "--":
+                            break
+                        if fl in uv_vals and j < n_tok:
+                            j += 1
+                    idx = j
+                    continue
             if tl == "sudo":
                 idx += 1
                 while idx < n_tok and tokens[idx].startswith("-"):
                     fl = tokens[idx]
                     idx += 1
-                    if fl in ("-u", "--user", "-g", "--group", "-h", "--host", "-p", "--prompt", "-C", "-D", "--chdir") and idx < n_tok:
+                    if fl == "--":
+                        break
+                    if fl in (
+                        "-u", "--user", "-g", "--group", "-h", "--host", "-p", "--prompt",
+                        "-r", "--role", "-t", "--type", "-C", "--close-from",
+                        "-T", "--command-timeout", "-D", "--chdir", "-R", "--chroot",
+                    ) and idx < n_tok:
                         if fl in ("-D", "--chdir"):
-                            effective_cwd = _ast_resolve_cwd(_expand_host_vars(tokens[idx]), effective_cwd)
+                            c_arg = _expand_host_vars(_unquote_shell_word(tokens[idx]), base_cwd=effective_cwd)
+                            effective_cwd = (
+                                None
+                                if _has_unexpanded_dynamic_var(c_arg) or (effective_cwd is None and not _is_anchored_path_str(c_arg))
+                                else _ast_resolve_cwd(c_arg, effective_cwd)
+                            )
                         idx += 1
                 continue
             if tl == "timeout":
@@ -2427,6 +2958,8 @@ def _detect_command_external_mutation(
                 while idx < n_tok and tokens[idx].startswith("-"):
                     fl = tokens[idx].lower()
                     idx += 1
+                    if fl == "--":
+                        break
                     if fl in ("-k", "--kill-after", "-s", "--signal") and idx < n_tok:
                         idx += 1
                 if idx < n_tok:
@@ -2437,11 +2970,34 @@ def _detect_command_external_mutation(
                 while idx < n_tok and tokens[idx].startswith("-"):
                     fl = tokens[idx].lower()
                     idx += 1
+                    if fl in ("--", "-e", "--exec"):
+                        break
                     if fl in ("-d", "--distribution", "-u", "--user", "--cd") and idx < n_tok:
                         if fl == "--cd":
-                            effective_cwd = _ast_resolve_cwd(_expand_host_vars(tokens[idx]), effective_cwd)
+                            c_arg = _expand_host_vars(_unquote_shell_word(tokens[idx]), base_cwd=effective_cwd)
+                            effective_cwd = (
+                                None
+                                if _has_unexpanded_dynamic_var(c_arg) or (effective_cwd is None and not _is_anchored_path_str(c_arg))
+                                else _ast_resolve_cwd(c_arg, effective_cwd)
+                            )
                         idx += 1
                 continue
+            if tl == "exec":
+                idx += 1
+                while idx < n_tok and tokens[idx].startswith("-"):
+                    fl = tokens[idx]
+                    idx += 1
+                    if fl == "--":
+                        break
+                    if fl == "-a" and idx < n_tok:
+                        idx += 1
+                continue
+            if tl == "eval":
+                idx += 1
+                if idx < n_tok and tokens[idx] == "--":
+                    idx += 1
+                eval_sub = " ".join(tokens[idx:]) if idx < n_tok else ""
+                break
             if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", t):
                 idx += 1
                 continue
@@ -2458,26 +3014,60 @@ def _detect_command_external_mutation(
                 if py_hit:
                     return py_hit
 
+        if effective_cwd != base_cwd:
+            for sub_expr in _extract_cmd_substitutions(raw_clause):
+                sub_hit = _detect_command_external_mutation(
+                    sub_expr, effective_cwd, allowed_norm_keys, allowed_resolved_keys,
+                    allow_os_temp, depth + 1, wsl_distribution,
+                )
+                if sub_hit:
+                    return sub_hit
+
         for m_red in _SHELL_REDIRECT_RE.finditer(raw_clause):
             if _pos_inside_quotes(raw_clause, m_red.start()):
                 continue
             checked_any_redirect = True
-            red_tok = m_red.group(1).strip().strip("\"'")
+            red_tok = _unquote_shell_word(m_red.group(1).strip())
+            if not red_tok or red_tok.lower() in _NULL_SINKS:
+                continue
+            expanded_red = _expand_host_vars(red_tok, base_cwd=effective_cwd)
+            if _has_unexpanded_dynamic_var(expanded_red, is_cmd_or_win=(wsl_distribution is not None)):
+                return "Shell 输出重定向写入 [未解析动态变量路径]", red_tok, _compact_snippet(m_red.group(0))
             if not _is_write_target_allowed(
-                red_tok, effective_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp, wsl_distribution
+                expanded_red, effective_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp, wsl_distribution
             ):
                 return "Shell 输出重定向写入", red_tok, _compact_snippet(m_red.group(0))
 
-        sub_unwrapped = _unwrap_shell_script_layer(clause)
-        if sub_unwrapped == _INVALID_ENCODED_SENTINEL:
-            return "PowerShell 编码命令无法静态解码审查 (-EncodedCommand)", "<ENCODED_COMMAND>", _compact_snippet(clause)
-        if sub_unwrapped:
+        if eval_sub is not None:
+            if eval_sub.strip():
+                eval_hit = _detect_command_external_mutation(
+                    eval_sub, effective_cwd, allowed_norm_keys, allowed_resolved_keys,
+                    allow_os_temp, depth + 1, wsl_distribution,
+                )
+                if eval_hit:
+                    return eval_hit
+            continue
+
+        sub_pair = _unwrap_shell_script_with_tail(clause)
+        if sub_pair is None and idx > 0 and idx < n_tok:
+            sub_pair = _unwrap_shell_script_with_tail(" ".join(shlex.quote(tok) for tok in tokens[idx:]))
+        if sub_pair is not None:
+            sub_unwrapped, sub_tail = sub_pair
+            if sub_unwrapped == _INVALID_ENCODED_SENTINEL:
+                return "PowerShell 编码命令无法静态解码审查 (-EncodedCommand)", "<ENCODED_COMMAND>", _compact_snippet(clause)
             sub_hit = _detect_command_external_mutation(
                 sub_unwrapped, effective_cwd, allowed_norm_keys, allowed_resolved_keys,
                 allow_os_temp, depth + 1, wsl_distribution,
             )
             if sub_hit:
                 return sub_hit
+            if sub_tail:
+                tail_hit = _detect_command_external_mutation(
+                    "true " + sub_tail, effective_cwd, allowed_norm_keys, allowed_resolved_keys,
+                    allow_os_temp, depth + 1, wsl_distribution,
+                )
+                if tail_hit:
+                    return tail_hit
             continue
 
         if lookup_only or idx >= n_tok:
@@ -2490,11 +3080,57 @@ def _detect_command_external_mutation(
             head_low = head_low[:-4]
 
         if head_low in ("cd", "chdir", "set-location", "pushd"):
-            cd_targets = _extract_clause_path_targets(cmd_tokens)
-            if cd_targets:
-                cd_target = _expand_host_vars(cd_targets[0])
-                if cd_target and not cd_target.startswith(("$", "%")):
-                    clause_cwd = _ast_resolve_cwd(cd_target, effective_cwd)
+            cd_raw_arg: Optional[str] = None
+            cd_i = 1
+            after_ddash = False
+            while cd_i < len(cmd_tokens):
+                ct = cmd_tokens[cd_i]
+                ct_low = ct.lower()
+                if not after_ddash:
+                    if ct == "--":
+                        after_ddash = True
+                        cd_i += 1
+                        continue
+                    if ct_low in ("-path", "-literalpath") and cd_i + 1 < len(cmd_tokens):
+                        cd_raw_arg = cmd_tokens[cd_i + 1]
+                        break
+                    if ct_low in ("/d", "-passthru") or re.fullmatch(r"-[LPpe@]+", ct):
+                        cd_i += 1
+                        continue
+                cd_raw_arg = ct
+                break
+            if cd_raw_arg is None:
+                if head_low in ("cd", "pushd", "set-location"):
+                    clause_cwd = str(Path.home())
+            else:
+                cd_unquoted = _unquote_shell_word(cd_raw_arg)
+                if cd_unquoted in ("-", "~-") or (
+                    head_low == "pushd" and bool(re.fullmatch(r"[+-]\d+", cd_unquoted))
+                ):
+                    clause_cwd = None
+                else:
+                    cd_target = _expand_host_vars(cd_unquoted, base_cwd=effective_cwd)
+                    if _has_unexpanded_dynamic_var(
+                        cd_target, is_cmd_or_win=(wsl_distribution is not None)
+                    ) or (effective_cwd is None and not _is_anchored_path_str(cd_target)):
+                        clause_cwd = None
+                    else:
+                        clause_cwd = _ast_resolve_cwd(cd_target, effective_cwd)
+            continue
+
+        if head_low == "git":
+            parsed_wt = _extract_git_worktree_add_target(cmd_tokens, effective_cwd)
+            if parsed_wt is not None:
+                wt_path, wt_cwd, wt_cwd_dyn = parsed_wt
+                exp_wt = _expand_host_vars(_unquote_shell_word(wt_path), base_cwd=wt_cwd)
+                if (
+                    (wt_cwd_dyn and not _is_anchored_path_str(exp_wt))
+                    or _has_unexpanded_dynamic_var(exp_wt, is_cmd_or_win=(wsl_distribution is not None))
+                    or not _is_write_target_allowed(
+                        exp_wt, wt_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp, wsl_distribution
+                    )
+                ):
+                    return "创建项目外 Git 工作树 (git worktree add)", wt_path, _compact_snippet(clause)
             continue
 
         action_label: Optional[str] = None
@@ -2512,6 +3148,9 @@ def _detect_command_external_mutation(
         elif head_low in _SHELL_COPY_VERBS:
             action_label = f"复制写入外部路径 ({raw_head})"
             targets = _extract_clause_path_targets(cmd_tokens, copy_dest_only=True, head_low=head_low)
+        elif head_low in _SHELL_LINK_VERBS:
+            action_label = f"创建链接写入外部路径 ({raw_head})"
+            targets = _extract_clause_path_targets(cmd_tokens, copy_dest_only=True, head_low=head_low)
         elif head_low in ("sed", "perl"):
             has_inplace = any(
                 t == "--in-place" or t.startswith("--in-place=") or t.startswith("-i")
@@ -2526,8 +3165,12 @@ def _detect_command_external_mutation(
             for cand in targets:
                 if not cand:
                     continue
-                expanded_cand = _expand_host_vars(cand)
-                if expanded_cand.startswith(("$", "%")):
+                unq_cand = _unquote_shell_word(cand)
+                expanded_cand = _expand_host_vars(unq_cand, base_cwd=effective_cwd)
+                is_win_verb = head_low in ("rd", "del", "erase", "md", "move", "ren", "rename", "copy", "xcopy", "robocopy", "mklink")
+                if _has_unexpanded_dynamic_var(
+                    expanded_cand, is_cmd_or_win=(is_win_verb or wsl_distribution is not None)
+                ):
                     return f"{action_label} [未解析动态变量路径]", cand, _compact_snippet(clause)
                 command_distribution = wsl_distribution
                 if wsl_distribution is not None and any(
@@ -2551,9 +3194,14 @@ def _detect_command_external_mutation(
         for m_red in _SHELL_REDIRECT_RE.finditer(shell_masked):
             if _pos_inside_quotes(shell_masked, m_red.start()):
                 continue
-            red_tok = m_red.group(1).strip().strip("\"'")
+            red_tok = _unquote_shell_word(m_red.group(1).strip())
+            if not red_tok or red_tok.lower() in _NULL_SINKS:
+                continue
+            expanded_red = _expand_host_vars(red_tok, base_cwd=base_cwd)
+            if _has_unexpanded_dynamic_var(expanded_red, is_cmd_or_win=(wsl_distribution is not None)):
+                return "Shell 输出重定向写入 [未解析动态变量路径]", red_tok, _compact_snippet(m_red.group(0))
             if not _is_write_target_allowed(
-                red_tok, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp, wsl_distribution
+                expanded_red, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp, wsl_distribution
             ):
                 return "Shell 输出重定向写入", red_tok, _compact_snippet(m_red.group(0))
 
@@ -2642,16 +3290,100 @@ def _native_turn_snapshot(payload: Dict[str, Any], *, all_turns=False) -> Tuple[
 def _dispatch_commands(command: str, depth: int = 0):
     if depth > MAX_WRAPPER_DEPTH:
         return
-    for clause in handoff_gate._split_shell_clauses(command):
-        tokens = _safe_split_tokens(clause.strip())
-        inner = _unwrap_shell_script_layer(clause.strip())
-        if inner and inner != _INVALID_ENCODED_SENTINEL:
-            yield from _dispatch_commands(inner, depth + 1)
+    for raw_clause in _split_shell_clauses(command):
+        clause = raw_clause.strip()
+        if not clause:
+            continue
+        clause = re.sub(
+            r"^(?:(?:if|then|else|elif|while|until|do)\b(?:\s+|$)|!\s+)+",
+            "",
+            clause,
+            flags=re.IGNORECASE,
+        ).strip()
+        if not clause or clause.lower() in ("fi", "done", "esac"):
+            continue
+        inner_pair = _unwrap_shell_script_with_tail(clause)
+        if inner_pair is not None and inner_pair[0] and inner_pair[0] != _INVALID_ENCODED_SENTINEL:
+            yield from _dispatch_commands(inner_pair[0], depth + 1)
+            if inner_pair[1]:
+                for tail_sub in _extract_cmd_substitutions(inner_pair[1]):
+                    yield from _dispatch_commands(tail_sub, depth + 1)
+            continue
+        for sub_expr in _extract_cmd_substitutions(clause):
+            yield from _dispatch_commands(sub_expr, depth + 1)
+        tokens = _safe_split_tokens(clause)
         while tokens:
             head = Path(tokens[0].replace(chr(92), "/")).name.lower().removesuffix(".exe")
-            if head in ("&", "command", "env", "call") or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tokens[0]):
+            if head in ("&", "call", "if", "then", "else", "elif", "while", "until", "do", "!") or re.match(
+                r"^[A-Za-z_][A-Za-z0-9_]*=", tokens[0]
+            ):
                 tokens.pop(0)
                 continue
+            if head == "command":
+                i = 1
+                is_query = False
+                while i < len(tokens) and tokens[i].startswith("-"):
+                    fl = tokens[i]
+                    i += 1
+                    if fl == "--":
+                        break
+                    if fl in ("-v", "-V") or (not fl.startswith("--") and any(c in fl[1:] for c in ("v", "V"))):
+                        is_query = True
+                        break
+                if is_query:
+                    tokens = []
+                    break
+                tokens = tokens[i:]
+                continue
+            if head == "env":
+                i = 1
+                split_sub = None
+                while i < len(tokens):
+                    fl = tokens[i]
+                    if fl == "--":
+                        i += 1
+                        break
+                    if fl in ("-u", "--unset", "-C", "--chdir") and i + 1 < len(tokens):
+                        i += 2
+                        continue
+                    if fl.startswith(("--unset=", "--chdir=")):
+                        i += 1
+                        continue
+                    if fl in ("-S", "--split-string") and i + 1 < len(tokens):
+                        split_sub = " ".join(tokens[i + 1:])
+                        break
+                    if fl.startswith("--split-string="):
+                        split_sub = _unquote_split_string_payload(
+                            fl.split("=", 1)[1] + (" " + " ".join(tokens[i + 1:]) if i + 1 < len(tokens) else "")
+                        )
+                        break
+                    if fl.startswith("-") or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", fl):
+                        i += 1
+                        continue
+                    break
+                if split_sub is not None:
+                    yield from _dispatch_commands(split_sub, depth + 1)
+                    tokens = []
+                    break
+                tokens = tokens[i:]
+                continue
+            if head == "uv" and len(tokens) >= 2:
+                i = 1
+                while i < len(tokens) and tokens[i].startswith("-"):
+                    i += 2 if tokens[i] in ("--directory", "--project", "--config-file") and i + 1 < len(tokens) else 1
+                if i < len(tokens) and tokens[i].lower() == "run":
+                    i += 1
+                    uv_vals = ("--python", "-p", "--with", "--with-editable", "--with-requirements",
+                               "--directory", "--project", "--env-file", "--package")
+                    while i < len(tokens) and tokens[i].startswith("-"):
+                        fl = tokens[i]
+                        i += 1
+                        if fl == "--":
+                            break
+                        if fl in uv_vals and i < len(tokens):
+                            i += 1
+                    tokens = tokens[i:]
+                    continue
             if head == "cmd":
                 marker = next((i for i, token in enumerate(tokens[1:], 1) if token.lower() in ("/c", "/k")), None)
                 if marker is None:
@@ -2667,7 +3399,33 @@ def _dispatch_commands(command: str, depth: int = 0):
                     flag = tokens[i].lower()
                     i += 2 if flag in ("/d", "/node", "/affinity", "/machine") else 1
                 tokens = tokens[i:]
+            elif head == "eval":
+                i = 2 if len(tokens) >= 2 and tokens[1] == "--" else 1
+                if i < len(tokens):
+                    yield from _dispatch_commands(" ".join(tokens[i:]), depth + 1)
+                tokens = []
+                break
+            elif head == "exec":
+                i = 1
+                while i < len(tokens) and tokens[i].startswith("-"):
+                    fl = tokens[i]
+                    i += 1
+                    if fl == "--":
+                        break
+                    if fl == "-a" and i < len(tokens):
+                        i += 1
+                tokens = tokens[i:]
+                continue
             elif head in ("bash", "sh", "zsh", "pwsh", "powershell"):
+                unw_sub = _unwrap_shell_script_with_tail(" ".join(shlex.quote(t) for t in tokens))
+                if unw_sub is not None:
+                    if unw_sub[0] and unw_sub[0] != _INVALID_ENCODED_SENTINEL:
+                        yield from _dispatch_commands(unw_sub[0], depth + 1)
+                        if unw_sub[1]:
+                            for tail_sub in _extract_cmd_substitutions(unw_sub[1]):
+                                yield from _dispatch_commands(tail_sub, depth + 1)
+                    tokens = []
+                    break
                 marker = next((i for i, token in enumerate(tokens[1:], 1) if token.lower() == "-command"
                                or re.fullmatch(r"-[a-z]*c", token.lower())), None)
                 if marker is None:
@@ -2698,9 +3456,12 @@ def _dispatch_commands(command: str, depth: int = 0):
                 yield from _dispatch_commands(tokens[0], depth + 1)
                 tokens = []
             elif tokens:
-                inner = _unwrap_shell_script_layer(" ".join(tokens))
-                if inner and inner != _INVALID_ENCODED_SENTINEL:
-                    yield from _dispatch_commands(inner, depth + 1)
+                inner_pair = _unwrap_shell_script_with_tail(" ".join(tokens))
+                if inner_pair is not None and inner_pair[0] and inner_pair[0] != _INVALID_ENCODED_SENTINEL:
+                    yield from _dispatch_commands(inner_pair[0], depth + 1)
+                    if inner_pair[1]:
+                        for tail_sub in _extract_cmd_substitutions(inner_pair[1]):
+                            yield from _dispatch_commands(tail_sub, depth + 1)
         if tokens:
             yield tokens
 
@@ -2719,12 +3480,45 @@ def _dispatch_option(tokens, name):
     return None
 
 
+_HARNESS_METRICS_CACHE: Dict[str, Tuple[int, Any]] = {}
+
+
+def _resolve_cae_harness_script(anchor_dir: Optional[Path] = None) -> Path:
+    base = Path(anchor_dir).resolve() if anchor_dir is not None else HOOKS_DIR
+    primary = base.parent / "skills" / "cae-harness" / "scripts" / "cae_harness.py"
+    candidates = [
+        primary,
+        base / "cae_harness.py",
+        *(skill_dir / "scripts" / "cae_harness.py" for skill_dir in user_words.global_cae_harness_skill_dirs()),
+    ]
+    for cand in candidates:
+        try:
+            if not user_words._is_reparse_or_link(cand) and cand.is_file():
+                return cand
+        except OSError:
+            continue
+    return primary
+
+
+def _load_harness_metrics_module(script: Path) -> Any:
+    key = str(script.resolve())
+    mtime_ns = script.stat().st_mtime_ns
+    cached = _HARNESS_METRICS_CACHE.get(key)
+    if cached and cached[0] == mtime_ns:
+        return cached[1]
+    spec = importlib.util.spec_from_file_location("_guard_harness_metrics", script)
+    metrics = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(metrics)
+    _HARNESS_METRICS_CACHE[key] = (mtime_ns, metrics)
+    return metrics
+
+
 def _check_dispatch_locked(payload, tool_name, args, sid, state_dir):
-    if os.environ.get("CAE_HARNESS_DEPTH") or os.environ.get("USER_GUARD_DISABLE_TICKET_GATE") == "1":
+    if _is_headless_subtask() or os.environ.get("USER_GUARD_DISABLE_TICKET_GATE") == "1":
         return None
     tool_name = _native_tool_name(tool_name)
-    command = str(args.get("CommandLine") or args.get("command_line") or args.get("command") or args.get("cmd") or "")
-    shell = tool_name in ("run_command", "Bash", "PowerShell", "exec_command", "bash")
+    command = _extract_native_shell_command(args)
+    shell = tool_name in ("run_command", "Bash", "PowerShell", "exec_command", "bash", "shell", "shell_command")
     heavy_tickets = []
     if shell:
         for tokens in _dispatch_commands(command):
@@ -2753,14 +3547,24 @@ def _check_dispatch_locked(payload, tool_name, args, sid, state_dir):
                 if tail[:1] == ["task"] and "--dry-run" not in tail:
                     target = (base / Path(target_arg).expanduser()).resolve()
                     if target.exists():
-                        # 复用派工端的过滤与字节估算，目录链接、空文件等判据只维护一处。
-                        script = HOOKS_DIR.parent / "skills/cae-harness/scripts/cae_harness.py"
-                        spec = importlib.util.spec_from_file_location("_guard_harness_metrics", script)
-                        metrics = importlib.util.module_from_spec(spec)
-                        spec.loader.exec_module(metrics)
-                        count, tokens_estimate = metrics._target_metrics(target, _dispatch_option(tail, "--user-prompt") or _dispatch_option(tail, "--task") or "")
-                        large_target = (count > config.get("heavy_max_light_files", 2)
-                                        or tokens_estimate > config.get("heavy_max_light_tokens", 24000))
+                        # 复用派工端的过滤与字节估算，目录链接、空文件等判据只维护一处；脚本缺失时拒绝因 FileNotFoundError 漏放。
+                        script = _resolve_cae_harness_script(HOOKS_DIR)
+                        metrics = None
+                        try:
+                            if script.is_file():
+                                metrics = _load_harness_metrics_module(script)
+                        except (OSError, ImportError, AttributeError):
+                            metrics = None
+                        if metrics is not None:
+                            count, tokens_estimate = metrics._target_metrics(
+                                target, _dispatch_option(tail, "--user-prompt") or _dispatch_option(tail, "--task") or ""
+                            )
+                            large_target = (
+                                count > config.get("heavy_max_light_files", 2)
+                                or tokens_estimate > config.get("heavy_max_light_tokens", 24000)
+                            )
+                        else:
+                            large_target = True
                 if tail and (tail[0] in ("batch", "audit", "gate") or code_task or long_task or large_target) and "--dry-run" not in tail:
                     heavy_tickets.append((_dispatch_option(tail, "--ticket"), extra_plan_dirs))
                 continue
@@ -2772,12 +3576,12 @@ def _check_dispatch_locked(payload, tool_name, args, sid, state_dir):
                     or head == "dsh" and ("--profile=headless" in low or any(low[i:i+2] == ["--profile", "headless"] for i in range(len(low))))
                     or head == "agy" and "task" in low)
             if bare:
-                return "【user-guard】禁止裸调第三方子代理 CLI。请改用 cae_harness.py，保留声明窗口、非委派挡位、快照核验与额度检查。"
+                return "【user-guard】禁止直接调用第三方子代理 CLI。请改用 cae_harness.py，保留声明窗口、非委派挡位、快照核验与额度检查。"
     native = _native_dispatch(tool_name, args)
     if not (native or heavy_tickets):
         return None
     if not user_words.valid_session_id(sid):
-        return _ticket_required_reason(sid)
+        return _ticket_required_reason(sid, state_dir)
     # 外部重任务只对无轨迹且未显式启用门禁的离线夹具豁免。
     offline = not (_dispatch_transcript(payload) or os.environ.get("USER_GUARD_ENFORCE_TICKET_GATE") == "1")
     if offline and not native:
@@ -2788,11 +3592,11 @@ def _check_dispatch_locked(payload, tool_name, args, sid, state_dir):
         file = state_dir / (sid + "_dispatch_guard.json")
         state = user_words._read_state_json(file) or {}
         if not isinstance(state, dict):
-            return _ticket_required_reason(sid)
+            return _ticket_required_reason(sid, state_dir)
         if state.get("turn") != turn:
             state = {"turn": turn, "count": 0, "calls": [], "channel_counts": {}}
         if type(state.get("count")) is not int or state["count"] < 0 or not isinstance(state.get("calls"), list):
-            return _ticket_required_reason(sid)
+            return _ticket_required_reason(sid, state_dir)
         identity = str(payload.get("tool_use_id") or payload.get("call_id") or "")
         if identity:
             calls = [call for call in calls if call["call_id"] != identity]
@@ -2808,7 +3612,7 @@ def _check_dispatch_locked(payload, tool_name, args, sid, state_dir):
                             for row in ticket.get("streams", [])) for ticket in tickets), default=0)
         heavy = tool_name in ("run_workflow", "swarm") or not _native_readonly(args) or count >= _heavy_min_streams()
         if heavy and channel_count > capacity:
-            return _ticket_required_reason(sid)
+            return _ticket_required_reason(sid, state_dir)
         if not duplicate:
             state["count"] = count
             state.setdefault("channel_counts", {})[channel] = channel_count
@@ -2818,14 +3622,29 @@ def _check_dispatch_locked(payload, tool_name, args, sid, state_dir):
     for ticket_id, extra_plan_dirs in heavy_tickets:
         if not ticket_id or not user_words.find_session_approved_tickets(
                 sid, state_dir, ticket_id=ticket_id, channel="cae_harness_headless", extra_plan_dirs=extra_plan_dirs):
-            return _ticket_required_reason(sid)
+            return _ticket_required_reason(sid, state_dir, extra_plan_dirs=extra_plan_dirs)
     return None
 
 
-def _ticket_required_reason(sid):
-    return ("【user-guard 重负载派工门禁】未找到当前会话有效且未过期的 APPROVED 批次票据。"
-            f"请先调用 cae_harness.py plan --session-id {sid} ...，生成人话弹卡，包含内部与外部子代理完整 14 项参数确认单；"
-            "获用户确认并执行 --approve-ticket 后再启动；原生调用须在票据中列出原生通道。")
+def _ticket_required_reason(sid, state_dir=None, extra_plan_dirs=()):
+    harness_script = _resolve_cae_harness_script(HOOKS_DIR)
+    pending_ticket = next(
+        (t for _, t in user_words._session_tickets(str(sid or ""), state_dir, statuses=("PENDING",), extra_plan_dirs=extra_plan_dirs)),
+        None,
+    )
+    if pending_ticket:
+        tid = str(pending_ticket.get("ticket_id") or "<TICKET_ID>")
+        detail_file = str(pending_ticket.get("card_detail_file") or "").strip()
+        detail_hint = f"（完整明细见：{detail_file}）" if detail_file else ""
+        return (
+            f"【user-guard 重负载派工门禁】检测到当前会话已有未过期的待确认（PENDING）批次票据 `{tid}`，尚未获得 APPROVED 授权{detail_hint}。"
+            f'请先向用户展示包含内部与外部子代理完整 14 项参数的中文确认单，待用户明确确认后再执行 `python "{harness_script}" plan --session-id {sid} --approve-ticket {tid}` 解锁启动（严禁未经用户确认自行审批或重复建单）；原生调用须在票据中列出原生通道。'
+        )
+    return (
+        "【user-guard 重负载派工门禁】当前会话尚无有效且未过期的批次票据（未找到 APPROVED 或待确认 PENDING 票据，或票据通道容量不匹配）。"
+        f'请先调用 `python "{harness_script}" plan --session-id {sid} ...` 生成中文确认单，包含内部与外部子代理完整 14 项参数明细；'
+        "获用户确认并执行 `--approve-ticket` 后再启动；原生调用须在票据中列出原生通道。"
+    )
 
 
 def _is_headless_subtask() -> bool:
@@ -2888,6 +3707,7 @@ def handle_pre_tool_use(payload: Dict[str, Any]) -> Dict[str, Any]:
     cwd = _ast_resolve_cwd(str(command_cwd), payload_cwd) if command_cwd else payload_cwd
     state_dir, logs_dir = get_data_dirs()
 
+    base_cwd: Optional[str] = None
     boundary: Optional[Dict[str, Any]] = None
     # 分支 0: 项目目录外文件改动硬边界门禁 (R4: 跨表面文件修改工具 / run_command / run_workflow)
     if tool_name in (*FILE_MUTATION_TOOLS, "run_command", "run_workflow"):
@@ -2911,7 +3731,7 @@ def handle_pre_tool_use(payload: Dict[str, Any]) -> Dict[str, Any]:
                     or ""
                 ).strip()
                 if write_arg and not _is_write_target_allowed(
-                    write_arg, base_cwd, allowed_keys, allowed_res_keys, allow_os_temp
+                    write_arg, base_cwd, allowed_keys, allowed_res_keys, allow_os_temp, from_shell=False
                 ):
                     if tool_name in EDIT_FILE_TOOLS:
                         t_lines = len(str(args.get("Target") or args.get("TargetContent") or "").splitlines()) or 1
@@ -2982,7 +3802,7 @@ def handle_pre_tool_use(payload: Dict[str, Any]) -> Dict[str, Any]:
             if ticket_reason:
                 return {"decision": "deny", "reason": ticket_reason}
             try:
-                return _check_polling_locked(tool_name, args, conversation_id, cwd, workspace_paths, transcript_path_str,
+                return _check_polling_locked(tool_name, args, conversation_id, base_cwd or cwd, workspace_paths, transcript_path_str,
                                              state_dir, logs_dir)
             except (OSError, ValueError) as exc:
                 log_event("PreToolUse:poll_state_error", conversation_id, f"轮询状态未更新（{exc}）")
@@ -3096,8 +3916,229 @@ def _claude_grep_evidence_targets(target: Path, raw_glob: Any) -> List[Path]:
     return sorted(matched)
 
 
-def _claude_check_polling(tool_name: str, args: Dict[str, Any], sid: str, cwd: Optional[str],
-                          state_dir: Path, logs_dir: Path) -> Dict[str, Any]:
+def _codex_readonly_subagent_role(payload: Dict[str, Any]) -> str:
+    """当 client=='codex' 且 rollout 首条 session_meta 明确标识当前会话自身为 readonly-* 子代理时返回其名称。"""
+    if payload.get("_client") != "codex":
+        return ""
+    raw_tp = user_words.strip_win_extended_prefix(
+        str(payload.get("transcript_path") or payload.get("transcriptPath") or "")
+    )
+    if not raw_tp:
+        return ""
+    tp = Path(raw_tp).expanduser()
+    if not tp.is_file():
+        return ""
+    try:
+        first_line, too_long = user_words.read_bounded_first_line(tp)
+        if too_long or not first_line:
+            return ""
+        entry = json.loads(user_words.decode_jsonl_line(first_line).lstrip("\ufeff"))
+    except (OSError, ValueError, RecursionError):
+        return ""
+    if not isinstance(entry, dict) or entry.get("type") != "session_meta":
+        return ""
+    meta = entry.get("payload")
+    if not isinstance(meta, dict):
+        return ""
+
+    def _pick_readonly(obj: Any) -> str:
+        if isinstance(obj, str):
+            val = obj.strip()
+            return val if val.lower().startswith("readonly-") else ""
+        if isinstance(obj, dict):
+            for k in (
+                "agent_role", "agent_nickname", "subagent", "agent_type", "subagent_type",
+                "agent_name", "role", "name", "custom", "other", "thread_spawn",
+            ):
+                if k in obj:
+                    hit = _pick_readonly(obj[k])
+                    if hit:
+                        return hit
+        return ""
+
+    for top_key in ("agent_role", "agent_nickname", "subagent", "agent_type", "subagent_type", "agent_name"):
+        if top_key in meta:
+            hit = _pick_readonly(meta[top_key])
+            if hit:
+                return hit
+    src = meta.get("source")
+    if isinstance(src, dict) and "subagent" in src:
+        hit = _pick_readonly(src["subagent"])
+        if hit:
+            return hit
+    return ""
+
+
+def _extract_native_shell_command(args: Dict[str, Any]) -> str:
+    for key in ("command", "cmd", "CommandLine", "command_line"):
+        raw_cmd = args.get(key)
+        if raw_cmd is not None and raw_cmd != "" and raw_cmd != []:
+            if isinstance(raw_cmd, list):
+                return " ".join(shlex.quote(str(part)) for part in raw_cmd)
+            return str(raw_cmd)
+    return ""
+
+
+def _sed_has_mutating_flags_or_cmds(args: List[str]) -> bool:
+    scripts: List[str] = []
+    explicit_e = False
+    i = 0
+    n = len(args)
+    while i < n:
+        a = args[i]
+        low = a.lower()
+        if a == "--":
+            i += 1
+            break
+        if low == "--in-place" or low.startswith("--in-place=") or a.startswith("-i") or (
+            a.startswith("-") and not a.startswith("--") and "i" in a[1:]
+        ):
+            return True
+        if low in ("-f", "--file") or low.startswith("--file=") or (a.startswith("-f") and not a.startswith("--")):
+            return True
+        if a in ("-e", "--expression") and i + 1 < n:
+            explicit_e = True
+            scripts.append(args[i + 1])
+            i += 2
+            continue
+        if low.startswith("--expression="):
+            explicit_e = True
+            scripts.append(a.split("=", 1)[1])
+            i += 1
+            continue
+        if a.startswith("-e") and not a.startswith("--") and len(a) > 2:
+            explicit_e = True
+            scripts.append(a[2:])
+            i += 1
+            continue
+        if a.startswith("-"):
+            i += 1
+            continue
+        if not explicit_e and not scripts:
+            scripts.append(a)
+        i += 1
+    for expr in scripts:
+        # 拦截 sed 写文件指令 w/W 与 GNU sed 执行命令指令 e
+        if re.search(r"(?:^|[;\n}])\s*(?:\d+|\$|/[^/]*/)?(?:\s*,\s*(?:\d+|\$|/[^/]*/))?\s*[wWe]\b", expr):
+            return True
+        if re.search(r"s(?P<d>[^\\\s])(?:\\.|(?!(?P=d)).)*(?P=d)(?:\\.|(?!(?P=d)).)*(?P=d)[0-9gipmM]*[wWe]", expr):
+            return True
+    return False
+
+
+def _python_tokens_is_safe_inline_readonly(tokens: List[str]) -> bool:
+    args = tokens[1:]
+    if not args:
+        return False
+    if len(args) == 1 and args[0] in ("--version", "-V", "--help", "-h"):
+        return True
+    i = 0
+    n = len(args)
+    code_str: Optional[str] = None
+    while i < n:
+        tok = args[i]
+        if tok == "--":
+            return False
+        if tok in ("-W", "-X", "-Q", "--check-hash-based-pycs"):
+            i += 2
+            continue
+        if tok == "--safe-path" or tok.startswith(("-W", "-X", "-Q", "--check-hash-based-pycs=")) or re.fullmatch(r"-[0-9][0-9.]*", tok):
+            i += 1
+            continue
+        m_c = re.fullmatch(r"-[BbIdEisSuqvVxOP]*c(.*)", tok, re.DOTALL)
+        if m_c:
+            if m_c.group(1):
+                code_str = m_c.group(1)
+            elif i + 1 < n:
+                code_str = args[i + 1]
+            break
+        if tok.startswith("-") and tok != "-" and not tok.startswith("-m") and tok != "--":
+            if re.fullmatch(r"-[BbIdEisSuqvVxOP]+", tok):
+                i += 1
+                continue
+        return False
+    if code_str is None:
+        return False
+    try:
+        tree = ast.parse(code_str)
+    except (SyntaxError, ValueError, RecursionError):
+        return False
+    blocked_imports = {"shutil", "tempfile", "subprocess", "ctypes", "pty", "socket", "urllib", "http"}
+    blocked_builtins = {"exec", "eval", "compile", "__import__", "getattr", "setattr", "delattr", "input"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            if any(alias.name.split(".")[0] in blocked_imports for alias in node.names):
+                return False
+        elif isinstance(node, ast.ImportFrom):
+            if node.module and node.module.split(".")[0] in blocked_imports:
+                return False
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in blocked_builtins:
+            return False
+    return True
+
+
+_READONLY_SUBAGENT_EXPLICIT_MUTATION_VERBS = (
+    _SHELL_DELETE_VERBS
+    | _SHELL_CREATE_WRITE_VERBS
+    | _SHELL_MOVE_VERBS
+    | _SHELL_COPY_VERBS
+    | _SHELL_LINK_VERBS
+    | {"sed", "perl", "python", "python3", "py"}
+    | {"apply_patch", "patch", "chmod", "chown", "chgrp", "truncate", "unlink", "shred", "dd", "install"}
+)
+
+
+def _detect_readonly_subagent_command_mutation(cmd_str: str, base_cwd: Optional[str]) -> Optional[Tuple[str, str, str]]:
+    hit = _detect_command_external_mutation(cmd_str, base_cwd, [], [], allow_os_temp=False)
+    if hit:
+        return hit
+    for tokens in _dispatch_commands(cmd_str):
+        if not tokens:
+            continue
+        head = Path(tokens[0].replace("\\", "/")).name.lower().removesuffix(".exe")
+        is_py_bin = head in ("python", "python3", "py") or bool(re.fullmatch(r"python[0-9.]+", head))
+        if head in _READONLY_SUBAGENT_EXPLICIT_MUTATION_VERBS or is_py_bin:
+            if head == "sed":
+                if _sed_has_mutating_flags_or_cmds(tokens[1:]):
+                    return "只读子代理禁止修改型 sed 命令 (sed)", tokens[0], _compact_snippet(" ".join(tokens))
+                continue
+            if head == "perl":
+                if not (len(tokens) == 2 and tokens[1] in ("-v", "-V", "-h", "--help", "--version")):
+                    return "只读子代理禁止执行 perl 脚本或内联修改 (perl)", tokens[0], _compact_snippet(" ".join(tokens))
+                continue
+            if is_py_bin:
+                if not _python_tokens_is_safe_inline_readonly(tokens):
+                    return f"只读子代理禁止执行脚本、模块或动态 Python 命令 ({head})", tokens[0], _compact_snippet(" ".join(tokens))
+                continue
+            return f"只读子代理禁止写删或修改命令 ({head})", tokens[0], _compact_snippet(" ".join(tokens))
+        if head == "find" and any(
+            a in ("-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprintf", "-fls")
+            for a in tokens[1:]
+        ):
+            return "只读子代理禁止 find 删除或执行副作用", "find", _compact_snippet(" ".join(tokens))
+        if head == "git":
+            subcmd, subargs = handoff_gate._git_subcommand(tokens)
+            writes_output = any(a == "--output" or a.startswith("--output=") for a in subargs)
+            is_ro = (
+                (subcmd in handoff_gate.GIT_READONLY_SUBCMDS and not writes_output)
+                or (subcmd == "branch" and handoff_gate._git_branch_is_readonly(subargs) and not writes_output)
+            )
+            if not is_ro:
+                label = f"git {subcmd}".strip() if subcmd else "git"
+                return f"只读子代理禁止修改型 Git 命令 ({label})", label, _compact_snippet(" ".join(tokens))
+    return None
+
+
+def _claude_check_polling(
+    tool_name: str,
+    args: Dict[str, Any],
+    sid: str,
+    cwd: Optional[str],
+    state_dir: Path,
+    logs_dir: Path,
+    client: str = "claude",
+) -> Dict[str, Any]:
+    tool_name = _native_tool_name(tool_name)
     raw_target = ""
     if tool_name == "Read":
         raw_target = str(args.get("file_path") or "")
@@ -3107,8 +4148,8 @@ def _claude_check_polling(tool_name: str, args: Dict[str, Any], sid: str, cwd: O
         signature = json.dumps({key: args.get(key) for key in
                                 ("pattern", "glob", "output_mode", "head_limit", "offset", "type", "-i", "-n", "-A", "-B", "-C", "multiline")},
                                sort_keys=True, ensure_ascii=False)
-    elif tool_name in ("Bash", "PowerShell", "exec_command", "bash"):
-        raw_target, subsystem, signature = parse_run_command_evidence(str(args.get("command") or args.get("cmd") or ""))
+    elif tool_name in ("Bash", "PowerShell", "exec_command", "bash", "shell", "shell_command"):
+        raw_target, subsystem, signature = parse_run_command_evidence(_extract_native_shell_command(args))
         if subsystem:
             return {}
     else:
@@ -3130,7 +4171,7 @@ def _claude_check_polling(tool_name: str, args: Dict[str, Any], sid: str, cwd: O
     if not fingerprints:
         return {}
     state_file = state_dir / f"{sid}_status_guard.json"
-    state = _load_guard_state(state_file, sid, logs_dir)
+    state = _load_guard_state(state_file, sid, logs_dir, client=client)
     query_key = f"claude:{tool_name}:{_canonical_path_key(target)}|{signature}"
     previous = state["records"].get(query_key)
     unchanged = isinstance(previous, dict) and previous.get("files") == fingerprints
@@ -3139,34 +4180,93 @@ def _claude_check_polling(tool_name: str, args: Dict[str, Any], sid: str, cwd: O
     if unchanged:
         reason = ("【user-guard 防空转门禁阻断】目标证据文件内容与查询参数自上次读取后未发生任何变化。"
                   "请等待后台任务产生新输出或先推进其他工作；改变读取区间或查询参数后将自动放行。")
-        log_event("PreToolUse:status_guard", sid, f"DENIED unchanged Claude {tool_name}", logs_dir)
+        log_event("PreToolUse:status_guard", sid, f"DENIED unchanged {client} {tool_name}", logs_dir, client=client)
         return _claude_permission("deny", reason)
     return {}
 
 
 def handle_claude_pre_tool_use(payload: Dict[str, Any], state_dir: Optional[Path] = None,
                                logs_dir: Optional[Path] = None) -> Dict[str, Any]:
-    """Claude PreToolUse：项目边界与证据查询门禁，放行使用空对象。"""
+    """Claude / Codex PreToolUse：项目边界、只读子代理防护与证据查询门禁，放行使用空对象。"""
     _sync_status_tunables()
     sid = str(payload.get("session_id") or "unknown_session").strip()
-    client = payload.get("_client", "claude")
+    client = str(payload.get("_client") or "claude")
     home = Path(os.environ.get("CODEX_HOME" if client == "codex" else "CLAUDE_CONFIG_DIR") or Path.home() / (".codex" if client == "codex" else ".claude")).expanduser()
     state_dir = Path(state_dir).expanduser() if state_dir is not None else home / "hooks" / "state"
     logs_dir = Path(logs_dir).expanduser() if logs_dir is not None else home / "hooks" / "logs"
-    tool_name = str(payload.get("tool_name") or "").strip()
-    args = payload.get("tool_input") if isinstance(payload.get("tool_input"), dict) else {}
+    raw_tool_name = str(payload.get("tool_name") or "").strip()
+    tool_name = _native_tool_name(raw_tool_name)
+    raw_input = payload.get("tool_input")
+    args = raw_input if isinstance(raw_input, dict) else {}
     cwd = str(payload.get("cwd") or "").strip() or None
     boundary_payload = {"cwd": cwd, "transcriptPath": payload.get("transcript_path"), "_client": client, "toolCall": {"name": "run_command", "args": {"Cwd": args.get("workdir") or args.get("Cwd") or args.get("cwd")}}}
     projects, allowed, resolved, display, base_cwd = _collect_boundary_context(boundary_payload, state_dir, logs_dir)
+
+    ro_subagent = _codex_readonly_subagent_role(payload)
+    if ro_subagent:
+        ro_hit: Optional[Tuple[str, str, str]] = None
+        if tool_name in ("Write", "Edit", "MultiEdit", "NotebookEdit", "write", "edit", "multiedit", "notebookedit", "write_file", "write_to_file", "edit_file"):
+            target = str(args.get("file_path") or args.get("notebook_path") or args.get("path") or args.get("Path") or "<FILE>").strip()
+            ro_hit = (f"{tool_name} 修改文件", target, "")
+        elif tool_name == "apply_patch":
+            ro_hit = ("apply_patch 修改文件", "<PATCH>", "")
+        elif tool_name.lower() == "write_stdin":
+            ro_hit = ("write_stdin 向会话写入标准输入", f"session_id={args.get('session_id', '<SESSION>')}", "")
+        elif tool_name in ("Bash", "PowerShell", "exec_command", "bash", "run_command", "shell", "shell_command"):
+            ro_hit = _detect_readonly_subagent_command_mutation(_extract_native_shell_command(args), base_cwd or cwd)
+        if ro_hit:
+            ro_act, ro_tgt, ro_snip = ro_hit
+            ro_reason = (
+                f"【user-guard 只读子代理硬边界】当前 Codex 会话为只读子代理（{ro_subagent}），"
+                f"严禁执行写文件、apply_patch 或写删命令：{ro_act} -> {ro_tgt}。"
+            )
+            if ro_snip:
+                ro_reason += f"触发语句：{ro_snip}。"
+            log_event("PreToolUse:readonly_subagent", sid, ro_reason, logs_dir, client=client)
+            return _claude_permission("deny", ro_reason)
+
     hit = None
     if projects:
         allow_temp = not any(_is_standard_os_temp_key(key) for key in projects)
-        if tool_name in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
-            target = str(args.get("file_path") or args.get("notebook_path") or args.get("path") or "").strip()
-            if target and not _is_write_target_allowed(target, base_cwd, allowed, resolved, allow_temp):
+        if tool_name in ("Write", "Edit", "MultiEdit", "NotebookEdit", "write", "edit", "multiedit", "notebookedit"):
+            target = str(args.get("file_path") or args.get("notebook_path") or args.get("path") or args.get("Path") or "").strip()
+            if target and not _is_write_target_allowed(target, base_cwd, allowed, resolved, allow_temp, from_shell=False):
                 hit = (f"{tool_name} 创建或修改文件", target, "")
-        elif tool_name in ("Bash", "PowerShell", "exec_command", "bash"):
-            hit = _detect_command_external_mutation(str(args.get("command") or args.get("cmd") or ""), base_cwd, allowed, resolved, allow_temp)
+            elif not target and (args.get("patch") or args.get("patch_text") or isinstance(raw_input, str)):
+                patch_text = str(args.get("patch") or args.get("patch_text") or (raw_input if isinstance(raw_input, str) else ""))
+                edits = _APPLY_PATCH_HEADER_RE.findall(patch_text)
+                if not edits:
+                    hit = (f"{tool_name} 未解析标准补丁头", "<UNPARSED_PATCH>", _compact_snippet(patch_text) if patch_text.strip() else "<EMPTY_PATCH>")
+                else:
+                    for op, raw_p in edits:
+                        cand_p = raw_p.strip()
+                        if not cand_p or not _is_write_target_allowed(cand_p, base_cwd, allowed, resolved, allow_temp, from_shell=False):
+                            hit = (f"{tool_name} ({op})", cand_p or "<EMPTY_PATCH_PATH>", f"*** {op}: {cand_p}")
+                            break
+        elif tool_name == "apply_patch":
+            patch_text = str(
+                args.get("patch")
+                or args.get("patch_text")
+                or args.get("input")
+                or args.get("command")
+                or args.get("cmd")
+                or (raw_input if isinstance(raw_input, str) else "")
+            )
+            edits = _APPLY_PATCH_HEADER_RE.findall(patch_text)
+            if not edits:
+                hit = ("apply_patch 未解析标准补丁头", "<UNPARSED_PATCH>", _compact_snippet(patch_text) if patch_text.strip() else "<EMPTY_PATCH>")
+            else:
+                for op, raw_p in edits:
+                    cand_p = raw_p.strip()
+                    if not cand_p or not _is_write_target_allowed(cand_p, base_cwd, allowed, resolved, allow_temp, from_shell=False):
+                        hit = (f"apply_patch ({op})", cand_p or "<EMPTY_PATCH_PATH>", f"*** {op}: {cand_p}")
+                        break
+        elif tool_name in ("Bash", "PowerShell", "exec_command", "bash", "shell", "shell_command"):
+            hit = _detect_command_external_mutation(_extract_native_shell_command(args), base_cwd, allowed, resolved, allow_temp)
+        elif tool_name.lower() == "write_stdin":
+            stdin_text = str(args.get("chars") if args.get("chars") is not None else (args.get("input") or ""))
+            if stdin_text.strip():
+                hit = _detect_command_external_mutation(stdin_text, base_cwd, allowed, resolved, allow_temp)
     if hit:
         action, target, snippet = hit
         decision = "deny" if _is_headless_subtask() else "ask"
@@ -3178,7 +4278,7 @@ def handle_claude_pre_tool_use(payload: Dict[str, Any], state_dir: Optional[Path
         if snippet:
             reason += f"触发语句：{snippet}。"
         reason += "无头子任务禁止越界写入。" if decision == "deny" else "按 R4，改动项目外业务文件或全局配置须先获得用户明确批准。"
-        log_event("PreToolUse:workspace_boundary", sid, reason, logs_dir)
+        log_event("PreToolUse:workspace_boundary", sid, reason, logs_dir, client=client)
         return _claude_permission(decision, reason)
     if not user_words.valid_session_id(sid):
         reason = _check_dispatch_locked(payload, tool_name, args, sid, state_dir)
@@ -3188,9 +4288,10 @@ def handle_claude_pre_tool_use(payload: Dict[str, Any], state_dir: Optional[Path
             reason = _check_dispatch_locked(payload, tool_name, args, sid, state_dir)
             if reason:
                 return _claude_permission("deny", reason)
-            return _claude_check_polling(tool_name, args, sid, cwd, state_dir, logs_dir)
+            return _claude_check_polling(tool_name, args, sid, base_cwd or cwd, state_dir, logs_dir, client=client)
     except (OSError, ValueError) as exc:
-        log_event("PreToolUse:state_error", sid, f"Claude 轮询状态未更新（{exc}）", logs_dir)
+        label = "Codex" if client == "codex" else "Claude"
+        log_event("PreToolUse:state_error", sid, f"{label} 轮询状态未更新（{exc}）", logs_dir, client=client)
         return {}
 
 
@@ -3205,7 +4306,8 @@ def main() -> None:
         payload = user_words.read_hook_payload()
     except (OSError, ValueError) as e:
         if args.client in ("claude", "codex"):
-            sys.stderr.write(f"Claude PreToolUse JSON parse error: {e}\n")
+            client_label = "Codex" if args.client == "codex" else "Claude"
+            sys.stderr.write(f"{client_label} PreToolUse JSON parse error: {e}\n")
         else:
             log_event("PreToolUse:status_guard", "unknown", f"Failed to parse stdin JSON: {e}")
 
@@ -3216,7 +4318,8 @@ def main() -> None:
     except Exception as e:
         stack_str = traceback.format_exc()
         if args.client in ("claude", "codex"):
-            sys.stderr.write(f"Claude PreToolUse: {e}\n")
+            client_label = "Codex" if args.client == "codex" else "Claude"
+            sys.stderr.write(f"{client_label} PreToolUse: {e}\n")
             response = {}
         else:
             log_event("PreToolUse:status_guard", str(payload.get("conversationId", "unknown")), f"Exception: {e}\n{stack_str}")

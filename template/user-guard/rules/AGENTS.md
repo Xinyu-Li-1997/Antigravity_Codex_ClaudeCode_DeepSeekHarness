@@ -16,14 +16,14 @@ Antigravity（反重力）、Codex、Claude Code（`cc`）和 DeepSeek Harness�
 
 1. **主动编排与点名覆盖**：主动核查不等于自动批准派工。用户用精确标识符或日常口语点名客户端、模型简称、推理挡位或省额度意图时，均作为 P0 第一优先级硬约束，锁定已指定维度，并通过 `--user-prompt` 传入原话。并列入口 `role:*` 提供 `orchestrator`、`math`、`code`、`review`、`fast` 五个槽位，也支持 `<client>:@<role>`、`<client>:default`、`<client>:<model>`；角色推荐不得覆盖用户点名。未指定的声明最大窗口、非委派挡位、无头非交互标志、只读小文件行号内联、快照及脱敏由 `cae_harness.py` 按配置补齐。轻量卡片承担非 `fast` 角色、所需本地路由未存活或点名对象不可用时，明确报错，不静默降级。
 2. **前端选择与动态配置**：主会话保留用户自己选择的模型与推理强度，后台派工只管理按需启动的独立进程。原生只读子代理默认 `inherit`，确认单须展示实际解析结果，无法解析时如实说明。五个角色的候选、声明窗口、推荐挡位以及 `runtime_tunables` 全部由 `fleet_profile.json` 驱动，不在常驻规则、钩子和脚本中写死时期性模型名或分散的运行阈值。默认跳过共享窗口的复合模式、静默降级路由、访问受限及已退役模型。
-3. **双门可用性与额度检查**：第一道门由独立的 `fleet-evolve` 流程联网评估能力，同时展示本机当前是否可用及本机配置的额度类型。用户在拍板节点决定启停哪些 agent 与 LLM，写入 `subscription_matrix.agents` 和 `subscription_matrix.models`；退订后置 `enabled: false`，全局选路跳过。第二道门由 `cae_harness.py plan` 在重负载弹卡前纯离线复查当前配置、路由存活和本机可读的额度状态，包括滚动窗口百分比与重置时间、卡片套餐或余额类型、日月限额及冷却记录，过滤不可用或超限通道。本地记录缺失不能推测为服务端余额充足。日常派工不联网更新性能，记录新旧以 `capability_ledger` 为据。
+3. **双门可用性与额度检查**：第一道门由独立的 `fleet-evolve` 流程联网评估能力，同时展示本机当前是否可用及本机配置的额度类型。用户在审批节点决定启停哪些 agent 与 LLM，写入 `subscription_matrix.agents` 和 `subscription_matrix.models`；退订后置 `enabled: false`，全局选路跳过。第二道门由 `cae_harness.py plan` 在生成重负载确认单前纯离线复查当前配置、路由存活和本机可读的额度状态，包括滚动窗口百分比与重置时间、卡片套餐或余额类型、日月限额及冷却记录，过滤不可用或超限通道。本地记录缺失不能推测为服务端余额充足。日常派工不联网更新性能，记录新旧以 `capability_ledger` 为据。
 4. **推理强度与额度中止**：后台常规推导、编码、审查和验证默认使用所选模型支持的单模型非委派最高强度，跳过会自动派生多层代理的 `ultra`。文字润色 `polish` 按配置的篇幅阈值选短篇 `medium` 或长篇 `high`，并核验事实锚定；用户要求省额度或调用 `role:fast` 时使用相应低消耗策略。显式非 `fast` 角色降到 `low` 仍保留该角色主力模型。返回 `quota_exhausted` 后立即停止重试并记录运行侧冷却。只有显式开启 `--fallback-on-quota` 且工作区尚无文件改动时才可按配置回退；不得违反 P0 点名，重负载计划变更须重新确认。每次后台调用使用全新独立进程。
-5. **全通道派工确认**：轻任务按 `runtime_tunables.dispatch_confirmation` 阈值静默执行。重负载包括外部无头调用和内部 `invoke_subagent`、`run_workflow`、`spawn_agent`、`Agent` 等多路或可写委派。执行前由 `plan` 展示背景、要做什么、预计后果及分路纵向展开的 14 项完整参数表：流号；子任务与范围；通道；客户端及子代理类型；模型名字；挡位；上下文窗口；是否无头；是否净室；访问模式、写入范围与验收命令；内联与超时；当前是否可用；本机配置额度类型与当前状态；回执或子代理日志位置。实际模型须含 `inherit` 解析，未知字段不得省略。确认单附 `capability_ledger.last_online_refresh_at` 与 `capability_ledger.local_bench_verified_at`，提供批准、微调后批准、暂缓并交接三个选项。用户明确选择后以 `plan --approve-ticket` 登记，执行绑定 `--ticket`。`status_guard.py` 核验获批票据并拦截裸 CLI 旁路；`batch` 仅执行外部无头通道，原生通道由对应客户端按批准计划调用。
-6. **维护审批与完工报账**：`fleet-evolve` 只用于上游配置仓库或用户明确要求演进全局工具链的任务。评估结合本机报错、官方资料和工程实测，同时说明优势与短板；区域限制、高频配额中止、协议转换失败、自动委派死等及压缩丢失约束优先排查。以下四类节点必须停下请用户决定：生成或调整推荐的客户端、模型、推理强度矩阵及 `runtime_tunables`；写入宿主机全局配置或切换主会话客户端；涉及编译型科学计算包的系统级 Python 跨次版本升级、CUDA 跨大版本升级或 WSL 跨 LTS 发行版升级等二进制接口（ABI）强耦合操作；执行 `git push`。草案用 `fleet_state.py propose` 登记，获批前不实施对应动作。重负载完成后，`reply_repeat_guard.py` 在 `Stop` 检查回复是否含有成败词、Token 用量或无法统计说明及回执或日志词项：外部任务按完整词项匹配各流标识（单路 `task` 或 `gate` 默认流号 `S1` 可用模型名或任务状态替代）及非空回执的实际文件名；原生任务匹配完成数量、全部流标识或互不重复的角色名之一及日志或轨迹说明。漏报且同回合尚无其他门禁阻断时单次阻断并附磁盘账单；主会话仍须亲自逐路核对具体状态、Token 明细与汇总算术。
+5. **全通道派工确认**：轻任务按 `runtime_tunables.dispatch_confirmation` 阈值静默执行。重负载包括外部无头调用和内部 `invoke_subagent`、`run_workflow`、`spawn_agent`、`Agent` 等多路或可写委派。执行前由 `plan` 展示背景、要做什么、预计后果及分路纵向展开的 14 项完整参数表：流号；子任务与范围；通道；客户端及子代理类型；模型名字；挡位；上下文窗口；是否无头；是否净室；访问模式、写入范围与验收命令；内联与超时；当前是否可用；本机配置额度类型与当前状态；回执或子代理日志位置。实际模型须含 `inherit` 解析，未知字段不得省略。确认单附 `capability_ledger.last_online_refresh_at` 与 `capability_ledger.local_bench_verified_at`，提供批准、微调后批准、暂缓并交接三个选项。用户明确选择后以 `plan --approve-ticket` 登记，执行绑定 `--ticket`。`status_guard.py` 核验获批票据并拦截直接调用底层无头 CLI；`batch` 仅执行外部无头通道，原生通道由对应客户端按批准计划调用。
+6. **维护审批与完工核验**：`fleet-evolve` 只用于上游配置仓库或用户明确要求演进全局工具链的任务。评估结合本机报错、官方资料和工程实测，同时说明优势与短板；区域限制、高频配额中止、协议转换失败、自动委派死等及压缩丢失约束优先排查。以下四类节点必须停下请用户决定：生成或调整推荐的客户端、模型、推理强度矩阵及 `runtime_tunables`；写入宿主机全局配置或切换主会话客户端；涉及编译型科学计算包的系统级 Python 跨次版本升级、CUDA 跨大版本升级或 WSL 跨 LTS 发行版升级等二进制接口（ABI）强耦合操作；执行 `git push`。草案用 `fleet_state.py propose` 登记，获批前不实施对应动作。重负载完成后，`reply_repeat_guard.py` 在 `Stop` 检查回复是否含有成败词、Token 用量或无法统计说明及回执或日志词项：外部任务按完整词项匹配各流标识（单路 `task` 或 `gate` 省略默认流号 `S1` 时须匹配具体模型名，仅在未记录具体模型名时可用任务状态词替代）及非空回执的实际文件名；原生任务匹配完成数量、全部流标识或互不重复的角色名之一及日志或轨迹说明。漏报且同回合尚无其他门禁阻断时单次阻断并附磁盘账单；主会话仍须亲自逐路核对具体状态、Token 明细与汇总算术。
 
 ### R3.2. 决策依据完整
 
-请用户拍板时，一次说明物理或工程背景、核心依据、方案差异、收益与风险，给出明确推荐。一次派工批准不能扩大为推荐矩阵或全局配置变更的授权。
+请用户决定时，一次说明物理或工程背景、核心依据、方案差异、收益与风险，给出明确推荐。一次派工批准不能扩大为推荐矩阵或全局配置变更的授权。
 
 ### R3.3. 明确范围与适度实现
 
@@ -43,7 +43,7 @@ Antigravity（反重力）、Codex、Claude Code（`cc`）和 DeepSeek Harness�
 
 - **R4. 授权与目录边界**：只修改用户明确授权的内容；确需改相邻模块时，先说明方案并获同意。未经明确批准，不得在当前项目根目录外的业务目录或宿主机全局配置目录创建、修改、移动或删除文件和目录，也不得在外部创建 `.codex-worktrees` 或执行 `git worktree add`。标准系统临时目录、客户端会话轨迹与制品目录、标准 `.cache` 缓存目录通常放行；本轮授权更严格时服从本轮边界。申请外部写入须列出意图、具体动作、完整路径与原因。遵守原生 Shell、路径和 UTF-8 编码规范；公开内容不得包含真实用户名路径、具体硬件型号、内网 IP、账号级精确账单指纹、密钥或凭据。
 - **R5. 防无声放大**：转述、归纳和重写须保留原有条件与证据强度。不得把局部规则扩大为全局承诺，把偶发写成必然，或使用无实测依据的最高级；不得混合物理假设、离散精度、守恒性质及适用条件不同的机制。
-- **R6. 独立审查与原文复核**：子代理及外部审查结果只作线索，主会话采纳前亲自打开原文件，核对精确行号和上下文。审查严禁改文件或运行构建测试。Antigravity 读取仅用 `read_file`、`search_web`，可用 `send_message`、`finish` 回传结果；Codex 使用 `read-only` 沙箱；Claude Code 仅用 `Read`、`Grep`、`Glob`。后台无头审查前后以文件哈希快照核验零改动。
+- **R6. 独立审查与原文复核**：子代理及外部审查结果只作线索，主会话采纳前亲自打开原文件，核对精确行号和上下文。审查严禁改文件或运行构建测试。Antigravity 读取仅用 `read_file`、`search_web`，可用 `send_message`、`finish` 回传结果；Codex 外部无头调用通过 `codex exec -s read-only` 具备独立沙箱与快照硬隔离，而交互式原生 `readonly-*` 子代理继承父会话沙箱并由开发者指令、`[features]` 权限收窄与 `PreToolUse` 钩子门禁约束；Claude Code 仅用 `Read`、`Grep`、`Glob`。后台无头审查前后以文件哈希快照核验零改动。
 - **R7. 方案比较与推荐**：物理建模、网格离散、边界处理、软硬约束划分或软件结构涉及关键取舍时，对比精度、计算开销、实现复杂度与维护风险，给出明确推荐，交用户最终决定。
 - **R8. 最新定论优先**：用户已确认或纠正的物理约定、数学符号、选型原则和工程边界贯穿后续步骤，行动前先核对最新定论。
 
@@ -51,8 +51,8 @@ Antigravity（反重力）、Codex、Claude Code（`cc`）和 DeepSeek Harness�
 
 **R9. 压缩交接对齐机制**：上下文自动压缩或跨会话恢复后，先做完以下四步再继续：
 
-1. **重读原话与关键返回**：完整重读磁盘保存的本会话用户原话及按 `runtime_tunables.compaction_recovery` 当前客户端参数归档的子代理摘要。无条件保留最新返回，在候选窗口内优先保留达到实质长度阈值的审查和推导。Antigravity 原话在 `plugin_data/user-guard/state/<conversation-id>_user_words.md`，Codex 与 Claude Code 在各自配置目录的 `hooks/state/user-words/<session-id>.md`。未挂归档钩子时回看会话历史。需要底层全文时，查 Antigravity 的 `transcript.jsonl`，遇 `truncated_fields` 回查 `transcript_full.jsonl` 及子代理轨迹；查 Codex 的 `sessions` 下会话轨迹和 `archived_sessions`；查 Claude Code 的 `projects/<project-slug>/<session-id>.jsonl` 与 `subagents` 支线。
-2. **核对现状与未决票据**：对照真实文件、历轮原话及最近核查结论检查遗漏和走样，引用仍须按 R6 复核。等待弹卡时若被自动压缩打断，钩子从磁盘未决票据独立加载重负载工作流的背景、要做什么、预计后果、完整 14 项参数表和选项卡。常规回读摘要与未决工作流严格分为两块，缺失内容不得凭摘要猜补。
+1. **重读原话与关键返回**：完整重读磁盘保存的本会话用户原话，以及按 `runtime_tunables.compaction_recovery` 结合当前客户端、模型与推理强度（`hooks/_lib/adaptive_policy.py`）动态缩放恢复预算并归档的子代理摘要；恢复阶段通过 `collapse_historical_cards` 折叠历史确认单明细表，无条件保留最新返回，在候选窗口内优先保留达到实质长度阈值的审查和推导。Antigravity 原话在 `plugin_data/user-guard/state/<conversation-id>_user_words.md`，Codex 与 Claude Code 在各自配置目录的 `hooks/state/user-words/<session-id>.md`。未挂归档钩子时回看会话历史。需要底层全文时，查 Antigravity 的 `transcript.jsonl`，遇 `truncated_fields` 回查 `transcript_full.jsonl` 及子代理轨迹；查 Codex 的 `sessions` 下会话轨迹和 `archived_sessions`；查 Claude Code 的 `projects/<project-slug>/<session-id>.jsonl` 与 `subagents` 支线。
+2. **核对现状与未决票据**：对照真实文件、历轮原话及最近核查结论检查遗漏和走样，引用仍须按 R6 复核。等待用户确认时若被自动压缩打断，钩子从磁盘未决票据 `<ticket_id>.json` 独立加载重负载工作流的背景、要做什么、预计后果、完整 14 项参数表和选项卡（同目录 `<ticket_id>_card.md` 同步保存完整明细文件供查阅）。常规回读摘要与未决工作流严格分为两块，缺失内容不得凭摘要猜补。
 3. **说明进展并恢复确认**：直白告诉用户重读了哪些记录与源码、已完成什么、还剩什么。存在未决重负载时，完整详述票据中的工作流、14 项全字段参数表、性能更新时间和选项卡，继续等待用户决定；自动压缩、沉默和超时都不构成批准。
 4. **整理长会话交接**：收到历史截断或长会话收尾提醒时，停止新开子代理、`git push` 和批量读图，在既有授权内整理当前局部工作。阈值及模式由 `runtime_tunables.handoff_thresholds` 驱动。进入 `drain` 或 `freeze` 强制交接时，`handoff_gate.py` 放行 `check-grounding --strict`，在 `Stop` 硬门禁要求完整交接。回复或交接文档须写明已验证进展、Git 状态、待办事项和可复制的【新对话提示词】；未决工作流的背景、目标、预计后果、14 项全字段参数表、性能更新时间、选项卡及票据须完整放入提示词，新会话用 `plan --resume-ticket` 读取复核，接力不等于批准。Antigravity 已开启 `/goal` 时末行单独输出 `<!-- GOAL_CANCELLED -->`；用户最新要求暂缓时按配置进入宽限期。Codex 与 Claude Code 默认采用 `advisory` 提醒，是否强制交接以实际模式为准。
 

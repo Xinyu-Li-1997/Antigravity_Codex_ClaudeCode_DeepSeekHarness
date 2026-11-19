@@ -153,11 +153,12 @@ BLOCK_REASON_TEXT = (
     "请停止重复汇报；后台任务尚未完成时，请直接结束本轮并等待系统 Reactive Wakeup 通知。"
 )
 
-
-def _build_block_reason_text() -> str:
+def _build_block_reason_text(client: str = "antigravity") -> str:
+    _ = client
+    base = BLOCK_REASON_TEXT
     if CONSECUTIVE_WAIT_LIMIT == 3:
-        return BLOCK_REASON_TEXT
-    return BLOCK_REASON_TEXT.replace("连续三次", f"连续 {CONSECUTIVE_WAIT_LIMIT} 次")
+        return base
+    return base.replace("连续三次", f"连续 {CONSECUTIVE_WAIT_LIMIT} 次")
 
 
 # ② 目录、日志与防重复状态读写
@@ -174,7 +175,12 @@ def log_event(event_name: str, conversation_id: str, message: str) -> None:
     user_words.append_lifecycle_log(HOOKS_DIR, event_name, conversation_id, message)
 
 
-def _load_repeat_state(state_file: Path, conversation_id: str, logs_dir: Optional[Path] = None) -> Dict[str, Any]:
+def _load_repeat_state(
+    state_file: Path,
+    conversation_id: str,
+    logs_dir: Optional[Path] = None,
+    client: str = "claude",
+) -> Dict[str, Any]:
     if state_file.exists():
         try:
             data = json.loads(state_file.read_text(encoding="utf-8-sig"))
@@ -195,7 +201,7 @@ def _load_repeat_state(state_file: Path, conversation_id: str, logs_dir: Optiona
                 log_event("Stop:repeat_state_error", conversation_id, f"防重复状态读取失败（{exc}），保留原文件")
             else:
                 user_words.append_jsonl_log(logs_dir / "lifecycle.log", {
-                    "event": "Stop:repeat_state_error", "client": "claude", "session_id": conversation_id,
+                    "event": "Stop:repeat_state_error", "client": client, "session_id": conversation_id,
                     "message": f"防重复状态读取失败（{exc}），保留原文件",
                 })
             raise
@@ -257,76 +263,140 @@ def _read_tail_steps_with_offset(transcript_path: Path) -> Tuple[List[Dict[str, 
         return [], 0
 
     steps: List[Dict[str, Any]] = []
-    # JSON 字符串允许含 U+2028 等字符，只能按真实换行字节分行。
-    for line in raw.split(b"\n"):
+    # JSON 字符串允许含 U+2028 等字符，只能按真实换行字节分行，并记录精确行首字节偏移 row_offset。
+    parts = raw.split(b"\n")
+    cur_offset = start_offset
+    for idx_part, line in enumerate(parts):
+        row_offset = cur_offset
+        cur_offset += len(line) + (1 if idx_part < len(parts) - 1 else 0)
         if not line.strip():
             continue
         try:
             obj = json.loads(user_words.decode_jsonl_line(line))
             if isinstance(obj, dict):
+                obj["row_offset"] = row_offset
                 steps.append(obj)
         except (ValueError, RecursionError):
             continue
     return steps, start_offset
 
 
-def _is_turn_boundary_step(step: Dict[str, Any]) -> bool:
-    """识别回合起点：人类显式 USER_INPUT 或跨代理派发的非 system 消息"""
-    s_type = step.get("type", "")
-    if s_type == "USER_INPUT" or step.get("source") == "USER_EXPLICIT":
+def _is_explicit_user_step(step: Dict[str, Any]) -> bool:
+    return step.get("type") == "USER_INPUT" or step.get("source") == "USER_EXPLICIT"
+
+
+def _is_turn_boundary_step(step: Dict[str, Any], allow_system_message: bool = True) -> bool:
+    """识别回合起点：人类显式 USER_INPUT；仅当无显式人类输入（纯子代理会话）时允许 SYSTEM_MESSAGE"""
+    if _is_explicit_user_step(step):
         return True
-    if s_type == "SYSTEM_MESSAGE":
+    if allow_system_message and step.get("type") == "SYSTEM_MESSAGE":
         return bool(user_words.clean_user_content(step.get("content"), "SYSTEM_MESSAGE"))
     return False
 
 
-def _find_turn_key_before_offset(transcript_path: Path, end_offset: int) -> str:
-    """当单回合轨迹超过尾部 256KB 窗口时，向前分块逆序定位最近一次回合起点并返回 turn_<step>_<hash>"""
+def _step_cursor_value(step: Dict[str, Any], fallback_offset: int) -> int:
+    raw_idx = step.get("step_index")
+    return raw_idx if type(raw_idx) is int else fallback_offset
+
+
+def _iter_located_lines_before_offset(
+    transcript_path: Path,
+    end_offset: int,
+    lower_bound: int = 0,
+):
+    pos = end_offset
+    carry = b""
+    with open(transcript_path, "rb") as f:
+        while pos > lower_bound:
+            chunk_start = max(lower_bound, pos - TAIL_SCAN_BYTES)
+            f.seek(chunk_start)
+            chunk = f.read(pos - chunk_start)
+            buf = chunk + carry
+            lines = buf.split(b"\n")
+            if chunk_start > lower_bound:
+                carry = lines[0]
+                candidate_lines = lines[1:]
+                offset = chunk_start + len(carry) + 1
+            elif chunk_start > 0:
+                # 触及非文件头下界时，首段可能是半行，跳过半行并精确对齐其后行首偏移。
+                dropped = lines[0]
+                carry = b""
+                candidate_lines = lines[1:]
+                offset = chunk_start + len(dropped) + 1
+            else:
+                carry = b""
+                candidate_lines = lines
+                offset = 0
+            located: List[Tuple[int, bytes]] = []
+            for idx_l, raw_line in enumerate(candidate_lines):
+                located.append((offset, raw_line))
+                offset += len(raw_line) + (1 if idx_l < len(candidate_lines) - 1 else 0)
+            for row_offset, raw_line in reversed(located):
+                yield row_offset, raw_line
+            pos = chunk_start
+
+
+def _find_turn_key_before_offset(
+    transcript_path: Path,
+    end_offset: int,
+    allow_system_message: bool = True,
+) -> str:
+    """当单回合轨迹超过尾部 256KB 窗口时，向前分块逆序定位最近一次回合起点并返回 turn_<cursor>_<hash>"""
     if end_offset <= 0:
         return "turn_0_initial"
+    fallback_sys_key: Optional[str] = None
     try:
-        pos = end_offset
-        carry = b""
-        with open(transcript_path, "rb") as f:
-            while pos > 0:
-                chunk_start = max(0, pos - TAIL_SCAN_BYTES)
-                f.seek(chunk_start)
-                chunk = f.read(pos - chunk_start)
-                buf = chunk + carry
-                lines = buf.split(b"\n")
-                if chunk_start > 0:
-                    carry = lines[0]
-                    candidate_lines = lines[1:]
-                else:
-                    carry = b""
-                    candidate_lines = lines
-                for raw_line in reversed(candidate_lines):
-                    stripped = raw_line.strip()
-                    if not stripped:
-                        continue
-                    if (
-                        b'"USER_INPUT"' not in stripped
-                        and b'"USER_EXPLICIT"' not in stripped
-                        and b"[Message]" not in stripped
-                    ):
-                        continue
-                    try:
-                        st = json.loads(user_words.decode_jsonl_line(stripped))
-                    except (ValueError, RecursionError):
-                        continue
-                    if isinstance(st, dict) and _is_turn_boundary_step(st):
-                        s_idx = st.get("step_index", 0)
-                        c_hash = hashlib.sha256(str(st.get("content", "")).encode("utf-8")).hexdigest()[:12]
-                        return f"turn_{s_idx}_{c_hash}"
-                pos = chunk_start
+        for row_offset, raw_line in _iter_located_lines_before_offset(transcript_path, end_offset, 0):
+            stripped = raw_line.strip()
+            if not stripped:
+                continue
+            if (
+                b'"USER_INPUT"' not in stripped
+                and b'"USER_EXPLICIT"' not in stripped
+                and (not allow_system_message or b"[Message]" not in stripped)
+            ):
+                continue
+            try:
+                st = json.loads(user_words.decode_jsonl_line(stripped))
+            except (ValueError, RecursionError):
+                continue
+            if not isinstance(st, dict):
+                continue
+            if _is_explicit_user_step(st):
+                s_idx = _step_cursor_value(st, row_offset)
+                c_hash = hashlib.sha256(str(st.get("content", "")).encode("utf-8")).hexdigest()[:12]
+                return f"turn_{s_idx}_{c_hash}"
+            if allow_system_message and fallback_sys_key is None and _is_turn_boundary_step(st, allow_system_message=True):
+                s_idx = _step_cursor_value(st, row_offset)
+                c_hash = hashlib.sha256(str(st.get("content", "")).encode("utf-8")).hexdigest()[:12]
+                fallback_sys_key = f"turn_{s_idx}_{c_hash}"
     except OSError:
         pass
-    return "turn_0_initial"
+    return fallback_sys_key or "turn_0_initial"
+
+
+def _has_explicit_user_before_offset(transcript_path: Path, end_offset: int) -> bool:
+    if end_offset <= 0:
+        return False
+    try:
+        for _, raw_line in _iter_located_lines_before_offset(transcript_path, end_offset, 0):
+            stripped = raw_line.strip()
+            if not stripped or (b'"USER_INPUT"' not in stripped and b'"USER_EXPLICIT"' not in stripped):
+                continue
+            try:
+                st = json.loads(user_words.decode_jsonl_line(stripped))
+            except (ValueError, RecursionError):
+                continue
+            if isinstance(st, dict) and _is_explicit_user_step(st):
+                return True
+    except OSError:
+        pass
+    return False
 
 
 def extract_current_turn_latest_reply(transcript_path_str: Optional[str]) -> Tuple[str, Optional[int], str]:
     """
-    提取当前回合键 turn_key、最新一条模型文本回复的 step_index 及其内容。
+    提取当前回合键 turn_key、最新一条模型文本回复的游标（step_index 或 row_offset）及其内容。
     """
     if not transcript_path_str:
         return "turn_0_initial", None, ""
@@ -339,20 +409,25 @@ def extract_current_turn_latest_reply(transcript_path_str: Optional[str]) -> Tup
     if not steps and window_start_offset <= 0:
         return "turn_0_initial", None, ""
 
+    has_explicit_user = any(_is_explicit_user_step(st) for st in steps)
+    if not has_explicit_user and window_start_offset > 0:
+        has_explicit_user = _has_explicit_user_before_offset(tp, window_start_offset)
+    allow_sys_boundary = not has_explicit_user
+
     turn_key = "turn_0_initial"
     turn_start_pos = 0
 
     for i in range(len(steps) - 1, -1, -1):
         st = steps[i]
-        if _is_turn_boundary_step(st):
-            s_idx = st.get("step_index", i)
+        if _is_turn_boundary_step(st, allow_system_message=allow_sys_boundary):
+            s_idx = _step_cursor_value(st, int(st.get("row_offset", i)))
             c_hash = hashlib.sha256(str(st.get("content", "")).encode("utf-8")).hexdigest()[:12]
             turn_key = f"turn_{s_idx}_{c_hash}"
             turn_start_pos = i + 1
             break
 
     if turn_key == "turn_0_initial" and window_start_offset > 0:
-        turn_key = _find_turn_key_before_offset(tp, window_start_offset)
+        turn_key = _find_turn_key_before_offset(tp, window_start_offset, allow_system_message=allow_sys_boundary)
 
     latest_step_idx: Optional[int] = None
     latest_text = ""
@@ -365,11 +440,37 @@ def extract_current_turn_latest_reply(transcript_path_str: Optional[str]) -> Tup
                 continue
             content = st.get("content")
             if isinstance(content, str) and content.strip():
-                raw_idx = st.get("step_index")
-                latest_step_idx = int(raw_idx) if isinstance(raw_idx, int) else pos
+                latest_step_idx = _step_cursor_value(st, int(st.get("row_offset", pos)))
                 latest_text = content
                 trunc_fields = st.get("truncated_fields") or []
                 latest_is_truncated = isinstance(trunc_fields, list) and "content" in trunc_fields
+
+    # 当尾部窗口首部截断丢弃了超长 PLANNER_RESPONSE（其后又有短步骤追加）时，有界向前读取找回本回合回复。
+    if latest_step_idx is None and turn_start_pos == 0 and window_start_offset > 0:
+        lower_bound = max(0, window_start_offset - user_words.MAX_HOOK_INPUT_CHARS)
+        try:
+            for row_offset, raw_line in _iter_located_lines_before_offset(tp, window_start_offset, lower_bound):
+                stripped = raw_line.strip()
+                if not stripped:
+                    continue
+                try:
+                    st = json.loads(user_words.decode_jsonl_line(stripped))
+                except (ValueError, RecursionError):
+                    continue
+                if not isinstance(st, dict):
+                    continue
+                if _is_turn_boundary_step(st, allow_system_message=allow_sys_boundary):
+                    break
+                if (st.get("type") == "PLANNER_RESPONSE" or st.get("source") == "MODEL") and st.get("type") != "GENERIC":
+                    content = st.get("content")
+                    if isinstance(content, str) and content.strip():
+                        latest_step_idx = _step_cursor_value(st, row_offset)
+                        latest_text = content
+                        trunc_fields = st.get("truncated_fields") or []
+                        latest_is_truncated = isinstance(trunc_fields, list) and "content" in trunc_fields
+                        break
+        except OSError:
+            pass
 
     if latest_is_truncated and latest_step_idx is not None:
         full_map = user_words._load_truncated_contents_map(
@@ -496,6 +597,19 @@ def _native_completion_bill(payload, state=None):
                 if not isinstance(entry, dict):
                     continue
                 typ = entry.get("type")
+                explicit_turn = typ == "USER_INPUT" or entry.get("source") == "USER_EXPLICIT"
+                if typ == "user":
+                    u_text, u_kind = user_words.claude_user_content(entry)
+                    explicit_turn = bool(u_text and u_kind in ("user_input", "queued_command"))
+                elif typ == "response_item":
+                    rec_u = entry.get("payload")
+                    if isinstance(rec_u, dict) and rec_u.get("type") == "message" and rec_u.get("role") == "user":
+                        _, word = user_words._extract_codex_record(entry, index)
+                        if word:
+                            word["source_path"] = str(path)
+                        explicit_turn = bool(word and user_words._codex_word_from_record(word))
+                if explicit_turn:
+                    completed.clear()
                 if typ in ("GENERIC", "TOOL_RESULT", "TOOL_RESPONSE"):
                     result = entry.get("tool_result") or entry
                     if not isinstance(result, dict):
@@ -512,11 +626,10 @@ def _native_completion_bill(payload, state=None):
                         elif not re.search(r"running in background|Created the following|in_progress", str(raw), re.I):
                             finish(key, call, raw, bool(entry.get("error") or result.get("error")))
                     else:
-                        match = re.search(r"Created the following subagent:\s*(\{.*\})", str(raw), re.S)
-                        if match:
-                            meta = user_words._parse_codex_json_maybe(match.group(1))
-                            if isinstance(meta, dict) and meta.get("conversationId"):
-                                agents[meta["conversationId"]] = (call, meta.get("logAbsoluteUri") or "")
+                        meta = user_words.parse_agy_created_subagent(str(raw))
+                        if meta is not None:
+                            if meta.get("conversationId"):
+                                agents[str(meta["conversationId"])] = (call, str(meta.get("logAbsoluteUri") or ""))
                         elif not re.search(r"running|pending|spawned", str(raw), re.I):
                             finish(key, call, raw, bool(entry.get("error") or result.get("error")))
                 elif typ == "SYSTEM_MESSAGE":
@@ -589,7 +702,7 @@ def _native_completion_bill(payload, state=None):
         return None
     reported = set((state or {}).get("reported_native_ids", []))
     rows = [row for row in completed.values() if row["native_id"] not in reported]
-    if not rows or not (len(rows) >= status_guard._heavy_min_streams() or any(
+    if not rows or not (len(completed) >= status_guard._heavy_min_streams() or any(
             r["channel"] in ("native_workflow", "native_swarm") or not r["readonly"] for r in rows)):
         return None
     token_keys = ("input_tokens", "cached_input_tokens", "output_tokens", "total_tokens")
@@ -613,11 +726,11 @@ def _render_heavy_bill(entries):
             outcome = row.get("status") or ("成功" if row.get("succeeded") else "失败")
             if "succeeded" in row:
                 outcome = ("成功" if row["succeeded"] else "失败") + " / " + str(outcome)
-            lines.append("| " + " | ".join(str(v).replace("\n", " ").replace("|", "\\|") for v in (
+            lines.append("| " + " | ".join(str(v).replace("\r\n", "\n").replace("\r", " ").replace("\n", " ").replace("|", "\\|") for v in (
                 row.get("stream_id", "未提供流号"), str(row.get("channel") or "cae_harness_headless") + " " +
                 str(row.get("engine") or "未提供 agent") + " / " + str(row.get("model") or "未提供模型"),
                 outcome, usage_text(row.get("token_usage")) + "；" + str(row.get("receipt_file") or entry.get("receipt_file") or "未提供回执路径"))) + " |")
-        lines.append("Token 汇总：" + usage_text(entry.get("token_usage_summary")) + "；回执：" + str(entry.get("receipt_file") or "未提供"))
+        lines.append("Token 汇总：" + usage_text(entry.get("token_usage_summary")) + "；回执：" + str(entry.get("receipt_file") or "未提供").replace("\r\n", "\n").replace("\r", " ").replace("\n", " "))
     return "\n".join(lines)
 
 
@@ -632,7 +745,10 @@ def _heavy_report_blocked(state_dir, sid, turn_key, payload):
 
 
 def _check_heavy_report_locked(payload, state_dir, sid, turn_key, reply, decision):
-    if os.environ.get("CAE_HARNESS_DEPTH") or os.environ.get("USER_GUARD_DISABLE_TICKET_GATE") == "1":
+    if (
+        os.environ.get("CAE_HARNESS_DEPTH", "").strip() not in ("", "0")
+        or os.environ.get("USER_GUARD_DISABLE_TICKET_GATE") == "1"
+    ):
         return None
     entries = user_words.load_unreported_heavy_completions(sid, state_dir)
     state_file = state_dir / (sid + "_heavy_report_guard.json")
@@ -676,7 +792,10 @@ def _check_heavy_report_locked(payload, state_dir, sid, turn_key, reply, decisio
                     single_task = len(rows) == 1 and stream_id == "S1" and entry.get("subcommand") in ("task", "gate")
                     model = str(row.get("model") or "")
                     task_status = str(row.get("status") or "")
-                    bound &= single_task and bool((model and model in reply) or (task_status and task_status in reply))
+                    has_concrete_model = bool(model and model != "inherit")
+                    model_bound = has_token(model) if has_concrete_model else False
+                    status_bound = (not has_concrete_model) and has_token(task_status)
+                    bound &= single_task and (model_bound or status_bound)
             if entry.get("receipt_file"):
                 filename = str(entry["receipt_file"]).replace(chr(92), "/").rsplit("/", 1)[-1]
                 bound &= has_token(filename)
@@ -691,13 +810,24 @@ def _check_heavy_report_locked(payload, state_dir, sid, turn_key, reply, decisio
     if state.get("blocked"):
         return None
     repeat = user_words._read_state_json(state_dir / (sid + "_repeat_guard.json")) or {}
-    handoff = user_words._read_state_json(state_dir / (sid + "_handoff_gate.json")) or {}
-    if (repeat.get("turns", {}).get(turn_key, {}).get("blockedSignatures")
-            or turn_key in handoff.get("stopGateBlockedTurnKeys", [])):
+    if repeat.get("turns", {}).get(turn_key, {}).get("blockedSignatures"):
         return None
+    for hg_path in (
+        state_dir / f"{sid}_handoff_gate.json",
+        state_dir / "handoff" / f"{sid}_handoff_gate.json",
+    ):
+        handoff = user_words._read_state_json(hg_path)
+        if not isinstance(handoff, dict):
+            continue
+        if (
+            turn_key in (handoff.get("stopGateBlockedTurnKeys") or [])
+            or handoff.get("stopCorrectionRequested") is True
+            or (handoff.get("mode") == "enforce" and handoff.get("phase") in ("drain", "freeze"))
+        ):
+            return None
     state["blocked"] = True
     user_words.atomic_write_json(state_file, state)
-    return {"decision": decision, "reason": "【user-guard 重负载完工报账】请在本轮回复补齐各路成败、Token 明细与汇总、回执或子代理日志位置。磁盘账单如下：\n" + _render_heavy_bill(entries)}
+    return {"decision": decision, "reason": "【user-guard 重负载完工核验】请在本轮回复补齐各路成败、Token 明细与汇总、回执或子代理日志位置。磁盘账单如下：\n" + _render_heavy_bill(entries)}
 
 
 def _handle_stop_locked(payload: Dict[str, Any], state_dir: Path, conversation_id: str) -> Dict[str, Any]:
@@ -846,7 +976,8 @@ def _claude_reverse_entries(path: Path):
 
 def _claude_turn_reply(payload: Dict[str, Any]) -> Tuple[str, Optional[int], str, str]:
     supplied = payload.get("last_assistant_message")
-    latest_reply = supplied.strip() if isinstance(supplied, str) else ""
+    supplied_text = supplied.strip() if isinstance(supplied, str) else ""
+    latest_reply = supplied_text
     _, transcript, _, skip = user_words.claude_hook_session(payload)
     if skip or transcript is None:
         return "turn_0_initial", None, latest_reply, ""
@@ -854,6 +985,8 @@ def _claude_turn_reply(payload: Dict[str, Any]) -> Tuple[str, Optional[int], str
     message_id = ""
     turn_key = "turn_0_initial"
     pending_question: Optional[Tuple[int, Dict[str, Any], Set[str]]] = None
+    assistant_checked = False
+    saw_newer_tool_activity = False
     try:
         for offset, entry in _claude_reverse_entries(transcript):
             if entry.get("isSidechain") is True or entry.get("isMeta") is True:
@@ -885,23 +1018,40 @@ def _claude_turn_reply(payload: Dict[str, Any]) -> Tuple[str, Optional[int], str
                 if r_ids and pending_question is None:
                     pending_question = (offset, entry, r_ids)
                 continue
-            if entry.get("type") != "assistant" or step is not None:
+            if not assistant_checked and entry.get("type") == "user":
+                if user_words._claude_tool_result_ids(entry) or isinstance(entry.get("toolUseResult"), dict):
+                    saw_newer_tool_activity = True
+                continue
+            if entry.get("type") != "assistant" or assistant_checked:
                 continue
             msg = entry.get("message")
             content = msg.get("content") if isinstance(msg, dict) else None
+            has_tool_use = False
             if isinstance(content, list):
+                has_tool_use = any(isinstance(b, dict) and b.get("type") == "tool_use" for b in content)
                 text = "\n".join(block["text"] for block in content if isinstance(block, dict)
                                  and block.get("type") == "text" and isinstance(block.get("text"), str))
             else:
                 text = content if isinstance(content, str) else ""
-            if text.strip():
+            flushed_text = text.strip()
+            if not flushed_text:
+                if has_tool_use:
+                    saw_newer_tool_activity = True
+                continue
+            assistant_checked = True
+            if saw_newer_tool_activity or has_tool_use or (supplied_text and supplied_text != flushed_text):
+                # 落盘助手文本之后已有更新的工具活动，或显式传入的新回复尚未刷盘：不复用旧落盘游标/message_id。
+                step = None
+                message_id = ""
+            else:
                 step = offset
                 message_id = str(entry.get("uuid") or entry.get("id") or "")
                 if not latest_reply:
-                    latest_reply = text.strip()
+                    latest_reply = flushed_text
         if step is None and latest_reply:
             # 宿主可能在助手记录刷盘前调用 Stop；同一快照的重复投递仍须幂等。
             step = transcript.stat().st_size
+            message_id = ""
     except OSError:
         return turn_key, None, latest_reply, ""
     return turn_key, step, latest_reply, message_id
@@ -911,28 +1061,71 @@ def _codex_turn_reply(payload):
     import status_guard
 
     turn, _ = status_guard._native_turn_snapshot(payload)
-    reply = str(payload.get("last_assistant_message") or "")
+    raw_supplied = payload.get("last_assistant_message")
+    supplied_raw = str(raw_supplied) if isinstance(raw_supplied, str) else ""
+    supplied = supplied_raw.strip()
+    reply = supplied_raw if supplied else ""
     path = status_guard._dispatch_transcript(payload)
     step = None
     if path:
         try:
+            offset = 0
+            flushed_step = None
+            flushed_reply = ""
+            saw_tool_after_assistant = False
             with path.open("rb") as source:
                 for index, line in enumerate(source):
+                    row_offset = offset
+                    offset += len(line)
                     try:
                         entry = json.loads(user_words.decode_jsonl_line(line))
                     except (ValueError, RecursionError):
                         continue
                     if not isinstance(entry, dict):
                         continue
-                    rec = entry.get("payload") or {}
-                    if entry.get("type") == "response_item" and rec.get("type") == "message" and rec.get("role") == "assistant":
-                        text = "\n".join(b.get("text", "") for b in rec.get("content", []) if isinstance(b, dict))
-                        if text:
-                            step = index
-                            if not payload.get("last_assistant_message"):
-                                reply = text
-            if step is None:
-                step = path.stat().st_size
+                    typ = entry.get("type")
+                    rec = entry.get("payload") if typ == "response_item" else None
+                    is_user_boundary = typ == "USER_INPUT" or entry.get("source") == "USER_EXPLICIT"
+                    if isinstance(rec, dict) and rec.get("type") == "message" and rec.get("role") == "user":
+                        _, word = user_words._extract_codex_record(entry, index)
+                        if word:
+                            word["source_path"] = str(path)
+                        is_user_boundary = bool(word and user_words._codex_word_from_record(word))
+                    if is_user_boundary:
+                        flushed_step = None
+                        flushed_reply = ""
+                        saw_tool_after_assistant = False
+                        continue
+                    if isinstance(rec, dict) and rec.get("type") == "message" and rec.get("role") == "assistant":
+                        text = "\n".join(b.get("text", "") for b in rec.get("content", []) if isinstance(b, dict) and isinstance(b.get("text"), str))
+                        if text.strip():
+                            flushed_step = row_offset
+                            flushed_reply = text
+                            saw_tool_after_assistant = False
+                        continue
+                    if flushed_step is not None and (
+                        (isinstance(rec, dict) and rec.get("type") in (
+                            "function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output",
+                            "local_shell_call", "local_shell_call_output", "web_search_call",
+                        ))
+                        or typ in ("TOOL_CALL", "TOOL_RESULT", "TOOL_RESPONSE", "GENERIC")
+                    ):
+                        saw_tool_after_assistant = True
+            if flushed_step is not None:
+                if saw_tool_after_assistant:
+                    if supplied:
+                        step = offset
+                    else:
+                        step = None
+                        reply = ""
+                elif supplied and supplied != flushed_reply.strip():
+                    step = offset
+                else:
+                    step = flushed_step
+                    if not supplied:
+                        reply = flushed_reply
+            elif reply:
+                step = offset
         except OSError:
             pass
     return turn, step, reply, ""
@@ -943,10 +1136,14 @@ def handle_claude_stop_repeat_guard(payload: Dict[str, Any], state_dir: Optional
     _sync_repeat_tunables()
     if payload.get("stop_hook_active") is True or payload.get("continuationActive") is True or payload.get("continuation_active") is True:
         return {}
-    sid, _, _, skip = user_words.claude_hook_session(payload)
+    client = payload.get("_client", "claude")
+    sid, _, _, skip = (
+        user_words.codex_hook_session(payload)
+        if client == "codex"
+        else user_words.claude_hook_session(payload)
+    )
     if skip or not user_words.valid_session_id(sid):
         return {}
-    client = payload.get("_client", "claude")
     home = Path(os.environ.get("CODEX_HOME" if client == "codex" else "CLAUDE_CONFIG_DIR") or Path.home() / (".codex" if client == "codex" else ".claude")).expanduser()
     state_dir = Path(state_dir).expanduser() if state_dir is not None else home / "hooks" / "state"
     logs_dir = Path(logs_dir).expanduser() if logs_dir is not None else home / "hooks" / "logs"
@@ -959,7 +1156,7 @@ def handle_claude_stop_repeat_guard(payload: Dict[str, Any], state_dir: Optional
             if not reply:
                 return {}
             state_file = state_dir / f"{sid}_repeat_guard.json"
-            state = _load_repeat_state(state_file, sid, logs_dir)
+            state = _load_repeat_state(state_file, sid, logs_dir, client=client)
             record = state["turns"].setdefault(turn_key, {
                 "consecutiveShortWaitCount": 0, "lastNormalizedReply": "", "lastStepIndex": None,
                 "blockedSignatures": [],
@@ -983,13 +1180,13 @@ def handle_claude_stop_repeat_guard(payload: Dict[str, Any], state_dir: Optional
             _save_repeat_state(state_file, state, sid)
             if block:
                 user_words.append_jsonl_log(logs_dir / "lifecycle.log", {
-                    "event": "Stop:reply_repeat_guard", "client": "claude", "session_id": sid,
+                    "event": "Stop:reply_repeat_guard", "client": client, "session_id": sid,
                     "turn_key": turn_key, "count": record["consecutiveShortWaitCount"],
                 })
-                return {"decision": "block", "reason": _build_block_reason_text()}
+                return {"decision": "block", "reason": _build_block_reason_text(client=client)}
     except (OSError, ValueError) as exc:
         user_words.append_jsonl_log(logs_dir / "lifecycle.log", {
-            "event": "Stop:state_error", "client": "claude", "session_id": sid, "message": str(exc),
+            "event": "Stop:state_error", "client": client, "session_id": sid, "message": str(exc),
         })
     return {}
 
@@ -1007,7 +1204,8 @@ def main() -> None:
         payload = user_words.read_hook_payload()
     except (OSError, ValueError) as e:
         if args.client in ("claude", "codex"):
-            sys.stderr.write(f"Claude Stop JSON parse error: {e}\n")
+            client_label = "Codex" if args.client == "codex" else "Claude"
+            sys.stderr.write(f"{client_label} Stop JSON parse error: {e}\n")
         else:
             log_event("Stop:reply_repeat_guard", "unknown", f"Failed to parse stdin JSON: {e}")
 
@@ -1018,7 +1216,8 @@ def main() -> None:
     except Exception as e:
         stack_str = traceback.format_exc()
         if args.client in ("claude", "codex"):
-            sys.stderr.write(f"Claude Stop: {e}\n")
+            client_label = "Codex" if args.client == "codex" else "Claude"
+            sys.stderr.write(f"{client_label} Stop: {e}\n")
             response = {}
         else:
             log_event("Stop:reply_repeat_guard", str(payload.get("conversationId", "unknown")), f"Exception: {e}\n{stack_str}")

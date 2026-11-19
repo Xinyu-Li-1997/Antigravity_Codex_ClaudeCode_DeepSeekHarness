@@ -13,6 +13,7 @@ test_lifecycle_offline.py - 上下文压缩原话回溯引擎离线单元测试�
 """
 
 import concurrent.futures
+import contextlib
 import hashlib
 import json
 import os
@@ -25,7 +26,62 @@ from pathlib import Path
 from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-HOOKS_DIR = Path(os.environ.get("USER_GUARD_INSTALLED_DIR", str(REPO_ROOT / "template" / "user-guard"))) / "hooks"
+def _resolve_hooks_dir(raw_env_val=None) -> Path:
+    default_base = REPO_ROOT / "template" / "user-guard"
+    raw_installed = (
+        os.environ.get("USER_GUARD_INSTALLED_DIR", "")
+        if raw_env_val is None
+        else str(raw_env_val)
+    ).strip()
+    if raw_installed:
+        cand = Path(raw_installed).expanduser()
+        if (cand / "hooks").is_dir():
+            return (cand / "hooks").resolve()
+        if cand.is_dir() and (cand / "user_words.py").is_file():
+            return cand.resolve()
+    return (default_base / "hooks").resolve()
+
+
+_ISOLATED_STRIP_EXACT = frozenset({
+    "PLUGIN_DATA",
+    "OPENAI_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+    "PYTHONPATH",
+})
+_ISOLATED_STRIP_PREFIXES = (
+    "AGY_",
+    "ANTIGRAVITY_",
+    "CODEX_",
+    "CLAUDE",
+    "ANTHROPIC_",
+    "DSH_",
+    "CAE_",
+    "GIT_",
+    "XDG_",
+)
+
+
+def _scrub_host_env(**overrides: str) -> dict:
+    cleaned = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in _ISOLATED_STRIP_EXACT
+        and not k.startswith(_ISOLATED_STRIP_PREFIXES)
+        and not (k.startswith("USER_GUARD_") and k != "USER_GUARD_INSTALLED_DIR")
+    }
+    cleaned.update(overrides)
+    return cleaned
+
+
+HOOKS_DIR = _resolve_hooks_dir()
 sys.path.insert(0, str(HOOKS_DIR))
 
 import handoff_gate  # noqa: E402
@@ -58,29 +114,26 @@ def _new_temp_dir(prefix: str = "lifecycle-test-") -> tempfile.TemporaryDirector
 
 class TestLifecycleCompactionEngine(unittest.TestCase):
     def setUp(self) -> None:
-        depth_patch = mock.patch.dict(os.environ, {"CAE_HARNESS_DEPTH": ""})
-        depth_patch.start()
-        self.addCleanup(depth_patch.stop)
         self.tmp_obj = _new_temp_dir()
-        self.tmp_root = Path(self.tmp_obj.name)
+        sandbox_root = Path(self.tmp_obj.name).resolve()
+        self.tmp_root = sandbox_root / "workspace"
+        self.tmp_root.mkdir(parents=True, exist_ok=True)
+        self.fake_home = sandbox_root / "home"
+        self.fake_home.mkdir(parents=True, exist_ok=True)
         self.plugin_data = self.tmp_root / "plugin_data"
-        self.old_plugin_data = os.environ.get("PLUGIN_DATA")
-        self.old_state = os.environ.get("USER_GUARD_STATE_DIR")
-        self.old_logs = os.environ.get("USER_GUARD_LOGS_DIR")
-
-        os.environ["PLUGIN_DATA"] = str(self.plugin_data)
-        os.environ.pop("USER_GUARD_STATE_DIR", None)
-        os.environ.pop("USER_GUARD_LOGS_DIR", None)
+        clean_env = _scrub_host_env(
+            HOME=str(self.fake_home),
+            USERPROFILE=str(self.fake_home),
+            PLUGIN_DATA=str(self.plugin_data),
+        )
+        self._env_patch = mock.patch.dict(os.environ, clean_env, clear=True)
+        self._env_patch.start()
+        self.addCleanup(self._env_patch.stop)
+        self._home_patch = mock.patch.object(Path, "home", return_value=self.fake_home)
+        self._home_patch.start()
+        self.addCleanup(self._home_patch.stop)
 
     def tearDown(self) -> None:
-        if self.old_plugin_data is None:
-            os.environ.pop("PLUGIN_DATA", None)
-        else:
-            os.environ["PLUGIN_DATA"] = self.old_plugin_data
-        if self.old_state is not None:
-            os.environ["USER_GUARD_STATE_DIR"] = self.old_state
-        if self.old_logs is not None:
-            os.environ["USER_GUARD_LOGS_DIR"] = self.old_logs
         self.tmp_obj.cleanup()
 
     def test_01_normal_session_zero_injection_across_turns(self) -> None:
@@ -1158,21 +1211,27 @@ class TestCodexHandoffAdapter(unittest.TestCase):
     """Codex 独立协议、保守默认值和严格模式的可观察状态转换。"""
 
     def setUp(self):
-        depth_patch = mock.patch.dict(os.environ, {"CAE_HARNESS_DEPTH": ""})
-        depth_patch.start()
-        self.addCleanup(depth_patch.stop)
         import handoff_gate
         self.gate = handoff_gate
         self.tmp = _new_temp_dir(prefix="codex-handoff-test-")
-        self.root = Path(self.tmp.name)
+        sandbox_root = Path(self.tmp.name).resolve()
+        self.root = sandbox_root / "workspace"
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.fake_home = sandbox_root / "home"
+        self.fake_home.mkdir(parents=True, exist_ok=True)
         self.state_dir = self.root / "state"
-        environment = mock.patch.dict(os.environ, {
-            "PLUGIN_DATA": str(self.root),
-            "USER_GUARD_LOGS_DIR": str(self.root / "logs"),
-        })
+        clean_env = _scrub_host_env(
+            HOME=str(self.fake_home),
+            USERPROFILE=str(self.fake_home),
+            PLUGIN_DATA=str(self.root),
+            USER_GUARD_LOGS_DIR=str(self.root / "logs"),
+        )
+        environment = mock.patch.dict(os.environ, clean_env, clear=True)
         environment.start()
         self.addCleanup(environment.stop)
-        os.environ.pop("USER_GUARD_STATE_DIR", None)
+        home_patch = mock.patch.object(Path, "home", return_value=self.fake_home)
+        home_patch.start()
+        self.addCleanup(home_patch.stop)
         self.transcript = self.root / "rollout.jsonl"
         self.sid = "codex-handoff-main"
         _append_jsonl(self.transcript, {"type": "session_meta", "payload": {
@@ -2241,17 +2300,30 @@ class TestHeavyWorkflowLifecycle(unittest.TestCase):
     def setUp(self):
         self.tmp = _new_temp_dir(prefix="workflow-lifecycle-")
         self.addCleanup(self.tmp.cleanup)
-        self.root = Path(self.tmp.name)
+        sandbox_root = Path(self.tmp.name).resolve()
+        self.root = sandbox_root / "workspace"
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.fake_home = sandbox_root / "home"
+        self.fake_home.mkdir(parents=True, exist_ok=True)
         self.state = self.root / "state"
         self.sid = "fixture-session"
-        environment = mock.patch.dict(os.environ, {
-            "CAE_PLAN_STATE_DIR": "", "USER_GUARD_STATE_DIR": str(self.state),
-            "PLUGIN_DATA": str(self.root / "plugin"), "USER_GUARD_LOGS_DIR": str(self.root / "logs"),
-            "CODEX_HOME": str(self.root / "codex"), "CLAUDE_CONFIG_DIR": str(self.root / "claude"),
-            "CAE_HARNESS_DEPTH": "",
-        })
+        clean_env = _scrub_host_env(
+            HOME=str(self.fake_home),
+            USERPROFILE=str(self.fake_home),
+            CAE_PLAN_STATE_DIR="",
+            USER_GUARD_STATE_DIR=str(self.state),
+            PLUGIN_DATA=str(self.root / "plugin"),
+            USER_GUARD_LOGS_DIR=str(self.root / "logs"),
+            CODEX_HOME=str(self.root / "codex"),
+            CLAUDE_CONFIG_DIR=str(self.root / "claude"),
+            CAE_HARNESS_DEPTH="",
+        )
+        environment = mock.patch.dict(os.environ, clean_env, clear=True)
         environment.start()
         self.addCleanup(environment.stop)
+        home_patch = mock.patch.object(Path, "home", return_value=self.fake_home)
+        home_patch.start()
+        self.addCleanup(home_patch.stop)
 
     def ticket(self, status="PENDING", tid="fixture-ticket", directory=None):
         import time
@@ -2676,6 +2748,523 @@ class TestHeavyWorkflowLifecycle(unittest.TestCase):
                     mock.patch.object(user_words, "session_state_lock") as lock:
                 self.assertEqual(handler({"hook_event_name": "Stop"}, self.state, "enforce"), {})
                 lock.assert_not_called()
+
+
+    def test_v1152_handoff_null_sinks_mutating_harness_flags_and_fence_info(self):
+        for ro_cmd in ("git status 2>$null", "rg foo src 2>$null", "git log -n 3 2>NUL", "python tools/cae_harness.py plan --resume-ticket t1"):
+            self.assertEqual(handoff_gate._classify_run_command(ro_cmd), "readonly_inspect", ro_cmd)
+        for mut_cmd in (
+            "python tools/cae_harness.py plan --approve-ticket t1",
+            "python tools/cae_harness.py probe --output out.json",
+            "tools/cae_harness.py plan --save-ticket",
+            "git status > nul/out.txt",
+        ):
+            self.assertEqual(handoff_gate._classify_run_command(mut_cmd), "mutating_other", mut_cmd)
+        _, ticket = self.ticket()
+        block = user_words.render_pending_workflow_block(ticket, for_handoff=True)
+        wrapped = "## 新对话提示词\n````markdown\n````json\n{\"x\": 1}\n```\n### 补充上下文标题\n" + block + "\n````"
+        self.assertTrue(handoff_gate._workflow_handoff_present(wrapped, [ticket]))
+
+    def test_v1152_user_words_plan_dir_links_dict_scrub_and_lock_sweep_subdirs(self):
+        import time
+        # 1) _scrub_lifecycle_entry 同时脱敏结构化字典敏感键名与内联键值且保持合法 JSON
+        secret_tok = "custom_router_" + "z" * 16
+        scrubbed = user_words._scrub_lifecycle_entry({
+            "summary": {"ANTHROPIC_AUTH_TOKEN": secret_tok, "CLAUDE_CODE_SKIP_BEDROCK_AUTH": "1", "input_tokens": 42},
+            "raw": json.dumps({"api_key": secret_tok, "ok": True}),
+        })
+        self.assertEqual(scrubbed["summary"]["ANTHROPIC_AUTH_TOKEN"], "<redacted>")
+        self.assertEqual(scrubbed["summary"]["CLAUDE_CODE_SKIP_BEDROCK_AUTH"], "1")
+        self.assertEqual(scrubbed["summary"]["input_tokens"], 42)
+        self.assertEqual(json.loads(scrubbed["raw"]), {"api_key": "<redacted>", "ok": True})
+        # 2) sweep_stale_lock_files 覆盖 dispatch_plans 与 heavy_completions 子目录
+        sweep_root = self.root / "sweep-v1152"
+        for sub in ("dispatch_plans", "heavy_completions"):
+            (sweep_root / sub).mkdir(parents=True, exist_ok=True)
+            lk = sweep_root / sub / ".expired-item.lock"
+            lk.write_text("x", encoding="utf-8")
+            old_ts = time.time() - 10 * 86400
+            os.utime(lk, (old_ts, old_ts))
+        self.assertEqual(user_words.sweep_stale_lock_files(sweep_root), 2)
+        # 3) candidate_dispatch_plan_dirs 拒绝末级软链同时兼容祖先软链目录
+        real_base = self.root / "real-base"
+        (real_base / "sub" / "plans").mkdir(parents=True)
+        evil_state = self.root / "evil-state"
+        evil_state.mkdir()
+        anc_link = self.root / "anc-link"
+        try:
+            anc_link.symlink_to(real_base, target_is_directory=True)
+            (evil_state / "dispatch_plans").symlink_to(real_base / "sub" / "plans", target_is_directory=True)
+        except OSError as exc:
+            self.skipTest(f"当前环境无符号链接创建权限: {exc}")
+        cands = user_words.candidate_dispatch_plan_dirs(evil_state, (anc_link / "sub" / "plans",))
+        self.assertEqual(cands[0], (real_base / "sub" / "plans").resolve())
+        self.assertNotIn((real_base / "sub" / "plans").resolve(), user_words.candidate_dispatch_plan_dirs(evil_state))
+
+    def test_v1153_h3_h9_handoff_proc_subst_control_flow_symlink_cwd_image_read_and_stop_fallback(self):
+        # 1) H3: 进程替换 <(...) / >(...) 与前导控制流关键字分类
+        self.assertEqual(
+            handoff_gate._extract_cmd_substitutions('diff <(git show HEAD:a) >(cat) \'<(ignored)\' "<(ignored2)"'),
+            ["git show HEAD:a", "cat"],
+        )
+        for blk_cmd in (
+            "cat <(git push origin main)",
+            "echo ok > >(git push origin main)",
+            "if git push origin main; then echo ok; fi",
+            "while true; do python cae_harness.py task --kind code; done",
+            "if false; then echo a; elif cat plot.png; then echo b; fi",
+        ):
+            self.assertEqual(handoff_gate._classify_run_command(blk_cmd), "blocked_always", blk_cmd)
+        for ro_cmd in (
+            "cat <(git status)",
+            "if git status; then git diff; fi",
+        ):
+            self.assertEqual(handoff_gate._classify_run_command(ro_cmd), "readonly_inspect", ro_cmd)
+        self.assertEqual(handoff_gate._classify_run_command("cat <(rm -f tmp_out.txt)"), "mutating_other")
+
+        # 2) H9-2: _claude_tool_kind 覆盖 dispatch_agent 与 Read 图片阻断
+        self.assertEqual(handoff_gate._claude_tool_kind({"tool_name": "dispatch_agent", "tool_input": {}}), ("blocked_always", []))
+        self.assertEqual(handoff_gate._claude_tool_kind({"tool_name": "Read", "tool_input": {"file_path": "fig/mesh.png"}}), ("blocked_always", []))
+        self.assertEqual(handoff_gate._claude_tool_kind({"tool_name": "Read", "tool_input": {"file_path": "docs/notes.md"}}), ("readonly", []))
+
+        # 3) H9-1: 软链 cwd 下 _claude_handoff_targets 与 _codex_handoff_patch_paths 兼容且防软链逃逸
+        real_proj = self.root / "real_proj_h9"
+        outside_dir = self.root / "outside_h9"
+        real_proj.mkdir()
+        outside_dir.mkdir()
+        sym_proj = self.root / "sym_proj_h9"
+        escape_link = real_proj / "escape_sub"
+        symlink_supported = True
+        try:
+            sym_proj.symlink_to(real_proj, target_is_directory=True)
+            escape_link.symlink_to(outside_dir, target_is_directory=True)
+        except OSError:
+            symlink_supported = False
+        if symlink_supported:
+            for raw_cand in ("handoff.md", str(sym_proj / "handoff.md"), str(real_proj / "handoff.md")):
+                self.assertEqual(len(handoff_gate._claude_handoff_targets([raw_cand], str(sym_proj))), 1, raw_cand)
+                patch_txt = f"*** Begin Patch\n*** Add File: {raw_cand}\n+ok\n*** End Patch\n"
+                self.assertEqual(len(handoff_gate._codex_handoff_patch_paths(patch_txt, str(sym_proj))), 1, raw_cand)
+            for bad_cand in ("../outside_h9/handoff.md", "escape_sub/handoff.md", str(sym_proj / "escape_sub" / "handoff.md")):
+                self.assertEqual(handoff_gate._claude_handoff_targets([bad_cand], str(sym_proj)), [], bad_cand)
+                bad_patch = f"*** Begin Patch\n*** Add File: {bad_cand}\n+bad\n*** End Patch\n"
+                self.assertEqual(handoff_gate._codex_handoff_patch_paths(bad_patch, str(sym_proj)), [], bad_cand)
+
+        # 4) H9-3: Stop 事件 last_assistant_message 为空时回退从 transcript 提取本回合最新助手交接回复
+        valid_handoff_reply = (
+            "已验证：全部离线单测通过。\nGit 工作区：干净。\n未完成：待下一会话继续基准测试。\n"
+            "## 新对话提示词\n```markdown\n请读取当前仓库状态并继续执行后续基准测试。\n```"
+        )
+        cl_tp = self.root / "claude_stop_fallback.jsonl"
+        _append_jsonl(cl_tp, {"type": "user", "uuid": "u-h9", "message": {"role": "user", "content": "/handoff"}})
+        cl_state = self.root / "cl_handoff_state"
+        handoff_gate.handle_claude_handoff(
+            {"hook_event_name": "UserPromptSubmit", "session_id": "cl-h9-sid", "transcript_path": str(cl_tp), "prompt": "/handoff"},
+            cl_state, mode="enforce", compact_limit=1,
+        )
+        _append_jsonl(cl_tp, {"type": "assistant", "uuid": "a-h9", "message": {"content": [{"type": "text", "text": valid_handoff_reply}]}})
+        cl_stop = handoff_gate.handle_claude_handoff(
+            {"hook_event_name": "Stop", "session_id": "cl-h9-sid", "transcript_path": str(cl_tp), "last_assistant_message": ""},
+            cl_state, mode="enforce", compact_limit=1,
+        )
+        self.assertEqual(cl_stop, {})
+        self.assertTrue(json.loads((cl_state / "cl-h9-sid_handoff_gate.json").read_text(encoding="utf-8"))["handoffRecorded"])
+
+        cx_tp = self.root / "codex_stop_fallback.jsonl"
+        _append_jsonl(cx_tp, {"type": "session_meta", "payload": {"id": "cx-h9-sid", "source": "cli", "cwd": str(real_proj)}})
+        _append_jsonl(cx_tp, {"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "/handoff"}]}})
+        cx_state = self.root / "cx_handoff_state"
+        handoff_gate.handle_codex_handoff(
+            {"hook_event_name": "UserPromptSubmit", "session_id": "cx-h9-sid", "transcript_path": str(cx_tp), "prompt": "/handoff"},
+            cx_state, mode="enforce", compact_limit=1,
+        )
+        _append_jsonl(cx_tp, {"type": "response_item", "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": valid_handoff_reply}]}})
+        cx_stop = handoff_gate.handle_codex_handoff(
+            {"hook_event_name": "Stop", "session_id": "cx-h9-sid", "transcript_path": str(cx_tp)},
+            cx_state, mode="enforce", compact_limit=1,
+        )
+        self.assertIs(cx_stop.get("continue"), False)
+        self.assertTrue(json.loads((cx_state / "cx-h9-sid_handoff_gate.json").read_text(encoding="utf-8"))["handoffRecorded"])
+
+    def test_v1153_h5_h8_h10_lock_reverify_log_symlink_bom_state_and_scrub_secrets(self):
+        # 1) H5-1: session_state_lock 在获得 flock / locking 之后复核 (st_dev, st_ino) 与 st_nlink==1，
+        # 若并发 _try_unlink_unheld_lock 在 open 与加锁之间删除并替换了锁文件，自动解锁重开新锁
+        lock_dir = self.root / "lock_race_dir"
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        lock_file = lock_dir / ".race-sid.lock"
+        lock_file.write_text("x", encoding="utf-8")
+        first_ino = lock_file.lstat().st_ino
+        unlinked_at_lock = {"done": False}
+
+        if os.name != "nt":
+            import fcntl
+            orig_flock = fcntl.flock
+            posix_race = {"lock_calls": 0}
+
+            def racing_flock(fd, op):
+                if op & fcntl.LOCK_EX:
+                    posix_race["lock_calls"] += 1
+                if not unlinked_at_lock["done"] and (op & fcntl.LOCK_EX):
+                    unlinked_at_lock["done"] = True
+                    lock_file.unlink(missing_ok=True)
+                return orig_flock(fd, op)
+
+            lock_ctx = mock.patch("fcntl.flock", side_effect=racing_flock)
+        else:
+            import msvcrt
+            orig_locking = msvcrt.locking
+            orig_lstat = Path.lstat
+            win_race = {"locked_once": False, "dropped_once": False, "unlocked": False}
+
+            def racing_locking(fd, mode, nbytes):
+                res = orig_locking(fd, mode, nbytes)
+                if mode == msvcrt.LK_NBLCK:
+                    win_race["locked_once"] = True
+                elif mode == msvcrt.LK_UNLCK and win_race["dropped_once"]:
+                    win_race["unlocked"] = True
+                return res
+
+            def racing_lstat(path_self):
+                if path_self == lock_file and win_race["locked_once"] and not win_race["dropped_once"]:
+                    win_race["dropped_once"] = True
+                    raise FileNotFoundError(str(path_self))
+                return orig_lstat(path_self)
+
+            lock_ctx = contextlib.ExitStack()
+            lock_ctx.enter_context(mock.patch("msvcrt.locking", side_effect=racing_locking))
+            lock_ctx.enter_context(mock.patch.object(Path, "lstat", autospec=True, side_effect=racing_lstat))
+
+        with lock_ctx:
+            with user_words.session_state_lock(lock_dir, "race-sid"):
+                self.assertTrue(lock_file.is_file(), "加锁后复核发现被 unlink 必须重开并锚定新锁文件")
+                self.assertEqual(lock_file.lstat().st_nlink, 1)
+                if os.name != "nt":
+                    self.assertGreaterEqual(posix_race["lock_calls"], 2)
+                    self.assertNotEqual(lock_file.read_bytes(), b"x")
+                else:
+                    self.assertTrue(win_race["dropped_once"] and win_race["unlocked"])
+
+        # 2) H5-2: append_jsonl_log 持锁后拒绝写入软链日志文件
+        logs_dir = self.root / "logs_symlink_guard"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        victim = self.root / "victim_outside.txt"
+        victim.write_text("KEEP_INTACT\n", encoding="utf-8")
+        sym_log = logs_dir / "lifecycle.log"
+        symlink_ok = True
+        try:
+            sym_log.symlink_to(victim)
+        except OSError:
+            symlink_ok = False
+        if symlink_ok:
+            user_words.append_jsonl_log(sym_log, {"event": "test", "message": "should_not_write"})
+            self.assertEqual(victim.read_text(encoding="utf-8"), "KEEP_INTACT\n")
+
+        # 3) H8: extract_agy_archive 兼容嵌套 JSON 与尾随花括号的子代理创建回执
+        agy_tp = self.root / "agy_nested_sub.jsonl"
+        _append_jsonl(agy_tp, {"step_index": 0, "type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "开始审查"})
+        _append_jsonl(agy_tp, {"step_index": 1, "type": "PLANNER_RESPONSE", "tool_calls": [
+            {"id": "call-n1", "name": "invoke_subagent", "args": {"TypeName": "readonly-auditor", "Role": "Mesh Auditor"}},
+        ]})
+        _append_jsonl(agy_tp, {"step_index": 2, "type": "GENERIC", "tool_result": {"call_id": "call-n1"},
+                               "content": 'Created the following subagent: {"conversationId": "sub-nested-99", "extra": {"a": {"b": 1}}, "logAbsoluteUri": "/tmp/s99.jsonl"} status={spawned}'})
+        _append_jsonl(agy_tp, {"step_index": 3, "type": "SYSTEM_MESSAGE",
+                               "content": "<SYSTEM_MESSAGE>\n[Message] sender=sub-nested-99 content=已完成全部网格法向核对并确认零穿透误差。\n</SYSTEM_MESSAGE>"})
+        arch = user_words.extract_agy_archive(str(agy_tp), include_subagent_msgs=False)
+        self.assertEqual(len(arch["subagent_returns"]), 1)
+        self.assertIn("readonly-auditor (Mesh Auditor)", arch["subagent_returns"][0]["label"])
+
+        # 4) H10: _read_state_json 支持 utf-8-sig BOM；_scrub_lifecycle_entry 支持转义引号、*_TOKEN、*_SECRET_ACCESS_KEY、PASSWORD/PASSWD、Basic 头与 tuple 递归
+        bom_json = self.root / "bom_state.json"
+        bom_json.write_bytes("\ufeff".encode("utf-8") + json.dumps({"ok": True, "v": 7}).encode("utf-8"))
+        self.assertEqual(user_words._read_state_json(bom_json), {"ok": True, "v": 7})
+
+        sec = "secretVal_" + ("k" * 12)
+        scrubbed = user_words._scrub_lifecycle_entry({
+            "escaped_json": f'{{\\"api_key\\": \\"{sec}\\", \\"ok\\": true}}',
+            "env_line": f"GITHUB_TOKEN={sec} AWS_SECRET_ACCESS_KEY={sec} PASSWORD={sec} PASSWD={sec} PWD=/tmp/work",
+            "auth_header": "Authorization: Basic dXNlcjpzdXBlcnNlY3JldA==",
+            "dict_pw": {"db_passwd": sec, "input_tokens": 128},
+            "tuple_payload": (f"HF_TOKEN={sec}", {"secret_access_key": sec}),
+        })
+        self.assertNotIn(sec, json.dumps(scrubbed))
+        self.assertIn('\\"api_key\\": \\"<redacted>\\"', scrubbed["escaped_json"])
+        self.assertIn("PWD=/tmp/work", scrubbed["env_line"])
+        self.assertNotIn("dXNlcjpzdXBlcnNlY3JldA==", scrubbed["auth_header"])
+        self.assertEqual(scrubbed["dict_pw"], {"db_passwd": "<redacted>", "input_tokens": 128})
+        self.assertIsInstance(scrubbed["tuple_payload"], tuple)
+        self.assertEqual(scrubbed["tuple_payload"], ("HF_TOKEN=<redacted>", {"secret_access_key": "<redacted>"}))
+
+    def test_r2_s2_01_codex_huge_bom_rollout_meta_and_agent_role_subagent(self):
+        # 1) >64KB 首行 session_meta + UTF-8 BOM 流式读取识别，以及 >8MB 无换行超长安全拒绝
+        big_tp = self.root / "rollout-huge-bom.jsonl"
+        huge_instructions = "A" * (160 * 1024)
+        meta_line = json.dumps({
+            "type": "session_meta",
+            "payload": {
+                "id": "codex-huge-ro",
+                "cwd": str(self.root),
+                "source": "cli",
+                "agent_role": "readonly-auditor",
+                "base_instructions": huge_instructions,
+            },
+        }) + "\n"
+        big_tp.write_bytes("\ufeff".encode("utf-8") + meta_line.encode("utf-8"))
+
+        meta, err = user_words.read_codex_rollout_meta(big_tp)
+        self.assertIsNone(err)
+        self.assertEqual(meta["id"], "codex-huge-ro")
+        self.assertEqual(meta["source_kind"], "subagent")
+        self.assertEqual(
+            status_guard._codex_readonly_subagent_role({"_client": "codex", "transcript_path": str(big_tp)}),
+            "readonly-auditor",
+        )
+
+        nick_tp = self.root / "rollout-nick.jsonl"
+        _append_jsonl(nick_tp, {
+            "type": "session_meta",
+            "payload": {"id": "codex-nick-sub", "cwd": str(self.root), "source": "cli", "agent_nickname": "Gauss"},
+        })
+        nick_meta, nick_err = user_words.read_codex_rollout_meta(nick_tp)
+        self.assertIsNone(nick_err)
+        self.assertEqual(nick_meta["source_kind"], "subagent")
+
+        _, limit_exceeded = user_words.read_bounded_first_line(big_tp, max_bytes=1024)
+        self.assertTrue(limit_exceeded)
+
+    def test_r2_s2_02_loader_mtime_stability_subagent_budget_bad_json_and_startup_sweep(self):
+        import time
+
+        # 1) [st_dev, st_ino]、file_size 与末尾 anchor 均未变时忽略单纯 mtime_ns 变化
+        cid = "agy-mtime-stable"
+        tp = self.root / "brain" / cid / ".system_generated" / "logs" / "transcript.jsonl"
+        _append_jsonl(tp, {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "保持守恒性"})
+        _append_jsonl(tp, {"step_index": 5, "source": "SYSTEM", "type": "CHECKPOINT"})
+        payload = {"conversationId": cid, "transcriptPath": str(tp)}
+        first = session_context_loader.handle_pre_invocation(payload)
+        self.assertEqual(len(first["injectSteps"]), 1)
+        st = tp.stat()
+        os.utime(tp, ns=(st.st_atime_ns, st.st_mtime_ns + 5_000_000_000))
+        second = session_context_loader.handle_pre_invocation(payload)
+        self.assertEqual(second["injectSteps"], [], "单纯 mtime_ns 变化不得重置 lastInjectedCheckpointStep 重复注入")
+
+        # 2) 超预算时先压缩 words_rendered 确保保留 subagent_section
+        huge_first_word = [{"turn": 1, "step_index": 0, "created_at": "2026-11-17T00:00:00Z", "kind": "user_input", "content": "首轮超长指令_" * 900}]
+        sub_returns = [{"step_index": 12, "label": "readonly-auditor (KeyCheck)", "log_path": "/tmp/sub.jsonl", "content": "关键审查结论：离散通量零泄漏。"}]
+        rendered = session_context_loader.build_compaction_system_message(
+            huge_first_word, self.root / "archive.md", "CHECKPOINT step #5",
+            subagent_returns=sub_returns,
+            policy={
+                "inline_total_chars": 1600,
+                "inline_user_item_chars": 1500,
+                "inline_subagent_total_chars": 500,
+                "inline_subagent_item_chars": 240,
+                "inline_guaranteed_head_turns": 1,
+            },
+        )
+        self.assertLessEqual(len(rendered), 1600)
+        self.assertIn("readonly-auditor (KeyCheck)", rendered)
+        self.assertIn("关键审查结论：离散通量零泄漏。", rendered)
+
+        # 3) claude/codex 遇损坏 stdin JSON 输出 {} 并以 0 退出；codex 异常同样截断至 inline_total_chars
+        for client, expected_label in (("claude", "Claude"), ("codex", "Codex")):
+            proc = subprocess.run(
+                [sys.executable, "-B", str(HOOKS_DIR / "session_context_loader.py"), "--client", client],
+                input="{corrupted-stdin-json",
+                capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(proc.returncode, 2, proc.stderr)
+            self.assertIn(expected_label, proc.stderr)
+
+        # 4) SessionStart(startup) 早退前执行 sweep_stale_lock_files
+        plugin_state, _ = session_context_loader.get_data_dirs()
+        plugin_state.mkdir(parents=True, exist_ok=True)
+        stale_lock = plugin_state / ".expired-startup.lock"
+        stale_lock.write_text("x", encoding="utf-8")
+        old_ts = time.time() - 10 * 86400
+        os.utime(stale_lock, (old_ts, old_ts))
+        (plugin_state / ".lock_sweep.stamp").unlink(missing_ok=True)
+        res_start = session_context_loader.handle_session_start({"conversationId": "startup-sid", "source": "startup"})
+        self.assertEqual(res_start, {"injectSteps": []})
+        self.assertFalse(stale_lock.exists(), "SessionStart(startup) 早退前应清理陈旧锁文件")
+
+        small_profile = self.root / "tiny_codex_cap.json"
+        small_profile.write_text(json.dumps({
+            "schema_version": 1,
+            "runtime_tunables": {"compaction_recovery": {"per_client": {"codex": {"inline_total_chars": 600}}}},
+        }), encoding="utf-8")
+        sym_bad_state = self.root / "sym_bad_state"
+        outside_target = self.root / "outside_target"
+        outside_target.mkdir(exist_ok=True)
+        try:
+            sym_bad_state.symlink_to(outside_target, target_is_directory=True)
+        except OSError as exc:
+            self.skipTest(f"当前环境无符号链接创建权限: {exc}")
+        codex_tp = self.root / "codex_err_cap.jsonl"
+        _append_jsonl(codex_tp, {"type": "session_meta", "payload": {"id": "cx-cap-sid", "source": "cli", "cwd": str(self.root)}})
+        proc_err = subprocess.run(
+            [sys.executable, "-B", str(HOOKS_DIR / "session_context_loader.py"), "--client", "codex",
+             "--state-dir", str(sym_bad_state / "session-context")],
+            input=json.dumps({"session_id": "cx-cap-sid", "transcript_path": str(codex_tp), "source": "compact_" + ("S" * 900)}),
+            env={**os.environ, "CAE_FLEET_PROFILE": str(small_profile)},
+            capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(proc_err.returncode, 0, proc_err.stderr)
+        err_ctx = json.loads(proc_err.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertEqual(len(err_ctx), 600)
+
+    def test_r2_s2_03_claude_task_notification_filtered_from_words_and_turn_key(self):
+        cl_tp = self.root / "claude_task_notif.jsonl"
+        _append_jsonl(cl_tp, {"type": "user", "uuid": "u-real-1", "message": {"role": "user", "content": "启动后台收敛测试"}})
+        _append_jsonl(cl_tp, {"type": "assistant", "uuid": "a-wait-1", "message": {"content": [{"type": "text", "text": "后台正在运行，请稍候。"}]}})
+        t1, _, _, _ = reply_repeat_guard._claude_turn_reply({"session_id": "cl-tn-1", "transcript_path": str(cl_tp)})
+        _append_jsonl(cl_tp, {
+            "type": "user",
+            "uuid": "u-notif-1",
+            "message": {"role": "user", "content": "<task-notification>\n<task-id>b1</task-id>\n<status>completed</status>\n</task-notification>"},
+        })
+        _append_jsonl(cl_tp, {"type": "assistant", "uuid": "a-wait-2", "message": {"content": [{"type": "text", "text": "后台正在运行，请稍候。"}]}})
+        t2, _, _, _ = reply_repeat_guard._claude_turn_reply({"session_id": "cl-tn-1", "transcript_path": str(cl_tp)})
+        self.assertEqual(t1, t2, "<task-notification> 不得重置人类回合 turn_key")
+        extracted = user_words.extract_claude_user_words(cl_tp)
+        self.assertEqual([w["content"] for w in extracted["words"]], ["启动后台收敛测试"])
+
+    def test_r2_s2_04_handoff_gate_redirs_quoted_gt_subdir_reply_stop_coord_and_parent_symlink_lock(self):
+        # 1) >&2, 1>&2, 2>>/dev/null 标准流/空设备重定向放行
+        for ro_cmd in ("echo check >&2", "git status 1>&2", "git diff 2>>/dev/null"):
+            self.assertEqual(handoff_gate._classify_run_command(ro_cmd), "readonly_inspect", ro_cmd)
+
+        # 2) _claude_tool_kind 先屏蔽引号再扫 >，且 Claude/Codex 均支持 handoff/*.md 子目录
+        proj = self.root / "proj_r2_hg"
+        proj.mkdir()
+        kind_ok, targets_ok = handoff_gate._claude_tool_kind({
+            "tool_name": "Bash",
+            "cwd": str(proj),
+            "tool_input": {"command": 'echo "step 1 -> step 2 > /outside/ignored" > handoff/summary.md'},
+        })
+        self.assertEqual(kind_ok, "handoff_document")
+        self.assertEqual(len(targets_ok), 1)
+        kind_bad, _ = handoff_gate._claude_tool_kind({
+            "tool_name": "Bash",
+            "cwd": str(proj),
+            "tool_input": {"command": 'echo "> handoff/summary.md" && rm -rf build'},
+        })
+        self.assertEqual(kind_bad, "mutating_other")
+        patch_sub = "*** Begin Patch\n*** Add File: handoff/notes.md\n+handoff body\n*** End Patch\n"
+        self.assertEqual(
+            handoff_gate._codex_tool_kind({"tool_name": "apply_patch", "cwd": str(proj), "tool_input": {"patch": patch_sub}})[0],
+            "handoff_document",
+        )
+        # _codex_tool_kind 纳入 shell / shell_command 列表态
+        self.assertEqual(
+            handoff_gate._codex_tool_kind({"tool_name": "functions.shell", "tool_input": {"command": ["git", "push", "origin", "main"]}})[0],
+            "blocked_always",
+        )
+        self.assertEqual(
+            handoff_gate._codex_tool_kind({"tool_name": "shell_command", "tool_input": {"command": ["git", "status"]}})[0],
+            "readonly_inspect",
+        )
+
+        # 3) _extract_native_turn_latest_reply：连续纯文本拼接、tool_use 中断态判空、Codex local_shell_call/web_search_call 重置
+        cl_stream = self.root / "cl_stream_reply.jsonl"
+        _append_jsonl(cl_stream, {"type": "user", "uuid": "u1", "message": {"role": "user", "content": "整理交接"}})
+        _append_jsonl(cl_stream, {"type": "assistant", "uuid": "a1", "message": {"content": [{"type": "text", "text": "已验证：单测全绿。\nGit 工作区：干净。"}]}})
+        _append_jsonl(cl_stream, {"type": "assistant", "uuid": "a2", "message": {"content": [{"type": "text", "text": "未完成：待上线。\n## 新对话提示词\n请继续完成上线验收与监控核对。"}]}})
+        merged_cl = handoff_gate._extract_native_turn_latest_reply(cl_stream, "claude")
+        self.assertTrue(handoff_gate._handoff_structure_present(merged_cl))
+        _append_jsonl(cl_stream, {"type": "assistant", "uuid": "a3", "message": {"content": [
+            {"type": "text", "text": "正在调用工具检查..."},
+            {"type": "tool_use", "id": "tu-1", "name": "Bash", "input": {"command": "git status"}},
+        ]}})
+        self.assertEqual(handoff_gate._extract_native_turn_latest_reply(cl_stream, "claude"), "")
+
+        cx_stream = self.root / "cx_stream_reply.jsonl"
+        _append_jsonl(cx_stream, {"type": "session_meta", "payload": {"id": "cx-s1", "source": "cli", "cwd": str(proj)}})
+        _append_jsonl(cx_stream, {"type": "response_item", "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "第一段"}]}})
+        _append_jsonl(cx_stream, {"type": "response_item", "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "第二段"}]}})
+        self.assertEqual(handoff_gate._extract_native_turn_latest_reply(cx_stream, "codex"), "第一段\n第二段")
+        for reset_type in ("local_shell_call", "web_search_call"):
+            tp_r = self.root / f"cx_{reset_type}.jsonl"
+            tp_r.write_bytes(cx_stream.read_bytes())
+            _append_jsonl(tp_r, {"type": "response_item", "payload": {"type": reset_type}})
+            self.assertEqual(handoff_gate._extract_native_turn_latest_reply(tp_r, "codex"), "")
+
+        # 4) reply_repeat_guard._check_heavy_report_locked 兼容 state_dir/handoff/<sid>_handoff_gate.json (enforce drain/freeze & stopCorrectionRequested)
+        user_words.atomic_write_json(self.state / "heavy_completions" / "coord-sid.json", [{
+            "run_id": "r1", "all_succeeded": True, "reported_to_user": False, "subcommand": "batch",
+            "receipt_file": "rec.json", "streams": [{"stream_id": "S1", "model": "m1", "succeeded": True, "status": "ok", "token_usage": {"total_tokens": 10}}],
+            "token_usage_summary": {"total_tokens": 10},
+        }])
+        user_words.atomic_write_json(self.state / "handoff" / "coord-sid_handoff_gate.json", {
+            "client": "claude", "version": 1, "conversationId": "coord-sid", "mode": "enforce",
+            "phase": "drain", "stopCorrectionRequested": False, "handoffRecorded": False,
+        })
+        self.assertIsNone(
+            reply_repeat_guard._check_heavy_report_locked({}, self.state, "coord-sid", "turn_1", "准备交接", "block")
+        )
+
+        # 5) CAE_HARNESS_DEPTH="2" 跳过缺失轨迹，"0" 不跳过；全新首轮无状态会话缺失轨迹静默返回 {}
+        with mock.patch.dict(os.environ, {"CAE_HARNESS_DEPTH": "2"}):
+            self.assertTrue(user_words.codex_hook_session({"session_id": "d2-sid", "transcript_path": ""})[3])
+            self.assertTrue(user_words.claude_hook_session({"session_id": "d2-sid", "transcript_path": str(self.root / "missing.jsonl")})[3])
+        with mock.patch.dict(os.environ, {"CAE_HARNESS_DEPTH": "0"}):
+            self.assertFalse(user_words.codex_hook_session({"session_id": "d0-sid", "transcript_path": ""})[3])
+
+        fresh_state = self.root / "fresh_native_state"
+        for ev in ("SessionStart", "UserPromptSubmit", "PreToolUse", "Stop"):
+            self.assertEqual(
+                handoff_gate.handle_claude_handoff(
+                    {"hook_event_name": ev, "session_id": "brand-new-cl", "transcript_path": str(self.root / "not_created_yet.jsonl")},
+                    fresh_state, mode="enforce", compact_limit=2,
+                ),
+                {},
+            )
+            self.assertEqual(
+                handoff_gate.handle_codex_handoff(
+                    {"hook_event_name": ev, "session_id": "brand-new-cx", "transcript_path": str(self.root / "not_created_yet.jsonl")},
+                    fresh_state, mode="enforce", compact_limit=2,
+                ),
+                {},
+            )
+        self.assertIn(
+            "systemMessage",
+            handoff_gate.handle_claude_handoff(
+                {"hook_event_name": "PostCompact", "session_id": "brand-new-cl", "transcript_path": str(self.root / "not_created_yet.jsonl")},
+                fresh_state, mode="enforce", compact_limit=2,
+            ),
+        )
+
+        # 6) 读图阻断原因明确说明多模态上下文消耗，且 Stop 补正提示列出 4 个必需交接章节要素
+        ux_payload = self.native_payload("claude")
+        ux_dir = self.root / "ux_handoff_state"
+        handoff_gate.handle_claude_handoff(dict(ux_payload, hook_event_name="UserPromptSubmit", prompt="/handoff"), ux_dir, "enforce")
+        img_deny = handoff_gate.handle_claude_handoff(
+            dict(ux_payload, hook_event_name="PreToolUse", tool_name="Read", tool_input={"file_path": "plot.png"}),
+            ux_dir, "enforce",
+        )
+        img_reason = img_deny["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertIn("多模态", img_reason)
+        stop_block = handoff_gate.handle_claude_handoff(
+            dict(ux_payload, hook_event_name="Stop", last_assistant_message="不完整的收尾"),
+            ux_dir, "enforce",
+        )
+        self.assertEqual(stop_block["decision"], "block")
+        for elem in ("① 已验证进展", "② Git/工作区状态", "③ 未完成事项", "④ 独立【新对话提示词】"):
+            self.assertIn(elem, stop_block["reason"])
+
+        # 7) session_state_lock 逐级校验已存在父目录软链
+        outside_lock_target = self.root / "outside_lock_dir"
+        outside_lock_target.mkdir(exist_ok=True)
+        sym_parent = self.root / "sym_lock_parent"
+        try:
+            sym_parent.symlink_to(outside_lock_target, target_is_directory=True)
+        except OSError as exc:
+            self.skipTest(f"当前环境无符号链接创建权限: {exc}")
+        for nested in (sym_parent / "handoff", sym_parent / "deep" / "handoff"):
+            with self.assertRaises(OSError):
+                with user_words.session_state_lock(nested, "valid-sid"):
+                    pass
+        self.assertFalse((outside_lock_target / "handoff").exists())
+        self.assertFalse((outside_lock_target / "deep").exists())
 
 
 if __name__ == "__main__":

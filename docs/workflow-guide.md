@@ -4,6 +4,24 @@
 
 Windows 环境统一使用 `python -B -X utf8`，WSL2 与 Linux 环境改用 `python3 -B -X utf8`。文中 `<...>` 均为按实际课题替换的受控占位符；票据目录、回执路径与净室临时目录均须落在本轮获准的写入范围内。
 
+在任意业务课题仓库运行本文命令前，先将变量 `HARNESS` 指向本机已安装客户端对应的技能脚本路径（四选一即可；若在本配置仓库上游维护模式下直接运行，可设为 `template/user-guard/skills/cae-harness/scripts/cae_harness.py`）：
+
+```powershell
+# Windows PowerShell（按本机已安装的任意一端设置 HARNESS）：
+$HARNESS = "$HOME\.codex\skills\cae-harness\scripts\cae_harness.py"                        # Codex
+# $HARNESS = "$HOME\.claude\skills\cae-harness\scripts\cae_harness.py"                     # Claude Code
+# $HARNESS = "$HOME\.dsh\skills\cae-harness\scripts\cae_harness.py"                        # DSH
+# $HARNESS = "$HOME\.gemini\config\plugins\user-guard\skills\cae-harness\scripts\cae_harness.py" # Antigravity
+```
+
+```bash
+# WSL2 与 Linux Bash（按本机已安装的任意一端设置 HARNESS）：
+HARNESS="$HOME/.codex/skills/cae-harness/scripts/cae_harness.py"                           # Codex
+# HARNESS="$HOME/.claude/skills/cae-harness/scripts/cae_harness.py"                        # Claude Code
+# HARNESS="$HOME/.dsh/skills/cae-harness/scripts/cae_harness.py"                           # DSH
+# HARNESS="$HOME/.gemini/config/plugins/user-guard/skills/cae-harness/scripts/cae_harness.py"    # Antigravity
+```
+
 ---
 
 ## 一、明确点名（P0）与模糊交办的并列选路机制
@@ -11,30 +29,30 @@ Windows 环境统一使用 `python -B -X utf8`，WSL2 与 Linux 环境改用 `py
 日常在任意已安装客户端（Antigravity、Codex、Claude Code 或 DeepSeek Harness）主窗口交流时，交互主会话始终保留你自己选择的客户端、模型与推理强度。遇到实质性数理推导、跨文件编码验证或独立审查时，先只读探测本机各对等端的可用状态：
 
 ```powershell
-python -B -X utf8 template/user-guard/skills/cae-harness/scripts/cae_harness.py probe --caller auto --redact
-python -B -X utf8 template/user-guard/skills/cae-harness/scripts/cae_harness.py assess --caller auto --redact
+python -B -X utf8 "$HARNESS" probe --caller auto --redact
+python -B -X utf8 "$HARNESS" assess --caller auto --redact
 ```
 
-在通用课题仓库（`workspace_mode: "general_project"`）中，直接调用本机已安装技能目录下的 `scripts/cae_harness.py` 即可；`probe` 与 `assess` 仅执行本地文件只读核对，不触发在线模型调用或性能榜单联网刷新。
+在通用课题仓库（`workspace_mode: "general_project"`）中，通过 `"$HARNESS"` 直接调用本机已安装的 `cae_harness.py` 即可，无需复制上游仓库文件；`probe` 与 `assess` 仅执行本地文件只读核对，不触发在线模型调用或性能榜单联网刷新。
 
 向后台派发任务时，**用户明确点名**与**动态角色槽位**（`role:*`）为并列入口，通过 `--user-prompt "<用户原话>"` 保留你的原始意图，其余繁琐底层参数由脚本自动补齐：
 
-| 你的指令类型 | 日常人话表达示例 | 锁定的维度（P0 优先） | 脚本自动补齐的参数与安全边界 |
+| 你的指令类型 | 日常自然语言表达示例 | 锁定的维度（P0 优先） | 脚本自动补齐的参数与安全边界 |
 | --- | --- | --- | --- |
 | **点名具体客户端或模型** | “这步编码用 Codex 高挡位做”“请交给 gpt-6-astra 做脱敏审查” | 锁定指定的客户端、模型标识或模型系列 | 外部无头调用自动补齐模型声明最大上下文窗口、无头非交互标志、只读行号内联、文件哈希快照与输出脱敏；目标不可用或 `enabled: false` 时直接报错，不静默换端 |
 | **点名推理挡位或省额度意图** | “这轮挂 high 挡跑”“先低挡快速扫一遍格式省点额度” | 锁定指定推理挡位或低消耗策略 | 显式非 `fast` 角色即使降到 `low` 挡仍保留该槽位主力模型；仅在调用 `role:fast` 或未锁专长角色时切入轻量模型 |
 | **多端并列协作指令** | “用 Codex 等多工作流全仓校核验证一下” | 识别“等、和、与、及”多端并列语义，不误锁单端 | 完整保留 `--spec-file` 中各分路声明的不同对等客户端与模型组合 |
 | **只说研究目标（模糊交办）** | “推导弯曲网格离散几何守恒律判据”“审查 `src/flux/` 边界相容性” | 按 `--kind` 搭配 `role:orchestrator / math / code / review / fast`（或 `<client>:@<role>`） | 按 `fleet_profile.json` 候选顺序选取当前已启用且额度正常的对等端；常规任务默认采用单模型非委派最高强度（跳过会自动派生多层子代理的 `ultra`），`polish` 润色按篇幅自动选 `medium` 或 `high` |
-| **同端多文件摘录与行号初筛** | “把这三篇论文的控制方程和源码对应行号摘出来” | 当前客户端内部原生 `readonly-reader / collaborator / auditor`（默认 `inherit`） | 禁写文件、禁跑构建与测试（Antigravity 与 Claude 禁用终端命令，Codex 采用 `read-only` 沙箱）；确认单展示从当前客户端配置解析出的真实模型名，不替代跨客户端独立审查 |
+| **同端多文件摘录与行号初筛** | “把这三篇论文的控制方程和源码对应行号摘出来” | 当前客户端内部原生 `readonly-reader / collaborator / auditor`（默认 `inherit`） | 禁写文件、禁跑构建与测试（Antigravity 与 Claude 禁用终端命令；Codex 交互式原生 `readonly-*` 子代理继承父会话沙箱并由开发者指令、`[features]` 权限收窄与 `PreToolUse` 钩子门禁约束，进程级独立沙箱与文件快照隔离由外部无头 `codex exec -s read-only` 提供）；确认单展示从当前客户端配置解析出的真实模型名，不替代跨客户端独立审查 |
 
 ---
 
-## 二、两道可用性门、全通道 14 项纵向确认单与多流执行
+## 二、两阶段可用性检查、全通道 14 项纵向确认单与多流执行
 
-### 1. 两道可用性与本地额度检查边界
+### 1. 两阶段可用性检查与本地额度边界
 
-- **第一道门（维护期启停拍板）**：由独立 `fleet-evolve` 流程联网评估能力并展示本机可用性及额度类型，用户决定启用或停用哪些客户端与模型，写入 `subscription_matrix`（如退订某模型后置 `enabled: false`，日常选路全局跳过）。
-- **第二道门（弹卡前纯离线复查）**：`cae_harness.py plan` 纯离线检查本机可执行文件、凭据、所需本地回环路由健康、本地会话记录中的滚动窗口已用百分比与重置时间、CC Switch 卡片套餐/余额类型与日月限额，以及当前运行环境的配额冷却记录，自动过滤不可用或已超限通道。本机未暴露的服务端实时余额如实标明未知，绝不谎称余额充足。
+- **维护期联网核查与启停确认**：由独立 `fleet-evolve` 流程联网评估能力并展示本机可用性及额度类型，用户决定启用或停用哪些客户端与模型，写入 `subscription_matrix`（如退订某模型后置 `enabled: false`，日常选路全局跳过）。
+- **派工前纯离线可用性复查**：`cae_harness.py plan` 在生成确认单前纯离线检查本机可执行文件、凭据、所需本地回环路由健康、本地会话记录中的滚动窗口已用百分比与重置时间、CC Switch 卡片套餐/余额类型与日月限额，以及当前运行环境的配额冷却记录，自动过滤不可用或已超限通道。本机未暴露的服务端实时余额如实标明未知，绝不谎称余额充足。
 
 ### 2. 单流与多流重负载确认单（4 列总览 + 3 列纵向 14 项明细）
 
@@ -49,7 +67,7 @@ python -B -X utf8 template/user-guard/skills/cae-harness/scripts/cae_harness.py 
 
 ```powershell
 # 1. 纯离线生成任务确认单与待批票据（不启动任何子代理）
-python -B -X utf8 template/user-guard/skills/cae-harness/scripts/cae_harness.py plan `
+python -B -X utf8 "$HARNESS" plan `
   --spec-file "<工作流配置.json>" --session-id "<当前会话标识>" --plan-dir "<授权票据目录>" `
   --user-prompt "<用户点名原话>" --output "<授权计划回执路径>" --redact `
   --workflow-bg "核心通量与边界模块已修改" `
@@ -59,7 +77,7 @@ python -B -X utf8 template/user-guard/skills/cae-harness/scripts/cae_harness.py 
 
 注意：两个 `role:review` 并不自动保证落在不同客户端；需要跨模型双源独立审查时，应如上例显式指定不同客户端，或使用 `audit --left ... --right ...` 双盲分片审查。
 
-`plan` 先用自然中文说明本次工作流的**背景、要做什么与预计后果**，随后输出一张紧凑的 **4 列各路总览表**，再按流顺序逐路展开 **3 列纵向 14 项完整参数明细表**（彻底消除超宽横向表格在窄屏视口与聊天侧栏中的单字竖排挤压，且零遗漏保留全部细节）：
+`plan` 先用自然中文说明本次工作流的**背景、要做什么与预计后果**，随后输出一张紧凑的 **4 列各路总览表**，再按流顺序逐路展开 **3 列纵向 14 项完整参数明细表**（彻底消除超宽横向表格在窄屏视口与聊天侧栏中的单字竖排挤压，且零遗漏保留全部细节）；保存票据时先写 `<ticket_id>.json` 再写 `<ticket_id>_card.md` 明细文件，并同步输出精简摘要 `compact_summary_card`：
 
 | 序号 | 参数项 | 展示内容与核验要求 |
 | --- | --- | --- |
@@ -74,24 +92,24 @@ python -B -X utf8 template/user-guard/skills/cae-harness/scripts/cae_harness.py 
 | 9 | 是否净室 | 是否启用剥离全局规则与项目说明的空上下文盲读隔离 |
 | 10 | 访问模式、写入范围与验收命令 | `只读`，或可写任务的 `--write-scope` 白名单及 `--verify-cmd` 验收命令 |
 | 11 | 内联与超时 | 只读文件是否附带行号内联（`--inline-readonly`）及本路超时秒数 |
-| 12 | 当前是否可用 | 第二道门离线可用性结论及不可用原因 |
+| 12 | 当前是否可用 | 派工前离线可用性复查结论及不可用原因 |
 | 13 | 本机配置额度类型与当前状态 | 额度计费来源；未启用 `--redact` 脱敏时显示本地可读百分比、重置时间或限额，启用脱敏或未暴露时标明隐藏或未知说明 |
 | 14 | 回执或子代理日志位置 | 结构化回执文件路径或客户端原生轨迹目录位置 |
 
 明细表下方展示 `capability_ledger.last_online_refresh_at` 与 `capability_ledger.local_bench_verified_at`，并提供三个选项：**① 批准当前计划（推荐）**、**② 微调引擎、挡位或超时后批准**（支持 `--override-json`）、**③ 暂缓并交接**。
 
-用户明确拍板批准后，登记票据为 `APPROVED` 并绑定 `--ticket` 执行（前后保持相同的 `--session-id` 与 `--plan-dir`）：
+用户明确确认批准后，登记票据为 `APPROVED` 并绑定 `--ticket` 执行（前后保持相同的 `--session-id` 与 `--plan-dir`）：
 
 ```powershell
 # 2. 登记用户批准并按后端并发上限执行外部无头批次
-python -B -X utf8 template/user-guard/skills/cae-harness/scripts/cae_harness.py plan `
+python -B -X utf8 "$HARNESS" plan `
   --approve-ticket "<票据标识>" --session-id "<当前会话标识>" --plan-dir "<授权票据目录>" --user-prompt "<用户点名原话>"
-python -B -X utf8 template/user-guard/skills/cae-harness/scripts/cae_harness.py batch `
+python -B -X utf8 "$HARNESS" batch `
   --ticket "<票据标识>" --session-id "<当前会话标识>" --plan-dir "<授权票据目录>" `
   --user-prompt "<用户点名原话>" --output "<授权回执路径>" --redact
 ```
 
-若计划包含内部原生通道（如在任意客户端内发起多路 `readonly-*` 或可写子代理），同样先用 `plan --channel native_subagent --caller auto --agent-type readonly-auditor --model inherit ...` 生成确认单并登记批准；执行时由当前客户端直接调用原生子代理工具（不交给 `batch`），`status_guard.py` 在 `PreToolUse` 自动核验批准票据与通道容量，并拦截绕过脚本的裸 CLI 调用。
+若计划包含内部原生通道（如在任意客户端内发起多路 `readonly-*` 或可写子代理），同样先用 `python -B -X utf8 "$HARNESS" plan --channel native_subagent --caller auto --agent-type readonly-auditor --model inherit ...` 生成确认单并登记批准；执行时由当前客户端直接调用原生子代理工具（不交给 `batch`），`status_guard.py` 在 `PreToolUse` 自动核验批准票据与通道容量，并拦截绕过 `cae_harness.py` 直接调用底层无头 CLI 的命令。
 
 ---
 
@@ -132,7 +150,7 @@ python -B -X utf8 template/user-guard/skills/cae-harness/scripts/cae_harness.py 
 生成确认票据并获用户批准后，绑定 `--ticket` 启动 `gate` 定量验证闭环（验证未通过时，真实报错在 `--max-rounds` 轮次内自动回传给执行模型迭代修正）：
 
 ```powershell
-python -B -X utf8 template/user-guard/skills/cae-harness/scripts/cae_harness.py gate `
+python -B -X utf8 "$HARNESS" gate `
   --caller auto --worker role:code --target "<项目根目录>" --task-file "task_hllc.md" `
   --write-scope "src/flux/*.py,tests/test_flux_conservation.py" `
   --verify-cmd "pytest -q tests/test_flux_conservation.py" `
@@ -152,19 +170,19 @@ flowchart LR
     S3 -->|gate_passed == true| S4["4. 跨端审查、事实锚定与 R6 终审<br/>audit / check-grounding --strict<br/>主会话亲自核对原文件行号"]
 ```
 
-修订重要技术文档时，可对支持净室的外部后端运行 `cae_harness.py task --kind review --engine role:review --clean-room --target "<文档路径>" ...` 剥离全局规则与项目说明，从新读者视角找出晦涩行话与阅读断层；主会话整篇重写后，运行 `cae_harness.py check-grounding --target "<项目根目录>" --strict` 做零黑名单词法事实核验。
+修订重要技术文档时，可对支持净室的外部后端运行 `python -B -X utf8 "$HARNESS" task --kind review --engine role:review --clean-room --target "<文档路径>" ...` 剥离全局规则与项目说明，从新读者视角找出晦涩行话与阅读断层；主会话整篇重写后，运行 `python -B -X utf8 "$HARNESS" check-grounding --target "<项目根目录>" --strict` 做零黑名单词法事实核验。
 
 ---
 
-## 四、压缩恢复、长会话交接与完工硬报账
+## 四、压缩恢复、长会话交接与完工回执核验
 
-1. **压缩打断后的双块恢复（`R9`）**：等待用户拍板期间若发生上下文自动压缩，钩子将恢复信息严格分为两块：一块是常规的历轮用户原话与实质子代理结论摘要；另一块直接从磁盘未决票据加载本次重负载工作流的背景、要做什么、预计后果、完整 14 项参数表与选项卡。主会话先如实说明已重读的记录与剩余工作，并完整复述未决工作流等待拍板——自动压缩与沉默绝不视同批准。
-2. **长会话交接与跨会话接力**：当会话进入 `drain` 或 `freeze` 强制交接阶段时，停止新派工并整理【新对话提示词】；`handoff_gate.py` 在 `Stop` 硬门禁校验提示词内已完整嵌入待选工作流详述、14 项参数表、性能时间、选项卡与票据号。进入新对话后先运行以下命令读取复核旧票据（该命令保留旧 `session_id` 不自动改绑，跨会话正式执行前须按原流内容与新会话标识重新生成确认票据）：
+1. **压缩打断后的双块恢复（`R9`）**：等待用户确认期间若发生上下文自动压缩，钩子按 `hooks/_lib/adaptive_policy.py` 根据当前模型窗口与推理强度动态调整恢复预算，并用 `collapse_historical_cards` 折叠历史确认单明细表；恢复信息严格分为两块：一块是常规的历轮用户原话与实质子代理结论摘要；另一块直接从磁盘未决票据加载本次重负载工作流的背景、要做什么、预计后果、完整 14 项参数表（或 `<ticket_id>_card.md`）与选项卡。主会话先如实说明已重读的记录与剩余工作，并完整复述未决工作流等待用户确认——自动压缩与沉默绝不视同批准。
+2. **长会话交接与跨会话接力**：当会话进入 `drain` 或 `freeze` 强制交接阶段时，停止新派工并整理【新对话提示词】；`handoff_gate.py` 在 `Stop` 阶段强制校验提示词内已完整嵌入待选工作流详述、14 项参数表、性能时间、选项卡与票据号。进入新对话后先运行以下命令读取复核旧票据（该命令保留旧 `session_id` 不自动改绑，跨会话正式执行前须按原流内容与新会话标识重新生成确认票据）：
    ```powershell
-   python -B -X utf8 template/user-guard/skills/cae-harness/scripts/cae_harness.py plan `
+   python -B -X utf8 "$HARNESS" plan `
      --resume-ticket "<票据标识>" --plan-dir "<授权票据目录>" --user-prompt "<用户点名原话>"
    ```
-3. **重负载完工报账硬钩子**：任务运行结束后，`reply_repeat_guard.py` 在 `Stop` 检查本轮回复是否包含：明确的执行成败词、真实 Token 用量数字（或“该通道未单独暴露整数、无法统计”的明确说明），以及外部任务的各流标识（单路 `task` 或单轮 `gate` 默认 `S1` 可用模型名或任务状态替代）与非空回执实际文件名（内部原生任务则覆盖完成数量、全部流标识或互不重复的角色名之一及轨迹或日志说明）。漏报且同回合未触发其他门禁时单次阻断并附上磁盘账单；主会话仍须逐路核对真实状态（`status`、`gate_passed`、`scope_violations`）、原文行号与汇总算术。
+3. **重负载完成回执检查钩子**：任务运行结束后，`reply_repeat_guard.py` 在 `Stop` 检查本轮回复是否包含：明确的执行成败词、真实 Token 用量数字（或“该通道未单独暴露整数、无法统计”的明确说明），以及外部任务的各流标识（单路 `task` 或单路 `gate` 省略默认流号 `S1` 时须匹配具体模型名，仅在未记录具体模型名时可用任务状态词替代）与非空回执实际文件名（内部原生任务则覆盖完成数量、全部流标识或互不重复的角色名之一及轨迹或日志说明）。漏报且同回合未触发其他门禁时单次阻断并附上本地保存的完成回执汇总；主会话仍须逐路核对真实状态（`status`、`gate_passed`、`scope_violations`）、原文行号与汇总算术。
 
 ---
 
@@ -174,7 +192,7 @@ flowchart LR
 
 | 证据等级 | 判定标准 | 典型科学计算与工程判据 | 对应回执特征 |
 | --- | --- | --- | --- |
-| **L1 源码或配置已写好** | 源码、接口或配置已落盘，尚未编译或未运行定量验证命令 | 静态结构与语法完整，待目标环境编译与单测 | `verification_executed: false` |
+| **L1 源码或配置已写好** | 源码、接口或配置已写入磁盘，尚未编译或未运行定量验证命令 | 静态结构与语法完整，待目标环境编译与单测 | `verification_executed: false` |
 | **L2 编译或离线单测已通过** | 目标编译器零错误通过，单函数/模块输出与解析公式或基准一致 | 解析雅可比与有限差分或复步导数相对误差达标；边界退化与离线契约单测全绿 | `gate_passed: true`（离线单测） |
 | **L3 离散守恒与系统不变量实测通过** | 算子在封闭、周期域或弯曲网格下严格保持物理守恒律与状态不变量 | 均匀自由流保持（GCL），全局质量、动量、总能离散守恒残差处于双精度机器零量级（$10^{-14} \sim 10^{-12}$）；多进程状态锁与快照零越界 | `gate_passed: true`（守恒与不变量实测） |
 | **L4 网格收敛阶与经典基准算例达标** | 在光滑解或制造解（MMS）加密序列（$h, h/2, h/4, \dots$）上达到理论设计阶数 $p$，或吻合标准算例 | 经验收敛阶 $\text{EOC} = \frac{\log(E_1 / E_2)}{\log(h_1 / h_2)}$ 稳定接近设计阶数 $p$；Sod/Lax 激波管、顶盖驱动方腔等与文献基准吻合 | `gate_passed: true`（收敛阶与基准算例） |

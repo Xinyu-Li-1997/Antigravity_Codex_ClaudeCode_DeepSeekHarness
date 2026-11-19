@@ -34,6 +34,25 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      - name: Check shell script syntax on Linux
+        if: runner.os == 'Linux'
+        shell: bash
+        run: bash -n install.sh template/claude/router/*.sh
+
+      - name: Check PowerShell entrypoint on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $tokens = $null; $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path .\install.ps1), [ref]$tokens, [ref]$errors)
+          if ($errors.Count -gt 0) { throw ($errors | Out-String) }
+          $probeJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 --probe-apps
+          if ($LASTEXITCODE -ne 0) { throw "install.ps1 --probe-apps exited with $LASTEXITCODE" }
+          $parsed = $probeJson | ConvertFrom-Json
+          foreach ($key in @('antigravity', 'codex', 'claude', 'dsh', 'cc_switch')) {
+            if ($null -eq $parsed.$key) { throw "Missing key $key in install.ps1 --probe-apps output" }
+          }
+
       - name: Run sandbox installations and full offline regression suite
         shell: bash
         env:
@@ -49,9 +68,26 @@ jobs:
           repo = pathlib.Path.cwd()
           py = [sys.executable, "-B", "-X", "utf8"]
 
+          def emit_ci_error(message: str) -> None:
+              escaped = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+              print(f"::error::{escaped}", flush=True)
+
           probe = subprocess.run([*py, "install.py", "--probe-apps"], cwd=repo, check=True, capture_output=True, text=True, encoding="utf-8")
           payload = json.loads(probe.stdout)
           assert all(name in payload for name in ("antigravity", "codex", "claude", "dsh", "cc_switch")), payload
+
+          grounding = subprocess.run(
+              [*py, "template/user-guard/skills/cae-harness/scripts/cae_harness.py", "check-grounding", "--target", ".", "--strict"],
+              cwd=repo, capture_output=True, text=True, encoding="utf-8", errors="replace",
+          )
+          if grounding.returncode != 0:
+              tail = " | ".join(
+                  line.strip() for line in (grounding.stdout + "\n" + grounding.stderr).splitlines() if line.strip()
+              )[-800:]
+              emit_ci_error(f"Grounding check failed (exit {grounding.returncode}): {tail}")
+              raise SystemExit(grounding.returncode)
+          grounding_report = json.loads(grounding.stdout)
+          assert grounding_report.get("ok") is True and grounding_report.get("finding_count") == 0, grounding_report
 
           with tempfile.TemporaryDirectory(prefix="user-guard-ci-") as tmp:
               base = pathlib.Path(tmp).resolve()
@@ -73,7 +109,7 @@ jobs:
                       tail = " | ".join(
                           line.strip() for line in (proc.stdout + "\n" + proc.stderr).splitlines() if line.strip()
                       )[-800:]
-                      print(f"::error::CI command failed (exit {proc.returncode}): {tail}", flush=True)
+                      emit_ci_error(f"CI command failed (exit {proc.returncode}): {tail}")
                       raise SystemExit(proc.returncode)
               def snapshot():
                   return {path.relative_to(base).as_posix():
@@ -89,8 +125,33 @@ jobs:
               )
               report = json.loads(audit.stdout)
               assert snapshot() == before_audit, "Upgrade audit changed sandbox files or directories"
+              assert (report.get("errors") == [] if "errors" in report else True) and not report.get("read_errors"), report
+              assert set(report["summary"]["recommended_actions"]) <= {"refresh_codex_model_catalog"}, report["summary"]
               for name in ("antigravity", "codex", "claude", "dsh"):
                   assert report[name]["drift_files"] == [], report[name]
               assert report["claude"]["router"]["drift_files"] == [], report["claude"]["router"]
               assert report["claude"]["router"]["config_exists"] is True, report["claude"]["router"]
+
+          unittest_proc = subprocess.run(
+              [*py, "-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py"],
+              cwd=repo, capture_output=True, text=True, encoding="utf-8", errors="replace",
+          )
+          if unittest_proc.stdout:
+              sys.stdout.write(unittest_proc.stdout)
+          if unittest_proc.stderr:
+              sys.stderr.write(unittest_proc.stderr)
+          if unittest_proc.returncode != 0:
+              tail = " | ".join(
+                  line.strip() for line in (unittest_proc.stdout + "\n" + unittest_proc.stderr).splitlines() if line.strip()
+              )[-800:]
+              emit_ci_error(f"Offline unittest suite failed (exit {unittest_proc.returncode}): {tail}")
+              raise SystemExit(unittest_proc.returncode)
+
+          git_status = subprocess.run(
+              ["git", "status", "--porcelain"],
+              cwd=repo, check=True, capture_output=True, text=True, encoding="utf-8",
+          )
+          if git_status.stdout.strip():
+              emit_ci_error(f"Repository not clean after CI run: {git_status.stdout.strip()}")
+              raise AssertionError(f"Expected empty git status --porcelain, got:\n{git_status.stdout}")
           PY

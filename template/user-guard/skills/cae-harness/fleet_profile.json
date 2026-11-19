@@ -10,7 +10,7 @@
     "defect_veto_priority": "同步核查各客户端与模型的优势与短板；实测优势决定当前角色分工，严重短板（平台区域访问受限、高频会话配额上限、协议转换反代丢包、自动派生子代理死等、长对话压缩丢失早期约束）作为排除或参数隔离依据。",
     "user_approval_required_before_apply": true,
     "approval_checkpoints": [
-      "生成或调整推荐的客户端 × 模型 × 推理强度矩阵及运行期定量参数（runtime_tunables）时须停下请用户拍板",
+      "生成或调整推荐的客户端 × 模型 × 推理强度矩阵及运行期定量参数（runtime_tunables）时须停下请用户审定",
       "向宿主机全局目录写入配置（install.py 正式执行）或切换主会话客户端时须先获用户批准（R4）",
       "涉及系统级 Python 跨次版本、CUDA 跨大版本或 WSL 跨 LTS 发行版等 ABI 强耦合升级时须发出警告并交由用户决定",
       "执行 git push 推送远端仓库前须停下等待用户明确指令"
@@ -146,7 +146,7 @@
       "router_primary_model": "k3.1-pro[1m]",
       "router_subagent_model": "deepseek-flash",
       "max_context_tokens": 1048576,
-      "auto_compact_window": 1000000,
+      "auto_compact_window": 754975,
       "router_card_name": "K3.1主+DS子代理",
       "managed_cards": [
         "Kimi",
@@ -214,8 +214,7 @@
     "dsh": [
       "codex",
       "agy",
-      "claude",
-      "dsh"
+      "claude"
     ]
   },
   "runtime_tunables": {
@@ -343,7 +342,6 @@
       "quota_default_cooldown_sec": 3600,
       "quota_max_horizon_days": 45,
       "catalog_max_age_days": 7,
-      "clean_room_inline_snapshot_kib": 256,
       "interop_stage_max_mib": 64,
       "audit_max_workers": 4,
       "consensus_line_tolerance": 8,
@@ -392,7 +390,6 @@
       "heavy_max_light_timeout_sec": 600,
       "ticket_ttl_sec": 86400,
       "codex_rollout_scan_files": 5,
-      "quota_warn_percent": 85.0,
       "quota_block_percent": 100.0
     }
   },
@@ -431,26 +428,30 @@
         "agent": "codex",
         "enabled": true,
         "quota_scheme": "rolling_window_5h_weekly",
-        "offline_perf_note": "工程编码、多文件实现与边界审查主力，high 挡单轮吞吐稳健"
+        "offline_perf_note": "工程编码、多文件实现与边界审查主力，high 挡单轮吞吐稳健",
+        "context_window": 872000
       },
       "gpt-6-astra": {
         "agent": "codex",
         "enabled": true,
         "quota_scheme": "rolling_window_5h_weekly",
-        "offline_perf_note": "长链数理推导强，max 挡单轮耗时长，常规分片宜用 high 挡"
+        "offline_perf_note": "长链数理推导强，max 挡单轮耗时长，常规分片宜用 high 挡",
+        "context_window": 872000
       },
       "k3.1-pro[1m]": {
         "agent": "claude",
         "enabled": false,
         "quota_scheme": "token_plan",
         "card": "Kimi",
-        "offline_perf_note": "当前在配置中设为停用（enabled: false），全局选路自动跳过；按需开启后可用于 1M 窗口跨文件审查"
+        "offline_perf_note": "当前在配置中设为停用（enabled: false），全局选路自动跳过；按需开启后可用于 1M 窗口跨文件审查",
+        "context_window": 1048576
       },
       "deepseek-v4-pro": {
         "agent": "dsh",
         "enabled": true,
         "quota_scheme": "api_balance",
-        "offline_perf_note": "数理推导与中文工程书面语校核扎实"
+        "offline_perf_note": "数理推导与中文工程书面语校核扎实",
+        "context_window": 1048576
       },
       "deepseek-flash[1M]": {
         "agent": "claude",
@@ -458,7 +459,31 @@
         "quota_scheme": "balance",
         "card": "DeepSeek",
         "lightweight": true,
-        "offline_perf_note": "轻量快速低成本初筛，不可冒充非 fast 专长角色主力"
+        "offline_perf_note": "轻量快速低成本初筛，不可冒充非 fast 专长角色主力",
+        "context_window": 1048576
+      },
+      "gemini-4-carbon": {
+        "agent": "agy",
+        "enabled": true,
+        "context_window": 1000000,
+        "quota_scheme": "rolling_window_5h_7d",
+        "offline_perf_note": "主会话总控与中文工程方案权衡主力，High 挡单模型稳定"
+      },
+      "gemini-4-hydrogen": {
+        "agent": "agy",
+        "enabled": true,
+        "context_window": 1000000,
+        "quota_scheme": "rolling_window_5h_7d",
+        "lightweight": true,
+        "offline_perf_note": "同代轻量快速系列，仅用于省额度或表面格式初筛"
+      },
+      "deepseek-flash": {
+        "agent": "dsh",
+        "enabled": true,
+        "context_window": 1048576,
+        "quota_scheme": "api_balance",
+        "lightweight": true,
+        "offline_perf_note": "DSH 内置轻量快速模型，用于显式省额度或表面格式初筛"
       }
     }
   }

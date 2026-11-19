@@ -2,13 +2,50 @@
 
 本文件记录四客户端共用规则、会话钩子、后台验证工具与上游维护流程的版本演进。当前插件版本以 `template/user-guard/plugin.json` 为准；常驻使用文档只说明机制和配置键，不重复维护版本号与性能日期。
 
+## [1.16.0] - 2026-11-17
+
+重构共享钩子基础库 `hooks/_lib/`、实现按客户端与模型/推理强度动态自适应的压缩与交接策略、新增确认单 `<ticket_id>_card.md` 写入与历史确认单折叠（`collapse_historical_cards`），并加固 `cae_harness.py` 票据并发锁与 `fleet_state.py` 锁/序列化边界：
+
+- **共享钩子基础库与模型/强度自适应策略（`hooks/_lib/`、`session_context_loader.py`、`handoff_gate.py`、`ccswitch_admin.py`、`install.py`）**：
+  - 将跨端钩子共用的原子写、符号链接/重解析点校验与跨平台文件锁抽离至 `hooks/_lib/fs_safety.py`，将 Shell 命令词法拆解与 ANSI-C 引号解码抽离至 `hooks/_lib/shell_lex.py`，并由 `hooks/_lib/adaptive_policy.py` 基于 `fleet_profile.json` 按 `(client, model, effort)` 动态派生压缩恢复字符预算与交接阈值（`resolve_adaptive_compaction_policy`、`resolve_adaptive_handoff_policy`），同步至 `ccswitch_admin.py` 自适应路由卡片默认参数与 `install.py --audit-upgrade` 的 `adaptive_meta` 体检；
+  - 拓展 `install._probe_dsh_hook_capability`，当上游 DSH 二进制开放 `--hooks` 协议时自动标记 `ready_for_fleet_evolve_dsh_hooks` 元更新触发信号。
+- **确认单精简卡片与历史表格折叠（`cae_harness.py`、`user_words.py`、`fleet_profile.json`）**：
+  - `_save_plan` 先原子写入 `<ticket_id>.json` 再写入完整 14 项明细文件 `<ticket_id>_card.md`（未保存票据的计划不输出 `--approve-ticket`/`--resume-ticket` 命令），`_render_plan` 同步生成精简摘要 `compact_summary_card`（缺失字段标为 `未声明`）；`user_words.collapse_historical_cards` 在压缩恢复时自动折叠历史 14 项明细表为 `[已折叠历史确认单/账单明细]`；
+  - 为 `cmd_plan` 的票据读取-修改-写盘周期增加 `plan_dir` 文件锁（`_plan_dir_lock`），在 `_load_ticket` 强制校验票据与流必填键，并拒绝未经 `--force` 对 `APPROVED` 票据执行 `--mark-handed-off` 或状态降级；移除 `fleet_profile.json` 中 `peer_fallback_order.dsh` 的自指项 `"dsh"`。
+- **状态锁与原子写安全加固、CI 与文档同步（`fleet_state.py`、`AGENTS.md`、`README.md`、`docs/`、`ci.yml`、`tests/`）**：
+  - 修复 `fleet_state.py` 中 `_atomic_write_json` 先序列化 JSON 再创建临时文件以防异常泄漏句柄，`_state_lock` 改用 `os.open(..., O_NOFOLLOW)` 与 `(st_dev, st_ino)` 复核且仅对新建叶目录执行 `chmod(0o700)`，将 `now = int(time.time())` 移入 `_state_lock` 临界区内采样，并收窄 `_run_repo_grounding_gate` 异常捕获范围；
+  - 在 `AGENTS.md` 明确三层仓库治理边界（`hooks/_lib/adaptive_policy.py` 归入 `项目主体代码层`，`项目自更新层` 仅含 `fleet_profile.json`、`fleet-evolve` 与 `install.py --audit-upgrade`），同步更新 `README.md`、`docs/`、`template/user-guard/README.md`、`cae-harness/SKILL.md`、`.github/workflows/ci.yml`（新增 `bash -n` 语法校验与干净仓库 `unittest` 回归）及 `tests/test_claude_and_router_offline.py`。
+
+---
+
+## [1.15.2] - 2026-11-17
+
+修复无头回执未转义 LaTeX 公式控制符损坏、`.agentignore` 前置锚定与同工作区并发快照竞态、命令包装与 Codex 补丁写边界绕过、路由器截断请求体拦截与 WSL2 NAT 代理回退、POSIX `flock` 锁复核与 `propose` 重启锁保护，以及三端只读子代理、CI 工作流与文档对齐：
+
+- **无头 JSON 公式转义、`.agentignore` 前置锚定、快照互斥及本地路由加固（`cae_harness.py`、`ccswitch_admin.py`、`router.py`）**：
+  - 修复 `_repair_json_string_escapes` 在修复非法反斜杠时将 `\beta`、`\frac`、`\rho`、`\tau`、`\theta`、`\times`、`\nabla`、`\text{...}` 等常见 LaTeX 宏误判为合法单字符控制转义的问题，完整保留真实路径双反斜杠与换行制表转义；
+  - 在可写任务快照与写范围核验前完成 `.agentignore` 规则前置锚定；在 `cmd_batch` 中按解析后的工作区根目录增加可写流与重叠目录流的快照临界区协调，覆盖 `build` 及显式授权子目录，扩展 `_scope_patterns` 与 `_scope_matches` 支持目录级 `--write-scope`（如 `src`、`src/`）及零层子目录递归通配 `/**/`，并补齐 `verify_exit_code` 与 `verify_output_tail` 验收诊断字段；
+  - 修复 `cmd_plan --resume-ticket` 在刷新动态额度摘要或继承模型显示名时将已交接（`HANDED_OFF`）票据重置回 `PENDING` 的状态回退问题，补齐 `cmd_plan --approve-ticket --override-json` 非法流标识与参数自救校验（限制内部原生通道仅允许微调 `tier` 与 `timeout`）及 `_check_ticket_execution` 对 `write_scope`、`verify_cmd` 的票据一致性核验，并在 `resolve_dispatch_plan_dir` 中对齐 `USER_GUARD_STATE_DIR` 与 `PLUGIN_DATA` 优先级；
+  - 为 `ccswitch_admin.py:inspect_status` 与 `cae_harness.py:_probe_router_health` 补齐本地回环地址的系统代理隔离（`ProxyHandler({})`）及 WSL2 NAT 模式下宿主机代理回退，补齐局部 `router.json` 默认路由合并与 `alias_map` 简称展开；为 `router.py` 增加截断请求体拦截、`_merge_request_headers` 多行同名非单值请求头合并（保留多条 `anthropic-beta`）、不区分大小写的 JSON `Content-Type` 识别及 `_scrub_log_value` 敏感字典键脱敏。
+- **生命周期钩子包装拆壳、Codex 写边界、POSIX `flock` 复核与状态锁保护（`status_guard.py`、`handoff_gate.py`、`reply_repeat_guard.py`、`user_words.py`、`fleet_state.py`）**：
+  - 补齐 `status_guard.py` 与 `handoff_gate.py` 对 `env`（含 `-i`、`-u`、`-C`、`-S`、`--split-string` 及键值前缀）、`command`、`sudo`、`nohup`、`nice` 与 `uv run` 包装器的递归剥离，收紧 Codex `apply_patch`、进程替换与动态重定向的项目外写删拦截边界，对齐软链 `TMPDIR` 下的词法路径与真实路径核验，并为 `status_guard.py` 增加按文件修改时间戳失效的 `cae_harness` 模块缓存；
+  - 扩展 `handoff_gate.py:_classify_run_command` 剔除 PowerShell `2>$null` 与 CMD `2>NUL` 空设备重定向，将携带 `--output`、`--approve-ticket`、`--save-ticket`、`--mark-handed-off` 写盘参数的 `cae_harness.py` 调用归入 `mutating_other`，并补齐 `_workflow_handoff_present` 闭合代码围栏的无后缀判据；
+  - 修复 `reply_repeat_guard.py:_codex_turn_reply` 跨用户回合未重置 `step` 偏移、Codex `Stop` 未调用 `codex_hook_session` 跳过子代理会话及单流省略 `S1` 时状态词子串误销账问题；
+  - 为 `user_words.py` 跨进程文件锁在 POSIX `flock` 加锁后增加目标路径与打开文件描述符 inode 复核，对齐 `candidate_dispatch_plan_dirs` 防软链检查、`_scrub_lifecycle_entry` 敏感键脱敏及 `sweep_stale_lock_files` 过期锁回收；修复 `fleet_state.py` 中 `propose` 与裸 `clear` 未携带 `--force` 时覆盖未过期 `AWAITING_USER_APPROVAL` 提案、已认领 `AWAITING_MASTER_RELOAD` Pass 2 重启锁或损坏状态文件的问题。
+- **三端只读子代理契约、安装体检对齐、CI 门禁与用户文档升级（`install.py`、`AGENTS.md`、`rules/AGENTS.md`、`template/*/agents/`、`README.md`、`docs/`、`ci.yml`、`tests/`）**：
+  - 在 `template/codex/agents/readonly-*.toml` 中保持顶层标量键位于所有表段之前并追加 `[features]` 权限收窄（禁用 `request_permissions_tool`、`apps`、`plugins`、`memories`），对齐 `readonly-auditor.toml` 只读命令与编译算例交回主会话边界，补齐 `readonly-collaborator.toml` 计算与内存开销及文献出处条款并统一三端 `readonly-*` 行号标注示例；修正 `AGENTS.md`、`R6` 与 `docs/workflow-guide.md`，区分外部无头 `codex exec -s read-only` 独立沙箱快照硬隔离与交互式原生 `readonly-*` 继承父会话沙箱并受开发者指令及 `PreToolUse` 钩子约束的边界；
+  - 统一 `install.py` 升级体检与默认模型选择对 Antigravity 目录的词边界拆分、禁用词剔除及主力优先逻辑；在 `.github/workflows/ci.yml` 中补齐 `::error::` 输出前 `%` 转义为 `%25`、`check-grounding --strict` CLI 子进程门禁、`--audit-upgrade` 零错误与推荐动作集合断言及末尾 `git status --porcelain` 判空断言；
+  - 在 `tests/` 中补齐 `ACTIVE_PLUGIN_DIR` 对空值或缺失 `USER_GUARD_INSTALLED_DIR` 的安全回退，扩充宿主机客户端会话、代理、XDG 目录、模块搜索路径与 Git 仓库环境变量剥离（含 `git` 子进程环境隔离），移除 `tests/` 仓内临时目录耦合，将源码与 `.yml` 配置中的固有连字符词项及拆分词干对称纳入 `test_02` 用户名与主机名碰撞豁免，并在 `test_01`、`test_41` 与 `test_50` 中补齐 TOML 顶层键与无自相矛盾条款、单流 `S1` 销账全仓同步、双引号 `$HOME` 规范、Claude 模板、`docs/assets/*.svg` 静态版本日期与页内 `#anchor` 标题锚点校验；
+  - 在 `docs/workflow-guide.md` 与 `cae-harness/SKILL.md` 中统一通过四端已安装脚本路径变量 `HARNESS` 在课题工作区根目录调用示例，同步全仓 6 处单流省略 `S1` 销账契约，在 `README.md` 补齐 `summary.recommended_actions`（含 `sync_codex_model_defaults` 与 `sync_claude_model_defaults`）排障提示，在 `docs/architecture-and-hooks.md` 补充 `router.py` 与 `ccswitch_admin.py` 双引号 `$HOME` 跨 Shell 命令示例、`fleet_state.py clear` 保护边界及按托管文件名精确清理（含三端顶层规则与 `plugin_data/user-guard` 运行态目录）的卸载说明。
+---
+
 ## [1.15.1] - 2026-11-16
 
 修复 14 列超宽横向表格窄视口挤压变形、GitHub Actions `ubuntu-latest` 与 WSL2 跨平台测试断言偏差、DSH 新版命令行无头权限补丁冲突及派工门禁目录边界问题，并由 Antigravity 完成全仓文档整篇润色、由 Codex `gpt-6-astra` 完成全仓脱敏核查：
 
 - **确认单与文档窄视口纵向排版重构（`cae_harness.py`、`user_words.py`、`handoff_gate.py`、`reply_repeat_guard.py`、`README.md`、`docs/`、`docs/assets/*.svg`）**：
   - 将 `_render_plan`、`render_pending_workflow_block`、`README.md` 与 `docs/workflow-guide.md` 中在窄屏视口和侧栏被挤压成单字竖条的 14 列横向大表重构为 **4 列各路总览表 + 每路 3 列纵向 14 项完整参数明细表**，零省略保留全部 14 个标准字段；同时在 `test_e2e_integration.py` 新增全仓 Markdown 表格列数上限（不超过 5 列）静态回归门禁；
-  - 修复 `user_words.py:render_pending_workflow_block` 在票据已存完整 `human_popup_markdown` 或 `handoff_prompt_block` 时重复拼接第二份背景与参数表的问题；更新 `handoff_gate.py:_workflow_handoff_present` 同时校验纵向 14 项参数明细表与历史 14 列横向行；将 `reply_repeat_guard.py:_render_heavy_bill` 规范为 4 列标准 GFM 表格。
+  - 修复 `user_words.py:render_pending_workflow_block` 在票据已存完整 `human_popup_markdown` 或 `handoff_prompt_block` 时重复拼接第二份背景与参数表的问题；更新 `handoff_gate.py:_workflow_handoff_present` 同时校验纵向 14 项参数明细表与历史 14 列横向行；将 `reply_repeat_guard.py:_render_heavy_bill` 规范为 4 列标准 Markdown 表格。
 - **跨客户端无头调用与门禁边界修复（`cae_harness.py`、`status_guard.py`、`install.py`、`fleet_profile.json`）**：
   - 修复 DSH 支持 `--permission-mode` 新版 CLI（`@deepseek-ai/dsh-permission-presets`）时，临时补丁仍写入旧版 `sandbox-policy`、`approval`、`permission` 导致预设服务启动报错退出码 `1` 的真机缺陷；
   - 修复 `_extract_prompt_backend_hint` 在用户发出“用 Codex 等多工作流”等多端并列指令时误锁单端覆盖分路配置的问题，并在 `--fallback-on-quota` 配额回退中严守用户单端 P0 点名与重负载获批票据绑定边界；为 `probe` 与 `assess` 子命令补齐 `--redact`、`--output`、`--no-redact-output` 参数，补齐 `cae_harness.py` 异常出口、WSL `/mnt/<盘符>/Users/` 路径、私网 IPv6、敏感字段键值的 `--redact` 脱敏及 `router.py`、`user_words.py` 诊断日志密钥擦除；将 `inline_readonly_max_kib` 提升至 `512` 以覆盖大型源码文件的带行号内联读取；
@@ -16,7 +53,7 @@
   - 合并前序闭环加固：完工门禁按完整词项绑定流标识与实际回执文件名并覆盖跨回合原生任务，派工门禁剥离常见命令包装器，状态锁保护有效待批提案，首次路由配置读取动态端口，卡片更新保留合法元数据。
 - **Linux（`ubuntu-latest`）与 WSL2 跨平台回归及文档润色脱敏（`tests/`、`README.md`、`docs/`、`CHANGELOG.md`）**：
   - 修复 `test_claude_and_router_offline.py` 健康检查硬编码 Windows 端口 `8240`（POSIX 默认 `8241`）、Windows 应用探测缺少 `_windows_app_binaries` 隔离、WSL2 DrvFS 挂载盘 `chmod` 权限位差异及回环请求未隔离系统代理的问题；修复 `test_e2e_integration.py` POSIX 专属用例在 Codex 五钩子对齐后 `--codex-handoff-mode off` 剩余 `3` 个非交接钩子的断言；将仓库内测试临时沙箱统一迁入已忽略的 `.pytest_cache/` 目录；
-  - 按**用户层**（一键安装、明确点名 P0 矩阵、日常课题角色矩阵、本仓库元自动更新独立章节）与**原理层**（两层解耦、双门检查、共有门禁与四客户端协议适配）重构 `README.md`、`AGENTS.md`、`template/user-guard/README.md`、`docs/` 并新增 `docs/assets/user-and-evolution-flow.svg`，消除单一客户端事件视角偏差与密集术语堆砌，统一自定义尾段识别条件、`--disable-ccswitch-prompts` / `--purge-ccswitch-legacy` 说明、国家留学基金管理委员会唯一资助声明及 Apache-2.0 第 4 条 `NOTICE` 原创归属说明。
+  - 按**用户层**（一键安装、明确点名 P0 矩阵、日常课题角色矩阵、本仓库元自动更新独立章节）与**原理层**（常驻与动态配置分层、双阶段额度复查、共有门禁与四客户端协议适配）重构 `README.md`、`AGENTS.md`、`template/user-guard/README.md`、`docs/` 并新增 `docs/assets/user-and-evolution-flow.svg`，消除单一客户端事件视角偏差与密集术语堆砌，统一自定义尾段识别条件、`--disable-ccswitch-prompts` / `--purge-ccswitch-legacy` 说明、国家留学基金管理委员会唯一资助声明及 Apache-2.0 第 4 条 `NOTICE` 原创归属说明。
 
 ---
 

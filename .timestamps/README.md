@@ -34,7 +34,7 @@
 在 `V1.0.0` 目录下执行：
 
 ```bash
-curl -L -o Antigravity_Codex_ClaudeCode_DeepSeekHarness-V1.0.0.zip \
+curl -fL -o Antigravity_Codex_ClaudeCode_DeepSeekHarness-V1.0.0.zip \
   "https://zenodo.org/api/records/24293508/files/Xinyu-Li-1997/Antigravity_Codex_ClaudeCode_DeepSeekHarness-V1.0.0.zip/content"
 
 sha256sum Antigravity_Codex_ClaudeCode_DeepSeekHarness-V1.0.0.zip

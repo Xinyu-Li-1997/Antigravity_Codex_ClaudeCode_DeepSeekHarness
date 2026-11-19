@@ -9,6 +9,7 @@ import base64
 import collections
 import concurrent.futures
 import contextlib
+import copy
 import datetime
 import fnmatch
 import hashlib
@@ -35,7 +36,9 @@ import uuid
 from pathlib import Path
 from urllib.error import URLError
 from urllib.parse import urlsplit
-from urllib.request import urlopen
+from urllib.request import ProxyHandler, build_opener, urlopen
+
+_STDLIB_URLOPEN = urlopen
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -173,7 +176,7 @@ def _fleet_profile():
         key = (str(path), st.st_mtime_ns, st.st_size)
         if _FLEET_PROFILE_CACHE['key'] == key and _FLEET_PROFILE_CACHE['data'] is not None:
             return _FLEET_PROFILE_CACHE['data']
-        raw = json.loads(path.read_text(encoding='utf-8'))
+        raw = json.loads(path.read_text(encoding='utf-8-sig'))
         if not isinstance(raw, dict) or raw.get('schema_version') != 1:
             raise ValueError('invalid fleet_profile schema_version')
         _FLEET_PROFILE_CACHE['key'] = key
@@ -229,11 +232,12 @@ def detect_workspace_mode(target_dir=None):
     if base.is_file():
         base = base.parent
     matched_root = None
+    stop_roots = {Path.home().resolve(), Path(tempfile.gettempdir()).resolve()}
     for candidate in (base, *base.parents):
+        if candidate in stop_roots:
+            break
         if (candidate / 'install.py').is_file() and (candidate / 'template' / 'user-guard' / 'plugin.json').is_file():
             matched_root = candidate
-            break
-        if candidate == Path.home().resolve():
             break
     is_upstream = matched_root is not None
     return {
@@ -327,6 +331,11 @@ def _max_interop_stage_bytes():
 
 
 STAGED_PROMPT_SUFFIX = '\n[跨端只读工作区说明] 当前目录已按原相对路径只读镜像目标文件，请直接在当前目录下按相对路径读取。'
+_AGENT_INSTRUCTION_FILENAMES = frozenset({
+    'AGENTS.MD', 'AGENTS.OVERRIDE.MD', 'CLAUDE.MD', 'CLAUDE.LOCAL.MD',
+})
+_STAGED_NEUTRAL_PREFIX = '_cae_readonly_target_'
+_STAGED_NEUTRAL_SUFFIX = '.txt'
 
 
 class HarnessError(RuntimeError):
@@ -377,9 +386,27 @@ def _positive_int(value):
         return None
 
 
+_GIT_REPO_ENV_VARS = (
+    'GIT_DIR',
+    'GIT_WORK_TREE',
+    'GIT_INDEX_FILE',
+    'GIT_OBJECT_DIRECTORY',
+    'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+    'GIT_COMMON_DIR',
+    'GIT_CEILING_DIRECTORIES',
+    'GIT_PREFIX',
+)
+
+
+def _clean_git_env(base_env=None):
+    src_env = os.environ if base_env is None else base_env
+    return {k: v for k, v in src_env.items() if k not in _GIT_REPO_ENV_VARS}
+
+
 def _local_command(args, cwd=None):
+    run_env = _clean_git_env() if (args and Path(str(args[0])).stem.lower() == 'git') else None
     try:
-        proc = subprocess.run(args, cwd=cwd, capture_output=True, text=True,
+        proc = subprocess.run(args, cwd=cwd, env=run_env, capture_output=True, text=True,
                               encoding='utf-8', errors='replace', timeout=10)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise HarnessError(f'本地查询无法完成: {args[0]}', stderr=str(exc)) from exc
@@ -745,17 +772,37 @@ def _agy_home(binary):
     return Path.home() / '.gemini', False
 
 
+_SESSION_ID_ENV_VARS = (
+    'AGY_CONVERSATION_ID',
+    'ANTIGRAVITY_CONVERSATION_ID',
+    'CLAUDE_SESSION_ID',
+    'CODEX_THREAD_ID',
+    'DSH_SESSION_ID',
+    'CAE_SESSION_ID',
+)
+_CHILD_SCRUB_SESSION_ENV_VARS = (
+    *_SESSION_ID_ENV_VARS,
+    'ANTIGRAVITY_AGENT',
+    'ANTIGRAVITY_APP_DATA_DIR',
+    'CODEX_CI',
+    'CLAUDECODE',
+    'CLAUDE_CODE_ENTRYPOINT',
+    'DSH_PROFILE',
+    'CAE_HARNESS_CALLER',
+)
+
+
 def resolve_caller(value):
     raw = str(value or '').strip().lower()
     if raw == 'auto':
         explicit_env = os.environ.get('CAE_HARNESS_CALLER', '').strip().lower()
         if explicit_env:
             raw = explicit_env
-        elif any(os.environ.get(k, '').strip() for k in ('ANTIGRAVITY_AGENT', 'ANTIGRAVITY_CONVERSATION_ID', 'ANTIGRAVITY_APP_DATA_DIR')):
+        elif any(os.environ.get(k, '').strip() for k in ('ANTIGRAVITY_AGENT', 'ANTIGRAVITY_CONVERSATION_ID', 'AGY_CONVERSATION_ID', 'ANTIGRAVITY_APP_DATA_DIR')):
             raw = 'antigravity'
         elif any(os.environ.get(k, '').strip() for k in ('CODEX_THREAD_ID', 'CODEX_CI')):
             raw = 'codex'
-        elif any(os.environ.get(k, '').strip() for k in ('CLAUDECODE', 'CLAUDE_CODE_ENTRYPOINT')):
+        elif any(os.environ.get(k, '').strip() for k in ('CLAUDECODE', 'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_SESSION_ID')):
             raw = 'claude'
         elif any(os.environ.get(k, '').strip() for k in ('DSH_SESSION_ID', 'DSH_PROFILE')):
             raw = 'dsh'
@@ -780,18 +827,55 @@ def _confirmation_tunables():
     return _fleet_profile().get('runtime_tunables', {}).get('dispatch_confirmation', {})
 
 
-def _subscription_model(model_slug):
-    key = re.sub(r'\[1m\]$', '', str(model_slug or ''), flags=re.I)
-    for slug, record in _fleet_profile().get('subscription_matrix', {}).get('models', {}).items():
-        if re.sub(r'\[1m\]$', '', slug, flags=re.I) == key:
-            return record
+def _subscription_model(model_slug, prefix=None):
+    key = re.sub(r'\[1m\]$', '', str(model_slug or '').strip(), flags=re.I).lower()
+    if not key:
+        return {}
+    norm_prefix = ({'cc': 'claude', 'antigravity': 'agy'}.get(str(prefix).strip().lower(), str(prefix).strip().lower())
+                   if prefix else None)
+    models = _fleet_profile().get('subscription_matrix', {}).get('models', {})
+    if not isinstance(models, dict):
+        return {}
+
+    def _lookup_key(target_key):
+        fallback = {}
+        for slug, record in models.items():
+            if not isinstance(record, dict):
+                continue
+            if re.sub(r'\[1m\]$', '', str(slug), flags=re.I).lower() != target_key:
+                continue
+            if not norm_prefix:
+                return record
+            rec_agent_raw = str(record.get('agent') or '').strip().lower()
+            rec_agent = {'cc': 'claude', 'antigravity': 'agy'}.get(rec_agent_raw, rec_agent_raw)
+            if rec_agent == norm_prefix:
+                return record
+            if not rec_agent and not fallback:
+                fallback = record
+        return fallback
+
+    exact = _lookup_key(key)
+    if exact:
+        return exact
+    if norm_prefix == 'agy' or norm_prefix is None:
+        family_base = _agy_slug_tier(key)[0]
+        if family_base and family_base != key:
+            fam_rec = _lookup_key(family_base)
+            if fam_rec and (
+                norm_prefix == 'agy'
+                or {'cc': 'claude', 'antigravity': 'agy'}.get(
+                    str(fam_rec.get('agent') or '').strip().lower(),
+                    str(fam_rec.get('agent') or '').strip().lower(),
+                ) == 'agy'
+            ):
+                return fam_rec
     return {}
 
 
 def _is_subscription_enabled(prefix, model_slug=None):
     matrix = _fleet_profile().get('subscription_matrix', {})
     return (matrix.get('agents', {}).get(prefix, {}).get('enabled') is not False
-            and _subscription_model(model_slug).get('enabled') is not False)
+            and _subscription_model(model_slug, prefix).get('enabled') is not False)
 
 
 def _require_subscription(prefix, model_slug=None):
@@ -801,7 +885,7 @@ def _require_subscription(prefix, model_slug=None):
 
 
 def _is_lightweight(prefix, slug):
-    return bool(_subscription_model(slug).get('lightweight')
+    return bool(_subscription_model(slug, prefix).get('lightweight')
                 or _tokens_lower(slug) & _fast_model_tags(prefix))
 
 
@@ -860,20 +944,62 @@ def _loopback_router_alive(base_url):
         return False
 
 
+_DEFAULT_CLAUDE_ROUTER_ROUTES = [{'prefix': 'deepseek', 'key_from_card': 'DeepSeek'}]
+
+
+def _load_claude_router_config(config_home, *, require_valid_file=False):
+    router_dir = Path(config_home or Path.home() / '.claude') / 'router'
+    primary = router_dir / 'router.json'
+    platform_cfg = router_dir / ('router.windows.json' if os.name == 'nt' else 'router.wsl.json')
+    cfg_path = primary if primary.exists() else (platform_cfg if platform_cfg.exists() else primary)
+    if cfg_path.exists():
+        try:
+            if _is_link(cfg_path) or not cfg_path.is_file():
+                raise ValueError('invalid router config file')
+            raw = json.loads(cfg_path.read_text(encoding='utf-8-sig'))
+        except (OSError, ValueError) as exc:
+            if require_valid_file:
+                raise HarnessError('Claude Code 路由配置格式无效，请检查 router/router.json') from exc
+            raw = None
+    else:
+        if require_valid_file:
+            raise HarnessError('Claude Code 路由配置格式无效，请检查 router/router.json')
+        raw = {}
+    if raw is None:
+        if require_valid_file:
+            raise HarnessError('Claude Code 路由配置格式无效，请检查 router/router.json')
+        raw = {}
+    if not isinstance(raw, dict) or not isinstance(raw.get('routes', []), list):
+        if require_valid_file:
+            raise HarnessError('Claude Code 路由配置格式无效，请检查 router/router.json')
+        return {'default_key_from_card': 'Kimi', 'routes': list(_DEFAULT_CLAUDE_ROUTER_ROUTES)}
+    merged = {'default_key_from_card': 'Kimi', 'routes': list(_DEFAULT_CLAUDE_ROUTER_ROUTES)}
+    merged.update(raw)
+    return merged
+
+
+def _resolve_claude_router_card(cfg, raw_model):
+    model = str(raw_model or '').strip()
+    claude_aliases = {str(k).lower(): str(v) for k, v in (_catalog_rules('claude').get('alias_map') or {}).items()}
+    if model.lower() in claude_aliases:
+        model = claude_aliases[model.lower()]
+    card = cfg.get('default_key_from_card')
+    for route in cfg.get('routes', []):
+        if isinstance(route, dict) and route.get('prefix') and model.lower().startswith(str(route['prefix']).lower()):
+            card = route.get('key_from_card') or card
+            break
+    return card
+
+
 def _claude_card_quota(info, model_slug):
-    cfg = _read_json(Path(info.get('config_home') or Path.home() / '.claude') / 'router/router.json') or {}
+    cfg = _load_claude_router_config(info.get('config_home'))
     db = Path(os.environ.get('CAE_CCSWITCH_DB') or cfg.get('ccswitch_db')
               or Path.home() / '.cc-switch' / 'cc-switch.db').expanduser()
     if not db.is_file():
         return {}
     card = None
     if info.get('uses_local_router') or info.get('llm_source') == 'local_router':
-        card = cfg.get('default_key_from_card')
-        slug = model_slug or info.get('model') or ''
-        for route in cfg.get('routes', []):
-            if route.get('prefix') and slug.lower().startswith(route['prefix'].lower()):
-                card = route.get('key_from_card') or card
-                break
+        card = _resolve_claude_router_card(cfg, model_slug or info.get('model') or '')
     try:
         with contextlib.closing(sqlite3.connect(db.absolute().as_uri() + '?mode=ro', uri=True, timeout=2)) as con:
             con.row_factory = sqlite3.Row
@@ -882,7 +1008,11 @@ def _claude_card_quota(info, model_slug):
             if not row:
                 return {}
             meta = json.loads(row.get('meta') or '{}')
-            usage = meta.get('usage_script') or meta.get('usageScript') or {}
+            if not isinstance(meta, dict):
+                meta = {}
+            usage = meta.get('usage_script') or meta.get('usageScript')
+            if not isinstance(usage, dict):
+                usage = {}
             result = {'quota_scheme': usage.get('templateType') or 'ccswitch_card_dependent', 'quota_exceeded': False}
             tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             if 'usage_daily_rollups' in tables:
@@ -905,13 +1035,13 @@ def _claude_card_quota(info, model_slug):
                             result['quota_exceeded'] |= float(amount) >= limit
                             result['quantitative_quota_known'] = True
             return result
-    except (OSError, sqlite3.Error, ValueError, TypeError, KeyError):
+    except (OSError, sqlite3.Error, ValueError, TypeError, KeyError, AttributeError):
         return {}
 
 
 def inspect_backend_quota_and_availability(prefix, info, model_slug=None, redact_usage=False, *, ignore_cooldown=False):
     matrix = _fleet_profile().get('subscription_matrix', {})
-    scheme = (_subscription_model(model_slug).get('quota_scheme')
+    scheme = (_subscription_model(model_slug, prefix).get('quota_scheme')
               or matrix.get('agents', {}).get(prefix, {}).get('quota_scheme') or 'unknown')
     enabled = _is_subscription_enabled(prefix, model_slug)
     reason = None if enabled else 'subscription_disabled'
@@ -1037,8 +1167,20 @@ def _resolve_role_engine(backends, caller, role_spec, prompt_text='', *, ignore_
                  and (ignore_cooldown or not _active_quota_record(prefix, backends[prefix]))]
     if avail_any:
         return avail_any[0]
-    if not ignore_cooldown and any(_active_quota_record(p, backends.get(p, {})) for p, _ in parsed):
-        raise HarnessError('角色候选均不可用或处于配额冷却', 'quota_exhausted')
+    if not ignore_cooldown:
+        cooled_pair = next(
+            ((p, _active_quota_record(p, backends.get(p, {}))) for p, _ in parsed
+             if backends.get(p, {}).get('available') and _active_quota_record(p, backends.get(p, {}))),
+            None,
+        ) or next(
+            ((p, _active_quota_record(p, backends.get(p, {}))) for p, _ in parsed
+             if _active_quota_record(p, backends.get(p, {}))),
+            None,
+        )
+        if cooled_pair:
+            cooled_p, cooled_rec = cooled_pair
+            raise HarnessError('角色候选均不可用或处于配额冷却', 'quota_exhausted', preflight_blocked=True,
+                               **_quota_user_choices(cooled_p, cooled_rec))
     raise HarnessError(f'未发现角色 {role_name} 可用的已安装后端，请先配置对应客户端')
 
 
@@ -1091,6 +1233,16 @@ def choose_engine(backends, caller, explicit='', prompt_text='', user_prompt='',
                 cooldown = _active_quota_record(cooled, backends[cooled])
                 raise HarnessError('候选客户端处于配额冷却', 'quota_exhausted', preflight_blocked=True,
                                    **_quota_user_choices(cooled, cooldown))
+        if not ready:
+            caller_backend = {'antigravity': 'agy', 'codex': 'codex', 'claude': 'claude', 'dsh': 'dsh'}.get(resolve_caller(caller))
+            if (
+                caller_backend
+                and caller_backend not in negated
+                and _is_subscription_enabled(caller_backend, backends.get(caller_backend, {}).get('model'))
+                and (ignore_cooldown or not _active_quota_record(caller_backend, backends.get(caller_backend, {})))
+                and _peer_auto_ready(backends, caller_backend, ignore_cooldown=ignore_cooldown)
+            ):
+                ready = caller_backend
         name = ready or allowed[0]
         explicit = name + ':default'
     _require_subscription(name, _engine_parts(explicit)[1])
@@ -1109,41 +1261,63 @@ def _ps_literal(text):
     return "'" + text.replace("'", "''") + "'"
 
 
+_CLEAN_ROOM_ONLY_INSTR_ERROR = (
+    '净室目录模式下目标范围仅含代理指令文件（AGENTS.md/CLAUDE.md 等）且已被自动剥离；'
+    '若需审查该指令文件本身，请将 --target 直接指向具体单文件'
+)
+
+
 def _stage_wsl_readonly_workspace(target_dir, stage_root, rel_files=None, *, exclude_agent_instructions=False):
     """将只读目标文件镜像到临时目录；清单不能逃出原目标树。"""
     target_dir = target_dir.resolve()
     stage_dir = stage_root / 'workspace'
     stage_dir.mkdir(parents=True, exist_ok=True)
     if rel_files is None:
-        records = collect_target_files(target_dir)
+        raw_records = collect_target_files(target_dir)
         if exclude_agent_instructions:
             records = [
-                item for item in records
-                if Path(item['rel_path']).name.upper() not in ('AGENTS.MD', 'CLAUDE.MD')
+                item for item in raw_records
+                if Path(item['rel_path']).name.upper() not in _AGENT_INSTRUCTION_FILENAMES
             ]
+            if raw_records and not records:
+                raise HarnessError(_CLEAN_ROOM_ONLY_INSTR_ERROR)
+        else:
+            records = raw_records
     else:
+        norm_rels = [_scope_patterns([rel])[0] for rel in rel_files]
         records = []
-        for rel in rel_files:
-            if exclude_agent_instructions and Path(rel).name.upper() in ('AGENTS.MD', 'CLAUDE.MD'):
+        explicit_single = len(norm_rels) == 1
+        for rel_norm in norm_rels:
+            is_instr = posixpath.basename(rel_norm).upper() in _AGENT_INSTRUCTION_FILENAMES
+            if exclude_agent_instructions and is_instr and not explicit_single:
                 continue
-            rel = _scope_patterns([rel])[0]
-            src = target_dir / rel
+            src = target_dir / rel_norm
+            staged_rel = (
+                posixpath.join(
+                    posixpath.dirname(rel_norm),
+                    f'{_STAGED_NEUTRAL_PREFIX}{posixpath.basename(rel_norm)}{_STAGED_NEUTRAL_SUFFIX}',
+                )
+                if (exclude_agent_instructions and is_instr and explicit_single) else rel_norm
+            )
             try:
                 src.resolve().relative_to(target_dir)
                 # 叶文件正常也可能经过目录链接，逐级检查阻止镜像树外材料。
                 ancestors = [src] + list(src.parents)[:len(src.relative_to(target_dir).parts) - 1]
                 if any(_is_link(path) for path in ancestors) or not src.is_file():
-                    raise HarnessError(f'只读镜像不接受文件或目录链接: {rel}')
-                records.append({'path': src, 'rel_path': rel, 'bytes': src.stat().st_size})
+                    raise HarnessError(f'只读镜像不接受文件或目录链接: {rel_norm}')
+                records.append({'path': src, 'rel_path': rel_norm, 'staged_rel_path': staged_rel, 'bytes': src.stat().st_size})
             except (OSError, ValueError) as exc:
-                raise HarnessError(f'无法在目标目录内镜像文件: {rel}') from exc
+                raise HarnessError(f'无法在目标目录内镜像文件: {rel_norm}') from exc
+        if exclude_agent_instructions and norm_rels and not records:
+            raise HarnessError(_CLEAN_ROOM_ONLY_INSTR_ERROR)
     stage_limit = _max_interop_stage_bytes()
     if sum(item['bytes'] for item in records) > stage_limit:
         limit_mib = max(1, stage_limit // (1024 * 1024))
         raise HarnessError(f'WSL 纯 Linux 路径只读镜像超出 {limit_mib}MB 上限，请缩小 --target 范围或在 WSL 安装原生 codex')
     windows_names = {}
     for item in records:
-        parts = Path(item['rel_path']).parts
+        effective_rel = item.get('staged_rel_path', item['rel_path'])
+        parts = Path(effective_rel).parts
         for index, part in enumerate(parts, 1):
             if (re.search(r'[<>:"|?*\x00-\x1f]', part) or part.endswith((' ', '.'))
                     or re.fullmatch(r'(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?', part, re.I)):
@@ -1158,7 +1332,7 @@ def _stage_wsl_readonly_workspace(target_dir, stage_root, rel_files=None, *, exc
             item['path'].resolve().relative_to(target_dir)
         except (OSError, ValueError) as exc:
             raise HarnessError(f'镜像源已离开目标目录: {item["rel_path"]}') from exc
-        dst = stage_dir / item['rel_path']
+        dst = stage_dir / item.get('staged_rel_path', item['rel_path'])
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(item['path'], dst)
     return stage_dir
@@ -1167,10 +1341,28 @@ def _stage_wsl_readonly_workspace(target_dir, stage_root, rel_files=None, *, exc
 def _rewrite_staged_paths(parsed, stage_dir):
     # Windows 可改变回执中的大小写；使用镜像里保留的原拼写还原 ext4 路径。
     original_paths = {}
+    neutral_map = {}
+    neutral_basename_targets = collections.defaultdict(list)
     for directory, _dirs, files in os.walk(stage_dir):
+        rel_dir = Path(directory).relative_to(stage_dir)
         for name in files:
-            relative = (Path(directory) / name).relative_to(stage_dir).as_posix()
-            original_paths[relative.casefold()] = relative
+            relative = (rel_dir / name).as_posix()
+            if name.startswith(_STAGED_NEUTRAL_PREFIX) and name.endswith(_STAGED_NEUTRAL_SUFFIX):
+                orig_name = name[len(_STAGED_NEUTRAL_PREFIX):-len(_STAGED_NEUTRAL_SUFFIX)]
+                orig_rel = (rel_dir / orig_name).as_posix()
+                original_paths[relative.casefold()] = orig_rel
+                original_paths[orig_rel.casefold()] = orig_rel
+                neutral_map[relative] = orig_rel
+                neutral_basename_targets[name.casefold()].append((name, orig_rel))
+            else:
+                original_paths[relative.casefold()] = relative
+
+    unique_neutral_basenames = {}
+    for base_key, entries in neutral_basename_targets.items():
+        if len(entries) == 1:
+            base_name, orig_rel = entries[0]
+            original_paths.setdefault(base_key, orig_rel)
+            unique_neutral_basenames[base_name] = orig_rel
 
     prefixes = [(str(stage_dir).replace('\\', '/').rstrip('/') + '/', os.name == 'nt'),
                 (str(stage_dir.resolve()).replace('\\', '/').rstrip('/') + '/', os.name == 'nt')]
@@ -1190,12 +1382,53 @@ def _rewrite_staged_paths(parsed, stage_dir):
                 return original_paths.get(relative.casefold(), relative)
         return original_paths.get(posixpath.normpath(norm).casefold(), raw_path)
 
+    text_replacements = []
+    if neutral_map:
+        for staged_rel, orig_rel in sorted(neutral_map.items(), key=lambda kv: -len(kv[0])):
+            staged_bs = staged_rel.replace('/', '\\')
+            for prefix, _ in prefixes:
+                prefix_bs = prefix.replace('/', '\\')
+                text_replacements.append((prefix + staged_rel, orig_rel))
+                if prefix_bs != prefix or staged_bs != staged_rel:
+                    text_replacements.append((prefix_bs + staged_bs, orig_rel))
+            text_replacements.append((staged_rel, orig_rel))
+            if staged_bs != staged_rel:
+                text_replacements.append((staged_bs, orig_rel))
+        for base_name, orig_rel in sorted(unique_neutral_basenames.items(), key=lambda kv: -len(kv[0])):
+            if base_name not in neutral_map:
+                text_replacements.append((base_name, orig_rel))
+
+    def _rewrite_text(val):
+        if not isinstance(val, str) or not text_replacements:
+            return val
+        for pat_str, repl_str in text_replacements:
+            val = re.sub(re.escape(pat_str), lambda _, r=repl_str: r, val, flags=re.I)
+        return val
+
     if 'read_files' in parsed:
         parsed['read_files'] = [_clean(item) for item in parsed['read_files']]
     if 'unread_files' in parsed:
-        parsed['unread_files'] = [{**item, 'file': _clean(item['file'])} for item in parsed['unread_files']]
+        parsed['unread_files'] = [
+            {**item, 'file': _clean(item['file']),
+             **({'reason': _rewrite_text(item['reason'])} if isinstance(item.get('reason'), str) else {})}
+            for item in parsed['unread_files']
+        ]
+    if isinstance(parsed.get('summary'), str):
+        parsed['summary'] = _rewrite_text(parsed['summary'])
+    if isinstance(parsed.get('content'), str):
+        parsed['content'] = _rewrite_text(parsed['content'])
+    if isinstance(parsed.get('evidence'), list):
+        parsed['evidence'] = [_rewrite_text(item) for item in parsed['evidence']]
+    if isinstance(parsed.get('unverified'), list):
+        parsed['unverified'] = [_rewrite_text(item) for item in parsed['unverified']]
     if 'findings' in parsed:
-        parsed['findings'] = [{**item, 'file': _clean(item['file'])} for item in parsed['findings']]
+        parsed['findings'] = [
+            {
+                k: (_clean(v) if k == 'file' else _rewrite_text(v) if isinstance(v, str) else v)
+                for k, v in item.items()
+            }
+            for item in parsed['findings']
+        ]
     return parsed
 
 
@@ -1206,9 +1439,14 @@ def _interop_command(command, work_dir, temp_dir, input_text, codex_home=None, e
         pipes = [
             '$output = $p.StandardOutput.BaseStream.CopyToAsync([Console]::OpenStandardOutput())',
             '$errors = $p.StandardError.BaseStream.CopyToAsync([Console]::OpenStandardError())',
-            'while ($null -ne ($line = [Console]::ReadLine())) {',
-            '$p.StandardInput.WriteLine($line)', '$p.StandardInput.Flush()', '}',
-            '$p.StandardInput.Close()', '$p.WaitForExit()', '$output.Wait()', '$errors.Wait()',
+            'try {',
+            '  while ($null -ne ($line = [Console]::ReadLine())) {',
+            '    $p.StandardInput.WriteLine($line)',
+            '    $p.StandardInput.Flush()',
+            '  }',
+            '  $p.StandardInput.Close()',
+            '} catch [System.IO.IOException] {}',
+            '$p.WaitForExit()', '$output.Wait()', '$errors.Wait()',
         ]
     else:
         prompt_file = temp_dir / 'input.txt'
@@ -1216,8 +1454,12 @@ def _interop_command(command, work_dir, temp_dir, input_text, codex_home=None, e
         pipes = [
             '$output = $p.StandardOutput.ReadToEndAsync()', '$errors = $p.StandardError.ReadToEndAsync()',
             '$inputBytes = [IO.File]::ReadAllBytes(' + _ps_literal(_wsl_path(prompt_file)) + ')',
-            '$p.StandardInput.BaseStream.Write($inputBytes, 0, $inputBytes.Length)', '$p.StandardInput.BaseStream.Flush()',
-            '$p.StandardInput.Close()', '$p.WaitForExit()',
+            'try {',
+            '  $p.StandardInput.BaseStream.Write($inputBytes, 0, $inputBytes.Length)',
+            '  $p.StandardInput.BaseStream.Flush()',
+            '  $p.StandardInput.Close()',
+            '} catch [System.IO.IOException] {}',
+            '$p.WaitForExit()',
             '[Console]::Out.Write($output.Result)', '[Console]::Error.Write($errors.Result)',
         ]
     args = subprocess.list2cmdline(command[1:])
@@ -1527,11 +1769,11 @@ def _prompt_engine_spec(backends, text):
     backend = _extract_prompt_backend_hint(text)
     if hint:
         for prefix, info in ([(backend, backends.get(backend, {}))] if backend else backends.items()):
-            aliases = _catalog_rules(prefix).get('alias_map') or {}
+            aliases = {str(k).lower(): str(v) for k, v in (_catalog_rules(prefix).get('alias_map') or {}).items()}
             slug = aliases.get(hint.lower(), hint)
             if (_exact_model_record(info.get('models', []), slug)
                     or hint.lower() in aliases
-                    or _subscription_model(slug).get('agent') == prefix):
+                    or _subscription_model(slug, prefix).get('agent') == prefix):
                 return prefix + ':' + slug
         if backend:
             return backend + ':' + hint
@@ -1616,7 +1858,8 @@ def _extract_prompt_model_hint(prompt_text):
     action = r'(?:使用|调用|采用|切到|指定|选用|改用|交给|让|用|\buse|\binvoke|\bvia)\s*'
     aliases = {str(key).lower() for prefix in ('codex', 'agy', 'claude', 'dsh')
                for key in (_catalog_rules(prefix).get('alias_map') or {})}
-    known = {slug.lower() for slug in _fleet_profile().get('subscription_matrix', {}).get('models', {})}
+    known = {re.sub(r'\[1m\]$', '', str(slug), flags=re.I).lower()
+             for slug in _fleet_profile().get('subscription_matrix', {}).get('models', {})}
 
     def is_client_name(candidate, tail):
         return bool(re.fullmatch(r'(?:claude\s*(?:code|cli)|deepseek\s*harness|cc(?:\s+cli)?|dsh(?:\s+cli)?)', candidate, re.I)
@@ -1629,7 +1872,8 @@ def _extract_prompt_model_hint(prompt_text):
             continue
         if _cue_is_negated(_CUE_BOUNDARIES.split(text[:match.start()])[-1]):
             continue
-        if (name.lower() in aliases or name.lower() in known
+        name_base = re.sub(r'\[1m\]$', '', name, flags=re.I).lower()
+        if (name.lower() in aliases or name.lower() in known or name_base in known
                 or re.fullmatch(r'(?:gpt|gemini|deepseek|kimi|k\d)[-\w.\[\]]*', name, re.I)):
             return name
     stop_words = NON_AI_MODEL_STOPWORDS - ROUTER_MODEL_TAGS
@@ -1691,8 +1935,13 @@ def _role_recommended_tier(engine):
 
 def select_task_tier(requested_tier='auto', kind='review', text='', file_count=1, estimated_tokens=0, *, engine=''):
     """默认选用单模型非委派最高挡位；显式挡位、角色槽位推荐挡位、节省额度意图与环境默认值可覆盖自动策略。"""
-    if requested_tier and requested_tier != 'auto':
-        return requested_tier, 'explicit_tier_flag'
+    if requested_tier is not None and not isinstance(requested_tier, str):
+        raise HarnessError(f'无效的挡位参数: {requested_tier!r}')
+    if requested_tier:
+        if requested_tier not in TIER_CHOICES:
+            raise HarnessError(f'无效的挡位参数: {requested_tier!r}')
+        if requested_tier != 'auto':
+            return requested_tier, 'explicit_tier_flag'
     sample = (text or '').strip()
     prose_requests = {
         'max': ('用最高挡', '用最高档', '选最高挡', '选最高档', '用最大挡', '用最大档', '使用 max 挡', 'use max effort'),
@@ -1767,6 +2016,8 @@ def _execution_budget(prefix, info, record):
     hd = _headless_tunables()
     default = _positive_int(record.get('context_window'))
     maximum = _positive_int(record.get('max_context_window'))
+    if not (maximum or default) and isinstance(record, dict) and record.get('slug'):
+        default = _positive_int(_subscription_model(record.get('slug'), prefix).get('context_window'))
     configured = _positive_int(info.get('configured_window_tokens'))
     compact = _positive_int(info.get('effective_compaction_tokens'))
     window = maximum or default
@@ -2053,6 +2304,13 @@ def resolve_execution_profile(backends, spec, tier='max', prompt_text='', kind='
                 if explicit_model:
                     raise
                 record, source, hint = {}, '', ''
+            if not record and explicit_model and enforce_subscription:
+                try:
+                    unfiltered_rec, _ = _resolve_explicit_agy_record(backends.get(prefix, {}).get('models', []), explicit_model, tier)
+                except HarnessError:
+                    unfiltered_rec = {}
+                if unfiltered_rec and unfiltered_rec.get('slug'):
+                    _require_subscription(prefix, unfiltered_rec['slug'])
             if record or explicit_model:
                 return _agy_profile(info, spec, record, record.get('slug') or explicit_model, tier,
                                     'prompt_fuzzy_model' if hint else source if record else 'explicit_engine_model')
@@ -2379,7 +2637,10 @@ def _claude_info(binary, requested=None):
     settings_file = root / 'settings.json'
     settings = _read_json(settings_file)
     settings = settings if isinstance(settings, dict) else {}
-    router_cfg = _read_json(root / 'router/router.json')
+    router_dir = root / 'router'
+    router_primary = router_dir / 'router.json'
+    router_platform = router_dir / ('router.windows.json' if (os.name == 'nt' or interop) else 'router.wsl.json')
+    router_cfg = _read_json(router_primary if router_primary.exists() else router_platform)
     env = settings.get('env', {})
     env = env if isinstance(env, dict) else {}
     env = {**os.environ, **env}
@@ -2398,11 +2659,23 @@ def _claude_info(binary, requested=None):
               else 'credentials_file' if (root / '.credentials.json').is_file() else 'unconfigured')
     model_names = [configured, *(env.get(key) for key in ('ANTHROPIC_DEFAULT_OPUS_MODEL', 'ANTHROPIC_DEFAULT_SONNET_MODEL',
                     'ANTHROPIC_DEFAULT_HAIKU_MODEL', 'CLAUDE_CODE_SUBAGENT_MODEL'))]
-    tag_1m_window = _positive_int(_catalog_rules('claude').get('auto_compact_window')) or 1_000_000
-    models = [{'slug': name, 'display_name': name, 'provider': 'claude_configured', 'priority': i,
-               'max_context_window': tag_1m_window if '[1m]' in name.lower() else configured_window,
-               'supported_efforts': ['low', 'medium', 'high', 'xhigh', 'max']}
-              for i, name in enumerate(dict.fromkeys(name for name in model_names if isinstance(name, str) and name.strip()))]
+    claude_max_ctx = _positive_int(_catalog_rules('claude').get('max_context_tokens'))
+    models = []
+    for i, name in enumerate(dict.fromkeys(name for name in model_names if isinstance(name, str) and name.strip())):
+        tag_1m_window = (
+            _positive_int(_subscription_model(name, 'claude').get('context_window'))
+            or configured_window
+            or claude_max_ctx
+            or 1_000_000
+        )
+        models.append({
+            'slug': name,
+            'display_name': name,
+            'provider': 'claude_configured',
+            'priority': i,
+            'max_context_window': tag_1m_window if '[1m]' in name.lower() else configured_window,
+            'supported_efforts': ['low', 'medium', 'high', 'xhigh', 'max'],
+        })
     if not models and source not in ('local_router', 'settings_env', 'placeholder_token'):
         models = [{'slug': alias, 'display_name': alias, 'provider': 'claude_builtin_alias', 'priority': i,
                    'max_context_window': configured_window, 'supported_efforts': ['low', 'medium', 'high', 'xhigh', 'max']}
@@ -2501,25 +2774,21 @@ def _probe_router_health(info):
         except HarnessError:
             return False
     try:
-        with urlopen(health_url, timeout=2.0) as response:
+        is_loopback = (urlsplit(health_url).hostname or '').lower() in ('127.0.0.1', 'localhost', '::1')
+        open_fn = (
+            build_opener(ProxyHandler({})).open
+            if is_loopback and urlopen is _STDLIB_URLOPEN
+            else urlopen
+        )
+        with open_fn(health_url, timeout=2.0) as response:
             return response.status == 200 and json.load(response).get('ok') is True
     except (OSError, URLError, ValueError, AttributeError):
         return False
 
 
 def _verify_claude_router_card_key(info, model_name):
-    cfg = _read_json(Path(info['config_home']) / 'router/router.json')
-    if not isinstance(cfg, dict) or not isinstance(cfg.get('routes', []), list):
-        raise HarnessError('Claude Code 路由配置格式无效，请检查 router/router.json')
-    model = (model_name or info.get('model') or '').strip()
-    claude_aliases = {str(k).lower(): str(v) for k, v in (_catalog_rules('claude').get('alias_map') or {}).items()}
-    if model.lower() in claude_aliases:
-        model = claude_aliases[model.lower()]
-    card = cfg.get('default_key_from_card')
-    for route in cfg.get('routes', []):
-        if isinstance(route, dict) and route.get('prefix') and model.lower().startswith(str(route['prefix']).lower()):
-            card = route.get('key_from_card')
-            break
+    cfg = _load_claude_router_config(info['config_home'], require_valid_file=True)
+    card = _resolve_claude_router_card(cfg, model_name or info.get('model') or '')
     if not card:
         return
     db_value = str(cfg.get('ccswitch_db') or '~/.cc-switch/cc-switch.db')
@@ -3336,6 +3605,22 @@ def _parse_agy_error_line(line):
         return None
 
 
+def _extract_errors_text(value):
+    if not isinstance(value, list) or not value:
+        return ''
+    parts = []
+    for item in value:
+        if isinstance(item, str) and item.strip():
+            parts.append(item.strip())
+        elif isinstance(item, dict):
+            msg = item.get('message') or item.get('error') or item.get('detail') or json.dumps(item, ensure_ascii=False)
+            if str(msg).strip():
+                parts.append(str(msg).strip())
+        elif item is not None and str(item).strip():
+            parts.append(str(item).strip())
+    return '; '.join(parts)
+
+
 def _check_output_status(parsed):
     """只解释协议错误，不把工具读出的额度说明或中间工具调用异常当作后端终止错误。"""
     if parsed.get('event', parsed.get('type')) in ('tool_call', 'tool_result'):
@@ -3352,11 +3637,18 @@ def _check_output_status(parsed):
         raise HarnessError('后端返回超时回执', 'timeout', backend_status=status)
     if status in ('cancelled', 'canceled', 'interrupted'):
         raise HarnessError('后端返回取消回执', 'cancelled', backend_status=status)
+    errors_text = _extract_errors_text(parsed.get('errors'))
     event_error = parsed.get('event', parsed.get('type')) == 'error'
-    if (event_error or finished_reason == 'error' or parsed.get('is_error') or parsed.get('error')
+    subtype_error = str(parsed.get('subtype', '')).lower().startswith('error')
+    if (event_error or subtype_error or finished_reason == 'error' or parsed.get('is_error')
+            or parsed.get('error') or errors_text
             or status in ('error', 'failed', 'partial', 'incomplete', 'invalid', 'waiting', 'running')):
         result_err = parsed.get('result') if isinstance(parsed.get('result'), str) else ''
-        error = str(parsed.get('error') or parsed.get('message') or result_err or '')[-2000:]
+        err_parts = [
+            str(v).strip() for v in (parsed.get('error'), errors_text, parsed.get('message'), result_err)
+            if v is not None and str(v).strip()
+        ]
+        error = '\n'.join(dict.fromkeys(err_parts))[-2000:]
         error_status = 'quota_exhausted' if _is_quota_exhausted(error) else 'failed'
         raise HarnessError('后端返回错误回执', error_status, backend_status=status or 'error',
                            finished_reason=finished_reason, error=error)
@@ -3371,6 +3663,49 @@ def _strip_dsml_tail(text):
 
 _HEX4_CHARS = frozenset('0123456789abcdefABCDEF')
 _VALID_JSON_ESCAPES = frozenset('"\\/bfnrt')
+_LATEX_CONTROL_ESCAPE_RE = re.compile(
+    r'^(?:[bf][A-Za-z]'
+    r'|(?:nabla|notin|nmid|noindent|nonumber|norm|ni|nleq|ngeq'
+    r'|rho|rightarrow|Rightarrow|rightharpoonup|rbrace|rangle|rceil|rfloor|rvert|rVert|rm'
+    r'|tau|theta|Theta|vartheta|times|tilde|widetilde|triangle|triangleq|tfrac'
+    r'|tanh|tan|top|to|therefore|textstyle)(?![A-Za-z])'
+    r'|(?:neq|ne)(?![A-Za-z]|\s*=)'
+    r'|nu(?=_(?=\{)|[\^\\{]|(?:\s*[,.;:)\]}\$]))'
+    r'|(?:text(?:bf|it|tt|rm|sf|sc|normal)?|tag)(?=\s*\{)'
+    r'|right(?=\s*[)\]\\|.]))'
+)
+_LINE_NUM_PREFIX_RE = re.compile(r':\d+$')
+_WIN_SPACE_CONT_RE = re.compile(r'^ [A-Za-z0-9_.-]+\\')
+
+
+def _starts_unescaped_win_drive(text, str_start, idx):
+    return (
+        idx - str_start >= 2
+        and text[idx - 1] == ':'
+        and text[idx - 2].isalpha()
+        and (idx - str_start == 2 or not (text[idx - 3].isalnum() or text[idx - 3] in ('_', '/', '\\')))
+        and idx + 1 < len(text)
+        and text[idx + 1] not in ('\\', '"', '/')
+    )
+
+
+def _win_path_continues_at_char(text, idx, ch):
+    if ch in ',;()[]{}<>|?*:\r\n\t':
+        return False
+    if ch.isspace():
+        return ch == ' ' and bool(_WIN_SPACE_CONT_RE.match(text[idx:idx + 64]))
+    return True
+
+
+def _is_unescaped_control_collision(text, str_start, idx, win_path_active):
+    nxt = text[idx + 1]
+    if nxt not in 'bfnrt':
+        return False
+    if win_path_active:
+        return True
+    if nxt in 'nt' and _LINE_NUM_PREFIX_RE.search(text[max(str_start, idx - 16):idx]):
+        return False
+    return bool(_LATEX_CONTROL_ESCAPE_RE.match(text[idx + 1:idx + 32]))
 
 
 def _repair_json_string_escapes(text):
@@ -3379,6 +3714,8 @@ def _repair_json_string_escapes(text):
         return text
     out = []
     in_string = False
+    str_start = 0
+    win_path_active = False
     idx = 0
     length = len(text)
     while idx < length:
@@ -3386,15 +3723,20 @@ def _repair_json_string_escapes(text):
         if not in_string:
             if ch == '"':
                 in_string = True
+                str_start = idx + 1
+                win_path_active = False
             out.append(ch)
             idx += 1
             continue
         if ch == '"':
             in_string = False
+            win_path_active = False
             out.append(ch)
             idx += 1
             continue
         if ch != '\\':
+            if win_path_active and not _win_path_continues_at_char(text, idx, ch):
+                win_path_active = False
             out.append(ch)
             idx += 1
             continue
@@ -3402,8 +3744,19 @@ def _repair_json_string_escapes(text):
             out.append('\\\\')
             idx += 1
             continue
+        if not win_path_active and _starts_unescaped_win_drive(text, str_start, idx):
+            win_path_active = True
         nxt = text[idx + 1]
-        if nxt in _VALID_JSON_ESCAPES:
+        if nxt == '"':
+            win_path_active = False
+            out.append('\\"')
+            idx += 2
+            continue
+        if nxt == '\\':
+            out.append('\\\\')
+            idx += 2
+            continue
+        if nxt in _VALID_JSON_ESCAPES and not _is_unescaped_control_collision(text, str_start, idx, win_path_active):
             out.append('\\')
             out.append(nxt)
             idx += 2
@@ -3417,8 +3770,61 @@ def _repair_json_string_escapes(text):
     return ''.join(out)
 
 
+def _has_unrepaired_latex_escape(text):
+    if '\\' not in text:
+        return False
+    in_string = False
+    str_start = 0
+    win_path_active = False
+    idx = 0
+    length = len(text)
+    while idx < length:
+        ch = text[idx]
+        if not in_string:
+            if ch == '"':
+                in_string = True
+                str_start = idx + 1
+                win_path_active = False
+            idx += 1
+            continue
+        if ch == '"':
+            in_string = False
+            win_path_active = False
+            idx += 1
+            continue
+        if ch != '\\':
+            if win_path_active and not _win_path_continues_at_char(text, idx, ch):
+                win_path_active = False
+            idx += 1
+            continue
+        if idx + 1 >= length:
+            return False
+        if not win_path_active and _starts_unescaped_win_drive(text, str_start, idx):
+            win_path_active = True
+        nxt = text[idx + 1]
+        if nxt == '"':
+            win_path_active = False
+            idx += 2
+            continue
+        if nxt in ('\\', '/'):
+            idx += 2
+            continue
+        if _is_unescaped_control_collision(text, str_start, idx, win_path_active):
+            return True
+        if nxt == 'u' and idx + 6 <= length and all(c in _HEX4_CHARS for c in text[idx + 2:idx + 6]):
+            idx += 6
+            continue
+        idx += (1 if win_path_active else 2)
+    return False
+
+
 def _loads_relaxed_dict(candidate):
-    for attempt in (candidate, _repair_json_string_escapes(candidate)):
+    attempts = (
+        (_repair_json_string_escapes(candidate), candidate)
+        if _has_unrepaired_latex_escape(candidate)
+        else (candidate, _repair_json_string_escapes(candidate))
+    )
+    for attempt in attempts:
         try:
             parsed = json.loads(attempt, strict=False)
             if isinstance(parsed, dict):
@@ -3433,7 +3839,12 @@ def _decode_output_json(raw_text):
     if not raw:
         raise OutputParseError('子任务输出为空')
     try:
-        return json.loads(raw)
+        first_raw = (
+            _repair_json_string_escapes(raw)
+            if raw.startswith(('{', '[')) and _has_unrepaired_latex_escape(raw)
+            else raw
+        )
+        return json.loads(first_raw)
     except RecursionError as exc:
         raise OutputParseError('JSON 嵌套过深') from exc
     except ValueError as exc:
@@ -3479,7 +3890,7 @@ def _decode_output_json(raw_text):
                 stripped = _strip_dsml_tail(line.strip())
                 if not stripped or stripped.startswith('[llm-'):
                     continue
-                events.append(json.loads(stripped))
+                events.append(json.loads(_repair_json_string_escapes(stripped) if _has_unrepaired_latex_escape(stripped) else stripped))
         except (ValueError, RecursionError) as decode_error:
             # 兼容 CLI wrapper（如 Windows .CMD / 插件提示行）混入少量非 JSON 诊断行的 JSONL 事件流
             tolerant_events = []
@@ -3488,7 +3899,7 @@ def _decode_output_json(raw_text):
                 if not stripped or not (stripped.startswith('{') and stripped.endswith('}')):
                     continue
                 try:
-                    ev_obj = json.loads(stripped)
+                    ev_obj = json.loads(_repair_json_string_escapes(stripped) if _has_unrepaired_latex_escape(stripped) else stripped)
                 except (ValueError, RecursionError):
                     continue
                 if isinstance(ev_obj, dict):
@@ -3508,27 +3919,41 @@ def _decode_output_json(raw_text):
                     if fenced_dict is not None:
                         return fenced_dict
             decoder = json.JSONDecoder(strict=False)
-            for scan_text in (raw, _repair_json_string_escapes(raw)):
-                schema_candidates = []
-                search_pos = 0
-                for _ in range(64):
-                    brace_idx = scan_text.find('{', search_pos)
-                    if brace_idx < 0:
-                        break
-                    search_pos = brace_idx + 1
+            schema_candidates = []
+            search_pos = 0
+            for _ in range(64):
+                brace_idx = raw.find('{', search_pos)
+                if brace_idx < 0:
+                    break
+                search_pos = brace_idx + 1
+                slice_text = raw[brace_idx:]
+                repaired_slice = _repair_json_string_escapes(slice_text)
+                attempts = (
+                    ((repaired_slice, True), (slice_text, False))
+                    if _has_unrepaired_latex_escape(slice_text)
+                    else ((slice_text, False), (repaired_slice, True))
+                )
+                decoded = None
+                for slice_used, was_repaired in attempts:
                     try:
-                        candidate_obj, end_idx = decoder.raw_decode(scan_text, brace_idx)
+                        candidate_obj, rel_end = decoder.raw_decode(slice_used, 0)
+                        decoded = (candidate_obj, slice_used, rel_end, was_repaired)
+                        break
                     except (ValueError, RecursionError):
                         continue
-                    if isinstance(candidate_obj, dict) and candidate_obj:
-                        tail_rest = _strip_dsml_tail(scan_text[end_idx:]).strip()
-                        if not tail_rest or re.fullmatch(r'```+', tail_rest):
-                            return candidate_obj
-                        if 'summary' in candidate_obj and ('content' in candidate_obj or 'findings' in candidate_obj):
-                            schema_candidates.append(candidate_obj)
-                            search_pos = max(search_pos, end_idx)
-                if len(schema_candidates) == 1:
-                    return schema_candidates[0]
+                if decoded is None:
+                    continue
+                candidate_obj, slice_used, rel_end, was_repaired = decoded
+                if isinstance(candidate_obj, dict) and candidate_obj:
+                    tail_rest = _strip_dsml_tail(slice_used[rel_end:]).strip()
+                    if not tail_rest or re.fullmatch(r'```+', tail_rest):
+                        return candidate_obj
+                    if 'summary' in candidate_obj and ('content' in candidate_obj or 'findings' in candidate_obj):
+                        schema_candidates.append(candidate_obj)
+                        adv_end = brace_idx + (1 if was_repaired else rel_end)
+                        search_pos = max(search_pos, adv_end)
+            if len(schema_candidates) == 1:
+                return schema_candidates[0]
             raise OutputParseError('子任务输出不是合法 JSON') from decode_error
         results = []
         for event in events:
@@ -3795,14 +4220,21 @@ def _backend_diagnostics(result, *, structured_only=False):
 
     def error_details(event, depth=0):
         details = {key: event[key] for key in (
-            'event', 'type', 'status', 'finished_reason', 'is_error', 'error', 'message',
+            'event', 'type', 'subtype', 'status', 'finished_reason', 'is_error', 'error', 'message',
             'code', 'reason', 'short_error', 'detail', 'details') if key in event}
-        is_error = (event.get('is_error') or event.get('error')
-                    or str(event.get('status', '')).lower() in (
-                        'error', 'failed', 'partial', 'incomplete', 'invalid', 'waiting', 'running',
-                        'timeout', 'cancelled', 'canceled', 'interrupted')
-                    or str(event.get('finished_reason', '')).lower() in (
-                        'error', 'print_timeout', 'interrupted', 'cancelled', 'canceled'))
+        errors_text = _extract_errors_text(event.get('errors'))
+        if errors_text:
+            details['errors'] = event['errors']
+            details['errors_joined'] = errors_text
+        is_error = bool(
+            event.get('is_error') or event.get('error') or errors_text
+            or str(event.get('subtype', '')).lower().startswith('error')
+            or str(event.get('status', '')).lower() in (
+                'error', 'failed', 'partial', 'incomplete', 'invalid', 'waiting', 'running',
+                'timeout', 'cancelled', 'canceled', 'interrupted')
+            or str(event.get('finished_reason', '')).lower() in (
+                'error', 'print_timeout', 'interrupted', 'cancelled', 'canceled')
+        )
         nested = event.get('result')
         if isinstance(nested, dict) and depth < 8:
             nested_details, nested_error = error_details(nested, depth + 1)
@@ -3868,19 +4300,42 @@ def _dsh_supports_cli_permission_flags(binary, env=None):
 
 def _inline_readonly_prompt(prompt, root, rel_files=None, *, exclude_agent_instructions=False):
     root = Path(root).resolve()
-    records = collect_target_files(root) if rel_files is None else [
-        {'rel_path': rel, 'path': root / rel} for rel in rel_files]
+    norm_rels = [_scope_patterns([rel])[0] for rel in rel_files] if rel_files is not None else None
+    explicit_single = norm_rels is not None and len(norm_rels) == 1
+    if norm_rels is None:
+        raw_records = collect_target_files(root)
+        if exclude_agent_instructions:
+            records = [
+                item for item in raw_records
+                if Path(item['rel_path']).name.upper() not in _AGENT_INSTRUCTION_FILENAMES
+            ]
+            if raw_records and not records:
+                raise HarnessError(_CLEAN_ROOM_ONLY_INSTR_ERROR)
+        else:
+            records = raw_records
+    else:
+        records = [{'rel_path': rel, 'path': root / rel} for rel in norm_rels]
+        if exclude_agent_instructions and not explicit_single:
+            filtered = [
+                item for item in records
+                if posixpath.basename(item['rel_path']).upper() not in _AGENT_INSTRUCTION_FILENAMES
+            ]
+            if records and not filtered:
+                raise HarnessError(_CLEAN_ROOM_ONLY_INSTR_ERROR)
+            records = filtered
     cap = (_positive_int(_headless_tunables().get('inline_readonly_max_kib')) or 256) * 1024
     header = '\n\n所需目标文件原文已附带精确行号内联在下方，请勿再重复调用文件读取工具遍历工作区。\n'
     blocks, omitted = [], []
     size = len(header.encode('utf-8'))
     for item in records:
         path, rel = Path(item['path']), item['rel_path']
-        if exclude_agent_instructions and path.name.upper() in ('AGENTS.MD', 'CLAUDE.MD'):
-            continue
         if (path.name.startswith('.env') or re.search(r'(?i)(credential|secret|auth\.json|private.?key|\.pem$|\.key$)', path.name)):
             omitted.append(rel)
             continue
+        if explicit_single and exclude_agent_instructions and not path.exists():
+            neutral_candidate = path.with_name(f'{_STAGED_NEUTRAL_PREFIX}{path.name}{_STAGED_NEUTRAL_SUFFIX}')
+            if neutral_candidate.exists():
+                path = neutral_candidate
         try:
             path.resolve().relative_to(root)
             if _is_link(path) or any(_is_link(parent) for parent in path.parents if parent != root and root in parent.parents):
@@ -4047,6 +4502,8 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
         schema_file.write_text(json.dumps(schema, ensure_ascii=False), encoding='utf-8')
         output_file = temp_path / 'result.json'
         env = os.environ.copy()
+        for _scrub_k in _CHILD_SCRUB_SESSION_ENV_VARS:
+            env.pop(_scrub_k, None)
         env['CAE_HARNESS_DEPTH'] = '1'
         effective_codex_home = info.get('config_home')
         effective_dsh_home = info.get('config_home')
@@ -4108,6 +4565,9 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
         exec_dir = target_dir
         stage_dir = None
         stage_before = None
+        stage_ignore_patterns = None
+        if stage_files is not None:
+            stage_files = [_scope_patterns([rel])[0] for rel in stage_files]
         exec_prompt = prompt
         translate = _wsl_path if interop else str
         win_target = translate(target_dir)
@@ -4120,11 +4580,19 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
                 stage_dir = _stage_wsl_readonly_workspace(
                     target_dir, temp_path, stage_files, exclude_agent_instructions=bool(clean_room)
                 )
-                stage_before = snapshot_files(stage_dir)
+                stage_ignore_patterns = read_agentignore_patterns(stage_dir)
+                stage_before = snapshot_files(stage_dir, ignore_patterns=stage_ignore_patterns)
                 receipt['staged_readonly_workspace'] = True
                 exec_dir = stage_dir
                 win_target = translate(stage_dir)
                 exec_prompt = prompt + STAGED_PROMPT_SUFFIX
+                if clean_room and stage_files and len(stage_files) == 1 and posixpath.basename(stage_files[0]).upper() in _AGENT_INSTRUCTION_FILENAMES:
+                    rel_norm = stage_files[0]
+                    neutral_rel = posixpath.join(
+                        posixpath.dirname(rel_norm),
+                        f'{_STAGED_NEUTRAL_PREFIX}{posixpath.basename(rel_norm)}{_STAGED_NEUTRAL_SUFFIX}',
+                    )
+                    exec_prompt += f'\n[净室单文件映射] 目标文件 {rel_norm} 在当前镜像目录中暂存为 {neutral_rel}。'
             if readonly and (inline_readonly is True or (inline_readonly is None and clean_room)):
                 exec_prompt = _inline_readonly_prompt(exec_prompt, stage_dir or target_dir, stage_files,
                                                       exclude_agent_instructions=clean_room)
@@ -4312,7 +4780,9 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
             return _rewrite_staged_paths(parsed, stage_dir) if stage_dir is not None else parsed
         finally:
             if stage_dir is not None and stage_before is not None:
-                receipt['staged_scope'] = _safe_changes_report(stage_before, stage_dir, [], readonly)
+                receipt['staged_scope'] = _safe_changes_report(
+                    stage_before, stage_dir, [], readonly, ignore_patterns=stage_ignore_patterns
+                )
 
 
 def invoke_readonly_engine(spec, target_dir, prompt, backends, timeout_sec=600, stage_files=None, effort=None, retry_quota=False,
@@ -4338,16 +4808,36 @@ def _snapshot_ignored_dirs():
                ['.git', '.venv', 'venv', 'build', 'dist', 'runs', '__pycache__', 'node_modules', '.cache']))
 
 
-def snapshot_files(root, ignore_dirs=None):
+def read_agentignore_patterns(root):
+    root = Path(root)
+    ignore_file = root / '.agentignore'
+    try:
+        ignore_text = _optional_text(ignore_file) if ignore_file.is_file() and not _is_link(ignore_file) else ''
+    except OSError:
+        ignore_text = ''
+    patterns = []
+    for raw_line in ignore_text.lstrip('\ufeff').splitlines():
+        line = raw_line.lstrip('\ufeff').strip()
+        if not line or line.startswith('#'):
+            continue
+        line = line.replace('\\', '/')
+        while line.startswith('./'):
+            line = line[2:]
+        line = line.rstrip('/')
+        if line and line != '.':
+            patterns.append(line)
+    return patterns
+
+
+def snapshot_files(root, ignore_dirs=None, ignore_patterns=None):
     """对独立任务目录作事后核对，排除 Git 元数据，不撤销文件。"""
     root = Path(root)
     ignored = set(ignore_dirs) if ignore_dirs is not None else _snapshot_ignored_dirs()
-    ignore_file = root / '.agentignore'
-    ignore_text = _optional_text(ignore_file) if ignore_file.is_file() and not _is_link(ignore_file) else ''
-    patterns = [line.strip().rstrip('/') for line in ignore_text.splitlines()
-                if line.strip() and not line.lstrip().startswith('#')]
+    patterns = list(ignore_patterns) if ignore_patterns is not None else read_agentignore_patterns(root)
     def excluded(path):
         rel = path.relative_to(root).as_posix()
+        if rel == '.agentignore':
+            return False
         return any(fnmatch.fnmatchcase(rel, pattern) or rel.split('/')[0] == pattern for pattern in patterns)
 
     def traversal_failed(exc):
@@ -4398,25 +4888,119 @@ def snapshot_files(root, ignore_dirs=None):
 
 
 def _scope_patterns(patterns):
+    if patterns is None:
+        return []
+    if isinstance(patterns, str):
+        patterns = [patterns]
+    elif not isinstance(patterns, (list, tuple, set, frozenset)):
+        raise HarnessError('--write-scope 必须为字符串或字符串列表')
     result = []
     for raw in patterns:
-        items = [part.strip() for part in raw.split(',')] if isinstance(raw, str) and ',' in raw else [raw]
+        if not isinstance(raw, str):
+            raise HarnessError('--write-scope 元素必须为字符串')
+        items = [part.strip() for part in raw.split(',')] if ',' in raw else [raw]
         for pattern in items:
-            normalized = str(pattern).strip().replace('\\', '/')
-            if not normalized or normalized.startswith('/') or ':' in normalized or '..' in normalized.split('/'):
+            raw_norm = pattern.strip().replace('\\', '/')
+            had_trailing_slash = raw_norm.endswith('/') and raw_norm != '/'
+            if not raw_norm or raw_norm.startswith('/') or ':' in raw_norm or '..' in raw_norm.split('/'):
                 raise HarnessError('--write-scope 必须使用目标目录内的相对路径或通配符')
-            normalized = posixpath.normpath(normalized)
+            normalized = posixpath.normpath(raw_norm)
             if normalized == '.':
                 raise HarnessError('--write-scope 不可为空路径')
-            result.append(normalized)
+            result.append(normalized + '/*' if had_trailing_slash else normalized)
     return result
+
+
+def _expand_globstar_variants(pat):
+    variants = {pat}
+    pending = [pat]
+    while pending:
+        cur = pending.pop()
+        nexts = set()
+        idx = 0
+        while True:
+            pos = cur.find('/**/', idx)
+            if pos < 0:
+                break
+            nexts.add(cur[:pos] + '/' + cur[pos + 4:])
+            idx = pos + 1
+        if cur.startswith('**/'):
+            nexts.add(cur[3:])
+        if cur.endswith('/**'):
+            nexts.add(cur[:-3])
+            nexts.add(cur[:-2] + '*')
+        for cand in nexts - variants:
+            variants.add(cand)
+            pending.append(cand)
+    return variants
 
 
 def _scope_matches(path, scopes):
     def key(value):
         return value.casefold() if os.name == 'nt' else value
 
-    return any(fnmatch.fnmatchcase(key(path), key(pattern)) for pattern in scopes)
+    target = key(path.rstrip('/'))
+    for pattern in scopes:
+        pat = key(pattern)
+        variants = _expand_globstar_variants(pat)
+        if any(fnmatch.fnmatchcase(target, cand) for cand in variants):
+            return True
+        if pat.endswith('/*') and target == pat[:-2]:
+            return True
+        if not any(ch in pattern for ch in '*?[]') and target.startswith(pat + '/'):
+            return True
+    return False
+
+
+def _scope_subset_of(req_scopes, allowed_scopes, target_root=None):
+    reqs = _scope_patterns(req_scopes)
+    allows = _scope_patterns(allowed_scopes)
+    if not reqs and not allows:
+        return True
+    if not reqs or not allows:
+        return False
+    root_path = Path(target_root).expanduser().resolve() if target_root is not None else None
+
+    def key(value):
+        return value.casefold() if os.name == 'nt' else value
+
+    def single_covered(req_pat, allow_pat):
+        rk, ak = key(req_pat), key(allow_pat)
+        if rk == ak or ak in ('*', '**'):
+            return True
+        # Subtree wildcard or directory prefix on allow_pat
+        subtree_prefix = None
+        if not any(ch in allow_pat for ch in '*?[]'):
+            allow_is_existing_file = bool(root_path is not None and (root_path / allow_pat).is_file())
+            if not allow_is_existing_file:
+                subtree_prefix = ak
+        elif ak.endswith('/*') and not any(ch in allow_pat[:-2] for ch in '*?[]'):
+            subtree_prefix = ak[:-2]
+        elif ak.endswith('/**') and not any(ch in allow_pat[:-3] for ch in '*?[]'):
+            subtree_prefix = ak[:-3]
+        if subtree_prefix is not None:
+            return rk == subtree_prefix or rk.startswith(subtree_prefix + '/')
+        # Concrete file path on req_pat against glob allow_pat
+        if not any(ch in req_pat for ch in '*?[]'):
+            if root_path is not None and (root_path / req_pat).is_dir():
+                return False
+            return _scope_matches(req_pat, [allow_pat])
+        if '[' in req_pat or '[' in allow_pat:
+            return False
+        s1 = 'zzprobe0'
+        s2 = 'qqprobe9'
+        while s1 in ak or s1 in rk:
+            s1 += 'x'
+        while s2 in ak or s2 in rk:
+            s2 += 'y'
+        for star_sub, q_sub in ((s1, '0'), (s2 + '/nested', '9'), (s1 + '_' + s2, 'z')):
+            probe = re.sub(r'\*{2,}', star_sub, req_pat)
+            probe = probe.replace('*', star_sub).replace('?', q_sub)
+            if not _scope_matches(probe, [allow_pat]):
+                return False
+        return True
+
+    return all(any(single_covered(r, a) for a in allows) for r in reqs)
 
 
 def changed_files(before, after):
@@ -4427,16 +5011,34 @@ def changed_files(before, after):
                   or not any(other != path and other.startswith(path) for other in changed))
 
 
-def _changes_report(before, root, scopes, readonly):
-    changes = changed_files(before, snapshot_files(root))
+def _snapshot_ignore_dirs_for(scopes=(), *, include_build=False):
+    heads = [scope.split('/')[0] for scope in (scopes or ()) if scope]
+    ignored = {
+        d for d in _snapshot_ignored_dirs()
+        if not any(
+            d == h or (d != '.git' and (
+                fnmatch.fnmatchcase(d.casefold(), h.casefold()) if os.name == 'nt' else fnmatch.fnmatchcase(d, h)
+            ))
+            for h in heads
+        )
+    }
+    if include_build:
+        ignored.discard('build')
+    return ignored
+
+
+def _changes_report(before, root, scopes, readonly, *, ignore_dirs=None, ignore_patterns=None):
+    changes = changed_files(before, snapshot_files(root, ignore_dirs=ignore_dirs, ignore_patterns=ignore_patterns))
     violations = changes if readonly else [path for path in changes if scopes and not _scope_matches(path, scopes)]
     return {'changed_files': changes, 'scope_violations': violations, 'scope_check': 'post_execution_snapshot',
             'scope_notice': '需使用独立任务目录，快照无法区分并发写入来源，检查不自动回滚。'}
 
 
-def _safe_changes_report(before, root, scopes, readonly):
+def _safe_changes_report(before, root, scopes, readonly, *, ignore_dirs=None, ignore_patterns=None):
     try:
-        report = _changes_report(before, root, scopes, readonly)
+        report = _changes_report(
+            before, root, scopes, readonly, ignore_dirs=ignore_dirs, ignore_patterns=ignore_patterns
+        )
         report['scope_verified'] = True
         return report
     except (HarnessError, OSError) as exc:
@@ -4450,10 +5052,10 @@ def _safe_changes_report(before, root, scopes, readonly):
         }
 
 
-def _workspace_unchanged(before, root):
+def _workspace_unchanged(before, root, ignore_dirs=None, ignore_patterns=None):
     if before is None:
         return False
-    scope = _safe_changes_report(before, root, [], True)
+    scope = _safe_changes_report(before, root, [], True, ignore_dirs=ignore_dirs, ignore_patterns=ignore_patterns)
     return scope['scope_verified'] and not scope['changed_files']
 
 
@@ -4566,25 +5168,29 @@ def _budget_for_spec(backends, spec):
     return resolve_execution_profile(backends, spec, kind='audit')['capacity']['input_budget_tokens']
 
 
-def _audit_engines(backends, dual_blind, left_override, right_override, allow_unconfigured, caller, prompt_text=''):
+def _audit_engines(backends, dual_blind, left_override, right_override, allow_unconfigured, caller, prompt_text='', *,
+                   ignore_cooldown=False):
     negated = _extract_negated_backends(prompt_text)
     if not left_override and caller == 'caller' and not _extract_prompt_backend_hint(prompt_text):
-        available = [name for name in ('codex', 'agy', 'claude', 'dsh') if name not in negated and _peer_auto_ready(backends, name)]
+        available = [name for name in ('codex', 'agy', 'claude', 'dsh')
+                     if name not in negated and _peer_auto_ready(backends, name, ignore_cooldown=ignore_cooldown)]
         if not available:
             if allow_unconfigured:
                 return None, None
             raise HarnessError('未发现已就绪的 agy、codex、claude 或 dsh 后端')
         left_override = available[0] + ':default'
-    left = choose_engine(backends, caller, left_override, prompt_text)
+    left = choose_engine(backends, caller, left_override, prompt_text, ignore_cooldown=ignore_cooldown)
     right = None
     if dual_blind:
         name, _ = _engine_parts(left)
         candidates = [peer for peer in ('agy', 'codex', 'claude', 'dsh') if peer != name and peer not in negated]
         if not right_override and not candidates:
             raise HarnessError('提示词已排除其余候选后端，无法组建双路审查')
-        other = next((peer for peer in candidates if _peer_auto_ready(backends, peer)),
+        other = next((peer for peer in candidates if _peer_auto_ready(backends, peer, ignore_cooldown=ignore_cooldown)),
                      candidates[0] if candidates else ('agy' if name == 'codex' else 'codex'))
-        right = choose_engine(backends, caller, right_override or other + ':default')
+        right_prompt = prompt_text if (right_override or '').strip().lower().startswith('role:') else ''
+        right = choose_engine(backends, caller, right_override or other + ':default', right_prompt,
+                              ignore_cooldown=ignore_cooldown)
         if left == right:
             raise HarnessError('双路审查需要两个不同引擎或显式模型')
     return left, right
@@ -4712,7 +5318,8 @@ def run_physics_gate_loop(target_dir, task_desc, verify_cmd, worker_fn, verify_f
     scopes = _scope_patterns(write_scope or [])
     # Gate 必须记录验收生成的 build 产物，并检查工作代理是否越界修改它们。
     # 其余缓存目录沿用默认排除配置；显式授权的顶层目录重新纳入快照。
-    ignored = _snapshot_ignored_dirs() - {'build'} - {scope.split('/')[0] for scope in scopes}
+    ignored = _snapshot_ignore_dirs_for(scopes, include_build=True)
+    ignore_patterns = read_agentignore_patterns(target_dir)
     worker_changes = set()
     verification_changes = set()
     violations = set()
@@ -4723,7 +5330,7 @@ def run_physics_gate_loop(target_dir, task_desc, verify_cmd, worker_fn, verify_f
 
     def checked_snapshot(phase, round_number=None):
         try:
-            return snapshot_files(target_dir, ignore_dirs=ignored)
+            return snapshot_files(target_dir, ignore_dirs=ignored, ignore_patterns=ignore_patterns)
         except (HarnessError, OSError) as exc:
             scope_failure.update(scope_error_phase=phase, scope_error=str(exc))
             if round_number is not None:
@@ -4831,16 +5438,25 @@ def _target(args):
     return target, target if target.is_dir() else target.parent
 
 
+def _raw_task_body(args):
+    if getattr(args, 'task_file', None):
+        raw = Path(args.task_file).expanduser().resolve().read_text(encoding='utf-8-sig')
+    else:
+        raw = getattr(args, 'task', None) or ''
+    return raw.strip()
+
+
 def _task_text(args):
-    text = Path(args.task_file).expanduser().resolve().read_text(encoding='utf-8-sig') if getattr(args, 'task_file', None) else args.task
-    if not text or not text.strip():
+    text = _raw_task_body(args)
+    if not text:
         raise HarnessError('任务内容为空')
     return (getattr(args, 'user_prompt', '') + '\n' + text).strip()
 
 
 def _git_head(root):
     try:
-        result = subprocess.run(['git', '-C', str(root), 'rev-parse', 'HEAD'], capture_output=True, text=True, timeout=10)
+        result = subprocess.run(['git', '-C', str(root), 'rev-parse', 'HEAD'],
+                                env=_clean_git_env(), capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.TimeoutExpired):
         return None
     return result.stdout.strip() if result.returncode == 0 else None
@@ -4848,14 +5464,18 @@ def _git_head(root):
 
 def _target_metrics(requested_target, text):
     prompt_tokens = estimate_tokens_from_bytes(len((text or '').encode('utf-8')))
-    if requested_target.is_file():
-        try:
-            size = requested_target.stat().st_size
-        except OSError:
-            size = 0
-        return 1, estimate_tokens_from_bytes(size) + prompt_tokens
-    records = collect_target_files(requested_target)
-    return max(1, len(records)), sum(item['tokens'] for item in records) + prompt_tokens
+    try:
+        target = Path(requested_target)
+        if target.is_file():
+            try:
+                size = target.stat().st_size
+            except OSError:
+                size = 0
+            return 1, estimate_tokens_from_bytes(size) + prompt_tokens
+        records = collect_target_files(target)
+        return max(1, len(records)), sum(item['tokens'] for item in records) + prompt_tokens
+    except (HarnessError, OSError):
+        return 1, prompt_tokens
 
 
 def _prepare_execution(backends, specs, batch, *, dry_run=False):
@@ -4907,11 +5527,36 @@ def _prepare_execution(backends, specs, batch, *, dry_run=False):
 
 def _planned_profile(args, backends, engine, tier, reason, text, kind, estimated_tokens):
     user_prompt = getattr(args, 'user_prompt', '')
-    if user_prompt:
+    ticket = getattr(args, '_approved_ticket', None)
+    explicit_eng = getattr(args, 'engine', '') or getattr(args, 'worker', '') or getattr(args, 'left', '')
+    skip_prompt_tier = bool(ticket) and getattr(args, 'tier', 'auto') != 'auto'
+    skip_prompt_engine = bool(ticket) and bool(explicit_eng) and not explicit_eng.strip().lower().startswith('role:')
+    if user_prompt and not skip_prompt_tier:
         selected, selected_reason = _resolve_effective_tier(args.tier, kind, user_prompt, text, engine)
         if selected_reason.startswith(('user_description_', 'economy_')):
             tier, reason = selected, selected_reason
-    profile = resolve_execution_profile(backends, engine, tier, user_prompt or text, kind, estimated_tokens)
+    if skip_prompt_engine:
+        raw_body = _raw_task_body(args)
+        ticket_streams = ticket.get('streams') if isinstance(ticket, dict) else ()
+        allow_fuzzy = any(
+            (s.get('execution_profile') or {}).get('profile_source') == 'prompt_fuzzy_model'
+            for s in (ticket_streams or ()) if isinstance(s, dict)
+        )
+        prof_text = '' if (not allow_fuzzy and _extract_prompt_model_hint(raw_body)) else raw_body
+        profile = resolve_execution_profile(backends, engine, tier, prof_text, kind, estimated_tokens)
+        if (
+            ticket_streams
+            and not any((s.get('execution_profile') or {}).get('spec') == profile['spec']
+                        for s in ticket_streams if isinstance(s, dict))
+            and user_prompt
+            and not _extract_prompt_model_hint(user_prompt)
+        ):
+            alt_prof = resolve_execution_profile(backends, engine, tier, user_prompt or text, kind, estimated_tokens)
+            if any((s.get('execution_profile') or {}).get('spec') == alt_prof['spec']
+                   for s in ticket_streams if isinstance(s, dict)):
+                profile = alt_prof
+    else:
+        profile = resolve_execution_profile(backends, engine, tier, user_prompt or text, kind, estimated_tokens)
     prefix, _ = _engine_parts(engine)
     profile.update(requested_tier=args.tier, tier_reason=reason,
                    quota_status=backends.get(prefix, {}).get('quota_status', 'unknown_until_called'))
@@ -4965,7 +5610,7 @@ def _run_cli_gate(args, root, requested_target, text, caller, engine, backends, 
     return result
 
 
-def _gate_can_replay(result, before, root):
+def _gate_can_replay(result, before, root, ignore_dirs=None, ignore_patterns=None):
     """第二轮、验收已执行、出现过改动或快照无法核对时，均不可自动重放。"""
     if (before is None or result.get('scope_verified') is not True
             or result.get('changed_files') != [] or result.get('worker_changed_files')
@@ -4975,17 +5620,18 @@ def _gate_can_replay(result, before, root):
     if (entry.get('verification_executed') or entry.get('verify_exit_code') is not None
             or not _quota_can_replay(entry, entry.get('invocation', {}))):
         return False
-    scope = _safe_changes_report(before, root, [], True)
+    scope = _safe_changes_report(before, root, [], True, ignore_dirs=ignore_dirs, ignore_patterns=ignore_patterns)
     return scope['scope_verified'] and not scope['changed_files']
 
 
 def _run_gate_with_fallback(args, root, requested_target, text, caller, engine, backends,
-                            scopes, profile, kind, estimated_tokens, batch, meta, before):
+                            scopes, profile, kind, estimated_tokens, batch, meta, before,
+                            *, ignore_dirs=None, ignore_patterns=None):
     result = _run_cli_gate(args, root, requested_target, text, caller, engine, backends,
                            scopes, profile, kind, estimated_tokens, batch)
     if (result.get('status') != 'quota_exhausted' or not getattr(args, 'fallback_on_quota', False)
             or getattr(args, '_approved_ticket', None) or 'quota_fallback' in meta
-            or not _gate_can_replay(result, before, root)):
+            or not _gate_can_replay(result, before, root, ignore_dirs=ignore_dirs, ignore_patterns=ignore_patterns)):
         return result
     fallback = _local_fallback_engine(caller, engine, backends, text)
     if not fallback:
@@ -4993,7 +5639,7 @@ def _run_gate_with_fallback(args, root, requested_target, text, caller, engine, 
     meta['quota_fallback'] = _quota_fallback_record(engine, fallback, result)
     try:
         _prepare_execution(backends, (fallback,), batch)
-        if not _workspace_unchanged(before, root):
+        if not _workspace_unchanged(before, root, ignore_dirs=ignore_dirs, ignore_patterns=ignore_patterns):
             meta.pop('quota_fallback')
             return result
         selected = _planned_profile(args, backends, fallback, profile['tier'], profile['tier_reason'],
@@ -5047,8 +5693,24 @@ _GROUNDING_STOP_CJK2 = frozenset({
     '计算', '科学', '工程', '系统', '软件', '分析', '数值', '规划', '方法', '模型', '算法', '项目', '求解', '问题',
     '检查', '判据', '连续', '容差', '有限', '二维', '三维', '复杂', '高可', '可靠', '靠系', '统软', '件研', '研发',
     '程研', '靠工', '发中', '算流', '体力', '元分', '性有', '线性', '非线', '解器', '器或', '库中', '领域', '标准',
-    '术语', '日常', '课题', '常见', '场景', '模块', '功能',
+    '术语', '日常', '课题', '常见', '场景', '模块', '功能', '不夸', '夸大', '大量', '量词',
 })
+
+_GROUNDING_CLIENT_READONLY_TOOLS = (
+    'view_file', 'grep_search', 'find_by_name',
+    'Get-Content', 'Select-String', 'Get-ChildItem',
+    'Read', 'Grep', 'Glob',
+    'read_file', 'search_web', 'send_message', 'finish',
+)
+
+_GROUNDING_REPO_SCRIPT_TOKENS = (
+    'install.py', 'install.ps1', 'install.sh',
+    'cae_harness.py', '$harness', '${harness}', '%harness%', '_harness',
+    'fleet_state.py', 'ccswitch_admin.py', 'router.py',
+    'handoff_gate.py', 'status_guard.py', 'reply_repeat_guard.py',
+    'user_words.py', 'session_context_loader.py',
+    'update-cc-switch-wsl.sh', 'launch-cc-switch-wsl.sh',
+)
 
 _GROUNDING_ANCHOR_EXTS = frozenset({
     '.py', '.f90', '.f95', '.f03', '.f08', '.f', '.for', '.c', '.cpp', '.cc', '.cxx', '.cu', '.cuh',
@@ -5098,9 +5760,69 @@ def _extract_anchor_numbers(text):
     return nums
 
 
+def _collect_toml_keys(obj, out):
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            out.add(str(k))
+            _collect_toml_keys(v, out)
+    elif isinstance(obj, list):
+        for item in obj:
+            _collect_toml_keys(item, out)
+
+
+def _is_codex_agent_toml_rel(rel):
+    return (rel.startswith('template/codex/agents/') or rel.startswith('.codex/agents/')) and rel.lower().endswith('.toml')
+
+
+def _is_md_agent_contract_rel(rel):
+    return (
+        rel.startswith('template/user-guard/agents/')
+        or rel.startswith('template/claude/agents/')
+        or rel.startswith('.claude/agents/')
+    ) and rel.lower().endswith('.md')
+
+
+def _extract_codex_agent_toml_doc(raw_text):
+    if not raw_text:
+        return ''
+    try:
+        parsed = tomllib.loads(raw_text.lstrip('\ufeff'))
+    except (tomllib.TOMLDecodeError, ValueError):
+        return raw_text
+    if not isinstance(parsed, dict):
+        return ''
+    out_lines = []
+    for field in ('description', 'developer_instructions'):
+        val = parsed.get(field)
+        if not isinstance(val, str) or not val.strip():
+            continue
+        m = re.search(rf'(?m)^\s*{re.escape(field)}\s*=', raw_text)
+        start_line = raw_text.count('\n', 0, m.start()) + 1 if m else (len(out_lines) + 1)
+        while len(out_lines) < start_line - 1:
+            out_lines.append('')
+        out_lines.extend(val.splitlines())
+    return '\n'.join(out_lines)
+
+
+def _extract_latest_changelog_section(raw_text):
+    if not raw_text:
+        return ''
+    out_lines = []
+    started = False
+    for line in raw_text.splitlines():
+        if re.match(r'^##\s*\[', line.strip()):
+            if not started:
+                started = True
+                out_lines.append(line)
+                continue
+            break
+        out_lines.append(line if started else '')
+    return '\n'.join(out_lines) if started else raw_text
+
+
 def _build_grounding_anchor(root_dir, exclude_rels, allow_files=None, extra_allowed_text=''):
     root_dir = Path(root_dir).resolve()
-    anchor_chunks = []
+    anchor_chunks = [' '.join(_GROUNDING_CLIENT_READONLY_TOOLS)]
     repo_names = set()
     dynamic_file_globs = set()
     for dirpath, dirs, files in os.walk(root_dir, followlinks=False):
@@ -5114,14 +5836,22 @@ def _build_grounding_anchor(root_dir, exclude_rels, allow_files=None, extra_allo
             repo_names.add(fname.lower())
             repo_names.add(fpath.stem.lower())
             repo_names.add(rel.lower())
-            if rel in exclude_rels or rel.startswith('tests/'):
+            if rel.startswith('tests/') or _is_md_agent_contract_rel(rel):
                 continue
-            is_agent_contract = (
-                (rel.startswith('template/user-guard/agents/') or rel.startswith('template/claude/agents/')
-                 or rel.startswith('.claude/agents/') or rel.startswith('.codex/agents/'))
-                and fpath.suffix.lower() in ('.md', '.toml')
-            )
-            if fpath.suffix.lower() in _GROUNDING_ANCHOR_EXTS or is_agent_contract or rel in ('NOTICE', 'CMakeLists.txt'):
+            if _is_codex_agent_toml_rel(rel):
+                txt = _optional_text(fpath)
+                if txt:
+                    try:
+                        toml_keys = set()
+                        _collect_toml_keys(tomllib.loads(txt.lstrip('\ufeff')), toml_keys)
+                        if toml_keys:
+                            anchor_chunks.append(' '.join(sorted(toml_keys)))
+                    except (tomllib.TOMLDecodeError, ValueError):
+                        pass
+                continue
+            if rel in exclude_rels:
+                continue
+            if fpath.suffix.lower() in _GROUNDING_ANCHOR_EXTS or rel in ('NOTICE', 'CMakeLists.txt'):
                 txt = _optional_text(fpath)
                 if txt:
                     anchor_chunks.append(txt)
@@ -5181,10 +5911,159 @@ def _iter_visible_doc_lines(rel_path, raw_text):
             yield line_no, line
 
 
+def _infer_project_anchor_root(target):
+    resolved = Path(target).expanduser().resolve()
+    mode_info = detect_workspace_mode(resolved)
+    if mode_info['upstream_repo_root']:
+        return Path(mode_info['upstream_repo_root'])
+    base = resolved if resolved.is_dir() else resolved.parent
+    stop_roots = {Path.home().resolve(), Path(tempfile.gettempdir()).resolve()}
+    for candidate in (base, *base.parents):
+        if candidate in stop_roots:
+            break
+        if (candidate / '.git').exists():
+            return candidate
+    return base
+
+
+_FENCED_SHELL_LANGS = frozenset({'bash', 'sh', 'shell', 'zsh', 'powershell', 'pwsh', 'ps1'})
+
+
+def _strip_shell_comment_line(line):
+    out = []
+    quote = ''
+    idx = 0
+    while idx < len(line):
+        ch = line[idx]
+        if quote:
+            if ch == '\\' and quote == '"' and idx + 1 < len(line):
+                out.append(line[idx:idx + 2])
+                idx += 2
+                continue
+            if ch == quote:
+                quote = ''
+            out.append(ch)
+            idx += 1
+            continue
+        if ch in ('"', "'"):
+            quote = ch
+            out.append(ch)
+            idx += 1
+            continue
+        if ch == '#' and (idx == 0 or line[idx - 1].isspace()):
+            break
+        out.append(ch)
+        idx += 1
+    return ''.join(out).rstrip()
+
+
+def _split_shell_clauses(pairs):
+    clauses = []
+    cur = []
+    for line_no, seg in pairs:
+        quote = ''
+        buf = []
+        idx = 0
+        while idx < len(seg):
+            ch = seg[idx]
+            if quote:
+                if ch == '\\' and quote == '"' and idx + 1 < len(seg):
+                    buf.append(seg[idx:idx + 2])
+                    idx += 2
+                    continue
+                if ch == quote:
+                    quote = ''
+                buf.append(ch)
+                idx += 1
+                continue
+            if ch in ('"', "'"):
+                quote = ch
+                buf.append(ch)
+                idx += 1
+                continue
+            if seg[idx:idx + 2] in ('&&', '||'):
+                if ''.join(buf).strip():
+                    cur.append((line_no, ''.join(buf)))
+                if cur:
+                    clauses.append(cur)
+                    cur = []
+                buf = []
+                idx += 2
+                continue
+            if ch in (';', '|'):
+                if ''.join(buf).strip():
+                    cur.append((line_no, ''.join(buf)))
+                if cur:
+                    clauses.append(cur)
+                    cur = []
+                buf = []
+                idx += 1
+                continue
+            buf.append(ch)
+            idx += 1
+        if ''.join(buf).strip():
+            cur.append((line_no, ''.join(buf)))
+    if cur:
+        clauses.append(cur)
+    return clauses
+
+
+def _iter_fenced_shell_clauses(rel_path, raw_text):
+    if rel_path.lower().endswith('.svg'):
+        return
+    fence_marker = ''
+    fence_len = 0
+    fence_lang = ''
+    block_lines = []
+    for line_no, line in enumerate(raw_text.splitlines(), 1):
+        stripped = line.lstrip()
+        m_fence = re.match(r'^(`{3,}|~{3,})', stripped)
+        if m_fence:
+            tok = m_fence.group(1)
+            if not fence_marker:
+                rest = stripped[len(tok):]
+                if tok not in rest:
+                    fence_marker, fence_len = tok[0], len(tok)
+                    fence_lang = rest.strip().split()[0].lower() if rest.strip() else ''
+                    block_lines = []
+                    continue
+            elif tok[0] == fence_marker and len(tok) >= fence_len and not stripped[len(tok):].strip():
+                if fence_lang in _FENCED_SHELL_LANGS and block_lines:
+                    current = []
+                    for ln, raw_ln in block_lines:
+                        cleaned = _strip_shell_comment_line(raw_ln)
+                        if not cleaned.strip():
+                            if current:
+                                yield from _split_shell_clauses(current)
+                                current = []
+                            continue
+                        cont = cleaned.endswith('\\') or (fence_lang in ('powershell', 'pwsh', 'ps1') and cleaned.endswith('`'))
+                        seg = cleaned[:-1].rstrip() if cont else cleaned
+                        current.append((ln, seg))
+                        if not cont:
+                            yield from _split_shell_clauses(current)
+                            current = []
+                    if current:
+                        yield from _split_shell_clauses(current)
+                fence_marker, fence_len, fence_lang, block_lines = '', 0, '', []
+                continue
+        if fence_marker:
+            block_lines.append((line_no, line))
+
+
 def _audit_single_doc_text(rel_path, doc_text, anchor, baseline_text=''):
     findings = []
     seen = set()
-    baseline_words = set(re.findall(r'[a-z0-9]+', baseline_text.lower())) if baseline_text else set()
+    baseline_low = baseline_text.lower() if baseline_text else ''
+    baseline_words = (
+        set(re.findall(r'[a-z0-9]+(?:[._-][a-z0-9]+)*', baseline_low)) | set(re.findall(r'[a-z0-9]+', baseline_low))
+    ) if baseline_low else set()
+    baseline_flags = set(re.findall(r'(?<![a-z0-9])(--[a-z0-9][a-z0-9_-]*)', baseline_low)) if baseline_low else set()
+    baseline_files = {
+        m.lower().lstrip('./')
+        for m in re.findall(r'\b([A-Za-z0-9_.*-]+(?:/[A-Za-z0-9_.*-]+)*\.(?:py|json|toml|yaml|yml|svg|sh|ps1))\b', baseline_text)
+    } if baseline_text else set()
+    baseline_files |= {Path(p).name for p in baseline_files}
     baseline_cjk2 = _extract_cjk_2grams(baseline_text) if baseline_text else set()
     baseline_nums = _extract_anchor_numbers(baseline_text) if baseline_text else set()
 
@@ -5222,13 +6101,14 @@ def _audit_single_doc_text(rel_path, doc_text, anchor, baseline_text=''):
             is_external_cmd = head_tok in _GROUNDING_EXTERNAL_CLIS or head_stem in _GROUNDING_EXTERNAL_CLIS
             if not is_external_cmd:
                 for flag in re.findall(r'(?<![A-Za-z0-9])(--[a-z0-9][a-z0-9_-]*)', flag_scan_text.lower()):
-                    if flag not in anchor['flags']:
+                    if flag not in anchor['flags'] and flag not in baseline_flags:
                         record(line_no, 'ungrounded_identifier', flag, '行内代码引用的 CLI 选项未在仓库脚本或配置中声明')
             else:
-                # 对 python install.py / cae_harness.py / fleet_state.py / ccswitch_admin.py 调用仍严格校验参数
-                if any(s in flag_scan_text.lower() for s in ('install.py', 'cae_harness.py', 'fleet_state.py', 'ccswitch_admin.py', 'handoff_gate.py', 'router.py')):
-                    for flag in re.findall(r'(?<![A-Za-z0-9])(--[a-z0-9][a-z0-9_-]*)', flag_scan_text.lower()):
-                        if flag not in anchor['flags']:
+                # 对仓库脚本及 $HARNESS 变量调用仍严格校验参数
+                if any(s in flag_scan_text.lower() for s in _GROUNDING_REPO_SCRIPT_TOKENS):
+                    span_unquoted = re.sub(r'"(?:\\.|[^"\\])*"|\x27[^\x27]*\x27', ' ', flag_scan_text)
+                    for flag in re.findall(r'(?<![A-Za-z0-9])(--[a-z0-9][a-z0-9_-]*)', span_unquoted.lower()):
+                        if flag not in anchor['flags'] and flag not in baseline_flags:
                             record(line_no, 'ungrounded_identifier', flag, '仓库脚本调用参数未在源码 argparse 中声明')
             if not is_external_cmd and not has_placeholder:
                 for fn in re.findall(r'\b([A-Za-z0-9_.*-]+(?:/[A-Za-z0-9_.*-]+)*\.(?:py|json|toml|yaml|yml|svg|sh|ps1))\b', span_clean):
@@ -5237,7 +6117,9 @@ def _audit_single_doc_text(rel_path, doc_text, anchor, baseline_text=''):
                     if '*' in base_low:
                         continue
                     if (fn_low in anchor['repo_names'] or base_low in anchor['repo_names']
+                            or fn_low in baseline_files or base_low in baseline_files
                             or base_low in anchor['words'] or base_low.lstrip('.') in anchor['words']
+                            or base_low in baseline_words or base_low.lstrip('.') in baseline_words
                             or any(fnmatch.fnmatchcase(base_low, pat) for pat in anchor['dynamic_file_globs'])):
                         continue
                     record(line_no, 'ungrounded_identifier', fn, '行内代码引用的脚本或配置文件名在仓库与锚点语料中均不存在')
@@ -5307,6 +6189,17 @@ def _audit_single_doc_text(rel_path, doc_text, anchor, baseline_text=''):
                 if len(grams) >= 3 and not (grams & anchor['cjk2']) and not (grams & baseline_cjk2):
                     record(line_no, 'ungrounded_rewrite_addition', part, '润色或重写阶段新增了原稿与仓库锚点均未出现的陌生领域短语')
 
+    for clause in _iter_fenced_shell_clauses(rel_path, doc_text):
+        joined_clause = ' '.join(re.sub(r'<[^>\n]*>', ' ', seg) for _, seg in clause)
+        if not any(s in joined_clause.lower() for s in _GROUNDING_REPO_SCRIPT_TOKENS):
+            continue
+        for ln, seg in clause:
+            seg_no_ph = re.sub(r'<[^>\n]*>', ' ', seg)
+            seg_no_quotes = re.sub(r'"(?:\\.|[^"\\])*"|\x27[^\x27]*\x27', ' ', seg_no_ph)
+            for flag in re.findall(r'(?<![A-Za-z0-9])(--[a-z0-9][a-z0-9_-]*)', seg_no_quotes.lower()):
+                if flag not in anchor['flags'] and flag not in baseline_flags:
+                    record(ln, 'ungrounded_identifier', flag, '代码块内仓库脚本调用参数未在源码或脚本中声明')
+
     return findings
 
 
@@ -5317,50 +6210,94 @@ def audit_doc_grounding(target_path, root_dir=None, *, base_ref=None, allow_file
         raise HarnessError(f'目标路径不存在: {target}')
     if root_dir is not None:
         root = Path(root_dir).expanduser().resolve()
+        if not root.exists() or not root.is_dir():
+            raise HarnessError(f'锚点根目录不存在或不是目录: {root}')
     else:
-        mode_info = detect_workspace_mode(target)
-        root = Path(mode_info['upstream_repo_root']) if mode_info['upstream_repo_root'] else (
-            target if target.is_dir() else target.parent
-        )
+        root = _infer_project_anchor_root(target)
+    resolved_allow_files = []
+    for extra_file in (allow_files or ()):
+        ep = Path(extra_file).expanduser()
+        if not ep.is_absolute():
+            ep = (root / ep) if (root / ep).exists() else (Path.cwd() / ep)
+        if not ep.exists() or _is_link(ep) or not ep.is_file():
+            raise HarnessError(f'允许锚点文件不存在或不可读: {extra_file}')
+        resolved_allow_files.append(ep.resolve())
+    git_toplevel = None
+    verified_commit = None
+    git_env = _clean_git_env()
+    if base_ref:
+        ref_str = str(base_ref).strip()
+        if not ref_str or ref_str.startswith('-'):
+            raise HarnessError(f'无效的 Git 基线引用: {base_ref!r}')
+        try:
+            top_proc = subprocess.run(
+                ['git', '-C', str(root), 'rev-parse', '--show-toplevel'],
+                env=git_env, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=10,
+            )
+            ver_proc = subprocess.run(
+                ['git', '-C', str(root), 'rev-parse', '--verify', f'{ref_str}^{{commit}}'],
+                env=git_env, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise HarnessError(f'无法核验 Git 基线引用 {ref_str!r}: {exc}') from exc
+        if top_proc.returncode != 0 or not top_proc.stdout.strip():
+            raise HarnessError(f'目标目录不在有效的 Git 仓库内，无法使用 --base-ref: {root}')
+        if ver_proc.returncode != 0 or not ver_proc.stdout.strip():
+            raise HarnessError(f'无效的 Git 基线引用: {ref_str}')
+        git_toplevel = Path(top_proc.stdout.strip()).resolve()
+        verified_commit = ver_proc.stdout.strip()
+    is_upstream_repo = detect_workspace_mode(root)['is_upstream_config_repo']
     doc_files = []
     if target.is_file():
         rel = target.relative_to(root).as_posix() if target.is_relative_to(root) else target.name
         doc_files.append((target, rel))
     else:
-        skip_rels = {'CHANGELOG.md', 'LICENSE', 'NOTICE'}
+        skip_rels = {'LICENSE', 'NOTICE'} if is_upstream_repo else {'CHANGELOG.md', 'LICENSE', 'NOTICE'}
         for dirpath, dirs, files in os.walk(target, followlinks=False):
             dirs[:] = sorted(d for d in dirs if d not in IGNORED_DIRS)
             dpath = Path(dirpath)
             for fname in sorted(files):
                 fpath = dpath / fname
-                if _is_link(fpath) or fpath.suffix.lower() not in ('.md', '.svg', '.rst'):
+                if _is_link(fpath):
                     continue
                 resolved_f = fpath.resolve()
                 rel = resolved_f.relative_to(root).as_posix() if resolved_f.is_relative_to(root) else resolved_f.relative_to(target).as_posix()
-                if (rel in skip_rels or rel.startswith('tests/')
-                        or rel.startswith('template/user-guard/agents/')
-                        or rel.startswith('template/claude/agents/')
-                        or rel == 'template/user-guard/assets/logo.svg'):
+                is_codex_toml = _is_codex_agent_toml_rel(rel)
+                if fpath.suffix.lower() not in ('.md', '.svg', '.rst') and not is_codex_toml:
+                    continue
+                if rel in skip_rels or rel.startswith('tests/') or rel == 'template/user-guard/assets/logo.svg':
                     continue
                 doc_files.append((fpath, rel))
     exclude_rels = {rel for _, rel in doc_files}
-    anchor = _build_grounding_anchor(root, exclude_rels, allow_files=allow_files, extra_allowed_text=extra_allowed_text)
+    anchor = _build_grounding_anchor(root, exclude_rels, allow_files=resolved_allow_files, extra_allowed_text=extra_allowed_text)
     all_findings = []
     checked_files = []
     for fpath, rel in doc_files:
         checked_files.append(rel)
+        raw_doc = _optional_text(fpath)
         baseline_txt = ''
-        if base_ref:
-            try:
-                proc = subprocess.run(
-                    ['git', '-C', str(root), 'show', f'{base_ref}:{rel}'],
-                    capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=10,
-                )
-                if proc.returncode == 0:
-                    baseline_txt = proc.stdout
-            except (OSError, subprocess.SubprocessError):
-                pass
-        all_findings.extend(_audit_single_doc_text(rel, _optional_text(fpath), anchor, baseline_txt))
+        if verified_commit and git_toplevel:
+            resolved_doc = fpath.resolve()
+            if resolved_doc.is_relative_to(git_toplevel):
+                git_rel = resolved_doc.relative_to(git_toplevel).as_posix()
+                try:
+                    proc = subprocess.run(
+                        ['git', '-C', str(git_toplevel), 'show', f'{verified_commit}:{git_rel}'],
+                        env=git_env, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=10,
+                    )
+                    if proc.returncode == 0:
+                        baseline_txt = proc.stdout
+                except (OSError, subprocess.SubprocessError):
+                    pass
+        if _is_codex_agent_toml_rel(rel):
+            raw_doc = _extract_codex_agent_toml_doc(raw_doc)
+            if baseline_txt:
+                baseline_txt = _extract_codex_agent_toml_doc(baseline_txt)
+        elif is_upstream_repo and rel == 'CHANGELOG.md':
+            raw_doc = _extract_latest_changelog_section(raw_doc)
+            if baseline_txt:
+                baseline_txt = _extract_latest_changelog_section(baseline_txt)
+        all_findings.extend(_audit_single_doc_text(rel, raw_doc, anchor, baseline_txt))
     by_category = collections.Counter(item['category'] for item in all_findings)
     return {
         'ok': not all_findings,
@@ -5480,40 +6417,44 @@ def cmd_audit(args):
     backends = _args_backends(args)
     if getattr(args, 'user_prompt', ''):
         args.focus = args.user_prompt + '\n' + args.focus
-        user_engine = _prompt_engine_spec(backends, args.user_prompt)
-        if user_engine:
-            original = (args.left or 'role:review').strip().lower()
-            slot = (original.split(':', 1)[1] if original.startswith('role:')
-                    else _per_backend_role_target(*_engine_parts(original)))
-            backend = _extract_prompt_backend_hint(args.user_prompt)
-            args.left = (f'{backend}:@{slot}' if slot and backend and not _extract_prompt_model_hint(args.user_prompt)
-                         else user_engine)
+        if not (getattr(args, '_approved_ticket', None) and args.left and not args.left.strip().lower().startswith('role:')):
+            user_engine = _prompt_engine_spec(backends, args.user_prompt)
+            if user_engine:
+                original = (args.left or 'role:review').strip().lower()
+                slot = (original.split(':', 1)[1] if original.startswith('role:')
+                        else _per_backend_role_target(*_engine_parts(original)))
+                backend = _extract_prompt_backend_hint(args.user_prompt)
+                args.left = (f'{backend}:@{slot}' if slot and backend and not _extract_prompt_model_hint(args.user_prompt)
+                             else user_engine)
     skipped = []
     records = collect_target_files(target, skipped)
     if not records:
         raise HarnessError('目标范围没有可审查文件', skipped_files=skipped)
     total_tokens = sum(item['tokens'] for item in records)
     try:
-        engines = _audit_engines(backends, not args.single, args.left, args.right, args.dry_run, caller, args.focus)
+        engines = _audit_engines(backends, not args.single, args.left, args.right, args.dry_run, caller, args.focus,
+                                 ignore_cooldown=getattr(args, 'retry_quota', False))
     except HarnessError as exc:
         if (exc.status != 'quota_exhausted' or not getattr(args, 'fallback_on_quota', False)
                 or getattr(args, '_approved_ticket', None)):
             return _dispatch_print(args, {'status': exc.status, 'error': str(exc), **exc.details})
-        prefix = exc.details.get('quota_backend')
-        fallback = _local_fallback_engine(caller, (prefix or 'codex') + ':default', backends, args.focus)
+        prefix = exc.details.get('quota_backend') or 'codex'
+        fallback = _local_fallback_engine(caller, prefix + ':default', backends, args.focus)
         if not fallback:
             return _dispatch_print(args, {'status': exc.status, 'error': str(exc), **exc.details})
         engines = (fallback, None)
         args._selection_fallback = _quota_fallback_record(prefix + ':default', fallback, exc.details)
 
     audit_engine_hint = (args.left or (engines[0] or '')) if args.single else ''
-    tier, tier_reason = _resolve_effective_tier(args.tier, 'audit', getattr(args, 'user_prompt', ''), args.focus, audit_engine_hint)
+    eff_audit_user_prompt = '' if (getattr(args, '_approved_ticket', None) and args.tier != 'auto') else getattr(args, 'user_prompt', '')
+    tier, tier_reason = _resolve_effective_tier(args.tier, 'audit', eff_audit_user_prompt, args.focus, audit_engine_hint)
     meta = {'caller': caller, 'handoff_to_caller': True, 'requested_tier': args.tier,
             'selected_tier': tier, 'tier_reason': tier_reason, 'target': str(root)}
     if getattr(args, '_selection_fallback', None):
         meta['quota_fallback'] = args._selection_fallback
     batch = _QuotaBatch(args.retry_quota)
-    fallback_before = snapshot_files(root) if getattr(args, 'fallback_on_quota', False) and not args.dry_run else None
+    snap_patterns = read_agentignore_patterns(root) if not args.dry_run else None
+    fallback_before = snapshot_files(root, ignore_patterns=snap_patterns) if getattr(args, 'fallback_on_quota', False) and not args.dry_run else None
     try:
         _prepare_execution(backends, engines, batch, dry_run=args.dry_run)
     except HarnessError as exc:
@@ -5521,7 +6462,7 @@ def cmd_audit(args):
         fb_engine = _local_fallback_engine(caller, f'{q_backend}:default', backends, args.focus) if (
             exc.status == 'quota_exhausted' and q_backend and getattr(args, 'fallback_on_quota', False)
             and not getattr(args, '_approved_ticket', None)
-            and _workspace_unchanged(fallback_before, root)
+            and _workspace_unchanged(fallback_before, root, ignore_patterns=snap_patterns)
         ) else None
         if not fb_engine:
             return _dispatch_print(args, {'status': exc.status, **meta, 'error': str(exc), 'requested_engines': list(engines), **exc.details})
@@ -5544,7 +6485,7 @@ def cmd_audit(args):
             engines = (target_engine, None)
         try:
             _prepare_execution(backends, engines, batch, dry_run=args.dry_run)
-            if not _workspace_unchanged(fallback_before, root):
+            if not _workspace_unchanged(fallback_before, root, ignore_patterns=snap_patterns):
                 raise HarnessError('回退预检后工作区发生变化或无法核对，已停止执行')
         except HarnessError as fb_exc:
             return _dispatch_print(args, {'status': fb_exc.status, **meta, 'error': str(fb_exc), 'requested_engines': list(engines), **fb_exc.details})
@@ -5566,7 +6507,7 @@ def cmd_audit(args):
     for profile in profiles.values():
         _require_execution_profile(profile)
     base = _git_head(root)
-    before = snapshot_files(root)
+    before = snapshot_files(root, ignore_patterns=snap_patterns)
     tasks = [(side, unit) for side in ('left', 'right') for unit in plan[side + '_units']]
     findings = {'left': [], 'right': []}
     errors, completed = [], []
@@ -5614,7 +6555,7 @@ def cmd_audit(args):
             except Exception as exc:
                 errors.append({**common, 'status': getattr(exc, 'status', 'failed'),
                                'error': str(exc), **getattr(exc, 'details', {})})
-    scope = _safe_changes_report(before, root, [], True)
+    scope = _safe_changes_report(before, root, [], True, ignore_patterns=snap_patterns)
     quota_err = next((err for err in errors if err.get('status') == 'quota_exhausted'), None)
     if scope['scope_violations']:
         status = 'scope_violation'
@@ -5668,14 +6609,19 @@ def cmd_gate(args):
     meta = {'caller': caller, 'handoff_to_caller': True, 'engine': engine, 'worker_engine': engine,
             'requested_tier': args.tier, 'selected_tier': tier, 'tier_reason': tier_reason,
             'target': str(root), 'requested_target': str(requested_target), 'verification_executed': False}
-    fallback_before = snapshot_files(root) if getattr(args, 'fallback_on_quota', False) and not args.dry_run else None
+    snap_ignored = _snapshot_ignore_dirs_for(scopes, include_build=True)
+    snap_patterns = read_agentignore_patterns(root) if not args.dry_run else None
+    fallback_before = (
+        snapshot_files(root, ignore_dirs=snap_ignored, ignore_patterns=snap_patterns)
+        if getattr(args, 'fallback_on_quota', False) and not args.dry_run else None
+    )
     try:
         _prepare_execution(backends, (engine,), batch, dry_run=args.dry_run)
     except HarnessError as exc:
         fb_engine = _local_fallback_engine(caller, engine, backends, text, clean_room=False) if (
             exc.status == 'quota_exhausted' and getattr(args, 'fallback_on_quota', False)
             and not getattr(args, '_approved_ticket', None)
-            and _workspace_unchanged(fallback_before, root)
+            and _workspace_unchanged(fallback_before, root, ignore_dirs=snap_ignored, ignore_patterns=snap_patterns)
         ) else None
         if not fb_engine:
             return _dispatch_print(args, {'status': exc.status, **meta, 'error': str(exc), **exc.details})
@@ -5684,12 +6630,12 @@ def cmd_gate(args):
         meta.update(engine=engine, worker_engine=engine)
         try:
             _prepare_execution(backends, (engine,), batch, dry_run=args.dry_run)
-            if not _workspace_unchanged(fallback_before, root):
+            if not _workspace_unchanged(fallback_before, root, ignore_dirs=snap_ignored, ignore_patterns=snap_patterns):
                 raise HarnessError('回退预检后工作区发生变化或无法核对，已停止执行')
         except HarnessError as fb_exc:
             return _dispatch_print(args, {'status': fb_exc.status, **meta, 'error': str(fb_exc), **fb_exc.details})
     profile = _planned_profile(args, backends, engine, tier, tier_reason, text, 'gate', est_tokens)
-    _check_ticket_execution(args, profile, requested_target, 'gate', text)
+    _check_ticket_execution(args, profile, requested_target, 'gate', text, write_scope=scopes, verify_cmd=args.verify_cmd)
     if args.dry_run:
         prefix, _ = _engine_parts(engine)
         return _dispatch_print(args, {'status': 'ok', 'dry_run': True, **meta, **_profile_payload(profile),
@@ -5698,8 +6644,11 @@ def cmd_gate(args):
     _require_execution_profile(profile)
     base = _git_head(root)
     try:
-        result = _run_gate_with_fallback(args, root, requested_target, text, caller, engine, backends,
-                                         scopes, profile, 'gate', est_tokens, batch, meta, fallback_before)
+        result = _run_gate_with_fallback(
+            args, root, requested_target, text, caller, engine, backends,
+            scopes, profile, 'gate', est_tokens, batch, meta, fallback_before,
+            ignore_dirs=snap_ignored, ignore_patterns=snap_patterns,
+        )
     except HarnessError as exc:
         return _dispatch_print(args, {'status': exc.status, **meta, 'base_commit': base, 'error': str(exc), **exc.details})
     return _dispatch_print(args, {**meta, **result, 'base_commit': base})
@@ -5726,6 +6675,10 @@ def cmd_task(args):
         raise HarnessError('--clean-room 仅支持只读任务（review/direction/polish/math），写入任务不可剥离安全钩子')
     if clean_room and engine.startswith('agy'):
         raise HarnessError('agy 后端不支持剥离全局插件目录，--clean-room 请显式指定 codex、cc 或 dsh')
+    if clean_room and requested_target.is_dir():
+        raw_dir_records = collect_target_files(requested_target)
+        if raw_dir_records and all(Path(r['rel_path']).name.upper() in _AGENT_INSTRUCTION_FILENAMES for r in raw_dir_records):
+            raise HarnessError(_CLEAN_ROOM_ONLY_INSTR_ERROR)
     rel_single_file = requested_target.relative_to(root).as_posix() if requested_target.is_file() else None
     if not readonly and rel_single_file and not scopes:
         scopes = [rel_single_file]
@@ -5743,14 +6696,19 @@ def cmd_task(args):
                'readonly': readonly, 'write_scope': scopes}
     if not readonly:
         payload['verification_executed'] = False
-    fallback_before = snapshot_files(root) if getattr(args, 'fallback_on_quota', False) and not args.dry_run else None
+    snap_ignored = None if readonly else _snapshot_ignore_dirs_for(scopes, include_build=bool(args.verify_cmd))
+    snap_patterns = read_agentignore_patterns(root) if not args.dry_run else None
+    fallback_before = (
+        snapshot_files(root, ignore_dirs=snap_ignored, ignore_patterns=snap_patterns)
+        if getattr(args, 'fallback_on_quota', False) and not args.dry_run else None
+    )
     try:
         _prepare_execution(backends, (engine,), batch, dry_run=args.dry_run)
     except HarnessError as exc:
         fb_engine = _local_fallback_engine(caller, engine, backends, text, clean_room=clean_room) if (
             exc.status == 'quota_exhausted' and getattr(args, 'fallback_on_quota', False)
             and not getattr(args, '_approved_ticket', None)
-            and _workspace_unchanged(fallback_before, root)
+            and _workspace_unchanged(fallback_before, root, ignore_dirs=snap_ignored, ignore_patterns=snap_patterns)
         ) else None
         if not fb_engine:
             return _dispatch_print(args, {'status': exc.status, **payload, 'result': {}, 'changed_files': [], 'scope_violations': [],
@@ -5760,13 +6718,13 @@ def cmd_task(args):
         payload['engine'] = engine
         try:
             _prepare_execution(backends, (engine,), batch, dry_run=args.dry_run)
-            if not _workspace_unchanged(fallback_before, root):
+            if not _workspace_unchanged(fallback_before, root, ignore_dirs=snap_ignored, ignore_patterns=snap_patterns):
                 raise HarnessError('回退预检后工作区发生变化或无法核对，已停止执行')
         except HarnessError as fb_exc:
             return _dispatch_print(args, {'status': fb_exc.status, **payload, 'result': {}, 'changed_files': [], 'scope_violations': [],
                            'error': str(fb_exc), **fb_exc.details})
     profile = _planned_profile(args, backends, engine, tier, tier_reason, text, args.kind, est_tokens)
-    _check_ticket_execution(args, profile, requested_target, args.kind, text)
+    _check_ticket_execution(args, profile, requested_target, args.kind, text, write_scope=scopes, verify_cmd=args.verify_cmd)
     prefix, _ = _engine_parts(engine)
     payload.update(_profile_payload(profile))
     if args.dry_run:
@@ -5774,15 +6732,18 @@ def cmd_task(args):
     _require_execution_profile(profile)
     if args.kind == 'code' and args.verify_cmd:
         try:
-            result = _run_gate_with_fallback(args, root, requested_target, text, caller, engine, backends,
-                                             scopes, profile, args.kind, est_tokens, batch, payload, fallback_before)
+            result = _run_gate_with_fallback(
+                args, root, requested_target, text, caller, engine, backends,
+                scopes, profile, args.kind, est_tokens, batch, payload, fallback_before,
+                ignore_dirs=snap_ignored, ignore_patterns=snap_patterns,
+            )
         except HarnessError as exc:
             return _dispatch_print(args, {'status': exc.status, **payload, 'result': {}, 'changed_files': [],
                            'scope_violations': [], 'error': str(exc), **exc.details})
         return _dispatch_print(args, {**payload, **result})
     if not readonly:
         payload['verification_notice'] = '未提供 --verify-cmd，本次代码修改未经宿主机命令实测验证，请总控运行验证后再验收。'
-    before = snapshot_files(root)
+    before = snapshot_files(root, ignore_dirs=snap_ignored, ignore_patterns=snap_patterns)
     rel_hint = f'（相对路径: {rel_single_file}）' if rel_single_file else ''
     stage_files = [rel_single_file] if (readonly and rel_single_file) else None
     polish_guard = (
@@ -5809,14 +6770,14 @@ def cmd_task(args):
                 and not getattr(args, '_approved_ticket', None)
                 and 'quota_fallback' not in payload
                 and _quota_can_replay(exc.details, invocation)
-                and _workspace_unchanged(before, root)
-                and _workspace_unchanged(fallback_before, root)
+                and _workspace_unchanged(before, root, ignore_dirs=snap_ignored, ignore_patterns=snap_patterns)
+                and _workspace_unchanged(fallback_before, root, ignore_dirs=snap_ignored, ignore_patterns=snap_patterns)
             ) else None
             if not fb_engine or (clean_room and fb_engine.startswith('agy')):
                 raise
             payload['quota_fallback'] = _quota_fallback_record(engine, fb_engine, exc.details)
             _prepare_execution(backends, (fb_engine,), batch, dry_run=False)
-            if not _workspace_unchanged(before, root):
+            if not _workspace_unchanged(before, root, ignore_dirs=snap_ignored, ignore_patterns=snap_patterns):
                 payload.pop('quota_fallback')
                 raise
             fb_profile = _planned_profile(args, backends, fb_engine, tier, tier_reason, text, args.kind, est_tokens)
@@ -5835,7 +6796,9 @@ def cmd_task(args):
         error = {'error': str(exc), **getattr(exc, 'details', {})}
     finally:
         staged_scope = invocation.get('staged_scope') if (readonly and invocation.get('staged_readonly_workspace')) else None
-        scope = dict(staged_scope) if isinstance(staged_scope, dict) else _safe_changes_report(before, root, scopes, readonly)
+        scope = dict(staged_scope) if isinstance(staged_scope, dict) else _safe_changes_report(
+            before, root, scopes, readonly, ignore_dirs=snap_ignored, ignore_patterns=snap_patterns
+        )
         invocation.pop('staged_scope', None)
     payload['quota_status'] = backends.get(prefix, {}).get('quota_status', payload['quota_status'])
     if not scope.get('scope_verified', True) and status == 'ok':
@@ -5845,8 +6808,17 @@ def cmd_task(args):
         status = 'scope_violation'
     if args.kind == 'polish' and status == 'ok' and isinstance(result, dict) and isinstance(result.get('content'), str):
         orig_doc = _optional_text(requested_target) if requested_target.is_file() else ''
-        rel_label = rel_single_file or requested_target.name
-        anchor = _build_grounding_anchor(root, {rel_label} if rel_single_file else set(), extra_allowed_text=text)
+        anchor_root = _infer_project_anchor_root(requested_target)
+        if requested_target.is_file():
+            rel_label = (
+                requested_target.relative_to(anchor_root).as_posix()
+                if requested_target.is_relative_to(anchor_root) else requested_target.name
+            )
+            exclude_set = {rel_label} if requested_target.is_relative_to(anchor_root) else set()
+        else:
+            rel_label = requested_target.name
+            exclude_set = set()
+        anchor = _build_grounding_anchor(anchor_root, exclude_set, extra_allowed_text=text)
         drift_hits = _audit_single_doc_text(rel_label, result['content'], anchor, baseline_text=orig_doc)
         payload['grounding_audit'] = {
             'ok': not drift_hits,
@@ -5856,9 +6828,39 @@ def cmd_task(args):
     return _dispatch_print(args, {'status': status, **payload, 'invocation': invocation, 'result': result, **error, **scope})
 
 
-def _atomic_json(path, value):
-    path = Path(path).expanduser().resolve()
+def _atomic_text(path, content):
+    raw_path = Path(path).expanduser()
+    for candidate in (raw_path, raw_path.parent):
+        if os.path.lexists(candidate) and _is_link(candidate):
+            raise HarnessError(f'拒绝通过符号链接写入文件: {candidate}')
+    path = raw_path.resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
+    for candidate in (raw_path, raw_path.parent, path, path.parent):
+        if os.path.lexists(candidate) and _is_link(candidate):
+            raise HarnessError(f'拒绝通过符号链接写入文件: {candidate}')
+    temporary = path.with_name(path.name + '.' + uuid.uuid4().hex + '.tmp')
+    try:
+        with temporary.open('x', encoding='utf-8', newline='\n') as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if os.path.lexists(path) and _is_link(path):
+            raise HarnessError(f'拒绝通过符号链接写入文件: {path}')
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _atomic_json(path, value):
+    raw_path = Path(path).expanduser()
+    for candidate in (raw_path, raw_path.parent):
+        if os.path.lexists(candidate) and _is_link(candidate):
+            raise HarnessError(f'拒绝通过符号链接写入文件: {candidate}')
+    path = raw_path.resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    for candidate in (raw_path, raw_path.parent, path, path.parent):
+        if os.path.lexists(candidate) and _is_link(candidate):
+            raise HarnessError(f'拒绝通过符号链接写入文件: {candidate}')
     temporary = path.with_name(path.name + '.' + uuid.uuid4().hex + '.tmp')
     try:
         with temporary.open('x', encoding='utf-8', newline='\n') as stream:
@@ -5866,14 +6868,31 @@ def _atomic_json(path, value):
             stream.write('\n')
             stream.flush()
             os.fsync(stream.fileno())
+        if os.path.lexists(path) and _is_link(path):
+            raise HarnessError(f'拒绝通过符号链接写入文件: {path}')
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
 
 
 def resolve_dispatch_plan_dir(state_dir=None):
-    return Path(state_dir or os.environ.get('CAE_PLAN_STATE_DIR') or
-                Path.home() / '.gemini' / 'antigravity' / 'plugin_data' / 'user-guard' / 'state' / 'dispatch_plans').expanduser().resolve()
+    extra_checks = ()
+    if state_dir:
+        raw = Path(state_dir).expanduser()
+    elif os.environ.get('CAE_PLAN_STATE_DIR'):
+        raw = Path(os.environ['CAE_PLAN_STATE_DIR']).expanduser()
+    elif os.environ.get('USER_GUARD_STATE_DIR'):
+        raw = Path(os.environ['USER_GUARD_STATE_DIR']).expanduser() / 'dispatch_plans'
+    elif os.environ.get('PLUGIN_DATA'):
+        plugin_root = Path(os.environ['PLUGIN_DATA']).expanduser()
+        extra_checks = (plugin_root,)
+        raw = plugin_root / 'state' / 'dispatch_plans'
+    else:
+        raw = (Path.home() / '.gemini' / 'antigravity' / 'plugin_data' / 'user-guard' / 'state' / 'dispatch_plans').expanduser()
+    for candidate in (*extra_checks, raw.parent, raw):
+        if os.path.lexists(candidate) and _is_link(candidate):
+            raise HarnessError(f'拒绝使用符号链接作为票据状态目录: {candidate}', 'ticket_invalid')
+    return raw.resolve()
 
 
 def _safe_state_id(value):
@@ -5883,25 +6902,103 @@ def _safe_state_id(value):
     return value
 
 
+def _caller_session_id(args):
+    explicit = str(getattr(args, 'session_id', '') or '').strip()
+    if explicit:
+        return explicit
+    for key in _SESSION_ID_ENV_VARS:
+        val = os.environ.get(key, '').strip()
+        if val:
+            return val
+    return ''
+
+
+def _verify_ticket_session(ticket, args):
+    ticket_sid = str((ticket or {}).get('session_id') or '').strip()
+    caller_sid = _caller_session_id(args)
+    if (
+        ticket_sid
+        and ticket_sid != 'unknown_session'
+        and caller_sid
+        and caller_sid != 'unknown_session'
+        and ticket_sid != caller_sid
+    ):
+        raise HarnessError('计划票据所属会话与当前会话不一致', 'ticket_invalid')
+
+
 def _session_id(args):
-    return (getattr(args, 'session_id', '') or getattr(args, '_approved_ticket', {}).get('session_id', '') or next((os.environ[k] for k in
-            ('AGY_CONVERSATION_ID', 'CLAUDE_SESSION_ID', 'CODEX_THREAD_ID', 'CAE_SESSION_ID') if os.environ.get(k)), ''))
+    explicit = str(getattr(args, 'session_id', '') or '').strip()
+    if explicit:
+        return explicit
+    approved = str((getattr(args, '_approved_ticket', None) or {}).get('session_id', '') or '').strip()
+    if approved:
+        return approved
+    for key in _SESSION_ID_ENV_VARS:
+        val = os.environ.get(key, '').strip()
+        if val:
+            return val
+    return ''
+
+
+def _clean_plan_streams(streams):
+    if not isinstance(streams, list):
+        return streams
+    return [{k: v for k, v in s.items() if not str(k).startswith('_')} if isinstance(s, dict) else s for s in streams]
 
 
 def _plan_hash(ticket):
     binding = {key: ticket.get(key) for key in ('streams', 'workflow_bg', 'workflow_goal', 'workflow_impact')}
+    binding['streams'] = _clean_plan_streams(binding.get('streams'))
     return hashlib.sha256(json.dumps(binding, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode('utf-8')).hexdigest()
 
 
 def _load_ticket(ticket_id, plan_dir=None, approved=False):
-    path = resolve_dispatch_plan_dir(plan_dir) / (_safe_state_id(ticket_id) + '.json')
+    raw = resolve_dispatch_plan_dir(plan_dir) / (_safe_state_id(ticket_id) + '.json')
+    for candidate in (raw, raw.parent):
+        if os.path.lexists(candidate) and _is_link(candidate):
+            raise HarnessError(f'拒绝读取符号链接计划票据: {candidate}', 'ticket_invalid')
+    path = raw.resolve()
     ticket = _read_json(path)
     if not isinstance(ticket, dict) or ticket.get('ticket_id') != ticket_id:
         raise HarnessError('计划票据不存在或格式无效', 'ticket_invalid')
-    try:
-        expired = time.time() >= float(ticket['expires_at'])
-    except (ValueError, TypeError, KeyError):
-        expired = True
+    required_ticket_keys = ('ticket_id', 'status', 'expires_at', 'streams', 'workflow_bg', 'workflow_goal', 'workflow_impact')
+    raw_expires = ticket.get('expires_at')
+    if (
+        any(key not in ticket for key in required_ticket_keys)
+        or not isinstance(ticket.get('status'), str)
+        or not ticket['status'].strip()
+        or isinstance(raw_expires, bool)
+        or not isinstance(raw_expires, (int, float))
+        or not math.isfinite(raw_expires)
+        or not all(isinstance(ticket.get(k), str) for k in ('workflow_bg', 'workflow_goal', 'workflow_impact'))
+    ):
+        raise HarnessError('计划票据缺少必要字段或格式无效', 'ticket_invalid')
+    streams = ticket.get('streams')
+    if not isinstance(streams, list) or not streams:
+        raise HarnessError('计划票据缺少有效流定义', 'ticket_invalid')
+    for stream in streams:
+        if not isinstance(stream, dict):
+            raise HarnessError('计划票据流条目格式无效', 'ticket_invalid')
+        timeout_val = stream.get('timeout')
+        if (
+            not isinstance(stream.get('stream_id'), str) or not stream['stream_id'].strip()
+            or not isinstance(stream.get('target'), str) or not stream['target'].strip()
+            or not isinstance(stream.get('kind'), str) or not stream['kind'].strip()
+            or not isinstance(stream.get('tier'), str) or not stream['tier'].strip()
+            or not isinstance(stream.get('engine'), str) or not stream['engine'].strip()
+            or isinstance(timeout_val, bool)
+            or not isinstance(timeout_val, (int, float))
+            or not math.isfinite(timeout_val)
+            or timeout_val <= 0
+        ):
+            raise HarnessError('计划票据流条目缺少必要字段或格式无效', 'ticket_invalid')
+        if 'execution_profile' in stream or (
+            approved and stream.get('channel', 'cae_harness_headless') == 'cae_harness_headless'
+        ):
+            ep = stream.get('execution_profile')
+            if not isinstance(ep, dict) or not isinstance(ep.get('spec'), str) or not ep['spec'].strip():
+                raise HarnessError('计划票据流条目缺少必要字段或格式无效', 'ticket_invalid')
+    expired = time.time() >= float(raw_expires)
     if expired or ticket.get('plan_hash') != _plan_hash(ticket):
         raise HarnessError('计划票据已过期或内容校验失败', 'ticket_invalid')
     if approved and ticket.get('status') != 'APPROVED':
@@ -5910,8 +7007,15 @@ def _load_ticket(ticket_id, plan_dir=None, approved=False):
 
 
 def _choose_dispatch_engine(args, backends, caller, explicit, text):
+    skip_user_prompt = (
+        bool(getattr(args, '_approved_ticket', None))
+        and bool(explicit)
+        and not explicit.strip().lower().startswith('role:')
+    )
+    eff_user_prompt = '' if skip_user_prompt else getattr(args, 'user_prompt', '')
     try:
-        return choose_engine(backends, caller, explicit, text, getattr(args, 'user_prompt', ''))
+        return choose_engine(backends, caller, explicit, text, eff_user_prompt,
+                             ignore_cooldown=getattr(args, 'retry_quota', False))
     except HarnessError as exc:
         if exc.status != 'quota_exhausted':
             raise
@@ -5926,29 +7030,79 @@ def _choose_dispatch_engine(args, backends, caller, explicit, text):
         raise
 
 
-def _check_ticket_execution(args, profile, target, kind, text=None):
+def _check_ticket_execution(args, profile, target, kind, text=None, *, write_scope=None, verify_cmd=None):
     ticket = getattr(args, '_approved_ticket', None)
     if not ticket:
         return
+    resolved_target = Path(target).expanduser().resolve()
+    target_root = resolved_target if resolved_target.is_dir() else resolved_target.parent
     matches = [stream for stream in ticket['streams']
                if stream.get('channel', 'cae_harness_headless') == 'cae_harness_headless'
-               and Path(stream['target']).resolve() == Path(target).resolve()
+               and Path(stream['target']).resolve() == resolved_target
                and stream['kind'] == kind and stream['execution_profile']['spec'] == profile['spec']
                and stream['tier'] == profile['tier'] and args.timeout <= stream['timeout']]
     if not matches:
         raise HarnessError('执行目标、模型、挡位或超时与获批票据不一致', 'ticket_invalid')
-    if text is not None and not any(stream.get('subtask', '').strip() == text.strip() for stream in matches):
-        raise HarnessError('任务内容与获批票据不一致', 'ticket_invalid')
+    if text is not None:
+        accepted_texts = {text.strip()}
+        raw_body = _raw_task_body(args)
+        if raw_body:
+            accepted_texts.add(raw_body)
+        matches = [stream for stream in matches if stream.get('subtask', '').strip() in accepted_texts]
+        if not matches:
+            raise HarnessError('任务内容与获批票据不一致', 'ticket_invalid')
+    if write_scope is not None:
+        req_scopes = list(write_scope)
+        allowed_scopes = [stream.get('write_scope') or [] for stream in matches]
+        matches = [
+            stream for stream in matches
+            if _scope_subset_of(req_scopes, stream.get('write_scope') or [], target_root=target_root)
+        ]
+        if not matches:
+            raise HarnessError(
+                f'写入范围与获批票据不一致（当前请求：{req_scopes}；票据允许：{allowed_scopes}）',
+                'ticket_invalid', requested_write_scope=req_scopes, approved_write_scopes=allowed_scopes,
+            )
+    if verify_cmd is not None:
+        req_verify = str(verify_cmd).strip()
+        allowed_verify = [str(stream.get('verify_cmd') or '').strip() for stream in matches]
+        if not any(not cmd or cmd == req_verify for cmd in allowed_verify):
+            raise HarnessError(
+                f'验收命令与获批票据不一致（当前请求：{req_verify!r}；票据要求：{allowed_verify}）',
+                'ticket_invalid', requested_verify_cmd=req_verify, approved_verify_cmds=allowed_verify,
+            )
 
 
 def _begin_dispatch(args):
     args._dispatch_started = time.monotonic()
     ticket_id = getattr(args, 'ticket', '')
     if ticket_id:
-        args._approved_ticket = _load_ticket(ticket_id, getattr(args, 'plan_dir', None), approved=True)
+        ticket = _load_ticket(ticket_id, getattr(args, 'plan_dir', None), approved=True)
+        _verify_ticket_session(ticket, args)
+        args._approved_ticket = ticket
 
 
-_SECRET_FIELD_KEY_RE = re.compile(r'(?i)(?:^|[_-])(?:api_?key|auth_?token|access_?token|secret(?:_?key)?|password|credential)$|(?:api|auth|access|secret)(?:Key|Token)$')
+_SECRET_FIELD_KEY_RE = re.compile(
+    r'(?i)(?:^|[_-])(?:api[_-]?(?:key|token)|auth[_-]?token|access[_-]?token|refresh[_-]?token|'
+    r'bearer[_-]?token|private[_-]?key|client[_-]?secret|secret(?:[_-]?key)?|password|credential|authorization)s?$'
+    r'|(?:api|auth|access|refresh|bearer|private|secret|client)(?:Key|Token|Secret)s?$'
+)
+
+
+def _redact_secret_leaves(value):
+    if isinstance(value, str):
+        return '<redacted>' if value else value
+    if isinstance(value, list):
+        return [_redact_secret_leaves(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_secret_leaves(item) for item in value)
+    if isinstance(value, dict):
+        return {
+            (_redact_public(k) if isinstance(k, str) else k): _redact_secret_leaves(v)
+            for k, v in value.items()
+            if k not in ('total_cost_usd', 'cost_usd', 'modelUsage', 'plan_type')
+        }
+    return value
 
 
 def _redact_public(value):
@@ -5958,21 +7112,38 @@ def _redact_public(value):
             if k in ('total_cost_usd', 'cost_usd', 'modelUsage', 'plan_type'):
                 continue
             rk = _redact_public(k) if isinstance(k, str) else k
-            if isinstance(k, str) and _SECRET_FIELD_KEY_RE.search(k) and isinstance(v, str) and v:
-                out[rk] = '<redacted>'
+            if isinstance(k, str) and _SECRET_FIELD_KEY_RE.search(k):
+                out[rk] = _redact_secret_leaves(v)
             else:
                 out[rk] = _redact_public(v)
         return out
     if isinstance(value, list):
         return [_redact_public(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_public(v) for v in value)
     if not isinstance(value, str):
         return value
     text = _redact_runtime_secret(value)
-    for path, replacement in ((str(Path.home()), '<HOME>'), (tempfile.gettempdir(), '<TEMP>')):
+    temp_raw = tempfile.gettempdir()
+    try:
+        temp_resolved = str(Path(temp_raw).resolve())
+    except OSError:
+        temp_resolved = temp_raw
+    for path, replacement in ((str(Path.home()), '<HOME>'), (temp_raw, '<TEMP>'), (temp_resolved, '<TEMP>')):
         if len(path) > 3:
-            text = re.sub(re.escape(path), lambda _: replacement, text, flags=re.I)
-            text = re.sub(re.escape(path.replace('\\', '/')), lambda _: replacement, text, flags=re.I)
-    text = re.sub(r'(?i)(?:[A-Z]:[\\/]Users[\\/][^\\/\s"\n]+|/mnt/[a-z]/Users/[^/\s"\n]+|/home/[^/\s"\n]+)', '<HOME>', text)
+            for variant in dict.fromkeys((path, path.replace('\\', '/'), path.replace('\\', '\\\\'))):
+                text = re.sub(re.escape(variant), lambda _: replacement, text, flags=re.I)
+    text = re.sub(
+        r'(?i)(?:'
+        r'(?:\\{2,}|//)wsl(?:\.localhost|\$)(?:\\+|/)[^\\/\s"\x27\n]+(?:\\+|/)home(?:\\+|/)[^\\/\s"\x27\n]+'
+        r'|[A-Z]:(?:\\+|/)Users(?:\\+|/)[^\\/\s"\x27\n]+'
+        r'|/mnt/[a-z]/Users/[^\\/\s"\x27\n]+'
+        r'|(?<![A-Za-z0-9_.-])/Users/[^\\/\s"\x27\n]+'
+        r'|(?<![A-Za-z0-9_.-])/home/[^\\/\s"\x27\n]+'
+        r')',
+        '<HOME>',
+        text,
+    )
     def mask_ip(match):
         try:
             address = ipaddress.ip_address(match.group())
@@ -5982,8 +7153,7 @@ def _redact_public(value):
     text = re.sub(r'(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])', mask_ip, text)
     text = re.sub(r'(?i)(?<![\w:])(?:f[cd][0-9a-f]{2}:[0-9a-f:]{2,}|fe80:[0-9a-f:]{2,})(?![\w:])', mask_ip, text)
     text = re.sub(r'cae-harness-[A-Za-z0-9_-]+', '<STAGING>', text)
-    if 'quota_summary' not in text:
-        text = re.sub(r'\b\d+(?:\.\d+)?%', '<USAGE>', text)
+    text = re.sub(r'\b\d+(?:\.\d+)?%', '<USAGE>', text)
     return text
 
 
@@ -6023,25 +7193,57 @@ def record_heavy_completion_for_stop_hook(args, payload):
     command = getattr(args, 'subcommand', '')
     heavy = command in ('audit', 'gate', 'batch') or getattr(args, 'ticket', '') or getattr(args, 'kind', '') == 'code'
     if not heavy and getattr(args, 'target', None):
-        count, tokens = _target_metrics(Path(args.target).expanduser().resolve(), getattr(args, 'user_prompt', ''))
+        try:
+            prompt_sample = _task_text(args)
+        except (HarnessError, OSError, AttributeError, TypeError):
+            prompt_sample = getattr(args, 'user_prompt', '') or ''
+        try:
+            count, tokens = _target_metrics(Path(args.target).expanduser().resolve(), prompt_sample)
+        except (HarnessError, OSError):
+            count, tokens = 1, estimate_tokens_from_bytes(len((prompt_sample or '').encode('utf-8')))
         heavy = _is_heavy_streams([{'file_count': count, 'estimated_tokens': tokens, 'timeout': args.timeout}])
     if not heavy:
         return
     run_id = uuid.uuid4().hex
-    plan_dir = resolve_dispatch_plan_dir(getattr(args, 'plan_dir', None))
-    receipt_path = Path(getattr(args, 'output', '') or plan_dir / 'receipts' / f'{run_id}_receipt.json').expanduser().resolve()
+    raw_plan_arg = getattr(args, 'plan_dir', None)
+    if raw_plan_arg:
+        raw_plan_p = Path(raw_plan_arg).expanduser()
+        if os.path.lexists(raw_plan_p) and _is_link(raw_plan_p):
+            raise HarnessError(f'拒绝使用符号链接作为票据状态目录: {raw_plan_p}')
+    plan_dir = resolve_dispatch_plan_dir(raw_plan_arg)
+    raw_out = getattr(args, 'output', '')
+    if raw_out:
+        raw_receipt = Path(raw_out).expanduser()
+    else:
+        receipts_dir = plan_dir / 'receipts'
+        if os.path.lexists(receipts_dir) and _is_link(receipts_dir):
+            raise HarnessError(f'拒绝通过符号链接目录写入回执: {receipts_dir}')
+        raw_receipt = receipts_dir / f'{run_id}_receipt.json'
+    if os.path.lexists(raw_receipt) and _is_link(raw_receipt):
+        raise HarnessError(f'拒绝通过符号链接写入回执文件: {raw_receipt}')
+    receipt_path = raw_receipt.resolve()
     payload['receipt_file'] = str(receipt_path)
     # Explicit --output is written by _dispatch_print after all metadata is attached.
-    if not getattr(args, 'output', ''):
-        _atomic_json(receipt_path, _redact_public(payload))
+    if not raw_out:
+        _atomic_json(raw_receipt, _redact_public(payload))
     session_id = _session_id(args)
     if session_id:
         state_dir = plan_dir.parent
-        path = state_dir / 'heavy_completions' / (_safe_state_id(session_id) + '.json')
+        hc_dir = state_dir / 'heavy_completions'
+        if os.path.lexists(hc_dir) and _is_link(hc_dir):
+            raise HarnessError(f'拒绝通过符号链接目录写入重负载完工记录: {hc_dir}')
+        path = hc_dir / (_safe_state_id(session_id) + '.json')
+        if os.path.lexists(path) and _is_link(path):
+            raise HarnessError(f'拒绝通过符号链接写入重负载完工记录: {path}')
         entry = {'run_id': run_id, 'ticket_id': getattr(args, 'ticket', '') or None,
                  'completed_at': datetime.datetime.now(datetime.timezone.utc).isoformat(), 'subcommand': command,
                  'receipt_file': str(receipt_path), 'all_succeeded': payload.get('status') == 'ok',
-                 'streams': [{'stream_id': stream.get('stream_id') or stream.get('shard_id') or f'S{i}',
+                 'streams': [{'stream_id': (
+                                  stream.get('stream_id')
+                                  or (f"{stream['side']}-S{stream['shard_id']}" if stream.get('side') and stream.get('shard_id') is not None
+                                      else f"S{stream['shard_id']}" if stream.get('shard_id') is not None
+                                      else f'S{i}')
+                              ),
                               'engine': stream.get('engine') or payload.get('engine'),
                               'model': stream.get('model') or payload.get('model'),
                               'succeeded': stream.get('succeeded', stream.get('status') == 'ok'),
@@ -6050,15 +7252,95 @@ def record_heavy_completion_for_stop_hook(args, payload):
                                              or extract_cli_token_usage('', '')}
                              for i, stream in enumerate(_result_streams(payload), 1)],
                  'token_usage_summary': payload['token_usage_summary'], 'reported_to_user': False}
-        with _COMPLETION_LOCK:
+        with _COMPLETION_LOCK, _heavy_completion_file_lock(hc_dir, session_id):
+            if os.path.lexists(path) and _is_link(path):
+                raise HarnessError(f'拒绝通过符号链接写入重负载完工记录: {path}')
             entries = _read_json(path) or []
             if not isinstance(entries, list):
-                raise HarnessError('重负载报账状态格式无效')
+                raise HarnessError('重负载完工记录状态格式无效')
             entries.append(entry)
             _atomic_json(path, entries)
 
 
 _COMPLETION_LOCK = threading.Lock()
+
+
+@contextlib.contextmanager
+def _directory_file_lock(directory, lock_id, label='重负载完工记录'):
+    directory = Path(directory).expanduser()
+    for candidate in (directory, directory.parent):
+        if os.path.lexists(candidate) and _is_link(candidate):
+            raise HarnessError(f'{label}目录不可为符号链接')
+    directory.mkdir(parents=True, exist_ok=True)
+    for candidate in (directory, directory.parent):
+        if os.path.lexists(candidate) and _is_link(candidate):
+            raise HarnessError(f'{label}目录不可为符号链接')
+    lock_path = directory / ('.' + _safe_state_id(lock_id) + '.lock')
+    for _attempt in range(8):
+        if os.path.lexists(lock_path) and _is_link(lock_path):
+            raise HarnessError(f'{label}锁路径不可为符号链接')
+        flags = os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0)
+        fd = os.open(lock_path, flags, 0o600)
+        locked = False
+        try:
+            opened_st = os.fstat(fd)
+            if not stat.S_ISREG(opened_st.st_mode) or opened_st.st_nlink > 1:
+                raise HarnessError(f'{label}锁必须为独立普通文件')
+            if os.name == 'nt':
+                import msvcrt
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+                locked = True
+            else:
+                import fcntl
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                locked = True
+            opened_after = os.fstat(fd)
+            try:
+                path_st = lock_path.lstat()
+            except FileNotFoundError:
+                path_st = None
+            if path_st is not None and _is_link(lock_path, st=path_st):
+                raise HarnessError(f'{label}锁路径不可为符号链接')
+            if (
+                not stat.S_ISREG(opened_after.st_mode)
+                or opened_after.st_nlink > 1
+                or (path_st is not None and not stat.S_ISREG(path_st.st_mode))
+            ):
+                raise HarnessError(f'{label}锁必须为独立普通文件')
+            if (
+                path_st is None
+                or ((os.name != 'nt' and opened_after.st_nlink == 0) or opened_after.st_nlink > 1)
+                or (
+                    (opened_after.st_dev or path_st.st_dev or opened_after.st_ino or path_st.st_ino)
+                    and (opened_after.st_dev, opened_after.st_ino) != (path_st.st_dev, path_st.st_ino)
+                )
+            ):
+                continue
+            yield
+            return
+        finally:
+            if locked:
+                with contextlib.suppress(OSError):
+                    if os.name == 'nt':
+                        import msvcrt
+                        os.lseek(fd, 0, os.SEEK_SET)
+                        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+            if fd >= 0:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+    raise HarnessError(f'{label}锁文件在加锁期间发生并发替换，无法稳定获取文件锁')
+
+
+def _heavy_completion_file_lock(directory, session_id):
+    return _directory_file_lock(directory, session_id, label='重负载完工记录')
+
+
+def _plan_dir_lock(plan_dir):
+    return _directory_file_lock(plan_dir, 'plan_dir', label='计划票据')
 
 
 def _dispatch_print(args, payload):
@@ -6149,7 +7431,26 @@ def _resolve_plan_streams(args, streams, backends):
     resolved, switched = [], False
     ids = set()
     for index, original in enumerate(streams, 1):
+        if not isinstance(original, dict):
+            raise HarnessError('工作流条目必须为对象')
         stream = dict(original)
+        override_engine = bool(stream.pop('_override_engine', False))
+        override_tier = bool(stream.pop('_override_tier', False))
+        orig_tier_before_override = stream.pop('_orig_tier', '')
+        is_persisted_stream = 'execution_profile' in stream
+        for str_field in ('target', 'engine', 'model', 'subtask', 'agent_type'):
+            if str_field in stream:
+                val = stream[str_field]
+                if val is None and str_field == 'model' and is_persisted_stream:
+                    continue
+                if not isinstance(val, str):
+                    raise HarnessError(f'工作流字段 {str_field} 必须为字符串')
+        for opt_str_field in ('requested_engine', 'requested_model'):
+            if opt_str_field in stream and stream[opt_str_field] is not None and not isinstance(stream[opt_str_field], str):
+                raise HarnessError(f'工作流字段 {opt_str_field} 必须为字符串')
+        if 'tier' in stream:
+            if not isinstance(stream['tier'], str) or (stream['tier'] and stream['tier'] not in TIER_CHOICES):
+                raise HarnessError(f'工作流 tier 无效: {stream["tier"]!r}')
         sid = str(stream.get('stream_id') or f'S{index}')
         if sid in ids:
             raise HarnessError('工作流 stream_id 不可重复')
@@ -6178,7 +7479,14 @@ def _resolve_plan_streams(args, streams, backends):
             info = backends.get(prefix, {})
             requested_model = requested_model or 'inherit'
             model, display, home, config = _native_plan_model(prefix, info, requested_model)
-            tier, reason = _resolve_effective_tier(stream.get('tier', args.tier), kind, user_text, text)
+            if override_tier:
+                sub_sample = stream.get('subtask', '')
+                tier, _ = select_task_tier(
+                    stream.get('tier') or args.tier, kind,
+                    '' if sub_sample == user_text else sub_sample, count, tokens,
+                )
+            else:
+                tier, _ = _resolve_effective_tier(stream.get('tier') or args.tier, kind, user_text, text)
             record = _exact_model_record(info.get('models', []), model) if model else {}
             capacity = _execution_budget(prefix, info, record or {})
             if prefix == 'codex' and (requested_model == 'inherit' or requested_model == config.get('model')):
@@ -6199,24 +7507,76 @@ def _resolve_plan_streams(args, streams, backends):
                                           or str(log_dir) + '（具体子代理日志由原生客户端分配）')
             resolved.append(_plan_stream_details(args, chosen, profile, prefix, channel))
             continue
+        locked_tier_model = False
+        if override_tier and not override_engine and stream.get('engine'):
+            orig_prefix, _ = _engine_parts(stream['engine'])
+            orig_model = stream.get('model') or ''
+            orig_tier = orig_tier_before_override or (stream.get('execution_profile') or {}).get('tier') or 'max'
+            orig_prof_src = (stream.get('execution_profile') or {}).get('profile_source')
+            orig_check_text = text
+            if orig_prof_src and orig_prof_src != 'prompt_fuzzy_model' and _extract_prompt_model_hint(orig_check_text):
+                orig_check_text = stream.get('subtask', '') if not _extract_prompt_model_hint(stream.get('subtask', '')) else ''
+            orig_model_still_current = False
+            if orig_model:
+                try:
+                    orig_prof_check = resolve_execution_profile(
+                        backends, stream['engine'], orig_tier, orig_check_text, kind, tokens,
+                    )
+                    orig_model_still_current = (
+                        not orig_prof_check.get('execution_blocked_reason')
+                        and orig_prof_check.get('model') == orig_model
+                    )
+                except HarnessError:
+                    orig_model_still_current = False
+            if orig_model_still_current:
+                if orig_prefix == 'agy':
+                    cand_family = _agy_slug_tier(orig_model)[0]
+                    if cand_family and any(
+                        _agy_slug_tier(m.get('slug'))[0] == cand_family
+                        for m in backends.get('agy', {}).get('models', [])
+                    ):
+                        requested = f'agy:{cand_family}'
+                        requested_model = ''
+                        locked_tier_model = True
+                    else:
+                        requested_model = orig_model
+                        locked_tier_model = True
+                else:
+                    requested_model = orig_model
+                    locked_tier_model = True
+        eff_user_engine = '' if (override_engine or locked_tier_model) else user_text
+        eff_text_engine = (
+            (stream.get('subtask', '') if not _extract_prompt_model_hint(stream.get('subtask', '')) else '')
+            if (override_engine or locked_tier_model) else text
+        )
         excluded = set()
         last_error = None
         chosen = None
         stream_switched = False
-        auto_route = (not _extract_prompt_backend_hint(user_text) and not _extract_prompt_model_hint(user_text)
+        auto_route = (not _extract_prompt_backend_hint(eff_user_engine) and not _extract_prompt_model_hint(eff_user_engine)
                       and (not requested or requested.startswith('role:')) and not requested_model)
         while len(excluded) < len(backends):
             available = {key: info for key, info in backends.items() if key not in excluded}
             engine = ''
             try:
-                engine = choose_engine(available, args.caller, requested, text, user_text,
+                engine = choose_engine(available, args.caller, requested, eff_text_engine, eff_user_engine,
                                        ignore_cooldown=getattr(args, 'retry_quota', False))
                 model = requested_model
-                if model and model != 'inherit' and not _extract_prompt_model_hint(user_text) and not excluded:
+                if model and model != 'inherit' and not _extract_prompt_model_hint(eff_user_engine) and not excluded:
                     engine = _engine_parts(engine)[0] + ':' + model
-                tier, reason = _resolve_effective_tier(stream.get('tier', args.tier), kind, user_text, text, engine)
-                profile = resolve_execution_profile(available, engine, tier, text, kind, tokens)
+                if override_tier:
+                    sub_sample = stream.get('subtask', '')
+                    tier, _ = select_task_tier(
+                        stream.get('tier') or args.tier, kind,
+                        '' if sub_sample == user_text else sub_sample, count, tokens, engine=engine,
+                    )
+                else:
+                    eff_user_tier = '' if override_engine else user_text
+                    eff_text_tier = eff_text_engine if override_engine else text
+                    tier, _ = _resolve_effective_tier(stream.get('tier') or args.tier, kind, eff_user_tier, eff_text_tier, engine)
+                profile = resolve_execution_profile(available, engine, tier, eff_text_engine, kind, tokens)
                 _require_execution_profile(profile)
+                eff_profile_tier = profile.get('tier') or tier
                 prefix, _ = _engine_parts(engine)
                 quota = inspect_backend_quota_and_availability(prefix, backends[prefix], profile['model'],
                                                                 redact_usage=getattr(args, 'redact', False),
@@ -6229,7 +7589,7 @@ def _resolve_plan_streams(args, streams, backends):
                     stream_switched = True
                     continue
                 chosen = {**stream, 'stream_id': sid, 'target': str(target), 'kind': kind,
-                          'requested_engine': requested, 'requested_model': requested_model, 'engine': engine, 'tier': tier,
+                          'requested_engine': requested, 'requested_model': requested_model, 'engine': engine, 'tier': eff_profile_tier,
                           'timeout': int(stream.get('timeout') or args.timeout), 'execution_profile': profile,
                           'file_count': count, 'estimated_tokens': tokens, **quota}
                 break
@@ -6261,8 +7621,14 @@ def _render_plan(ticket):
             '| --- | --- | --- | --- |']
     details = []
 
+    def _clean_text(value):
+        return str(value).replace('\r\n', '\n').replace('\r', ' ')
+
+    def _cell(value):
+        return _clean_text(value).replace('|', r'\|').replace('\n', ' ')
+
     def row(values):
-        return '| ' + ' | '.join(str(value).replace('|', r'\|').replace('\n', ' ') for value in values) + ' |'
+        return '| ' + ' | '.join(_cell(value) for value in values) + ' |'
 
     yes_no = lambda value: '是' if value else '否'
     for stream in ticket['streams']:
@@ -6278,113 +7644,336 @@ def _render_plan(ticket):
                   available, stream['quota_scheme'] + '；' + stream['quota_summary'], stream['receipt_location']]
         rows.append(row([values[0], values[2] + '；' + values[3], values[4] + '；' + values[5],
                          values[11] + '；' + values[12]]))
-        details += ['', '#### 流 ' + stream['stream_id'] + '（14 项完整参数明细）', '',
+        details += ['', '#### 流 ' + _clean_text(stream['stream_id']).replace('\n', ' ') + '（14 项完整参数明细）', '',
                     '| 序号 | 参数项 | 当前值 |', '| --- | --- | --- |']
         details.extend(row([index, name, value]) for index, (name, value) in enumerate(zip(columns, values), 1))
     rows.extend(details)
     ledger = ticket.get('capability_ledger', {})
-    markdown = ('工作流背景：' + ticket['workflow_bg'] + '\n\n要做什么：' + ticket['workflow_goal']
-                + '\n\n预计后果：' + ticket['workflow_impact'] + '\n\n' + '\n'.join(rows)
-                + '\n\ncapability_ledger 离线性能记录更新时间：在线刷新 ' + str(ledger.get('last_online_refresh_at'))
-                + '；本机实测 ' + str(ledger.get('local_bench_verified_at'))
-                + '\n\n选项：① 批准当前计划（推荐）；② 微调引擎、挡位或超时后批准；③ 暂缓并交接。'
-                + '\n\n票据：' + ticket['ticket_id'] + '；状态：' + ticket['status'])
+    status = _clean_text(ticket.get('status') or 'PENDING').strip() or 'PENDING'
+    tid_clean = _clean_text(ticket['ticket_id']).replace('\n', ' ')
+    if status == 'PENDING':
+        popup_footer = '\n\n选项：① 批准当前计划（推荐）；② 微调引擎、挡位或超时后批准；③ 暂缓并交接。'
+    elif status == 'APPROVED':
+        popup_footer = f'\n\n当前状态：已批准（APPROVED），可按票据 {tid_clean} 执行（--ticket {tid_clean}）。'
+    elif status == 'HANDED_OFF':
+        popup_footer = '\n\n当前状态：已登记交接（HANDED_OFF）；新会话复核后可选：① 批准当前计划；② 微调引擎、挡位或超时后批准；③ 暂缓并交接。'
+    else:
+        popup_footer = f'\n\n当前状态：{status}。'
+    markdown = ('工作流背景：' + _clean_text(ticket['workflow_bg']) + '\n\n要做什么：' + _clean_text(ticket['workflow_goal'])
+                + '\n\n预计后果：' + _clean_text(ticket['workflow_impact']) + '\n\n' + '\n'.join(rows)
+                + '\n\ncapability_ledger 离线性能记录更新时间：在线刷新 ' + _clean_text(ledger.get('last_online_refresh_at'))
+                + '；本机实测 ' + _clean_text(ledger.get('local_bench_verified_at'))
+                + popup_footer
+                + '\n\n票据：' + tid_clean + '；状态：' + status)
     ticket['human_popup_markdown'] = markdown
+    stream_lines = []
+    for s in ticket.get('streams', []):
+        client_disp = s.get('client') or s.get('engine') or '未声明'
+        model_disp = s.get('model_display') or s.get('model') or '未声明'
+        win_val = s.get('context_window') or s.get('window') or s.get('window_tokens')
+        win_disp = f"{win_val} tokens" if win_val else '未声明'
+        access_disp = s.get('access_mode') or '未声明'
+        stream_lines.append(
+            f"- {_cell(s['stream_id'])}: {_cell(client_disp)} | {_cell(model_disp)} | {_cell(win_disp)} | {_cell(access_disp)}"
+        )
+    persisted = bool(ticket.get('card_detail_file'))
+    detail_ref = f"\n完整 14 项明细文件：{_clean_text(ticket['card_detail_file']).replace(chr(10), ' ')}" if persisted else ""
+    if status == 'PENDING':
+        options_line = (
+            f"\n选项：① 批准（--approve-ticket {tid_clean}）；② 微调后批准；③ 暂缓并交接。"
+            if persisted
+            else "\n选项：① 批准当前计划（未保存票据文件，如需持久票据请加 --save-ticket）；② 微调后批准；③ 暂缓并交接。"
+        )
+    elif status == 'APPROVED':
+        options_line = f"\n状态：已批准（APPROVED，可执行 --ticket {tid_clean}）。"
+    elif status == 'HANDED_OFF':
+        options_line = (
+            f"\n状态：已交接（HANDED_OFF）；新会话复核后可 --approve-ticket {tid_clean} 批准、微调后批准或继续暂缓交接。"
+            if persisted
+            else "\n状态：已交接（HANDED_OFF）。"
+        )
+    else:
+        options_line = f"\n状态：{status}。"
+    ticket['compact_summary_card'] = (
+        f"工作流目标：{_cell(ticket['workflow_goal'])}\n"
+        + "\n".join(stream_lines)
+        + detail_ref
+        + options_line
+    )
+    resume_ref = ('\n恢复命令：plan --resume-ticket ' + tid_clean) if persisted else ''
     ticket['handoff_prompt_block'] = ('【新对话提示词】\n请接力以下完整工作流，先读取并复核票据，不要推测缺失内容。\n'
-                                      + markdown + '\n恢复命令：plan --resume-ticket ' + ticket['ticket_id'])
+                                      + markdown + resume_ref)
 
 
 def _save_plan(ticket, plan_dir):
+    tid = _safe_state_id(ticket.get('ticket_id', ''))
+    plan_dir = resolve_dispatch_plan_dir(plan_dir)
+    if isinstance(ticket.get('streams'), list):
+        ticket['streams'] = _clean_plan_streams(ticket['streams'])
     ticket['plan_hash'] = _plan_hash(ticket)
+    detail_path = plan_dir / (tid + '_card.md')
+    ticket_path = plan_dir / (tid + '.json')
+    ticket['card_detail_file'] = str(detail_path)
     _render_plan(ticket)
-    _atomic_json(plan_dir / (ticket['ticket_id'] + '.json'), ticket)
-    session_id = ticket.get('session_id')
+    _atomic_json(ticket_path, ticket)
+    _atomic_text(detail_path, ticket['human_popup_markdown'] + '\n')
+    session_id = str(ticket.get('session_id') or '').strip()
     if session_id:
         pointer = plan_dir / ('session_' + _safe_state_id(session_id) + '_pending.json')
+        if os.path.lexists(pointer) and _is_link(pointer):
+            raise HarnessError(f'拒绝操作符号链接会话指针文件: {pointer}', 'ticket_invalid')
         if ticket['status'] == 'APPROVED':
-            pointer.unlink(missing_ok=True)
+            existing_ptr = _read_json(pointer)
+            if isinstance(existing_ptr, dict) and existing_ptr.get('ticket_id') == tid:
+                pointer.unlink(missing_ok=True)
         else:
-            _atomic_json(pointer, {'ticket_id': ticket['ticket_id'], 'status': ticket['status'],
-                                   'ticket_file': str(plan_dir / (ticket['ticket_id'] + '.json'))})
+            _atomic_json(pointer, {'ticket_id': tid, 'status': ticket['status'],
+                                   'ticket_file': str(ticket_path)})
 
 
 def cmd_plan(args):
+    if getattr(args, 'ticket', ''):
+        raise HarnessError(
+            'plan 子命令不支持 --ticket；批准票据请用 --approve-ticket <ID>，'
+            '恢复查看请用 --resume-ticket <ID>，登记交接请用 --mark-handed-off <ID>，'
+            '按已批准票据执行请改用 batch/gate/task/audit --ticket <ID>',
+            'ticket_invalid',
+        )
+    if getattr(args, 'override_json', '') and not getattr(args, 'approve_ticket', ''):
+        raise HarnessError(
+            '--override-json 仅可配合 --approve-ticket <ID> 在批准票据时微调 engine/tier/timeout',
+            'ticket_invalid',
+        )
     plan_dir = resolve_dispatch_plan_dir(args.plan_dir)
     ticket_id = args.approve_ticket or args.resume_ticket or args.mark_handed_off
     if ticket_id:
-        ticket = _load_ticket(ticket_id, plan_dir)
-        args.user_prompt = args.user_prompt or ticket.get('user_prompt', '')
-        ticket['user_prompt'] = args.user_prompt
-        if args.mark_handed_off:
-            ticket['status'] = 'HANDED_OFF'
-        else:
-            if args.approve_ticket and args.override_json:
-                overrides = json.loads(args.override_json)
-                if not isinstance(overrides, dict):
-                    raise HarnessError('--override-json 须按 stream_id 提供对象')
-                for stream in ticket['streams']:
-                    override = overrides.get(stream['stream_id'], {})
-                    if set(override) - {'engine', 'tier', 'timeout'}:
-                        raise HarnessError('只可微调 engine、tier、timeout')
-                    stream.update(override)
-                    if 'engine' in override:
-                        stream['requested_engine'] = override['engine']
-                        stream['requested_model'] = ''
-            backends = _args_backends(args, refresh_model_cache=False)
-            core_fields = ('engine', 'model', 'tier', 'timeout', 'channel', 'context_window',
-                           'currently_available', 'unavailable_reason', 'quota_exceeded')
-            expected = [{key: stream.get(key) for key in core_fields} for stream in ticket['streams']]
-            profile_fields = ('spec', 'model', 'reasoning_effort', 'cli_effort')
-            expected_profiles = [{key: stream.get('execution_profile', {}).get(key) for key in profile_fields}
-                                 for stream in ticket['streams']]
-            # 微调的预期值先按用户指定引擎和挡位计算；第二道门仍负责检查可用性和漂移。
-            if args.approve_ticket and args.override_json:
-                for stream, core, profile_core in zip(ticket['streams'], expected, expected_profiles):
-                    override = overrides.get(stream['stream_id'], {})
-                    if (set(override) & {'engine', 'tier'} and stream['channel'] == 'cae_harness_headless'):
+        with _plan_dir_lock(plan_dir), _directory_file_lock(plan_dir, ticket_id, label='计划票据'):
+            ticket = _load_ticket(ticket_id, plan_dir)
+            if args.approve_ticket or args.mark_handed_off:
+                _verify_ticket_session(ticket, args)
+            args.user_prompt = args.user_prompt or ticket.get('user_prompt', '')
+            ticket['user_prompt'] = args.user_prompt
+            forced = bool(getattr(args, 'force', False))
+            if args.mark_handed_off:
+                if ticket.get('status') == 'APPROVED' and not forced:
+                    raise HarnessError('已批准票据不可直接降级为已交接状态，如需强制交接请传 --force', 'ticket_invalid')
+                ticket['status'] = 'HANDED_OFF'
+            else:
+                orig_streams = copy.deepcopy(ticket['streams'])
+                candidate_streams = copy.deepcopy(orig_streams)
+                overrides = {}
+                if args.approve_ticket and args.override_json:
+                    try:
+                        overrides = json.loads(args.override_json)
+                    except ValueError as exc:
+                        raise HarnessError('--override-json 不是合法 JSON', 'ticket_invalid') from exc
+                    if not isinstance(overrides, dict):
+                        raise HarnessError('--override-json 须按 stream_id 提供对象', 'ticket_invalid')
+                    ordered_ids = [stream['stream_id'] for stream in orig_streams]
+                    known_ids = set(ordered_ids)
+                    unknown_ids = sorted(set(overrides) - known_ids)
+                    if unknown_ids:
+                        raise HarnessError(
+                            f'--override-json 包含未知 stream_id: {", ".join(unknown_ids)}（当前票据可选流号：{", ".join(ordered_ids)}）',
+                            'ticket_invalid', unknown_stream_ids=unknown_ids, available_stream_ids=ordered_ids,
+                        )
+                    valid_tiers = ', '.join(TIER_CHOICES)
+                    for sid, raw_ov in overrides.items():
+                        if not isinstance(raw_ov, dict):
+                            raise HarnessError(f'--override-json[{sid}] 必须为 JSON 对象', 'ticket_invalid')
+                        if set(raw_ov) - {'engine', 'tier', 'timeout'}:
+                            raise HarnessError('只可微调 engine、tier、timeout', 'ticket_invalid')
+                        if 'tier' in raw_ov and (not isinstance(raw_ov['tier'], str) or raw_ov['tier'] not in TIER_CHOICES):
+                            raise HarnessError(
+                                f'--override-json[{sid}].tier 无效：{raw_ov["tier"]!r}（可选值：{valid_tiers}）',
+                                'ticket_invalid',
+                            )
+                        if 'timeout' in raw_ov and _positive_int(raw_ov['timeout']) is None:
+                            raise HarnessError(f'--override-json[{sid}].timeout 必须为正整数', 'ticket_invalid')
+                        if 'engine' in raw_ov and (not isinstance(raw_ov['engine'], str) or not raw_ov['engine'].strip()):
+                            raise HarnessError(f'--override-json[{sid}].engine 必须为非空字符串', 'ticket_invalid')
+                    for orig_stream, stream in zip(orig_streams, candidate_streams):
+                        override = dict(overrides.get(stream['stream_id'], {}))
+                        if 'engine' in override and stream.get('channel', 'cae_harness_headless') != 'cae_harness_headless':
+                            raise HarnessError(
+                                f'原生通道流 {stream["stream_id"]} 不支持通过 --override-json 微调 engine',
+                                'ticket_invalid',
+                            )
+                        if 'timeout' in override:
+                            override['timeout'] = int(override['timeout'])
+                        if 'tier' in override:
+                            stream['_orig_tier'] = orig_stream.get('tier') or ''
+                        stream.update(override)
                         if 'engine' in override:
-                            engine = choose_engine(backends, args.caller, stream['requested_engine'], stream.get('subtask', ''), args.user_prompt)
-                        else:
-                            # 只改挡位时用原票据的具体模型计算强度，不重新解释 default 或角色别名。
-                            engine = _engine_parts(stream['engine'])[0] + ':' + stream['model']
-                        tier, _ = _resolve_effective_tier(stream['tier'], stream['kind'], args.user_prompt, stream.get('subtask', ''), engine)
-                        profile = resolve_execution_profile(backends, engine, tier, args.user_prompt or stream.get('subtask', ''), stream['kind'])
+                            stream['requested_engine'] = override['engine']
+                            stream['requested_model'] = ''
+                            stream['_override_engine'] = True
+                            if 'tier' not in override:
+                                stream['tier'] = 'auto'
+                        if 'tier' in override:
+                            stream['_override_tier'] = True
+                backends = _args_backends(args, refresh_model_cache=False)
+                core_fields = ('engine', 'model', 'tier', 'timeout', 'channel', 'context_window',
+                               'currently_available', 'unavailable_reason', 'quota_exceeded')
+                expected = [{key: stream.get(key) for key in core_fields} for stream in candidate_streams]
+                profile_fields = ('spec', 'model', 'reasoning_effort', 'cli_effort')
+                expected_profiles = [{key: stream.get('execution_profile', {}).get(key) for key in profile_fields}
+                                     for stream in candidate_streams]
+                # 微调的预期值先按用户指定引擎和挡位计算；第二道门仍负责检查可用性和漂移。
+                if args.approve_ticket and args.override_json:
+                    for orig_stream, stream, core, profile_core in zip(orig_streams, candidate_streams, expected, expected_profiles):
+                        override = overrides.get(stream['stream_id'], {})
+                        if not (set(override) & {'engine', 'tier'}):
+                            continue
+                        if stream.get('channel', 'cae_harness_headless') != 'cae_harness_headless':
+                            if 'tier' in override:
+                                sub_sample = stream.get('subtask', '')
+                                tier, _ = select_task_tier(
+                                    stream['tier'], stream['kind'],
+                                    '' if sub_sample == args.user_prompt else sub_sample,
+                                    stream.get('file_count', 1), stream.get('estimated_tokens', 0),
+                                )
+                                core['tier'] = tier
+                            continue
+                        locked_model_target = False
                         if 'engine' in override:
-                            core.update(engine=engine, model=profile['model'], tier=tier,
-                                        context_window=profile['capacity']['selected_window_tokens'])
-                            profile_core.update({key: profile.get(key) for key in profile_fields})
+                            sub_clean = stream.get('subtask', '') if not _extract_prompt_model_hint(stream.get('subtask', '')) else ''
+                            engine = choose_engine(backends, args.caller, stream['requested_engine'], sub_clean, '',
+                                                   ignore_cooldown=getattr(args, 'retry_quota', False))
+                            locked_model_target = True
                         else:
-                            core['tier'] = tier
-                            profile_core.update({key: profile.get(key) for key in ('reasoning_effort', 'cli_effort')})
-            try:
-                streams, switched = _resolve_plan_streams(args, ticket['streams'], backends)
-            except HarnessError:
-                if not args.approve_ticket:
-                    raise
-                streams = [dict(stream) for stream in ticket['streams']]
-                for stream in streams:
-                    prefix, _ = _engine_parts(stream['engine'])
-                    stream.update(inspect_backend_quota_and_availability(prefix, backends[prefix], stream.get('model')))
-                if all(all(stream.get(key) == value for key, value in core.items())
-                       for stream, core in zip(streams, expected)):
-                    raise
-                switched = True
-            drift = switched or any(any(stream.get(key) != value for key, value in core.items())
-                                    for stream, core in zip(streams, expected)) or any(
-                any(stream.get('execution_profile', {}).get(key) != value for key, value in core.items())
-                for stream, core in zip(streams, expected_profiles))
-            if args.approve_ticket and drift:
-                ticket.update(streams=streams, status='PENDING', is_heavy=_is_heavy_streams(streams, switched))
-                _save_plan(ticket, plan_dir)
-                raise HarnessError('确认期间通道可用性或选路发生变化，已更新确认单，请重新向用户展示确认', 'ticket_changed')
-            if args.approve_ticket and any(not stream['currently_available'] for stream in streams):
-                raise HarnessError('二次检查门拒绝批准不可用的原生通道', 'quota_exhausted' if any(
-                    stream['quota_exceeded'] for stream in streams) else 'failed')
-            changed = ticket['streams'] != streams
-            ticket['streams'] = streams
-            ticket['is_heavy'] = _is_heavy_streams(streams, switched)
-            ticket['status'] = 'APPROVED' if args.approve_ticket else ('PENDING' if changed else ticket['status'])
-        _save_plan(ticket, plan_dir)
+                            orig_prefix = _engine_parts(orig_stream['engine'])[0]
+                            orig_model = orig_stream.get('model') or ''
+                            orig_tier = orig_stream.get('tier') or 'max'
+                            orig_prof_src = (orig_stream.get('execution_profile') or {}).get('profile_source')
+                            orig_check_text = args.user_prompt or orig_stream.get('subtask', '')
+                            if orig_prof_src and orig_prof_src != 'prompt_fuzzy_model' and _extract_prompt_model_hint(orig_check_text):
+                                orig_check_text = orig_stream.get('subtask', '') if not _extract_prompt_model_hint(orig_stream.get('subtask', '')) else ''
+                            still_current = False
+                            if orig_model:
+                                try:
+                                    orig_check = resolve_execution_profile(
+                                        backends, orig_stream['engine'], orig_tier, orig_check_text,
+                                        orig_stream['kind'], estimated_tokens=orig_stream.get('estimated_tokens', 0),
+                                    )
+                                    still_current = (
+                                        not orig_check.get('execution_blocked_reason')
+                                        and orig_check.get('model') == orig_model
+                                    )
+                                except HarnessError:
+                                    still_current = False
+                            if not still_current:
+                                sub_sample = stream.get('subtask', '')
+                                tier, _ = select_task_tier(
+                                    stream['tier'], stream['kind'],
+                                    '' if sub_sample == args.user_prompt else sub_sample,
+                                    stream.get('file_count', 1), stream.get('estimated_tokens', 0), engine=orig_stream['engine'],
+                                )
+                                core['tier'] = tier
+                                continue
+                            cand_family = _agy_slug_tier(orig_model)[0] if orig_prefix == 'agy' else ''
+                            if cand_family and any(
+                                _agy_slug_tier(m.get('slug'))[0] == cand_family
+                                for m in backends.get('agy', {}).get('models', [])
+                            ):
+                                engine = f'agy:{cand_family}'
+                            else:
+                                # 只改挡位且未发生目录漂移时锁定原具体模型并同步更新 core。
+                                engine = orig_prefix + ':' + (orig_model or 'default')
+                            locked_model_target = True
+                        if 'tier' in override:
+                            sub_sample = stream.get('subtask', '')
+                            tier, _ = select_task_tier(
+                                stream['tier'], stream['kind'],
+                                '' if sub_sample == args.user_prompt else sub_sample,
+                                stream.get('file_count', 1), stream.get('estimated_tokens', 0), engine=engine,
+                            )
+                        else:
+                            eff_user_tier = '' if 'engine' in override else args.user_prompt
+                            eff_sub_tier = (
+                                (stream.get('subtask', '') if not _extract_prompt_model_hint(stream.get('subtask', '')) else '')
+                                if 'engine' in override else stream.get('subtask', '')
+                            )
+                            tier, _ = _resolve_effective_tier(stream['tier'], stream['kind'], eff_user_tier, eff_sub_tier, engine)
+                        prof_text = (
+                            (stream.get('subtask', '') if not _extract_prompt_model_hint(stream.get('subtask', '')) else '')
+                            if locked_model_target
+                            else (args.user_prompt or stream.get('subtask', ''))
+                        )
+                        profile = resolve_execution_profile(
+                            backends, engine, tier, prof_text, stream['kind'],
+                            estimated_tokens=stream.get('estimated_tokens', 0),
+                        )
+                        _require_execution_profile(profile)
+                        core.update(engine=engine, model=profile['model'], tier=profile['tier'],
+                                    context_window=profile['capacity']['selected_window_tokens'])
+                        profile_core.update({key: profile.get(key) for key in profile_fields})
+                has_engine_override = any(isinstance(ov, dict) and 'engine' in ov for ov in overrides.values())
+                try:
+                    streams, switched = _resolve_plan_streams(args, candidate_streams, backends)
+                except HarnessError:
+                    ticket['streams'] = _clean_plan_streams(orig_streams)
+                    if not args.approve_ticket or has_engine_override:
+                        raise
+                    streams = [dict(stream) for stream in ticket['streams']]
+                    for stream in streams:
+                        prefix, _ = _engine_parts(stream['engine'])
+                        stream.update(inspect_backend_quota_and_availability(
+                            prefix, backends[prefix], stream.get('model'),
+                            redact_usage=getattr(args, 'redact', False),
+                            ignore_cooldown=getattr(args, 'retry_quota', False),
+                        ))
+                    orig_expected = [{key: s.get(key) for key in core_fields} for s in orig_streams]
+                    if all(all(stream.get(key) == value for key, value in core.items())
+                           for stream, core in zip(streams, orig_expected)):
+                        raise
+                    switched = True
+                drift = switched or any(any(stream.get(key) != value for key, value in core.items())
+                                        for stream, core in zip(streams, expected)) or any(
+                    any(stream.get('execution_profile', {}).get(key) != value for key, value in core.items())
+                    for stream, core in zip(streams, expected_profiles))
+                if args.approve_ticket and drift:
+                    if ticket.get('status') == 'APPROVED' and not forced:
+                        raise HarnessError('已批准票据在通道漂移时不可静默降级为待决状态，如需重置请传 --force', 'ticket_invalid')
+                    ticket.update(streams=streams, status='PENDING', is_heavy=_is_heavy_streams(streams, switched))
+                    _save_plan(ticket, plan_dir)
+                    raise HarnessError('确认期间通道可用性或选路发生变化，已更新确认单，请重新向用户展示确认', 'ticket_changed')
+                if args.approve_ticket:
+                    unavail_streams = [stream for stream in streams if not stream.get('currently_available')]
+                    if unavail_streams:
+                        unavail_desc = '；'.join(
+                            f"{s.get('stream_id', '?')}[{s.get('channel', 'cae_harness_headless')}]"
+                            f"({s.get('unavailable_reason') or 'unavailable'})"
+                            for s in unavail_streams
+                        )
+                        raise HarnessError(
+                            f'二次检查门拒绝批准不可用的工作流：{unavail_desc}',
+                            'quota_exhausted' if any(s.get('quota_exceeded') for s in unavail_streams) else 'failed',
+                            unavailable_streams=[
+                                {
+                                    'stream_id': s.get('stream_id'),
+                                    'channel': s.get('channel', 'cae_harness_headless'),
+                                    'client': s.get('client'),
+                                    'unavailable_reason': s.get('unavailable_reason'),
+                                }
+                                for s in unavail_streams
+                            ],
+                        )
+                changed = orig_streams != streams
+                ticket['streams'] = streams
+                ticket['is_heavy'] = _is_heavy_streams(streams, switched)
+                if args.approve_ticket:
+                    for stream in streams:
+                        ep_tier = (stream.get('execution_profile') or {}).get('tier')
+                        if ep_tier:
+                            stream['tier'] = ep_tier
+                    ticket['status'] = 'APPROVED'
+                elif ticket.get('status') == 'APPROVED':
+                    if forced and changed:
+                        ticket['status'] = 'PENDING'
+                elif ticket.get('status') != 'HANDED_OFF' and changed:
+                    ticket['status'] = 'PENDING'
+            _save_plan(ticket, plan_dir)
     else:
         streams = _read_stream_spec(args.spec_file) if args.spec_file else [{
             'stream_id': 'S1', 'subtask': args.workflow_goal or args.user_prompt or '检查目标',
@@ -6401,7 +7990,8 @@ def cmd_plan(args):
         ticket['plan_hash'] = _plan_hash(ticket)
         _render_plan(ticket)
         if ticket['is_heavy'] or args.save_ticket:
-            _save_plan(ticket, plan_dir)
+            with _plan_dir_lock(plan_dir), _directory_file_lock(plan_dir, ticket['ticket_id'], label='计划票据'):
+                _save_plan(ticket, plan_dir)
     if args.output:
         _atomic_json(args.output, ticket if args.no_redact_output else _redact_public(ticket))
     _print(_redact_public(ticket) if args.redact else ticket)
@@ -6422,6 +8012,26 @@ def cmd_batch(args):
         raise HarnessError('原生通道请在 caller 客户端内部执行，batch 仅执行 cae_harness_headless 通道')
     limits = _headless_tunables().get('batch_max_workers_per_backend', {})
     blocked, lock = set(), threading.Lock()
+    ws_cond, active_ws = threading.Condition(), []
+
+    def _ws_conflicts(r1, w1, r2, w2):
+        return (w1 or w2) and (r1 == r2 or r1 in r2.parents or r2 in r1.parents)
+
+    @contextlib.contextmanager
+    def _workspace_guard(root_path, writable):
+        resolved_root = Path(root_path).resolve()
+        with ws_cond:
+            while any(_ws_conflicts(resolved_root, writable, ar, aw) for ar, aw in active_ws):
+                ws_cond.wait()
+            token = (resolved_root, writable)
+            active_ws.append(token)
+        try:
+            yield
+        finally:
+            with ws_cond:
+                active_ws.remove(token)
+                ws_cond.notify_all()
+
     quota_batch = _QuotaBatch(args.retry_quota)
     def run(stream):
         started = time.monotonic()
@@ -6434,68 +8044,119 @@ def cmd_batch(args):
                 raise HarnessError('批处理 gate 任务必须声明非空 verify_cmd')
             with lock:
                 if prefix in blocked:
-                    raise HarnessError('同后端前序任务已触发额度熔断，停止排队流', 'quota_exhausted')
-            quota = inspect_backend_quota_and_availability(prefix, backends[prefix], stream['execution_profile']['model'],
+                    raise HarnessError('同后端前序任务已触发额度熔断，停止排队流', 'quota_exhausted', queue_aborted=True)
+            quota = inspect_backend_quota_and_availability(prefix, backends[prefix], (stream.get('execution_profile') or {}).get('model'),
                                                            ignore_cooldown=args.retry_quota)
             if not quota['currently_available']:
                 if quota['quota_exceeded']:
                     with lock:
                         blocked.add(prefix)
-                raise HarnessError('批处理二次检查门拒绝执行', quota['unavailable_reason'])
+                raise HarnessError('批处理二次检查门拒绝执行', quota['unavailable_reason'], preflight_blocked=True)
             text = args.user_prompt or stream.get('subtask', '')
-            tier, _ = _resolve_effective_tier(stream['tier'], stream['kind'], args.user_prompt, text, engine)
-            profile = resolve_execution_profile(backends, engine, tier, text, stream['kind'])
+            if getattr(args, '_approved_ticket', None):
+                tier = stream['tier']
+                if stream.get('execution_profile', {}).get('profile_source') != 'prompt_fuzzy_model' and _extract_prompt_model_hint(text):
+                    text = stream.get('subtask', '') if not _extract_prompt_model_hint(stream.get('subtask', '')) else ''
+            else:
+                tier, _ = _resolve_effective_tier(stream['tier'], stream['kind'], args.user_prompt, text, engine)
+            profile = resolve_execution_profile(
+                backends, engine, tier, text, stream['kind'],
+                estimated_tokens=stream.get('estimated_tokens', 0),
+            )
+            approved_prof = stream.get('execution_profile') or {}
+            if (
+                getattr(args, '_approved_ticket', None)
+                and profile['spec'] != approved_prof.get('spec')
+                and approved_prof.get('profile_source') != 'prompt_fuzzy_model'
+            ):
+                sub_only = stream.get('subtask', '')
+                if _extract_prompt_model_hint(sub_only):
+                    sub_only = ''
+                if sub_only != text:
+                    alt_profile = resolve_execution_profile(
+                        backends, engine, tier, sub_only, stream['kind'],
+                        estimated_tokens=stream.get('estimated_tokens', 0),
+                    )
+                    if not alt_profile.get('execution_blocked_reason'):
+                        profile = alt_profile
             _require_execution_profile(profile)
-            if getattr(args, '_approved_ticket', None) and profile['spec'] != stream['execution_profile']['spec']:
+            if getattr(args, '_approved_ticket', None) and (
+                profile['spec'] != approved_prof.get('spec')
+                or profile.get('cli_effort') != approved_prof.get('cli_effort')
+            ):
                 raise HarnessError('实际模型与获批计划不一致，请重新确认票据', 'ticket_invalid')
             result['model'] = profile['model']
+            target = Path(stream['target']).expanduser().resolve()
+            if not target.exists():
+                raise HarnessError(f'工作流目标不存在: {target}')
             if args.dry_run:
                 result.update(status='ok', dry_run=True)
                 return result
-            target = Path(stream['target'])
             root = target if target.is_dir() else target.parent
             readonly = stream['kind'] not in ('code', 'gate')
             scopes = _scope_patterns(stream.get('write_scope', []))
             if not readonly and not scopes:
                 raise HarnessError('批处理编码任务必须声明 write_scope')
-            before = snapshot_files(root)
-            try:
-                result['result'] = invoke_engine(profile['spec'], root, stream.get('subtask', ''), backends,
-                                                 TASK_JSON_SCHEMA, readonly, stream['timeout'],
-                                                 agent=stream.get('agent_type') or 'readonly-collaborator',
-                                                 stage_files=[target.name] if target.is_file() else None,
-                                                 profile=profile, receipt=invocation, batch=quota_batch,
-                                                 clean_room=stream.get('clean_room', False),
-                                                 inline_readonly=stream.get('inline_readonly', args.inline_readonly))
-                result['status'] = 'ok'
-            finally:
-                scope = _safe_changes_report(before, root, scopes, readonly)
-                staged_scope = invocation.get('staged_scope')
-                if isinstance(staged_scope, dict):
-                    # 暂存副本与原目录都要检查；任一快照违规或核对失败均不得通过。
-                    scope = {**scope, **staged_scope,
-                             'scope_verified': bool(scope.get('scope_verified') and staged_scope.get('scope_verified')),
-                             'scope_violations': sorted(set(scope.get('scope_violations', []))
-                                                        | set(staged_scope.get('scope_violations', [])))}
-                result.update(scope)
-                if scope.get('scope_violations'):
-                    result['status'] = 'scope_violation'
-                elif not scope.get('scope_verified'):
-                    result['status'] = 'failed'
-            if result['status'] == 'ok' and not readonly and stream.get('verify_cmd'):
-                verification = run_process(stream['verify_cmd'], root, timeout_sec=stream['timeout'], shell=True)
-                result['verification_executed'] = True
-                if verification.returncode:
-                    result['status'] = 'verification_failed'
+            with _workspace_guard(root, not readonly):
+                snap_ignored = None if readonly else _snapshot_ignore_dirs_for(
+                    scopes, include_build=bool((stream.get('verify_cmd') or '').strip())
+                )
+                snap_patterns = read_agentignore_patterns(root)
+                before = snapshot_files(root, ignore_dirs=snap_ignored, ignore_patterns=snap_patterns)
+                try:
+                    result['result'] = invoke_engine(profile['spec'], root, stream.get('subtask', ''), backends,
+                                                     TASK_JSON_SCHEMA, readonly, stream['timeout'],
+                                                     agent=stream.get('agent_type') or 'readonly-collaborator',
+                                                     stage_files=[target.name] if target.is_file() else None,
+                                                     profile=profile, receipt=invocation, batch=quota_batch,
+                                                     clean_room=stream.get('clean_room', False),
+                                                     inline_readonly=stream.get('inline_readonly', args.inline_readonly))
+                    result['status'] = 'ok'
+                finally:
+                    scope = _safe_changes_report(
+                        before, root, scopes, readonly, ignore_dirs=snap_ignored, ignore_patterns=snap_patterns
+                    )
+                    staged_scope = invocation.pop('staged_scope', None)
+                    if isinstance(staged_scope, dict):
+                        # 暂存副本与原目录都要检查；任一快照违规或核对失败均不得通过。
+                        both_verified = bool(scope.get('scope_verified') and staged_scope.get('scope_verified'))
+                        c1, c2 = scope.get('changed_files'), staged_scope.get('changed_files')
+                        merged_changed = (
+                            None if (c1 is None or c2 is None) and not (c1 or c2)
+                            else sorted(set(c1 or []) | set(c2 or []))
+                        )
+                        scope = {
+                            **staged_scope,
+                            **scope,
+                            'scope_verified': both_verified,
+                            'scope_check': scope.get('scope_check') if not scope.get('scope_verified') else staged_scope.get('scope_check', 'post_execution_snapshot'),
+                            'changed_files': merged_changed,
+                            'scope_violations': sorted(set(scope.get('scope_violations') or [])
+                                                       | set(staged_scope.get('scope_violations') or [])),
+                        }
+                    result.update(scope)
+                    if scope.get('scope_violations'):
+                        result['status'] = 'scope_violation'
+                    elif not scope.get('scope_verified'):
+                        result['status'] = 'failed'
+                if result['status'] == 'ok' and not readonly and stream.get('verify_cmd'):
+                    verification = run_process(stream['verify_cmd'], root, timeout_sec=stream['timeout'], shell=True)
+                    result['verification_executed'] = True
+                    result['verify_exit_code'] = verification.returncode
+                    result['verify_output_tail'] = ((verification.stdout or '') + '\n' + (verification.stderr or '')).strip()[-2000:]
+                    if verification.returncode:
+                        result['status'] = 'verification_failed'
         except Exception as exc:
             status = getattr(exc, 'status', 'failed')
+            details = getattr(exc, 'details', {})
             if result['status'] != 'scope_violation':
                 result['status'] = status
-            result.update(error=str(exc), **getattr(exc, 'details', {}))
+            result.update(error=str(exc), **details)
             if status == 'quota_exhausted':
                 with lock:
                     blocked.add(prefix)
-                if not args.dry_run:
+                if (not args.dry_run and not details.get('quota_cooldown')
+                        and not details.get('preflight_blocked') and not details.get('queue_aborted')):
                     _record_quota_exhausted(prefix, backends[prefix], str(exc), batch=quota_batch)
         finally:
             result['succeeded'] = result['status'] == 'ok'
@@ -6552,21 +8213,23 @@ def build_arg_parser():
     plan.add_argument('--write-scope', action='append', default=[])
     plan.add_argument('--verify-cmd', default='')
     plan.add_argument('--receipt-location', default='')
-    plan.add_argument('--spec-file', default='')
-    plan.add_argument('--workflow-bg', default='')
-    plan.add_argument('--workflow-goal', default='')
-    plan.add_argument('--workflow-impact', default='')
-    plan.add_argument('--save-ticket', action='store_true')
+    plan.add_argument('--spec-file', default='', help='多流工作流配置 JSON 文件路径')
+    plan.add_argument('--workflow-bg', default='', help='工作流背景说明')
+    plan.add_argument('--workflow-goal', default='', help='工作流目标说明')
+    plan.add_argument('--workflow-impact', default='', help='预计后果与影响范围说明')
+    plan.add_argument('--save-ticket', action='store_true', help='即使未达重负载阈值也强制保存票据文件')
     actions = plan.add_mutually_exclusive_group()
-    actions.add_argument('--approve-ticket', default='')
-    actions.add_argument('--resume-ticket', default='')
-    actions.add_argument('--mark-handed-off', default='')
-    plan.add_argument('--override-json', default='')
+    actions.add_argument('--approve-ticket', default='', help='按票据 ID 经二次可用性检查后登记为已批准状态')
+    actions.add_argument('--resume-ticket', default='', help='按票据 ID 读取并刷新待决或已交接工作流状态')
+    actions.add_argument('--mark-handed-off', default='', help='按票据 ID 将工作流标记为已交接状态')
+    plan.add_argument('--override-json', default='', help='配合 --approve-ticket 按 stream_id 微调 engine、tier 或 timeout 的 JSON 对象')
+    plan.add_argument('--force', action='store_true', help='强制允许对已批准票据执行交接或状态重置')
     batch = sub.add_parser('batch', help='按后端限流执行独立工作流')
-    batch.add_argument('--spec-file', default='')
-    batch.add_argument('--target', default='.')
-    batch.add_argument('--kind', default='review')
-    batch.add_argument('--engine', default='')
+    batch.add_argument('--spec-file', default='', help='待执行的无头工作流列表 JSON 文件路径')
+    batch.add_argument('--target', default='.', help='默认目标目录或文件路径')
+    batch.add_argument('--kind', default='review', choices=['review', 'math', 'code', 'gate', 'direction', 'polish'],
+                       help='默认子任务类型（当工作流条目未单独声明 kind 时生效）')
+    batch.add_argument('--engine', default='', help='默认后端与模型规格')
     audit = sub.add_parser('audit', help='单路或双路文件审计')
     audit.add_argument('--target', required=True)
     audit.add_argument('--focus', default='')
@@ -6610,15 +8273,20 @@ def build_arg_parser():
         command.add_argument('--timeout', type=_positive_arg, default=default_timeout)
         command.add_argument('--dry-run', action='store_true')
     for command in (probe, assess, audit, gate, task, plan, batch):
-        command.add_argument('--output', default='')
-        command.add_argument('--no-redact-output', action='store_true')
-        command.add_argument('--redact', action='store_true')
+        command.add_argument('--output', default='', help='将结构化结果写入指定 JSON 文件路径（默认自动脱敏）')
+        command.add_argument('--no-redact-output', action='store_true', help='写入 --output 文件时保留未脱敏原始路径与统计字段')
+        command.add_argument('--redact', action='store_true', help='对标准输出 JSON 启用路径、私网地址、用量比例与敏感键值脱敏')
     for command in (audit, gate, task, plan, batch):
-        command.add_argument('--user-prompt', default='')
-        command.add_argument('--session-id', default='')
-        command.add_argument('--plan-dir', default='')
-        command.add_argument('--ticket', default='')
-        command.add_argument('--inline-readonly', action=argparse.BooleanOptionalAction, default=True)
+        command.add_argument('--user-prompt', default='', help='传入用户原话以锁定显式点名的后端、模型简称或挡位意图')
+        command.add_argument('--session-id', default='', help='绑定当前会话标识符以关联待批票据与完工记录')
+        command.add_argument('--plan-dir', default='', help='显式指定确认票据与运行回执状态目录路径')
+        ticket_help = (
+            '（误用拦截）plan 请改用 --approve-ticket / --resume-ticket / --mark-handed-off'
+            if command is plan else '绑定已获批准的确认票据 ID 执行一致性核验'
+        )
+        command.add_argument('--ticket', default='', help=ticket_help)
+        command.add_argument('--inline-readonly', action=argparse.BooleanOptionalAction, default=True,
+                             help='为只读无头任务自动内联小文件带行号原文')
     return parser
 
 

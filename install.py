@@ -28,6 +28,11 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+
+if sys.version_info < (3, 11):
+    sys.stderr.write("[!] 错误：需要 Python 3.11 或更高版本 (Python 3.11+ is required).\n")
+    raise SystemExit(2)
+
 import tomllib
 from pathlib import Path, PureWindowsPath
 from typing import Any, Dict, List, NamedTuple, Optional, Set, Tuple
@@ -59,10 +64,16 @@ TOML_KEY_PATH = rf"{TOML_KEY}(?:[ \t]*\.[ \t]*{TOML_KEY})*"
 TOML_TABLE = re.compile(rf"^[ \t]*(\[{{1,2}})[ \t]*({TOML_KEY_PATH})[ \t]*(\]{{1,2}})[ \t]*(?:#.*)?$")
 TOML_ASSIGNMENT = re.compile(rf"^([ \t]*({TOML_KEY_PATH})[ \t]*=[ \t]*)(.*)$")
 HOOK_PYTHON_FLAGS = ["-X", "utf8", "-I", "-B"]
+PY_LAUNCHER_ARGS: Tuple[List[str], ...] = (["-3"], ["-3.14"], ["-3.13"], ["-3.12"], ["-3.11"])
+POSIX_HOOK_PYTHON_NAMES: Tuple[str, ...] = (
+    "python3", "python", "python3.14", "python3.13", "python3.12", "python3.11",
+)
+AGY_SINGLE_EFFORT_RE = re.compile(r"^(.+)-(minimal|low|medium|high|xhigh|max)$", re.IGNORECASE)
 LEGACY_PYTHON_FLAGS = ([], ["-B"], ["-I", "-B"], HOOK_PYTHON_FLAGS)
 HANDOFF_MARKER = re.compile(r"\[user-guard codex-handoff v1 mode=(advisory|enforce|off) compact_limit=([0-9]+)\]")
 CLAUDE_HOOK_SCRIPTS = ("user_words.py", "session_context_loader.py", "status_guard.py", "reply_repeat_guard.py", "handoff_gate.py")
 CODEX_HOOK_ENTRIES = ("session_context_loader.py", "status_guard.py", "reply_repeat_guard.py", "handoff_gate.py")
+HOOK_LIB_FILES = ("__init__.py", "fs_safety.py", "shell_lex.py", "adaptive_policy.py")
 CLAUDE_RETIRED_SCRIPTS = ("background_status.py", "read_delegation_guard.py", "receipts_stop.py")
 
 
@@ -92,17 +103,34 @@ def _default_claude_effort(repo_root: Optional[Path] = None) -> str:
     return val if val in {"low", "medium", "high", "xhigh", "max"} else "xhigh"
 
 
-def _default_handoff_policy(client: str, repo_root: Optional[Path] = None) -> Tuple[str, int]:
-    tunables = _load_fleet_profile(repo_root).get("runtime_tunables")
-    ht = tunables.get("handoff_thresholds") if isinstance(tunables, dict) else None
-    cfg = ht.get(client) if isinstance(ht, dict) else None
-    if not isinstance(cfg, dict):
-        return "advisory", 0
-    raw_mode = str(cfg.get("default_mode") or "advisory").strip().lower()
-    mode = raw_mode if raw_mode in {"advisory", "enforce", "off"} else "advisory"
-    raw_lim = cfg.get("default_compact_limit")
-    limit = int(raw_lim) if isinstance(raw_lim, int) and not isinstance(raw_lim, bool) and raw_lim >= 0 else 0
-    return mode, limit
+def _default_handoff_policy(
+    client: str,
+    repo_root: Optional[Path] = None,
+    model_name: str = "",
+    effort: str = "",
+    explicit_window: Optional[int] = None,
+) -> Tuple[str, int]:
+    profile = _load_fleet_profile(repo_root)
+    hooks_lib_parent = (repo_root / "template/user-guard/hooks") if repo_root is not None else (Path(__file__).resolve().parent / "template/user-guard/hooks")
+    if hooks_lib_parent.is_dir() and str(hooks_lib_parent) not in sys.path:
+        sys.path.insert(0, str(hooks_lib_parent))
+    try:
+        from _lib import adaptive_policy  # type: ignore
+        resolved = adaptive_policy.resolve_adaptive_handoff_policy(
+            profile, client, model_name=model_name, effort=effort, explicit_window=explicit_window,
+        )
+        return str(resolved["default_mode"]), int(resolved["default_compact_limit"])
+    except ImportError:
+        tunables = profile.get("runtime_tunables")
+        ht = tunables.get("handoff_thresholds") if isinstance(tunables, dict) else None
+        cfg = ht.get(client) if isinstance(ht, dict) else None
+        if not isinstance(cfg, dict):
+            return "advisory", 0
+        raw_mode = str(cfg.get("default_mode") or "advisory").strip().lower()
+        mode = raw_mode if raw_mode in {"advisory", "enforce", "off"} else "advisory"
+        raw_lim = cfg.get("default_compact_limit")
+        limit = int(raw_lim) if isinstance(raw_lim, int) and not isinstance(raw_lim, bool) and raw_lim >= 0 else 0
+        return mode, limit
 
 
 def _is_mnt_windows_path(path_str: Optional[str]) -> bool:
@@ -157,7 +185,7 @@ def _same_nonlink_path(left: Path, right: Path) -> bool:
         return False
 
 
-def _validate_path(path: Path, *, directory: bool) -> Path:
+def _validate_path(path: Path, *, directory: bool, allow_hardlinks: bool = False) -> Path:
     """逐级检查真实目录，拒绝路径跳转和目标文件硬链接。"""
     path = path.expanduser().absolute()
     if ".." in path.parts:
@@ -183,7 +211,7 @@ def _validate_path(path: Path, *, directory: bool) -> Path:
             raise ValueError(f"安装目标或其祖先必须为目录: {ancestor}")
         if not want_directory and not stat.S_ISREG(metadata.st_mode):
             raise ValueError(f"安装目标必须为普通文件: {ancestor}")
-        if not want_directory and metadata.st_nlink > 1:
+        if not want_directory and not allow_hardlinks and metadata.st_nlink > 1:
             raise ValueError(f"安装目标存在硬链接，请指定独立文件: {ancestor}")
     return path
 
@@ -257,8 +285,8 @@ class FileChange(NamedTuple):
     content: bytes
 
 
-def _read_optional_bytes(path: Path) -> Optional[bytes]:
-    path = _validate_path(path, directory=False)
+def _read_optional_bytes(path: Path, *, allow_hardlinks: bool = False) -> Optional[bytes]:
+    path = _validate_path(path, directory=False, allow_hardlinks=allow_hardlinks)
     try:
         return path.read_bytes()
     except FileNotFoundError:
@@ -663,11 +691,25 @@ def _windows_app_binaries(home: Path, local_app: Path, name: str) -> Tuple[Optio
     return _first_executable(cli, windows=True), _first_executable(desktop, windows=True)
 
 
+def _is_posix_native_cli_path(path_str: Optional[str]) -> bool:
+    if not path_str:
+        return False
+    if _is_mnt_windows_path(path_str) or path_str.lower().endswith((".exe", ".cmd", ".bat")):
+        return False
+    try:
+        resolved = str(Path(path_str).resolve())
+    except OSError:
+        return False
+    if _is_mnt_windows_path(resolved) or resolved.lower().endswith((".exe", ".cmd", ".bat")):
+        return False
+    return True
+
+
 def _native_cli(name: str, home: Path) -> Optional[str]:
     if name == "dsh":
         override = os.environ.get("CAE_DSH_BINARY")
         found = (shutil.which(override) or _first_executable([Path(override).expanduser()], windows=os.name == "nt")) if override else shutil.which("dsh")
-        if found and (os.name == "nt" or not (_is_mnt_windows_path(found) or found.lower().endswith((".exe", ".cmd", ".bat")))):
+        if found and (os.name == "nt" or _is_posix_native_cli_path(found)):
             return found
     if os.name == "nt":
         local_app = Path(os.environ.get("LOCALAPPDATA") or str(home / "AppData" / "Local"))
@@ -685,7 +727,7 @@ def _native_cli(name: str, home: Path) -> Optional[str]:
         candidates.append(Path("/opt/DeepSeek Harness/resources/runtime/cli/bin/dsh"))
     candidates += [Path("/usr/bin") / name, Path("/usr/local/bin") / name]
     found = _first_executable(candidates) or shutil.which(name)
-    return found if found and not _is_mnt_windows_path(found) and not found.lower().endswith(".exe") else None
+    return found if _is_posix_native_cli_path(found) else None
 
 
 def _is_windows() -> bool:
@@ -920,12 +962,41 @@ def _probe_windows_wsl() -> Dict[str, Any]:
                     result["apps"].setdefault(name, []).append(
                         {"distro": distro, "binary": binary or None, "config_dir_exists": trace == "true"}
                     )
-            if any(not any(item["distro"] == distro for item in result["apps"].get(name, [])) for name in ("agy", "codex", "claude")):
+            if any(not any(item["distro"] == distro for item in result["apps"].get(name, [])) for name in ("agy", "codex", "claude", "dsh", "cc-switch")):
                 complete = False
         except (OSError, ValueError, subprocess.SubprocessError):
             complete = False
     result["status"] = "checked" if complete else "unknown"
     return result
+
+
+def _probe_dsh_hook_capability(dsh_bin: Optional[str]) -> Dict[str, Any]:
+    """探测 DSH CLI 是否已原生支持生命周期硬钩子，用于触发后续元更新。"""
+    info: Dict[str, Any] = {
+        "hook_protocol": "soft_rules_only",
+        "hard_hooks_supported": False,
+        "meta_update_trigger": "awaiting_upstream_dsh_hooks",
+    }
+    if not dsh_bin:
+        return info
+    try:
+        cmd = (
+            [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", dsh_bin, "--help"]
+            if os.name == "nt" and Path(dsh_bin).suffix.lower() in {".cmd", ".bat"}
+            else [dsh_bin, "--help"]
+        )
+        proc = subprocess.run(
+            cmd,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=3,
+        )
+        help_txt = (proc.stdout or "") + "\n" + (proc.stderr or "")
+        if any(tok in help_txt for tok in ("PreToolUse", "SessionStart", "hooks.json", "--hooks")):
+            info["hook_protocol"] = "lifecycle_hooks"
+            info["hard_hooks_supported"] = True
+            info["meta_update_trigger"] = "ready_for_fleet_evolve_dsh_hooks"
+    except (OSError, subprocess.SubprocessError, ValueError):
+        pass
+    return info
 
 
 def detect_installed_apps() -> Dict[str, Any]:
@@ -1032,6 +1103,7 @@ def detect_installed_apps() -> Dict[str, Any]:
     cx["target_codex_home"] = str(codex_root)
     cl["target_claude_home"] = str(claude_root)
     dsh["target_dsh_home"] = str(dsh_root)
+    dsh.update(_probe_dsh_hook_capability(dsh.get("native_binary")))
     cc.update(db_path=str(cc_db), db_exists=cc_db.is_file())
     ag_native, cx_native = ag["native_installed"], cx["native_installed"]
     cl_native = cl["native_installed"]
@@ -1083,25 +1155,42 @@ def _hook_python_candidates() -> List[Tuple[str, str, List[str]]]:
         if directory.is_absolute():
             path_dirs.append(directory)
     if os.name == "nt":
-        for name, args in (("python.exe", []), ("py.exe", ["-3"])):
-            for directory in path_dirs:
-                path = directory / name
-                if not any(part.lower() == "windowsapps" for part in path.parts) and path.is_file():
-                    candidates.append((name, str(path), args))
-                    break
+        seen_py: Set[str] = set()
+        for directory in path_dirs:
+            path = directory / "python.exe"
+            if not any(part.lower() == "windowsapps" for part in path.parts) and path.is_file():
+                norm_path = str(path).lower()
+                if norm_path not in seen_py:
+                    seen_py.add(norm_path)
+                    candidates.append(("python.exe", str(path), []))
+        seen_launcher: Set[str] = set()
+        for directory in path_dirs:
+            path = directory / "py.exe"
+            if not any(part.lower() == "windowsapps" for part in path.parts) and path.is_file():
+                norm_path = str(path).lower()
+                if norm_path not in seen_launcher:
+                    seen_launcher.add(norm_path)
+                    for launcher_args in PY_LAUNCHER_ARGS:
+                        candidates.append(("py.exe", str(path), list(launcher_args)))
     else:
-        for name in ("python3", "python"):
-            path = shutil.which(name, path=os.pathsep.join(map(str, path_dirs)))
-            if path:
-                candidates.append((name, path, []))
-    if sys.executable:
+        posix_dirs = [directory for directory in path_dirs if not _is_mnt_windows_path(str(directory))]
+        seen_posix: Set[Tuple[str, str]] = set()
+        for name in POSIX_HOOK_PYTHON_NAMES:
+            for directory in posix_dirs:
+                hit = shutil.which(name, path=str(directory))
+                if hit and (name, hit) not in seen_posix and _is_posix_native_cli_path(hit):
+                    seen_posix.add((name, hit))
+                    candidates.append((name, hit, []))
+    if sys.executable and (os.name == "nt" or _is_posix_native_cli_path(sys.executable)):
         candidates.append(("", sys.executable, []))
     return candidates
 
 
 def _is_working_python_cmd(executable: str, launcher_args: List[str]) -> bool:
     """只执行安装器发现的解释器，并只传入固定版本探测参数。"""
-    if not Path(executable).is_absolute() or launcher_args not in ([], ["-3"]):
+    if not Path(executable).is_absolute() or launcher_args not in ([], *PY_LAUNCHER_ARGS):
+        return False
+    if os.name != "nt" and not _is_posix_native_cli_path(executable):
         return False
     try:
         proc = subprocess.run(
@@ -1122,31 +1211,62 @@ def detect_hook_python_command(*, antigravity: bool = False) -> str:
         if not name:
             continue
         shell_path = shutil.which(name)
-        if shell_path and _same_nonlink_path(Path(shell_path), Path(executable)) and _is_working_python_cmd(executable, launcher_args):
+        if (
+            shell_path
+            and (os.name == "nt" or _is_posix_native_cli_path(shell_path))
+            and _same_nonlink_path(Path(shell_path), Path(executable))
+            and _is_working_python_cmd(executable, launcher_args)
+        ):
             return " ".join([name, *launcher_args, flags])
     if antigravity and os.name == "nt":
-        raise ValueError("Windows 反重力钩子需要 PATH 中可执行的 Python 3.11+（python.exe 或 py.exe -3）。")
+        raise ValueError("Windows 反重力钩子需要 PATH 中可执行的 Python 3.11+（python.exe 或 py.exe -3 / -3.14..-3.11）。")
     executable = f'"{sys.executable}"' if os.name == "nt" else shlex.quote(sys.executable)
     return f"{executable} {flags}"
 
 
+def _is_usable_zotero_binary(path_str: Optional[str]) -> bool:
+    if not path_str:
+        return False
+    if os.name != "nt":
+        if _is_mnt_windows_path(path_str) or path_str.lower().endswith((".exe", ".cmd", ".bat")):
+            return False
+        try:
+            resolved = str(Path(path_str).resolve())
+        except OSError:
+            return False
+        if _is_mnt_windows_path(resolved) or resolved.lower().endswith((".exe", ".cmd", ".bat")):
+            return False
+    return True
+
+
 def detect_zotero_mcp_executable(explicit_cmd: str = "") -> Optional[str]:
     """动态探测本机是否存在可用的 zotero-mcp 可执行文件（零个人路径硬编码）。"""
-    if explicit_cmd:
-        explicit_path = Path(explicit_cmd).expanduser()
-        if explicit_path.is_file():
-            return str(explicit_path.resolve())
-        found = shutil.which(explicit_cmd)
-        if found:
-            return found
+    def _which_usable(cmd_name: str) -> Optional[str]:
+        hit = shutil.which(cmd_name)
+        if _is_usable_zotero_binary(hit):
+            return hit
+        if hit and os.name != "nt":
+            for part in os.environ.get("PATH", "").split(os.pathsep):
+                if not part or _is_mnt_windows_path(part):
+                    continue
+                cand = Path(part) / cmd_name
+                if cand.is_file() and _is_usable_zotero_binary(str(cand)) and os.access(cand, os.X_OK):
+                    return str(cand)
         return None
 
-    in_path = shutil.which("zotero-mcp")
-    if in_path and not _is_mnt_windows_path(in_path):
+    if explicit_cmd:
+        explicit_path = Path(explicit_cmd).expanduser()
+        if explicit_path.is_file() and _is_usable_zotero_binary(str(explicit_path)):
+            return str(explicit_path.resolve())
+        return _which_usable(explicit_cmd)
+
+    in_path = _which_usable("zotero-mcp")
+    if in_path:
         return in_path
 
     home = Path.home()
     exe_names = ["zotero-mcp.exe", "zotero-mcp"] if os.name == "nt" else ["zotero-mcp"]
+    venv_subdirs = ("Scripts", "bin") if os.name == "nt" else ("bin",)
 
     # 1. 扫描 ~/.local/share/codex-tools/zotero-mcp-* 虚拟环境
     codex_tools_dir = home / ".local" / "share" / "codex-tools"
@@ -1154,7 +1274,7 @@ def detect_zotero_mcp_executable(explicit_cmd: str = "") -> Optional[str]:
     try:
         for venv_dir in sorted(codex_tools_dir.glob("zotero-mcp*"), reverse=True):
             candidates.extend(venv_dir / ".venv" / subdir / name
-                              for subdir in ("Scripts", "bin") for name in exe_names)
+                              for subdir in venv_subdirs for name in exe_names)
     except OSError:
         pass
 
@@ -1165,8 +1285,9 @@ def detect_zotero_mcp_executable(explicit_cmd: str = "") -> Optional[str]:
         home / ".local" / "pipx" / "venvs" / "zotero-mcp" / ("Scripts" if os.name == "nt" else "bin"),
     ]
     candidates.extend(directory / name for directory in common_bins for name in exe_names)
-    found = _first_executable(candidates, windows=os.name == "nt")
-    if found:
+    usable_candidates = [item for item in candidates if _is_usable_zotero_binary(str(item))]
+    found = _first_executable(usable_candidates, windows=os.name == "nt")
+    if _is_usable_zotero_binary(found):
         return str(Path(found).resolve())
 
     # 3. 兼容从本机 ~/.codex/config.toml 中读取已验证存在的 zotero 路径
@@ -1179,7 +1300,11 @@ def detect_zotero_mcp_executable(explicit_cmd: str = "") -> Optional[str]:
             command = cfg.get("mcp_servers", {}).get("zotero", {}).get("command")
             if isinstance(command, str):
                 candidate = Path(command).expanduser()
-                if candidate.is_absolute() and _first_executable([candidate], windows=os.name == "nt"):
+                if (
+                    candidate.is_absolute()
+                    and _is_usable_zotero_binary(str(candidate))
+                    and _first_executable([candidate], windows=os.name == "nt")
+                ):
                     return str(candidate.resolve())
         except (AttributeError, OSError, ValueError, RuntimeError):
             pass
@@ -1191,6 +1316,8 @@ def detect_zotero_mcp_executable(explicit_cmd: str = "") -> Optional[str]:
 
 
 def should_ignore_template_item(path: Path) -> bool:
+    if len(path.parts) >= 2 and path.parts[0] == "hooks" and path.parts[1] in ("state", "logs"):
+        return True
     return any(part in IGNORED_NAMES for part in path.parts) or path.suffix.lower() in IGNORED_SUFFIXES
 
 
@@ -1199,6 +1326,126 @@ def _template_files(template_dir: Path) -> List[Path]:
         item for item in sorted(template_dir.rglob("*"))
         if not should_ignore_template_item(item.relative_to(template_dir)) and item.is_file()
     ]
+
+
+def _is_valid_python_exe_name(exe_name: str) -> bool:
+    low = exe_name.lower()
+    if low in {"py", "py.exe", "python", "python.exe", "python3", "python3.exe", "python3t", "python3t.exe"}:
+        return True
+    if re.fullmatch(r"python[4-9]\d*t?(?:\.exe)?", low):
+        return True
+    match = re.fullmatch(r"python(\d+)\.(\d+)(?:\.\d+)*t?(?:\.exe)?", low)
+    if not match:
+        return False
+    major, minor = int(match.group(1)), int(match.group(2))
+    return major > 3 or (major == 3 and minor >= 11)
+
+
+def _is_valid_hook_python_prefix(prefix: str) -> bool:
+    try:
+        raw_tokens = shlex.split(prefix, posix=(os.name != "nt"))
+    except ValueError:
+        return False
+    tokens = [tok.strip('"') for tok in raw_tokens] if os.name == "nt" else raw_tokens
+    if not tokens or not tokens[0] or tokens[0].endswith(("/", "\\")):
+        return False
+    exe_token = tokens[0]
+    has_sep = "/" in exe_token or "\\" in exe_token or PureWindowsPath(exe_token).is_absolute()
+    if os.name == "nt":
+        if has_sep:
+            return False
+    elif has_sep:
+        if (
+            "\\" in exe_token
+            or not Path(exe_token).is_absolute()
+            or not _is_posix_native_cli_path(exe_token)
+            or not Path(exe_token).is_file()
+        ):
+            return False
+    else:
+        resolved_cmd = shutil.which(exe_token)
+        if resolved_cmd and not _is_posix_native_cli_path(resolved_cmd):
+            return False
+    exe_name = PureWindowsPath(exe_token).name.lower()
+    if not _is_valid_python_exe_name(exe_name):
+        return False
+    if exe_name in {"py", "py.exe"}:
+        return any(tokens[1:] == [*launcher_args, *HOOK_PYTHON_FLAGS] for launcher_args in PY_LAUNCHER_ARGS)
+    return tokens[1:] == HOOK_PYTHON_FLAGS
+
+
+_PRESERVED_HOOK_RUNTIME_DIRS = frozenset({
+    Path("hooks/state"),
+    Path("hooks/logs"),
+    Path("hooks/state/handoff"),
+    Path("hooks/state/session-context"),
+    Path("hooks/state/user-words"),
+})
+
+
+def _is_preserved_mirror_dir(template_dir: Path, rel: Path) -> bool:
+    if (template_dir / rel).is_dir() and not should_ignore_template_item(rel):
+        return True
+    return (template_dir / "hooks").is_dir() and rel in _PRESERVED_HOOK_RUNTIME_DIRS
+
+
+def _stale_mirror_files(
+    template_dir: Path,
+    target_dir: Path,
+    expected_rel_files: Optional[Set[Path]] = None,
+) -> List[Path]:
+    """按 mirror_sync_plugin 同源排除规则扫描 target_dir 中多出的陈旧文件、软链与空目录（排除运行态日志/状态/__pycache__）。"""
+    if not target_dir.exists() or _is_link_or_junction(target_dir) or not target_dir.is_dir():
+        return []
+    if expected_rel_files is None:
+        expected_rel_files = {item.relative_to(template_dir) for item in _template_files(template_dir)}
+    stale_files: List[Path] = []
+    for parent, dirs, files in os.walk(target_dir, followlinks=False):
+        parent_path = Path(parent)
+        kept_dirs: List[str] = []
+        for dname in sorted(dirs):
+            dpath = parent_path / dname
+            if _is_link_or_junction(dpath):
+                stale_files.append(dpath)
+                continue
+            if dname == "__pycache__":
+                continue
+            kept_dirs.append(dname)
+        dirs[:] = kept_dirs
+        for fname in sorted(files):
+            existing = parent_path / fname
+            if _is_link_or_junction(existing):
+                stale_files.append(existing)
+                continue
+            rel = existing.relative_to(target_dir)
+            if "__pycache__" in rel.parts:
+                continue
+            if len(rel.parts) >= 2 and rel.parts[0] == "hooks" and rel.parts[1] in ("state", "logs"):
+                if (
+                    fname == ".gitkeep"
+                    or fname.endswith("_stop_gate.json")
+                    or (fname.startswith("session-") and fname.endswith(".json.lock"))
+                ):
+                    stale_files.append(existing)
+                continue
+            if rel not in expected_rel_files:
+                stale_files.append(existing)
+    stale_empty_dirs: Set[Path] = set()
+    for parent, _, _ in os.walk(target_dir, topdown=False, followlinks=False):
+        directory = Path(parent)
+        if directory == target_dir or _is_link_or_junction(directory):
+            continue
+        rel = directory.relative_to(target_dir)
+        if "__pycache__" in rel.parts or _is_preserved_mirror_dir(template_dir, rel):
+            continue
+        try:
+            entries = list(directory.iterdir())
+        except OSError:
+            continue
+        if all(entry in stale_empty_dirs for entry in entries):
+            stale_empty_dirs.add(directory)
+            stale_files.append(directory)
+    return sorted(set(stale_files))
 
 
 def _validate_mirror(template_dir: Path, target_dir: Path) -> None:
@@ -1252,33 +1499,20 @@ def mirror_sync_plugin(
     if not target_plugin_dir.exists():
         return
 
-    stale_files: List[Path] = []
+    stale_files = _stale_mirror_files(template_dir, target_plugin_dir, expected_rel_files)
     stale_dirs: List[Path] = []
-
     for existing in sorted(target_plugin_dir.rglob("*")):
-        rel = existing.relative_to(target_plugin_dir)
         if existing.is_dir():
+            rel = existing.relative_to(target_plugin_dir)
             if existing.name == "__pycache__" and not any(parent.name == "__pycache__" for parent in rel.parents):
                 stale_dirs.append(existing)
-            continue
-
-        if "__pycache__" in rel.parts:
-            continue
-
-        if len(rel.parts) >= 2 and rel.parts[0] == "hooks" and rel.parts[1] in ("state", "logs"):
-            if (
-                existing.name == ".gitkeep"
-                or existing.name.endswith("_stop_gate.json")
-                or (existing.name.startswith("session-") and existing.name.endswith(".json.lock"))
-            ):
-                stale_files.append(existing)
-            continue
-
-        if rel not in expected_rel_files:
-            stale_files.append(existing)
 
     for stale_file in stale_files:
         rel = stale_file.relative_to(target_plugin_dir)
+        if stale_file.is_dir() and not _is_link_or_junction(stale_file):
+            if dry_run:
+                print(f"  [Dry-Run CLEAN] 将清理过时空目录: {rel}")
+            continue
         if dry_run:
             print(f"  [Dry-Run CLEAN] 将清理过时文件: {rel}")
         else:
@@ -1300,7 +1534,7 @@ def mirror_sync_plugin(
         for parent, _, _ in os.walk(target_plugin_dir, topdown=False, followlinks=False):
             directory = Path(parent)
             rel = directory.relative_to(target_plugin_dir)
-            if directory == target_plugin_dir or (template_dir / rel).is_dir():
+            if directory == target_plugin_dir or _is_preserved_mirror_dir(template_dir, rel):
                 continue
             _validate_path(directory, directory=True)
             if not any(directory.iterdir()):
@@ -1355,10 +1589,13 @@ def _parse_agy_model_lines(output: str) -> List[Dict[str, str]]:
     return parsed
 
 
-def _select_agy_frontier_max_label(
-    models: List[Dict[str, str]], repo_root: Optional[Path] = None,
-) -> Optional[str]:
-    agy_rules = _load_fleet_profile(repo_root).get("client_catalog_rules", {}).get("agy", {})
+def _agy_slug_tokens(slug: str) -> Set[str]:
+    return set(re.split(r"[^a-z0-9]+", slug.lower()))
+
+
+def _filter_agy_catalog_models(
+    models: List[Dict[str, Any]], agy_rules: Dict[str, Any],
+) -> Tuple[List[Dict[str, Any]], Set[str]]:
     blocked_tokens = {
         str(tok).lower()
         for tok in (agy_rules.get("blocked_auto_tokens") or ("orchestrator", "router", "claude", "sonnet", "opus", "haiku", "gpt", "oss"))
@@ -1367,15 +1604,20 @@ def _select_agy_frontier_max_label(
         str(tok).lower()
         for tok in (agy_rules.get("fast_tags") or ("lite", "mini", "fast", "flash"))
     }
-    family_priority = [str(tok).lower() for tok in (agy_rules.get("family_priority") or ())]
-
-    def _tokens(slug: str) -> Set[str]:
-        return set(re.split(r"[^a-z0-9]+", slug.lower()))
-
     eligible = [
         item for item in models
-        if not item["slug"].lower().endswith("-ultra") and not (_tokens(item["slug"]) & blocked_tokens)
+        if not item["slug"].lower().endswith("-ultra") and not (_agy_slug_tokens(item["slug"]) & blocked_tokens)
     ]
+    return eligible, light_tokens
+
+
+def _select_agy_frontier_max_label(
+    models: List[Dict[str, str]], repo_root: Optional[Path] = None,
+) -> Optional[str]:
+    agy_rules = _load_fleet_profile(repo_root).get("client_catalog_rules", {}).get("agy", {})
+    family_priority = [str(tok).lower() for tok in (agy_rules.get("family_priority") or ())]
+    _tokens = _agy_slug_tokens
+    eligible, light_tokens = _filter_agy_catalog_models(models, agy_rules)
     if not eligible:
         return None
     tiered: List[Tuple[str, str, str]] = []
@@ -1480,7 +1722,7 @@ def _plan_agy_model(
 def configure_agy_frontier_max_default(
     gemini_root: Path, dry_run: bool = False, *, overwrite: bool = False, repo_root: Optional[Path] = None,
 ) -> None:
-    """把已校验的模型变更逐文件原子落盘，预演只输出计划。"""
+    """把已校验的模型变更逐文件原子写入磁盘，预演只输出计划。"""
     for change in _plan_agy_model(gemini_root, dry_run=dry_run, overwrite=overwrite, repo_root=repo_root):
         _apply_file_change(change, dry_run)
 
@@ -1807,27 +2049,31 @@ def _codex_managed_hook(
             continue
         args = tokens[idx + 1:]
         executable = tokens[0]
-        launcher = ["-3"] if os.name == "nt" and executable.lower() in {"py", "py.exe"} else []
-        path_prefix = Path(executable).is_absolute()
-        command = executable.lower() if os.name == "nt" else executable
-        known_names = {"python", "python.exe", "py", "py.exe"} if os.name == "nt" else {"python", "python3"}
-        if command not in known_names and not path_prefix:
+        exe_name = PureWindowsPath(executable).name.lower()
+        path_prefix = (
+            Path(executable).is_absolute()
+            or (os.name == "nt" and (PureWindowsPath(executable).is_absolute() or executable.startswith("/")))
+        )
+        if not path_prefix and ("/" in executable or "\\" in executable):
             return ManagedCodexHook("custom", None)
+        command = executable.lower() if os.name == "nt" else executable
         interpreter = next(
             ((path, flags) for name, path, flags in candidates
              if (path_prefix and _same_nonlink_path(Path(executable), Path(path)))
-             or (name and command == name)
-             or (os.name == "nt" and name and command + ".exe" == name)),
+             or (not path_prefix and name and command == name)
+             or (not path_prefix and os.name == "nt" and name and command + ".exe" == name)),
             None,
         )
-        if path_prefix:
-            if interpreter is None:
-                return ManagedCodexHook("custom", None)
-            launcher = interpreter[1]
-        elif interpreter is not None:
+        if not path_prefix and interpreter is not None:
             resolved = shutil.which(executable)
             if not resolved or not _same_nonlink_path(Path(resolved), Path(interpreter[0])):
                 interpreter = None
+        if interpreter is not None:
+            launcher = interpreter[1]
+        else:
+            if (path_prefix and Path(executable).exists()) or not _is_valid_python_exe_name(exe_name):
+                return ManagedCodexHook("custom", None)
+            launcher = tokens[1:2] if exe_name in {"py", "py.exe"} and tokens[1:2] in PY_LAUNCHER_ARGS else []
         actual_flags = tokens[1:idx]
         if not any(actual_flags == launcher + flags for flags in LEGACY_PYTHON_FLAGS):
             return ManagedCodexHook("custom", None)
@@ -1848,7 +2094,7 @@ def _codex_managed_hook(
             return ManagedCodexHook("custom", None)
         if (
             script_name == "handoff_gate.py" and len(args) == 8
-            and actual_flags == launcher + HOOK_PYTHON_FLAGS
+            and actual_flags in (launcher + HOOK_PYTHON_FLAGS, launcher + ["-I", "-B"])
             and args[:3] == ["--client", "codex", "--mode"] and args[3] in {"advisory", "enforce"}
             and args[4] == "--compact-limit" and re.fullmatch(r"[0-9]+", args[5])
             and args[6] == "--state-dir" and matches(args[7], hook_root / "state" / "handoff")
@@ -1861,6 +2107,7 @@ def _codex_managed_hook(
 def _codex_handoff_policy(
     doc: Dict[str, Any], policies: Set[Tuple[str, int]], requested_mode: Optional[str],
     requested_limit: Optional[int], *, repo_root: Optional[Path] = None,
+    model_name: str = "", effort: str = "", explicit_window: Optional[int] = None,
 ) -> Tuple[str, int]:
     description = doc.get("description", "")
     if not isinstance(description, str):
@@ -1877,7 +2124,7 @@ def _codex_handoff_policy(
     limits = {limit for _, limit in policies}
     if (requested_mode is None and len(modes) > 1) or (requested_limit is None and len(limits) > 1):
         raise ValueError("Codex 钩子交接策略不一致，请用 --codex-handoff-mode 和 --codex-handoff-compactions 指定需要保留的值")
-    def_mode, def_limit = _default_handoff_policy("codex", repo_root)
+    def_mode, def_limit = _default_handoff_policy("codex", repo_root, model_name=model_name, effort=effort, explicit_window=explicit_window)
     mode = requested_mode if requested_mode is not None else next(iter(modes), def_mode)
     limit = requested_limit if requested_limit is not None else next(iter(limits), def_limit)
     marker = f"[user-guard codex-handoff v1 mode={mode} compact_limit={limit}]"
@@ -1906,6 +2153,7 @@ def _plan_codex_hooks(
     hooks_path: Path, template_path: Path, py_cmd: str,
     mode: Optional[str] = None, compact_limit: Optional[int] = None,
     *, verify_interpreters: bool = True, repo_root: Optional[Path] = None,
+    config_bytes: Optional[bytes] = None,
 ) -> CodexHooksPlan:
     """逐条识别本项目钩子并合并，保留用户 handler、信任信息及交接策略。"""
     _validate_path(hooks_path, directory=False)
@@ -1943,7 +2191,23 @@ def _plan_codex_hooks(
                     print(f"[!] {hooks_path} 的 {event} 包含自定义脚本命令，保留原 handler。", file=sys.stderr)
                 if managed and managed.policy is not None:
                     policies.add(managed.policy)
-    mode, compact_limit = _codex_handoff_policy(doc, policies, mode, compact_limit, repo_root=repo_root)
+    cx_model, cx_effort, cx_window = "", "", None
+    cfg_toml = codex_root / "config.toml"
+    cfg_raw = config_bytes if config_bytes is not None else _read_optional_bytes(cfg_toml)
+    if cfg_raw is not None:
+        try:
+            top = tomllib.loads(cfg_raw.decode("utf-8-sig"))
+            cx_model = str(top.get("model") or "").strip()
+            cx_effort = str(top.get("model_reasoning_effort") or "").strip()
+            raw_cw = top.get("model_context_window")
+            if isinstance(raw_cw, int) and not isinstance(raw_cw, bool):
+                cx_window = raw_cw
+        except (UnicodeError, tomllib.TOMLDecodeError, ValueError, RecursionError):
+            pass
+    mode, compact_limit = _codex_handoff_policy(
+        doc, policies, mode, compact_limit, repo_root=repo_root,
+        model_name=cx_model, effort=cx_effort, explicit_window=cx_window,
+    )
 
     for event, groups in defaults.items():
         matcher = groups[0].get("matcher")
@@ -1989,11 +2253,11 @@ def _plan_codex_hooks(
                             updated_handler = {**handler, "command": desired[kind]["command"]}
                         else:
                             tokens = _codex_hook_tokens(handler)
-                            launcher = managed.interpreter[1] if managed.interpreter else (["-3"] if tokens[1:2] == ["-3"] else [])
+                            launcher = managed.interpreter[1] if managed.interpreter else (
+                                tokens[1:2] if PureWindowsPath(tokens[0]).name.lower() in {"py", "py.exe"} and tokens[1:2] in PY_LAUNCHER_ARGS else []
+                            )
                             latest_args = _codex_hook_tokens(desired[kind])[py_prefix_size:]
-                            if (
-                                kind != "gate" and tokens[1:] != launcher + HOOK_PYTHON_FLAGS + latest_args
-                            ) or (kind == "gate" and managed.policy != (mode, compact_limit)):
+                            if tokens[1:] != launcher + HOOK_PYTHON_FLAGS + latest_args:
                                 prefix = " ".join([quote_exe(tokens[0]), *launcher, *HOOK_PYTHON_FLAGS])
                                 updated_handler = {**handler, "command": prefix + desired[kind]["command"][len(py_cmd):]}
                     handlers.append(updated_handler)
@@ -2025,7 +2289,7 @@ def _plan_codex_hooks(
     return CodexHooksPlan(change, mode, compact_limit)
 
 
-def _codex_hook_script_names(mode: str) -> List[str]:
+def _codex_hook_script_names() -> List[str]:
     return [*CODEX_HOOK_ENTRIES, "user_words.py"]
 
 
@@ -2039,7 +2303,7 @@ def _sync_codex_hooks(
     hooks_path = codex_root / "hooks.json"
     dst_hooks_dir = codex_root / "hooks"
     mode, compact_limit = plan.mode, plan.compact_limit
-    hook_scripts = _codex_hook_script_names(mode)
+    hook_scripts = _codex_hook_script_names()
     for target in (dst_hooks_dir, *(dst_hooks_dir / name for name in hook_scripts)):
         if _is_link_or_junction(target):
             raise ValueError(f"Codex 钩子脚本或目录是链接，请先核对: {target}")
@@ -2054,15 +2318,34 @@ def _sync_codex_hooks(
         scripts_updated.append(name)
         if not dry_run:
             _atomic_write(FileChange(dst_file, original, src_bytes))
+    src_lib_dir = user_guard_hooks_dir / "_lib"
+    if src_lib_dir.is_dir():
+        dst_lib_dir = dst_hooks_dir / "_lib"
+        if _is_link_or_junction(dst_lib_dir):
+            raise ValueError(f"Codex 钩子共享库目录是链接，请先核对: {dst_lib_dir}")
+        for lib_name in HOOK_LIB_FILES:
+            src_lib = src_lib_dir / lib_name
+            if not src_lib.is_file():
+                continue
+            dst_lib = dst_lib_dir / lib_name
+            if _is_link_or_junction(dst_lib):
+                raise ValueError(f"Codex 钩子共享库文件是链接，请先核对: {dst_lib}")
+            src_bytes = src_lib.read_bytes()
+            original = _read_optional_bytes(dst_lib)
+            if original == src_bytes:
+                continue
+            scripts_updated.append(f"_lib/{lib_name}")
+            if not dry_run:
+                _atomic_write(FileChange(dst_lib, original, src_bytes))
 
-    pycache_dir = dst_hooks_dir / "__pycache__"
-    _validate_path(pycache_dir, directory=True)
-    _validate_tree_links(pycache_dir)
-    if pycache_dir.is_dir():
-        if dry_run:
-            print(f"  [Dry-Run CLEAN] 将清理 Codex 钩子字节码缓存: {pycache_dir}")
-        else:
-            shutil.rmtree(pycache_dir)
+    for pycache_dir in (dst_hooks_dir / "__pycache__", dst_hooks_dir / "_lib" / "__pycache__"):
+        _validate_path(pycache_dir, directory=True)
+        _validate_tree_links(pycache_dir)
+        if pycache_dir.is_dir():
+            if dry_run:
+                print(f"  [Dry-Run CLEAN] 将清理 Codex 钩子字节码缓存: {pycache_dir}")
+            else:
+                shutil.rmtree(pycache_dir)
     _clean_legacy_session_lock_files(dst_hooks_dir / "state", dry_run=dry_run)
 
     if scripts_updated:
@@ -2086,7 +2369,7 @@ def _validate_codex_assets(
     _validate_path(codex_root / "config.toml", directory=False)
     if not args.no_codex_rules:
         source_rules = codex_template_dir.parent / "user-guard" / "rules" / "AGENTS.md"
-        _decode_utf8(source_rules, _validate_path(source_rules, directory=False).read_bytes())
+        _decode_utf8(source_rules, _validate_path(source_rules, directory=False, allow_hardlinks=True).read_bytes())
         rules = _validate_path(codex_root / "AGENTS.md", directory=False)
         _decode_utf8(rules, _read_optional_bytes(rules) or b"")
     if not args.no_codex_agents:
@@ -2094,23 +2377,33 @@ def _validate_codex_assets(
         if not source_agents.is_dir():
             raise ValueError(f"找不到 Codex 只读子代理模板目录 {source_agents}")
         _validate_path(codex_root / "agents", directory=True)
-        for source in source_agents.glob("*.toml"):
-            _decode_utf8(source, _validate_path(source, directory=False).read_bytes())
+        for source in sorted(source_agents.glob("*.toml")):
+            _decode_utf8(source, _validate_path(source, directory=False, allow_hardlinks=True).read_bytes())
             _validate_path(codex_root / "agents" / source.name, directory=False)
     if hooks_plan is not None:
         hooks_dir = codex_root / "hooks"
         _validate_path(hooks_dir, directory=True)
         if hooks_plan.mode == "off":
             _validate_path(hooks_dir / "handoff_gate.py", directory=False)
-        for name in _codex_hook_script_names(hooks_plan.mode):
+        for name in _codex_hook_script_names():
             source = codex_template_dir.parent / "user-guard" / "hooks" / name
-            _decode_utf8(source, _validate_path(source, directory=False).read_bytes())
+            _decode_utf8(source, _validate_path(source, directory=False, allow_hardlinks=True).read_bytes())
             _validate_path(hooks_dir / name, directory=False)
+        _validate_path(hooks_dir / "_lib", directory=True)
+        src_lib_dir = codex_template_dir.parent / "user-guard" / "hooks" / "_lib"
+        if os.path.lexists(src_lib_dir):
+            _validate_path(src_lib_dir, directory=True)
+        for lib_name in HOOK_LIB_FILES:
+            src_lib = src_lib_dir / lib_name
+            if os.path.lexists(src_lib):
+                _decode_utf8(src_lib, _validate_path(src_lib, directory=False, allow_hardlinks=True).read_bytes())
+            _validate_path(hooks_dir / "_lib" / lib_name, directory=False)
         for rel in ("state", "state/handoff", "state/session-context", "state/user-words", "logs"):
             _validate_path(hooks_dir / rel, directory=True)
         _validate_path(hooks_dir / "logs" / "session-context.jsonl", directory=False)
-        pycache = _validate_path(hooks_dir / "__pycache__", directory=True)
-        _validate_tree_links(pycache)
+        for pycache in (hooks_dir / "__pycache__", hooks_dir / "_lib" / "__pycache__"):
+            _validate_tree_links(_validate_path(pycache, directory=True))
+        _validate_tree_links(hooks_dir / "state")
 
 
 # 六、Claude Code、路由器与 CC Switch 同步
@@ -2140,12 +2433,17 @@ def _claude_hook_tokens(handler: Dict[str, Any]) -> List[str]:
 
 def _claude_managed_script(handler: Dict[str, Any], claude_root: Path) -> Optional[str]:
     tokens = _claude_hook_tokens(handler)
-    if len(tokens) < 2:
+    if len(tokens) < 2 or not tokens[0] or tokens[0].endswith(("/", "\\")):
         return None
-    exe_name = Path(tokens[0]).name.lower()
-    if not re.fullmatch(r"(?:python(?:\d+(?:\.\d+)*)?|py)(?:\.exe)?", exe_name):
+    exe_token = tokens[0]
+    if os.name != "nt" and ("/" in exe_token or "\\" in exe_token) and ("\\" in exe_token or not Path(exe_token).is_absolute()):
         return None
-    idx = 2 if tokens[1:2] == ["-3"] else 1
+    if os.name == "nt" and ("/" in exe_token or "\\" in exe_token) and not PureWindowsPath(exe_token).is_absolute():
+        return None
+    exe_name = PureWindowsPath(exe_token).name.lower()
+    if not _is_valid_python_exe_name(exe_name):
+        return None
+    idx = 2 if exe_name in {"py", "py.exe"} and tokens[1:2] in PY_LAUNCHER_ARGS else 1
     while idx < len(tokens):
         if tokens[idx] == "-X" and idx + 1 < len(tokens):
             idx += 2
@@ -2169,6 +2467,7 @@ def _claude_managed_script(handler: Dict[str, Any], claude_root: Path) -> Option
 def _claude_handoff_policy(
     handlers: List[Dict[str, Any]], mode: Optional[str], compact_limit: Optional[int],
     *, repo_root: Optional[Path] = None,
+    model_name: str = "", effort: str = "", explicit_window: Optional[int] = None,
 ) -> Tuple[str, int]:
     policies = set()
     for handler in handlers:
@@ -2183,7 +2482,7 @@ def _claude_handoff_policy(
     modes, limits = {item[0] for item in policies}, {item[1] for item in policies}
     if (mode is None and len(modes) > 1) or (compact_limit is None and len(limits) > 1):
         raise ValueError("Claude 交接策略不一致，请显式指定 --claude-handoff-mode 和 --claude-handoff-compactions")
-    def_mode, def_limit = _default_handoff_policy("claude", repo_root)
+    def_mode, def_limit = _default_handoff_policy("claude", repo_root, model_name=model_name, effort=effort, explicit_window=explicit_window)
     return mode or next(iter(modes), def_mode), compact_limit if compact_limit is not None else next(iter(limits), def_limit)
 
 
@@ -2231,7 +2530,7 @@ def _plan_claude_settings(
                         gates.append(handler)
                     tokens = _claude_hook_tokens(handler)
                     executable = tokens[0]
-                    launcher = ["-3"] if tokens[1:2] == ["-3"] else []
+                    launcher = tokens[1:2] if PureWindowsPath(executable).name.lower() in {"py", "py.exe"} and tokens[1:2] in PY_LAUNCHER_ARGS else []
                     resolved = executable if Path(executable).is_absolute() else shutil.which(executable)
                     if resolved and verify_interpreters:
                         key = (resolved, tuple(launcher))
@@ -2243,19 +2542,24 @@ def _plan_claude_settings(
                             prefixes.setdefault(name, " ".join([quote(executable), *launcher, *HOOK_PYTHON_FLAGS]))
         # 关闭模式通过现有托管钩子中不含 gate 的状态沿用，无需添加非标准 settings 字段。
         modern = any("args" not in handler and "--client" in tokens
-                     and tokens[2 if tokens[1:2] == ["-3"] else 1:][:4] == HOOK_PYTHON_FLAGS
+                     and tokens[2 if tokens[1:2] in PY_LAUNCHER_ARGS else 1:][:4] == HOOK_PYTHON_FLAGS
                      for groups in events.values() for group in groups for handler in group["hooks"]
                      if id(handler) in managed for tokens in [_claude_hook_tokens(handler)])
         if mode is None and managed and modern and not gates:
             mode = "off"
-        mode, compact_limit = _claude_handoff_policy(gates, mode, compact_limit, repo_root=repo_root)
+        cl_model = str(env.get("ANTHROPIC_MODEL") or "").strip()
+        cl_effort = str(doc.get("effortLevel") or "").strip()
+        raw_cl_win = str(env.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS") or "").strip()
+        cl_window = int(raw_cl_win) if raw_cl_win.isdigit() else None
+        mode, compact_limit = _claude_handoff_policy(
+            gates, mode, compact_limit, repo_root=repo_root,
+            model_name=cl_model, effort=cl_effort, explicit_window=cl_window,
+        )
         for event, groups in list(events.items()):
             retained = []
-            canonical_matcher = defaults.get(event, [{}])[0].get("matcher")
             for group in groups:
                 handlers = [handler for handler in group["hooks"] if id(handler) not in managed]
-                canonical = event in defaults and group.get("matcher") == canonical_matcher
-                if handlers or not group["hooks"] or canonical:
+                if handlers or not group["hooks"]:
                     retained.append({**group, "hooks": handlers})
             if retained:
                 events[event] = retained
@@ -2285,13 +2589,19 @@ def _plan_claude_settings(
                 existing.append(target)
             target["hooks"].extend(desired)
     else:
-        def_mode, def_limit = _default_handoff_policy("claude", repo_root)
+        cl_model = str(env.get("ANTHROPIC_MODEL") or "").strip()
+        cl_effort = str(doc.get("effortLevel") or "").strip()
+        raw_cl_win = str(env.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS") or "").strip()
+        cl_window = int(raw_cl_win) if raw_cl_win.isdigit() else None
+        def_mode, def_limit = _default_handoff_policy(
+            "claude", repo_root, model_name=cl_model, effort=cl_effort, explicit_window=cl_window,
+        )
         mode, compact_limit = mode or def_mode, compact_limit if compact_limit is not None else def_limit
     content = _preserve_text_format(_json_bytes(doc), original)
     return CodexHooksPlan(FileChange(settings_path, original, content) if doc != initial else None, mode, compact_limit)
 
 
-def _claude_hook_script_names(mode: str) -> List[str]:
+def _claude_hook_script_names() -> List[str]:
     return list(CLAUDE_HOOK_SCRIPTS)
 
 
@@ -2299,11 +2609,23 @@ def _sync_claude_hooks(
     source_hooks: Path, claude_root: Path, plan: CodexHooksPlan, dry_run: bool = False,
 ) -> None:
     hooks_dir = claude_root / "hooks"
-    for name in _claude_hook_script_names(plan.mode):
+    for name in _claude_hook_script_names():
         target = hooks_dir / name
         original, content = _read_optional_bytes(target), (source_hooks / name).read_bytes()
         if original != content:
             _apply_file_change(FileChange(target, original, content), dry_run)
+    src_lib_dir = source_hooks / "_lib"
+    if src_lib_dir.is_dir():
+        dst_lib_dir = hooks_dir / "_lib"
+        _validate_path(dst_lib_dir, directory=True)
+        for lib_name in HOOK_LIB_FILES:
+            src_lib = src_lib_dir / lib_name
+            if not src_lib.is_file():
+                continue
+            target_lib = _validate_path(dst_lib_dir / lib_name, directory=False)
+            original, content = _read_optional_bytes(target_lib), src_lib.read_bytes()
+            if original != content:
+                _apply_file_change(FileChange(target_lib, original, content), dry_run)
     retired = list(CLAUDE_RETIRED_SCRIPTS)
     for name in retired:
         target = _validate_path(hooks_dir / name, directory=False)
@@ -2312,13 +2634,13 @@ def _sync_claude_hooks(
                 print(f"[Dry-Run CLEAN] 将清理 Claude 废弃钩子 {target}")
             else:
                 target.unlink()
-    cache = hooks_dir / "__pycache__"
-    _validate_tree_links(cache)
-    if cache.is_dir():
-        if dry_run:
-            print(f"[Dry-Run CLEAN] 将清理 {cache}")
-        else:
-            shutil.rmtree(cache)
+    for cache in (hooks_dir / "__pycache__", hooks_dir / "_lib" / "__pycache__"):
+        _validate_tree_links(cache)
+        if cache.is_dir():
+            if dry_run:
+                print(f"[Dry-Run CLEAN] 将清理 {cache}")
+            else:
+                shutil.rmtree(cache)
     _clean_legacy_session_lock_files(hooks_dir / "state", dry_run=dry_run)
     _apply_file_change(plan.change, dry_run)
 
@@ -2356,27 +2678,53 @@ def _load_ccswitch_admin(repo_root: Path) -> ModuleType:
     source = repo_root / "template" / "claude" / "router" / "ccswitch_admin.py"
     module = ModuleType("installer_ccswitch_admin")
     module.__file__ = str(source)
-    # 不通过导入缓存落盘，即使调用方没有启用 -B，体检也保持零写入。
+    # 不通过导入机制生成字节码缓存，即使调用方没有启用 -B，体检也保持零写入。
     exec(compile(source.read_bytes(), str(source), "exec"), module.__dict__)
     return module
 
 
-def _validate_claude_assets(repo_root: Path, claude_root: Path, args: argparse.Namespace, mode: str) -> None:
-    _validate_tree_links(claude_root)
+def _validate_claude_assets(repo_root: Path, claude_root: Path, args: argparse.Namespace) -> None:
+    _validate_path(claude_root, directory=True)
+    _validate_path(claude_root / "settings.json", directory=False)
     sources = []
     if not args.no_claude_rules:
         sources.append((repo_root / "template/user-guard/rules/AGENTS.md", claude_root / "CLAUDE.md"))
     if not args.no_claude_agents:
+        source_agents = _validate_path(repo_root / "template/claude/agents", directory=True)
+        if not source_agents.is_dir():
+            raise ValueError(f"找不到 Claude 只读子代理模板目录 {source_agents}")
+        _validate_path(claude_root / "agents", directory=True)
         sources.extend((source, claude_root / "agents" / source.name)
-                       for source in (repo_root / "template/claude/agents").glob("readonly-*.md"))
+                       for source in sorted(source_agents.glob("readonly-*.md")))
     if not args.no_claude_hooks:
-        sources.append((repo_root / "template/claude/router/ccswitch_admin.py", claude_root / "hooks/ccswitch_admin.py"))
-        sources.extend((repo_root / "template/user-guard/hooks" / name, claude_root / "hooks" / name)
-                       for name in _claude_hook_script_names(mode))
+        hooks_dir = _validate_path(claude_root / "hooks", directory=True)
+        _validate_path(hooks_dir / "_lib", directory=True)
+        for lib_name in HOOK_LIB_FILES:
+            _validate_path(hooks_dir / "_lib" / lib_name, directory=False)
+        for name in CLAUDE_RETIRED_SCRIPTS:
+            _validate_path(hooks_dir / name, directory=False)
+        for rel in ("state", "state/handoff", "state/session-context", "state/user-words", "logs"):
+            _validate_path(hooks_dir / rel, directory=True)
+        _validate_path(hooks_dir / "logs" / "session-context.jsonl", directory=False)
+        _validate_tree_links(hooks_dir / "__pycache__")
+        _validate_tree_links(hooks_dir / "_lib" / "__pycache__")
+        _validate_tree_links(hooks_dir / "state")
+        sources.append((repo_root / "template/claude/router/ccswitch_admin.py", hooks_dir / "ccswitch_admin.py"))
+        sources.extend((repo_root / "template/user-guard/hooks" / name, hooks_dir / name)
+                       for name in _claude_hook_script_names())
+        src_lib_dir = repo_root / "template/user-guard/hooks/_lib"
+        if os.path.lexists(src_lib_dir):
+            _validate_path(src_lib_dir, directory=True)
+            sources.extend(
+                (src_lib_dir / lib_name, hooks_dir / "_lib" / lib_name)
+                for lib_name in HOOK_LIB_FILES
+                if os.path.lexists(src_lib_dir / lib_name)
+            )
     if args.with_cc_router:
+        _validate_tree_links(claude_root / "router")
         sources.extend(_cc_router_files(repo_root / "template/claude/router", claude_root))
     for source, target in sources:
-        _decode_utf8(source, _validate_path(source, directory=False).read_bytes())
+        _decode_utf8(source, _validate_path(source, directory=False, allow_hardlinks=True).read_bytes())
         original = _read_optional_bytes(target)
         if target.name == "CLAUDE.md":
             _decode_utf8(target, original or b"")
@@ -2534,6 +2882,107 @@ def _audit_redact(value: Any, roots: List[Tuple[Path, str]], secrets: Set[str]) 
     return value
 
 
+def _normalize_agy_configured_model(
+    raw_configured: Any,
+    ag_models: Optional[List[Dict[str, Any]]] = None,
+) -> Tuple[str, str, Optional[int]]:
+    raw = str(raw_configured or "").strip()
+    if not raw:
+        return "", "", None
+    raw_low = raw.lower()
+    matched_slug = ""
+    explicit_win: Optional[int] = None
+    for item in ag_models or ():
+        if not isinstance(item, dict):
+            continue
+        slug = str(item.get("slug") or "").strip()
+        disp = str(item.get("display_name") or "").strip()
+        if (slug and slug.lower() == raw_low) or (disp and disp.lower() == raw_low):
+            matched_slug = slug
+            explicit_win = _model_window(item)
+            break
+    source = matched_slug or raw
+    effort = ""
+    paren_match = re.match(r"^(.*?)\s*\(\s*(minimal|low|medium|high|xhigh|max)\s*\)\s*$", source, re.IGNORECASE)
+    if paren_match:
+        source = paren_match.group(1).strip()
+        effort = paren_match.group(2).lower()
+    normalized = re.sub(r"[\s_]+", "-", source.strip().lower()).strip("-")
+    tier_match = AGY_SINGLE_EFFORT_RE.match(normalized)
+    if tier_match:
+        normalized = tier_match.group(1)
+        if not effort:
+            effort = tier_match.group(2).lower()
+    if not effort and matched_slug:
+        raw_paren = re.match(r"^(.*?)\s*\(\s*(minimal|low|medium|high|xhigh|max)\s*\)\s*$", raw, re.IGNORECASE)
+        if raw_paren:
+            effort = raw_paren.group(2).lower()
+    return normalized, effort, explicit_win
+
+
+def _agy_catalog_matches_model(slug: str, target_model: str) -> bool:
+    slug_low = slug.strip().lower()
+    target_low = target_model.strip().lower()
+    if not slug_low or not target_low:
+        return False
+    if slug_low == target_low:
+        return True
+    tier_match = AGY_SINGLE_EFFORT_RE.match(slug_low)
+    return bool(tier_match and tier_match.group(1) == target_low)
+
+
+def _build_adaptive_meta_summary(
+    fleet_profile: Dict[str, Any],
+    ag: Dict[str, Any],
+    cx: Dict[str, Any],
+    cl: Dict[str, Any],
+    repo_root: Optional[Path] = None,
+    ag_models: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    base_root = Path(repo_root) if repo_root is not None else Path(__file__).resolve().parent
+    hooks_parent = base_root / "template/user-guard/hooks"
+    if hooks_parent.is_dir() and str(hooks_parent) not in sys.path:
+        sys.path.insert(0, str(hooks_parent))
+    try:
+        from _lib import adaptive_policy  # type: ignore
+    except ImportError:
+        return {}
+    ag_model_val, ag_effort_val, ag_win_val = _normalize_agy_configured_model(
+        ag.get("configured_model"), ag_models,
+    )
+    cx_model_val = str(cx.get("model") or "").strip()
+    cx_raw_win = cx.get("model_context_window")
+    cx_win_val = cx_raw_win if isinstance(cx_raw_win, int) and not isinstance(cx_raw_win, bool) and cx_raw_win > 0 else None
+    cx_effort_val = "" if (not cx_model_val and cx_win_val is None) else str(cx.get("model_reasoning_effort") or "").strip()
+    cl_mapping = cl.get("model_mapping") or {}
+    raw_cl_win = str(cl_mapping.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS") or "").strip()
+    cl_window = int(raw_cl_win) if raw_cl_win.isdigit() and int(raw_cl_win) > 0 else None
+    cl_model_val = str(cl_mapping.get("ANTHROPIC_MODEL") or "").strip()
+    cl_effort_val = "" if (not cl_model_val and cl_window is None) else str(cl.get("effortLevel") or "").strip()
+    out: Dict[str, Any] = {}
+    for cname, model_val, effort_val, win_val in (
+        ("antigravity", ag_model_val, ag_effort_val, ag_win_val),
+        ("codex", cx_model_val, cx_effort_val, cx_win_val),
+        ("claude", cl_model_val, cl_effort_val, cl_window),
+    ):
+        if not model_val and win_val is None:
+            effort_val = ""
+        cr = adaptive_policy.resolve_adaptive_compaction_policy(
+            fleet_profile, client=cname, model_name=model_val, effort=effort_val, explicit_window=win_val,
+        )
+        hg = adaptive_policy.resolve_adaptive_handoff_policy(
+            fleet_profile, client=cname, model_name=model_val, effort=effort_val, explicit_window=win_val,
+        )
+        out[cname] = {
+            "active_model": model_val or None,
+            "effective_context_window": hg.get("effective_context_window"),
+            "adaptive_inline_total_chars": cr.get("inline_total_chars"),
+            "adaptive_handoff_mode": hg.get("default_mode"),
+            "adaptive_compact_limit": hg.get("default_compact_limit"),
+        }
+    return out
+
+
 def audit_upgrade_status(
     repo_root: Optional[Path] = None, target_plugin_dir: Optional[Path] = None,
     codex_root: Optional[Path] = None, claude_root: Optional[Path] = None,
@@ -2578,9 +3027,9 @@ def audit_upgrade_status(
             for item in doc:
                 collect_secrets(item)
 
-    def read_json(path: Path) -> Dict[str, Any]:
+    def read_json(path: Path, *, allow_hardlinks: bool = False) -> Dict[str, Any]:
         try:
-            result = _read_json_object(path, _read_optional_bytes(path))
+            result = _read_json_object(path, _read_optional_bytes(path, allow_hardlinks=allow_hardlinks))
             collect_secrets(result)
             return result
         except (OSError, ValueError, RuntimeError) as exc:
@@ -2607,7 +3056,7 @@ def audit_upgrade_status(
                 result.append(relative)
         return result
 
-    repo_version = read_json(template / "plugin.json").get("version")
+    repo_version = read_json(template / "plugin.json", allow_hardlinks=True).get("version")
     ag = _audit_cli(detection.get("antigravity", {}))
     ag.update(plugin_exists=target_plugin_dir.is_dir(), installed_version=read_json(target_plugin_dir / "plugin.json").get("version"))
     version_tuple = lambda value: tuple(int(part) for part in re.findall(r"\d+", str(value or "")))
@@ -2615,12 +3064,26 @@ def audit_upgrade_status(
     ag_sources = [(source, source.relative_to(template).as_posix()) for source in _template_files(template)
                   if source.relative_to(template).as_posix() != "hooks.json"]
     ag["drift_files"] = drift(target_plugin_dir, ag_sources)
+    def extend_stale_mirror_drift(drift_list: List[str], tpl_dir: Path, dst_dir: Path, rel_root: Path) -> None:
+        try:
+            for stale in _stale_mirror_files(tpl_dir, dst_dir):
+                rel_posix = stale.relative_to(rel_root).as_posix()
+                if rel_posix not in drift_list:
+                    drift_list.append(rel_posix)
+        except OSError as exc:
+            errors[str(dst_dir)] = type(exc).__name__
+
+    extend_stale_mirror_drift(ag["drift_files"], template, target_plugin_dir, target_plugin_dir)
     installed_ag_hooks = read_json(target_plugin_dir / "hooks.json")
     try:
         lifecycle = installed_ag_hooks["user-guard-lifecycle"]
         first = next(iter(lifecycle.values()))[0]
-        prefix = first.get("hooks", [first])[0]["command"].partition(" ./hooks/")[0]
-        if installed_ag_hooks != json.loads(_agy_hooks_bytes((template / "hooks.json").read_bytes(), prefix)):
+        prefix, sep, _ = first.get("hooks", [first])[0]["command"].partition(" ./hooks/")
+        if (
+            not sep
+            or not _is_valid_hook_python_prefix(prefix)
+            or installed_ag_hooks != json.loads(_agy_hooks_bytes((template / "hooks.json").read_bytes(), prefix))
+        ):
             ag["drift_files"].append("hooks.json")
     except (KeyError, IndexError, TypeError, ValueError):
         ag["drift_files"].append("hooks.json")
@@ -2648,9 +3111,11 @@ def audit_upgrade_status(
     ag["model_catalog"] = [{"slug": item["slug"], "generation": list(_model_generation(item["slug"])),
                              "declared_max_context_window": _model_window(item), "supported_efforts": _model_efforts(item)} for item in ag_models]
     agy_priorities = [str(tok).lower() for tok in (agy_rules.get("family_priority") or ("pro",))]
+    eligible_agy, agy_light_tokens = _filter_agy_catalog_models(ag_models, agy_rules)
+    non_light_agy = [item for item in eligible_agy if not (_agy_slug_tokens(item["slug"]) & agy_light_tokens)] or eligible_agy
     primary_agy_models: List[Dict[str, Any]] = []
     for fam_tok in agy_priorities:
-        matched = [item for item in ag_models if fam_tok in item["slug"].lower() and not item["slug"].lower().endswith("-ultra")]
+        matched = [item for item in non_light_agy if fam_tok in _agy_slug_tokens(item["slug"])]
         if matched:
             primary_agy_models = matched
             break
@@ -2722,14 +3187,16 @@ def audit_upgrade_status(
     cx.update(model_aligned=not reasons, upgrade_recommended=bool(reasons), alignment_reasons=reasons,
               catalog_source="interop_delegated" if codex_interop_only else "local_cache")
     codex_doc = read_json(codex_root / "hooks.json")
-    marker = HANDOFF_MARKER.search(str(codex_doc.get("description", "")))
-    codex_mode = marker[1] if marker else "advisory"
     cx_sources = [(template / "rules/AGENTS.md", "AGENTS.md")]
-    cx_sources += [(source, "agents/" + source.name) for source in (repo_root / "template/codex/agents").glob("*.toml")]
-    cx_sources += [(template / "hooks" / name, "hooks/" + name) for name in _codex_hook_script_names(codex_mode)]
+    cx_sources += [(source, "agents/" + source.name) for source in sorted((repo_root / "template/codex/agents").glob("*.toml"))]
+    cx_sources += [(template / "hooks" / name, "hooks/" + name) for name in _codex_hook_script_names()]
+    cx_sources += [(template / "hooks" / "_lib" / lib_name, "hooks/_lib/" + lib_name) for lib_name in HOOK_LIB_FILES if (template / "hooks" / "_lib" / lib_name).is_file()]
     skill_sources = [(source, source.relative_to(template).as_posix()) for source in _template_files(template / "skills")]
     cx_sources += skill_sources
+    managed_skill_names = _managed_skill_names(template)
     cx["drift_files"] = drift(codex_root, cx_sources, core_rules=True)
+    for sname in managed_skill_names:
+        extend_stale_mirror_drift(cx["drift_files"], template / "skills" / sname, codex_root / "skills" / sname, codex_root)
     codex_hooks_path = codex_root / "hooks.json"
     try:
         cx_plan = _plan_codex_hooks(
@@ -2738,7 +3205,12 @@ def audit_upgrade_status(
         )
         expected_cx_doc = json.loads(cx_plan.change.content) if cx_plan.change else codex_doc
 
-        def codex_hook_layout(doc: Dict[str, Any]) -> List[Any]:
+        def _hook_exe_exists_if_abs(exe_tok: str) -> bool:
+            if os.name == "nt":
+                return not PureWindowsPath(exe_tok).is_absolute() or Path(exe_tok).is_file()
+            return not Path(exe_tok).is_absolute() or (_is_posix_native_cli_path(exe_tok) and Path(exe_tok).is_file())
+
+        def codex_hook_layout(doc: Dict[str, Any], *, check_exe: bool = False) -> List[Any]:
             result = []
             for event, groups in doc.get("hooks", {}).items():
                 for group in groups:
@@ -2749,12 +3221,16 @@ def audit_upgrade_status(
                             if sname in CODEX_HOOK_ENTRIES and _same_nonlink_path(
                                 Path(tok).expanduser(), codex_root / "hooks" / sname
                             ):
-                                prefix_end = 2 if tokens[1:2] == ["-3"] else 1
-                                result.append((event, group.get("matcher"), sname, tokens[prefix_end:idx], tokens[idx + 1:]))
+                                prefix_end = 2 if tokens[1:2] in PY_LAUNCHER_ARGS else 1
+                                exe_ok = (not check_exe) or (
+                                    _is_valid_python_exe_name(PureWindowsPath(tokens[0]).name)
+                                    and _hook_exe_exists_if_abs(tokens[0])
+                                )
+                                result.append((event, group.get("matcher"), sname, tokens[prefix_end:idx], tokens[idx + 1:], exe_ok))
                                 break
             return sorted(result, key=repr)
 
-        cx["hooks_aligned"] = codex_hooks_path.is_file() and codex_hook_layout(codex_doc) == codex_hook_layout(expected_cx_doc)
+        cx["hooks_aligned"] = codex_hooks_path.is_file() and codex_hook_layout(codex_doc, check_exe=True) == codex_hook_layout(expected_cx_doc, check_exe=False)
     except (OSError, ValueError, TypeError, KeyError, RuntimeError):
         cx["hooks_aligned"] = False
     if not cx["hooks_aligned"]:
@@ -2767,13 +3243,11 @@ def audit_upgrade_status(
     env = env if isinstance(env, dict) else {}
     cl.update(effortLevel=settings.get("effortLevel"), locked_effort_env="CLAUDE_CODE_EFFORT_LEVEL" in env,
               model_mapping={key: env.get(key) for key in ("ANTHROPIC_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL", "CLAUDE_CODE_MAX_CONTEXT_TOKENS")})
-    claude_mode = "advisory"
     try:
         plan = _plan_claude_settings(settings_path, repo_root / "template/claude/hooks.json", "python3 -X utf8 -I -B",
                                     include_model=False, verify_interpreters=False, repo_root=repo_root)
-        claude_mode = plan.mode
         expected_doc = json.loads(plan.change.content) if plan.change else settings
-        def hook_layout(doc: Dict[str, Any]) -> List[Any]:
+        def hook_layout(doc: Dict[str, Any], *, check_exe: bool = False) -> List[Any]:
             result = []
             for event, groups in doc.get("hooks", {}).items():
                 for group in groups:
@@ -2781,29 +3255,39 @@ def audit_upgrade_status(
                         name = _claude_managed_script(handler, claude_root)
                         if name:
                             tokens = _claude_hook_tokens(handler)
-                            prefix_end = 2 if tokens[1:2] == ["-3"] else 1
-                            result.append((event, group.get("matcher"), name, tokens[prefix_end:], "args" in handler))
+                            prefix_end = 2 if tokens[1:2] in PY_LAUNCHER_ARGS else 1
+                            exe_ok = (not check_exe) or (
+                                (not (os.name != "nt" and Path(tokens[0]).is_absolute()) or (_is_posix_native_cli_path(tokens[0]) and Path(tokens[0]).is_file()))
+                                and (not (os.name == "nt" and PureWindowsPath(tokens[0]).is_absolute()) or Path(tokens[0]).is_file())
+                            )
+                            result.append((event, group.get("matcher"), name, tokens[prefix_end:], "args" in handler, exe_ok))
             return sorted(result, key=repr)
-        cl["hooks_aligned"] = settings_path.is_file() and hook_layout(settings) == hook_layout(expected_doc)
+        cl["hooks_aligned"] = settings_path.is_file() and hook_layout(settings, check_exe=True) == hook_layout(expected_doc, check_exe=False)
     except (OSError, ValueError, TypeError, KeyError):
         cl["hooks_aligned"] = False
     cl_sources = [(template / "rules/AGENTS.md", "CLAUDE.md")]
-    cl_sources += [(source, "agents/" + source.name) for source in (repo_root / "template/claude/agents").glob("readonly-*.md")]
-    cl_sources += [(template / "hooks" / name, "hooks/" + name) for name in _claude_hook_script_names(claude_mode)]
+    cl_sources += [(source, "agents/" + source.name) for source in sorted((repo_root / "template/claude/agents").glob("readonly-*.md"))]
+    cl_sources += [(template / "hooks" / name, "hooks/" + name) for name in _claude_hook_script_names()]
+    cl_sources += [(template / "hooks" / "_lib" / lib_name, "hooks/_lib/" + lib_name) for lib_name in HOOK_LIB_FILES if (template / "hooks" / "_lib" / lib_name).is_file()]
     cl_sources += [(repo_root / "template/claude/router/ccswitch_admin.py", "hooks/ccswitch_admin.py")]
     cl_sources += skill_sources
     cl["drift_files"] = drift(claude_root, cl_sources, core_rules=True)
     cl["drift_files"].extend("hooks/" + name for name in CLAUDE_RETIRED_SCRIPTS if read_raw(claude_root / "hooks" / name) is not None)
+    for sname in managed_skill_names:
+        extend_stale_mirror_drift(cl["drift_files"], template / "skills" / sname, claude_root / "skills" / sname, claude_root)
     if not cl["hooks_aligned"]:
         cl["drift_files"].append("settings.json")
     router_sources = [(source, source.name) for source in _template_files(repo_root / "template/claude/router")]
     router_drift = drift(claude_root / "router", router_sources)
     cl["router"] = {"installed": (claude_root / "router/router.py").is_file(), "drift_files": router_drift,
                     "config_exists": (claude_root / "router/router.json").is_file(),
+                    "static_timeout_override": None,
                     "template_hashes": {relative: hashlib.sha256(source.read_bytes()).hexdigest() for source, relative in router_sources}}
 
     dsh = _audit_cli(detection.get("dsh", {}))
     dsh["drift_files"] = drift(dsh_root, [(template / "rules/AGENTS.md", "AGENTS.md"), *skill_sources], core_rules=True)
+    for sname in managed_skill_names:
+        extend_stale_mirror_drift(dsh["drift_files"], template / "skills" / sname, dsh_root / "skills" / sname, dsh_root)
     dsh["credentials_present"] = any((dsh_root / name).is_file() for name in (".credentials.yaml", ".env"))
     if app_scope == "all":
         ag_active, cx_active, cl_active = True, True, True
@@ -2853,9 +3337,15 @@ def audit_upgrade_status(
     router_cfg_path = claude_root / "router/router.json"
     if router_cfg_path.is_file():
         custom_router_cfg = read_json(router_cfg_path)
-        custom_port = custom_router_cfg.get("port") if isinstance(custom_router_cfg, dict) else None
-        if isinstance(custom_port, int) and not isinstance(custom_port, bool) and 1 <= custom_port <= 65535:
-            port = custom_port
+        if isinstance(custom_router_cfg, dict):
+            custom_port = custom_router_cfg.get("port")
+            if isinstance(custom_port, int) and not isinstance(custom_port, bool) and 1 <= custom_port <= 65535:
+                port = custom_port
+            for timeout_key in ("timeout_s", "timeout_sec"):
+                raw_timeout = custom_router_cfg.get(timeout_key)
+                if isinstance(raw_timeout, int) and not isinstance(raw_timeout, bool) and raw_timeout > 0:
+                    cl["router"]["static_timeout_override"] = raw_timeout
+                    break
 
     def _url_points_to_local_router(raw_url: Any, expected_port: int) -> bool:
         if not isinstance(raw_url, str) or not raw_url.strip():
@@ -2904,7 +3394,7 @@ def audit_upgrade_status(
             continue
         detected = detection.get("antigravity" if client == "agy" else client, {})
         subscription_candidates["agents"][client] = {
-            "enabled_in_profile": bool(entry.get("enabled", False)),
+            "enabled_in_profile": bool(entry.get("enabled", entry.get("enabled_in_profile", False))),
             "currently_available": bool(peer_reports.get(client, {}).get("native_installed")
                                         or detected.get("interop_available")),
             "quota_scheme": entry.get("quota_scheme"),
@@ -2930,17 +3420,25 @@ def audit_upgrade_status(
         elif client in catalogs:
             available = available and (
                 (interop_delegated and not catalogs[client])
-                or any(item["slug"] == model and item.get("visibility") != "hide" for item in catalogs[client])
+                or any(
+                    item.get("visibility") != "hide"
+                    and (
+                        _agy_catalog_matches_model(item["slug"], str(model))
+                        if client == "agy"
+                        else item["slug"] == model
+                    )
+                    for item in catalogs[client]
+                )
             )
         elif client == "dsh":
             available = available and (
                 dsh["credentials_present"] or bool(os.environ.get("DEEPSEEK_API_KEY")) or interop_delegated
             )
         subscription_candidates["models"][model] = {
-            "agent": client, "enabled_in_profile": bool(entry.get("enabled", False)),
+            "agent": client, "enabled_in_profile": bool(entry.get("enabled", entry.get("enabled_in_profile", False))),
             "currently_available": bool(available), "quota_scheme": scheme,
         }
-    managed_card_names = {str(name) for name in (cl_rules.get("managed_cards") or ("Kimi", "DeepSeek")) if name}
+    managed_card_names = {str(name) for name in (cl_rules.get("managed_cards") or ("Kimi", "DeepSeek", "K3.1主+DS子代理")) if name}
     custom_card_refs: List[Tuple[str, str]] = []
     _card_uuid_re = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
     for card in cc.get("cards") or []:
@@ -3028,7 +3526,11 @@ def audit_upgrade_status(
                        "wsl_probe": detection.get("wsl_probe"), "toolchain": toolchain},
               "antigravity": ag, "codex": cx, "claude": cl, "dsh": dsh, "cc_switch": cc,
               "subscription_candidates": subscription_candidates,
-              "summary": {"all_aligned": not actions, "recommended_actions": actions}, "read_errors": errors}
+              "summary": {"all_aligned": not actions, "recommended_actions": actions},
+              "adaptive_meta": _build_adaptive_meta_summary(
+                  fleet_profile, ag, cx, cl, repo_root=repo_root, ag_models=ag_models,
+              ),
+              "read_errors": errors}
     roots = [(home, "~"), (target_plugin_dir, "<antigravity>"), (codex_root, "<codex>"), (claude_root, "<claude>"),
              (dsh_root, "<dsh>"), (ccswitch_db.parent, "<ccswitch>"), (repo_root, "<repo>")]
     return _audit_redact(report, roots, secrets)
@@ -3257,7 +3759,6 @@ def main() -> None:
     if args.app == "all" and is_sandbox_run and not (args.target_dir and (args.codex_home or args.codex_skills_dir) and args.claude_home):
         parser.error("--app all 自定义安装必须同时提供 --target-dir、Codex 目录与 --claude-home")
 
-    repo_root = Path(__file__).resolve().parent
     template_dir = repo_root / "template" / "user-guard"
     codex_template_dir = repo_root / "template" / "codex"
     claude_template_dir = repo_root / "template" / "claude"
@@ -3293,10 +3794,19 @@ def main() -> None:
     if args.app == "dsh":
         install_ag, install_cx, install_cl = False, False, False
     elif args.app == "auto" and install_dsh and not has_legacy_dirs:
+        peer_names = ("antigravity", "codex", "claude")
         install_ag, install_cx, install_cl = (False, False, False) if has_explicit_dsh else tuple(
-            bool(detection.get(name, {}).get("native_installed")) for name in ("antigravity", "codex", "claude"))
-        if not (install_ag or install_cx or install_cl) and is_interactive and not (args.yes or args.dry_run):
-            if not _confirm_single_app_install("DeepSeek Harness", "Antigravity / Codex / Claude Code", True, False, False):
+            bool(detection.get(name, {}).get("native_installed")) for name in peer_names)
+        if not (install_ag or install_cx or install_cl) and not has_explicit_dsh:
+            if any(
+                detection.get(name, {}).get("interop_available")
+                or detection.get(name, {}).get("interop_status") == "unknown"
+                for name in peer_names
+            ):
+                print("[*] 对侧客户端可用或状态未确认，本次只配置已检测到的本侧客户端。")
+            elif not _confirm_single_app_install(
+                "DeepSeek Harness", "Antigravity / Codex / Claude Code", is_interactive, args.yes, args.dry_run
+            ):
                 return
     else:
         install_ag, install_cx, install_cl = resolve_multi_app_plan(
@@ -3365,9 +3875,6 @@ def main() -> None:
         agy_config_root = None
         if target_plugin_dir is not None:
             target_plugin_dir = validate_install_target(target_plugin_dir, repo_root)
-            for forbidden_peer in {default_codex_root.resolve(), (Path.home().resolve() / ".codex"), default_claude_root.resolve(), default_dsh_root.resolve()}:
-                if target_plugin_dir == forbidden_peer or forbidden_peer in target_plugin_dir.parents:
-                    raise ValueError(f"反重力插件目标目录不能位于其他客户端配置目录内: {target_plugin_dir}")
             _validate_mirror(template_dir, target_plugin_dir)
             standard_layout = target_plugin_dir == target_plugin_dir.parent.parent / "plugins" / "user-guard"
             if zotero_exe and not standard_layout:
@@ -3395,7 +3902,7 @@ def main() -> None:
         default_plugin_root = default_config_root / "plugins" / "user-guard"
         if target_plugin_dir is not None and any(
             _paths_overlap(target_plugin_dir, other)
-            for other in (default_codex_root, default_claude_root, default_dsh_root)
+            for other in (default_codex_root, Path.home() / ".codex", default_claude_root, default_dsh_root)
         ):
             raise ValueError("反重力插件目录不能与其他客户端配置目录相互包含")
         if codex_root is not None:
@@ -3437,16 +3944,18 @@ def main() -> None:
         if target_plugin_dir is not None:
             agy_hooks = _agy_hooks_bytes((template_dir / "hooks.json").read_bytes(), py_cmd)
         if codex_root is not None:
-            if not args.no_codex_hooks:
-                codex_hooks_plan = _plan_codex_hooks(
-                    codex_root / "hooks.json", codex_template_dir / "hooks.json", py_cmd,
-                    args.codex_handoff_mode, args.codex_handoff_compactions, repo_root=repo_root,
-                )
-            _validate_codex_assets(codex_root, codex_template_dir, args, codex_hooks_plan)
+            _validate_path(codex_root / "config.toml", directory=False)
             codex_config_change = _plan_codex_config(
                 codex_root, include_sandbox=not args.no_sandbox_config, include_model=not args.no_model_config,
                 overwrite_model=args.sync_model_defaults, zotero_exe=zotero_exe, repo_root=repo_root,
             )
+            if not args.no_codex_hooks:
+                codex_hooks_plan = _plan_codex_hooks(
+                    codex_root / "hooks.json", codex_template_dir / "hooks.json", py_cmd,
+                    args.codex_handoff_mode, args.codex_handoff_compactions, repo_root=repo_root,
+                    config_bytes=codex_config_change.content if codex_config_change is not None else None,
+                )
+            _validate_codex_assets(codex_root, codex_template_dir, args, codex_hooks_plan)
         if claude_root is not None:
             claude_settings_plan = _plan_claude_settings(
                 claude_root / "settings.json", claude_template_dir / "hooks.json", py_cmd or "", args.claude_handoff_mode,
@@ -3454,13 +3963,13 @@ def main() -> None:
                 include_model=not args.no_model_config, overwrite_model=args.sync_model_defaults,
                 repo_root=repo_root,
             )
-            _validate_claude_assets(repo_root, claude_root, args, claude_settings_plan.mode)
+            _validate_claude_assets(repo_root, claude_root, args)
         if retire_ccswitch:
             _validate_path(ccswitch_db, directory=False)
             ccswitch_admin = _load_ccswitch_admin(repo_root)
             # 先只读验证 schema，再写入客户端资产；预演不备份、不改库。
             ccswitch_admin.retire_prompts_and_skills(ccswitch_db, purge=args.purge_ccswitch_legacy, dry_run=True)
-        if target_plugin_dir == (default_config_root / "plugins" / "user-guard").absolute() and not args.no_model_config:
+        if target_plugin_dir == (default_config_root / "plugins" / "user-guard").resolve() and not args.no_model_config:
             agy_model_changes = _plan_agy_model(
                 default_config_root.parent, dry_run=args.dry_run, overwrite=args.sync_model_defaults,
                 repo_root=repo_root,
@@ -3564,12 +4073,18 @@ def main() -> None:
         print("  正在执行全量无字节码 (-B) 自动化测试回归...")
         print("=" * 80)
 
-        env = os.environ.copy()
-        env.pop("USER_GUARD_STATE_DIR", None)
-        env.pop("USER_GUARD_LOGS_DIR", None)
-        env.pop("USER_GUARD_INSTALLED_CODEX_DIR", None)
-        env.pop("USER_GUARD_INSTALLED_CLAUDE_DIR", None)
-        env.pop("USER_GUARD_INSTALLED_DSH_DIR", None)
+        _scrub_exact = {
+            "PLUGIN_DATA", "OPENAI_API_KEY", "DEEPSEEK_API_KEY",
+            "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "PYTHONPATH",
+        }
+        _scrub_prefixes = (
+            "CAE_", "USER_GUARD_", "AGY_", "ANTIGRAVITY_", "CODEX_",
+            "CLAUDE", "ANTHROPIC_", "DSH_", "GIT_", "XDG_",
+        )
+        env = {
+            k: v for k, v in os.environ.items()
+            if k.upper() not in _scrub_exact and not k.upper().startswith(_scrub_prefixes)
+        }
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         env["USER_GUARD_INSTALLED_DIR"] = str(target_plugin_dir if (install_ag and target_plugin_dir is not None) else template_dir)
         if install_cx and codex_root is not None:

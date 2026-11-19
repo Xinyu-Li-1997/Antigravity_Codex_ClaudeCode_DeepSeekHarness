@@ -18,6 +18,8 @@ Antigravity 适配保留原有遥测与门禁；Codex 独立入口默认仅观�
 # ① 常量、阈值与宿主依赖
 
 import argparse
+import base64
+import binascii
 import hashlib
 import json
 import os
@@ -31,6 +33,8 @@ HOOKS_DIR = Path(__file__).resolve().parent
 if str(HOOKS_DIR) not in sys.path:
     sys.path.insert(0, str(HOOKS_DIR))
 import user_words  # noqa: E402
+from _lib import adaptive_policy as _adaptive_policy  # noqa: E402
+from _lib import shell_lex as _shell_lex  # noqa: E402
 
 user_words.ensure_utf8_stdio()
 
@@ -227,18 +231,45 @@ def _pos_float(raw: Any, fallback: float) -> float:
     return val if val > 0 else fallback
 
 
-def _sync_handoff_tunables() -> Dict[str, Any]:
+_extract_runtime_model_and_effort = _adaptive_policy.extract_runtime_model_and_effort
+_LAST_ACTIVE_HANDOFF_CTX: Tuple[str, str, str] = ("antigravity", "", "")
+
+
+def _sync_handoff_tunables(
+    client: Optional[str] = None,
+    model_name: Optional[str] = None,
+    effort: Optional[str] = None,
+) -> Dict[str, Any]:
     """从 fleet_profile.json 同步交接门禁参数；若单测通过 monkeypatch 覆盖了模块属性则保留覆盖值。"""
-    global _LAST_HANDOFF_PROFILE_TOKEN
-    cache_token = user_words.get_fleet_profile_cache_token(HOOKS_DIR)
+    global _LAST_HANDOFF_PROFILE_TOKEN, _LAST_ACTIVE_HANDOFF_CTX
+    if client is None and model_name is None and effort is None:
+        eff_client, eff_model, eff_effort = _LAST_ACTIVE_HANDOFF_CTX
+    else:
+        eff_client = (client or "antigravity").strip().lower() or "antigravity"
+        eff_model = (model_name or "").strip()
+        eff_effort = (effort or "").strip()
+        _LAST_ACTIVE_HANDOFF_CTX = (eff_client, eff_model, eff_effort)
+    cache_token = (user_words.get_fleet_profile_cache_token(HOOKS_DIR), eff_client, eff_model, eff_effort)
+    profile = user_words.load_fleet_profile(HOOKS_DIR)
     ht = user_words.get_runtime_tunables("handoff_thresholds", HOOKS_DIR)
     if _LAST_HANDOFF_PROFILE_TOKEN == cache_token:
         return ht
     _LAST_HANDOFF_PROFILE_TOKEN = cache_token
-    agy = ht.get("antigravity") if isinstance(ht.get("antigravity"), dict) else {}
-    codex = ht.get("codex") if isinstance(ht.get("codex"), dict) else {}
-    claude = ht.get("claude") if isinstance(ht.get("claude"), dict) else {}
-    comp_agy = user_words.get_compaction_tunables("antigravity", HOOKS_DIR)
+    agy = _adaptive_policy.resolve_adaptive_handoff_policy(
+        profile, "antigravity", eff_model if eff_client == "antigravity" else "", eff_effort if eff_client == "antigravity" else ""
+    )
+    codex = _adaptive_policy.resolve_adaptive_handoff_policy(
+        profile, "codex", eff_model if eff_client == "codex" else "", eff_effort if eff_client == "codex" else ""
+    )
+    claude = _adaptive_policy.resolve_adaptive_handoff_policy(
+        profile, "claude", eff_model if eff_client == "claude" else "", eff_effort if eff_client == "claude" else ""
+    )
+    comp_agy = user_words.get_compaction_tunables(
+        "antigravity",
+        HOOKS_DIR,
+        model_name=eff_model if eff_client == "antigravity" else "",
+        effort=eff_effort if eff_client == "antigravity" else "",
+    )
     resolved: Dict[str, Any] = {
         "DEFAULT_DRAIN_INVOCATIONS": user_words._coerce_pos_int(agy.get("default_drain_invocations"), _HANDOFF_BUILTINS["DEFAULT_DRAIN_INVOCATIONS"]),
         "DEFAULT_DRAIN_ACTIONS": user_words._coerce_pos_int(agy.get("default_drain_actions"), _HANDOFF_BUILTINS["DEFAULT_DRAIN_ACTIONS"]),
@@ -355,6 +386,7 @@ def save_gate_state(state_dir: Path, conversation_id: str, gate_state: Dict[str,
 def _gate_state_lock(state_dir: Path, conversation_id: str, timeout_sec: float = 1.5,
                      strict: bool = False) -> ContextManager[None]:
     """保留既有测试和调用入口，两种模式均须持锁才可进入事务。"""
+    _ = strict
     return user_words.session_state_lock(state_dir, conversation_id, timeout_sec)
 
 
@@ -438,94 +470,7 @@ def record_image_read(
 
 # ③ Shell 分句、包装器与命令副作用分类
 
-def _split_shell_clauses(cmd_str: str) -> List[str]:
-    """切分引号外的命令分组，保留命令替换和函数调用中的内嵌括号。"""
-    clauses: List[str] = []
-    buf: List[str] = []
-    quote_ch: Optional[str] = None
-    embedded_parens = 0
-    i = 0
-    n = len(cmd_str)
-    while i < n:
-        ch = cmd_str[i]
-        if quote_ch:
-            buf.append(ch)
-            if ch == "\\" and quote_ch == '"' and i + 1 < n:
-                buf.append(cmd_str[i + 1])
-                i += 2
-                continue
-            if ch == quote_ch:
-                quote_ch = None
-            i += 1
-            continue
-
-        if ch in ("'", '"'):
-            quote_ch = ch
-            buf.append(ch)
-            i += 1
-            continue
-
-        if ch == "\\" and i + 1 < n and cmd_str[i + 1] in ";&|{}()\n\"'":
-            buf.extend((ch, cmd_str[i + 1]))
-            i += 2
-            continue
-
-        if ch == "(":
-            previous = buf[-1] if buf else ""
-            # %(refname) 等 Git 格式占位符也属于当前参数。
-            if embedded_parens or (previous and (previous.isalnum() or previous in "$<>_:%")):
-                embedded_parens += 1
-                buf.append(ch)
-            else:
-                seg = "".join(buf).strip()
-                if seg:
-                    clauses.append(seg)
-                buf = []
-            i += 1
-            continue
-
-        if ch == ")" and embedded_parens:
-            embedded_parens -= 1
-            buf.append(ch)
-            i += 1
-            continue
-
-        if embedded_parens:
-            buf.append(ch)
-            i += 1
-            continue
-
-        if ch in ("\n", ";", "{", "}", ")"):
-            seg = "".join(buf).strip()
-            if seg:
-                clauses.append(seg)
-            buf = []
-            i += 1
-            continue
-
-        if ch in ("&", "|"):
-            if i + 1 < n and cmd_str[i + 1] == ch:
-                seg = "".join(buf).strip()
-                if seg:
-                    clauses.append(seg)
-                buf = []
-                i += 2
-                continue
-            if ch == "|" or (ch == "&" and (i == 0 or cmd_str[i - 1] not in "><")):
-                seg = "".join(buf).strip()
-                if seg:
-                    clauses.append(seg)
-                buf = []
-                i += 1
-                continue
-
-        buf.append(ch)
-        i += 1
-
-    tail = "".join(buf).strip()
-    if tail:
-        clauses.append(tail)
-    return clauses
+_split_shell_clauses = _shell_lex.split_shell_clauses
 
 
 def _safe_split_clause_tokens(clause: str) -> List[str]:
@@ -541,6 +486,22 @@ def _strip_token_quotes(tok: str) -> str:
         inner = s[1:-1]
         return inner.replace('\\"', '"') if s[0] == '"' else inner.replace("''", "'")
     return s
+
+
+def _unquote_split_string_payload(inner: str) -> str:
+    """剥离 Windows shlex(posix=False) 拆解 --split-string="..." 后残留的外层成对引号。"""
+    s = inner.strip()
+    if len(s) >= 2 and s[0] in ("'", '"'):
+        q = s[0]
+        if s[-1] == q:
+            return _strip_token_quotes(s)
+        end = s.find(q, 1)
+        if end != -1:
+            return _strip_token_quotes(s[: end + 1]) + s[end + 1 :]
+    return s
+
+
+_ENCODED_CMD_BLOCKED_SENTINEL = "\x00__BLOCKED_ENCODED_COMMAND__"
 
 
 def _unwrap_clause_or_shell(tokens: List[str]) -> Tuple[List[str], Optional[str]]:
@@ -570,9 +531,49 @@ def _unwrap_clause_or_shell(tokens: List[str]) -> Tuple[List[str], Optional[str]
                 idx += 1
                 if fl == "--":
                     break
-                if fl in ("-u", "--unset", "-C", "--chdir", "-S", "--split-string") and idx < n:
+                if fl.startswith("--split-string="):
+                    inner = fl.split("=", 1)[1]
+                    if idx < n:
+                        inner += " " + " ".join(tokens[idx:])
+                    return [], _unquote_split_string_payload(inner)
+                if fl in ("-S", "--split-string"):
+                    if idx >= n:
+                        return [], ""
+                    rest = [_strip_token_quotes(tokens[idx])] + list(tokens[idx + 1 :])
+                    return [], " ".join(rest)
+                if fl in ("-u", "--unset", "-C", "--chdir") and idx < n:
                     idx += 1
             continue
+        if head_name == "nohup":
+            idx += 1
+            continue
+        if head_name == "nice":
+            idx += 1
+            while idx < n and _strip_token_quotes(tokens[idx]).startswith("-"):
+                fl = _strip_token_quotes(tokens[idx])
+                idx += 1
+                if fl == "--":
+                    break
+                if fl in ("-n", "--adjustment") and idx < n:
+                    idx += 1
+            continue
+        if head_name == "uv" and idx + 1 < n:
+            j = idx + 1
+            while j < n and _strip_token_quotes(tokens[j]).startswith("-"):
+                j += 2 if _strip_token_quotes(tokens[j]) in ("--directory", "--project", "--config-file") and j + 1 < n else 1
+            if j < n and _strip_token_quotes(tokens[j]).lower() == "run":
+                j += 1
+                uv_vals = ("--python", "-p", "--with", "--with-editable", "--with-requirements",
+                           "--directory", "--project", "--env-file", "--package")
+                while j < n and _strip_token_quotes(tokens[j]).startswith("-"):
+                    fl = _strip_token_quotes(tokens[j])
+                    j += 1
+                    if fl == "--":
+                        break
+                    if fl in uv_vals and j < n:
+                        j += 1
+                idx = j
+                continue
         if head_name == "sudo":
             idx += 1
             while idx < n and _strip_token_quotes(tokens[idx]).startswith("-"):
@@ -580,7 +581,7 @@ def _unwrap_clause_or_shell(tokens: List[str]) -> Tuple[List[str], Optional[str]
                 idx += 1
                 if fl == "--":
                     break
-                if fl in ("-u", "--user", "-g", "--group", "-h", "--host", "-p", "--prompt", "-r", "--role", "-t", "--type", "-C", "-D", "--chdir") and idx < n:
+                if fl in ("-u", "--user", "-g", "--group", "-h", "--host", "-p", "--prompt", "-r", "--role", "-t", "--type", "-C", "--close-from", "-T", "--command-timeout", "-D", "--chdir", "-R", "--chroot") and idx < n:
                     idx += 1
             continue
         if "=" in head_raw and not head_raw.startswith("-") and "/" not in head_raw and "\\" not in head_raw:
@@ -607,14 +608,55 @@ def _unwrap_clause_or_shell(tokens: List[str]) -> Tuple[List[str], Optional[str]
                     idx += 1
             continue
         if head_name in SHELL_WRAPPERS:
+            shell_idx = idx
             idx += 1
+            is_cmd_shell = head_name in ("cmd", "cmd.exe")
+            is_ps_shell = head_name in ("pwsh", "pwsh.exe", "powershell", "powershell.exe")
+            is_posix_shell = head_name in ("bash", "sh", "zsh")
             while idx < n:
                 fl = _strip_token_quotes(tokens[idx]).lower()
-                if fl in ("-executionpolicy", "-ep", "-windowstyle", "-w", "-inputformat", "-outputformat") and idx + 1 < n:
+                if (
+                    fl in (
+                        "-executionpolicy", "-ep", "-windowstyle", "-w", "-inputformat",
+                        "-outputformat", "-configurationname", "-workingdirectory", "-version", "-v",
+                    )
+                    and idx + 1 < n
+                ):
                     idx += 2
                     continue
-                if fl in ("-c", "/c", "-command") or (
-                    head_name in ("bash", "sh", "zsh") and re.fullmatch(r"-[a-z]*c", fl)
+                if is_ps_shell and fl in ("-encodedcommand", "-ec"):
+                    idx += 1
+                    if idx >= n:
+                        return [], _ENCODED_CMD_BLOCKED_SENTINEL
+                    raw_b64_tok = tokens[idx]
+                    b64_str = _strip_token_quotes(raw_b64_tok).strip()
+                    extra_tail = [_strip_token_quotes(t).strip() for t in tokens[idx + 1 :] if _strip_token_quotes(t).strip()]
+                    if any(
+                        not re.fullmatch(r"(?:\d+)?(?:>&[12]|>&-)|(?:&>{1,2}|\d*>{1,2})(?:/dev/null|\$null|nul)?", t, re.I)
+                        for t in extra_tail
+                    ):
+                        return [], _ENCODED_CMD_BLOCKED_SENTINEL
+                    if (
+                        not b64_str
+                        or "$" in raw_b64_tok
+                        or "$" in b64_str
+                        or re.search(r"%[A-Za-z_][A-Za-z_0-9]*%", raw_b64_tok)
+                    ):
+                        return [], _ENCODED_CMD_BLOCKED_SENTINEL
+                    try:
+                        raw_bytes = base64.b64decode(b64_str, validate=True)
+                        if not raw_bytes or len(raw_bytes) % 2 != 0:
+                            return [], _ENCODED_CMD_BLOCKED_SENTINEL
+                        decoded_script = raw_bytes.decode("utf-16-le")
+                    except (binascii.Error, ValueError, UnicodeDecodeError):
+                        return [], _ENCODED_CMD_BLOCKED_SENTINEL
+                    if not decoded_script.strip() or "\x00" in decoded_script:
+                        return [], _ENCODED_CMD_BLOCKED_SENTINEL
+                    return [], decoded_script
+                if (
+                    (is_cmd_shell and fl in ("/c", "/k"))
+                    or (is_ps_shell and fl in ("-c", "-command"))
+                    or (is_posix_shell and bool(re.fullmatch(r"-[a-z]*c", fl)))
                 ):
                     idx += 1
                     if idx >= n:
@@ -623,11 +665,12 @@ def _unwrap_clause_or_shell(tokens: List[str]) -> Tuple[List[str], Optional[str]
                         return [], _strip_token_quotes(tokens[idx])
                     rest = [_strip_token_quotes(tokens[idx])] + list(tokens[idx + 1 :])
                     return [], " ".join(rest)
-                if fl.startswith("-") or (head_name in ("cmd", "cmd.exe") and fl.startswith("/")):
+                if fl.startswith("-") or (is_cmd_shell and fl.startswith("/")):
                     idx += 1
                     continue
                 break
-            continue
+            idx = shell_idx
+            break
         break
     return tokens[idx:], None
 
@@ -649,90 +692,10 @@ def _git_subcommand(tokens: List[str]) -> Tuple[Optional[str], List[str]]:
     return None, []
 
 
-def _strip_quoted_segments(clause: str) -> str:
-    """屏蔽引号内字符串文本，防止 commit 信息中的 `>` / `>>` 等字符触发重定向误判"""
-    out: List[str] = []
-    quote_ch: Optional[str] = None
-    i = 0
-    n = len(clause)
-    while i < n:
-        ch = clause[i]
-        if quote_ch:
-            if ch == "\\" and quote_ch == '"' and i + 1 < n:
-                i += 2
-                continue
-            if ch == quote_ch:
-                quote_ch = None
-            out.append(" ")
-            i += 1
-            continue
-        if ch in ("'", '"'):
-            quote_ch = ch
-            out.append(" ")
-            i += 1
-            continue
-        out.append(ch)
-        i += 1
-    return "".join(out)
+_strip_quoted_segments = _shell_lex.strip_quoted_segments
 
 
-def _extract_cmd_substitutions(clause: str) -> List[str]:
-    """提取非单引号区间的 $(...) 与成对反引号命令替换表达式，防 echo "$(git push)" 类隐蔽执行绕过"""
-    subs: List[str] = []
-    in_single = False
-    in_double = False
-    i = 0
-    n = len(clause)
-    while i < n:
-        ch = clause[i]
-        if ch == "\\" and not in_single and i + 1 < n:
-            i += 2
-            continue
-        if ch == "'" and not in_double:
-            in_single = not in_single
-            i += 1
-            continue
-        if ch == '"' and not in_single:
-            in_double = not in_double
-            i += 1
-            continue
-        if not in_single:
-            if ch == "$" and i + 1 < n and clause[i + 1] == "(":
-                depth = 1
-                j = i + 2
-                s_q = False
-                d_q = False
-                while j < n and depth > 0:
-                    c2 = clause[j]
-                    if c2 == "\\" and not s_q and j + 1 < n:
-                        j += 2
-                        continue
-                    if c2 == "'" and not d_q:
-                        s_q = not s_q
-                    elif c2 == '"' and not s_q:
-                        d_q = not d_q
-                    elif not s_q and not d_q:
-                        if c2 == "(":
-                            depth += 1
-                        elif c2 == ")":
-                            depth -= 1
-                    j += 1
-                if depth == 0:
-                    inner = clause[i + 2 : j - 1].strip()
-                    if inner:
-                        subs.append(inner)
-                    i = j
-                    continue
-            if ch == "`" and i + 1 < n:
-                j = clause.find("`", i + 1)
-                if j != -1:
-                    inner = clause[i + 1 : j].strip()
-                    if inner and inner not in ("r", "n", "t", "0"):
-                        subs.append(inner)
-                    i = j + 1
-                    continue
-        i += 1
-    return subs
+_extract_cmd_substitutions = _shell_lex.extract_cmd_substitutions
 
 
 def _git_branch_is_readonly(subargs: List[str]) -> bool:
@@ -768,6 +731,13 @@ def _git_branch_is_readonly(subargs: List[str]) -> bool:
     return True
 
 
+def _is_readonly_harness_subcommand(sub_tokens: List[str]) -> bool:
+    if not sub_tokens or sub_tokens[0] not in ("check-grounding", "assess", "probe", "plan", "--help", "-h", "status"):
+        return False
+    mutating_flags = ("--output", "--approve-ticket", "--save-ticket", "--mark-handed-off")
+    return not any(tok in mutating_flags or any(tok.startswith(f + "=") for f in mutating_flags) for tok in sub_tokens[1:])
+
+
 def _classify_run_command(cmd_str: str, is_daemon: bool = False, _depth: int = 0) -> str:
     """
     将 run_command 分类为：
@@ -776,7 +746,7 @@ def _classify_run_command(cmd_str: str, is_daemon: bool = False, _depth: int = 0
     - git_local_commit: 含 git add/commit 且无外部写操作与 push
     - mutating_other: 其他会改动/运行测试/脚本的命令
     """
-    if is_daemon:
+    if is_daemon or cmd_str == _ENCODED_CMD_BLOCKED_SENTINEL:
         return "blocked_always"
     if not cmd_str or not cmd_str.strip():
         return "mutating_other"
@@ -797,8 +767,22 @@ def _classify_run_command(cmd_str: str, is_daemon: bool = False, _depth: int = 0
             elif sub_expr_kind == "git_local_commit":
                 has_git_commit_or_add = True
 
+        clause = re.sub(
+            r"^(?:(?:if|then|else|elif|while|until|do)\b(?:\s+|$)|!\s+)+",
+            "",
+            clause.strip(),
+            flags=re.IGNORECASE,
+        ).strip()
+        if not clause or clause.lower() in ("fi", "done", "esac"):
+            continue
+
         unquoted = _strip_quoted_segments(clause)
-        stripped_redirs = re.sub(r"\d?>&1|\d?>\s*/dev/null", "", unquoted)
+        stripped_redirs = re.sub(
+            r"(?:\d+)?(?:>&[12]|>&-)|(?:&>{1,2}|\d*>{1,2})\s*(?:/dev/null|\$null|nul)(?![A-Za-z0-9_./\\])",
+            "",
+            unquoted,
+            flags=re.IGNORECASE,
+        )
         has_redir = bool(re.search(r"(?:>>|>|\bout-file\b|\bset-content\b|\badd-content\b|\btee\b)", stripped_redirs, re.IGNORECASE))
 
         tokens, inner_script = _unwrap_clause_or_shell(_safe_split_clause_tokens(clause))
@@ -827,10 +811,10 @@ def _classify_run_command(cmd_str: str, is_daemon: bool = False, _depth: int = 0
 
         if head_file == "cae_harness.py":
             sub_tokens = [_strip_token_quotes(st) for st in tokens[1:]]
-            if (
-                not has_redir
-                and sub_tokens and sub_tokens[0] in ("check-grounding", "assess", "probe", "plan", "--help", "-h", "status")
-            ):
+            if not has_redir and _is_readonly_harness_subcommand(sub_tokens):
+                continue
+            if sub_tokens and sub_tokens[0] in ("check-grounding", "assess", "probe", "plan", "--help", "-h", "status"):
+                has_mutating = True
                 continue
             return "blocked_always"
 
@@ -862,13 +846,23 @@ def _classify_run_command(cmd_str: str, is_daemon: bool = False, _depth: int = 0
             saw_inline_or_mod = False
             while idx_arg < len(py_args):
                 tok_arg = _strip_token_quotes(py_args[idx_arg])
-                if tok_arg in ("-c", "-m"):
+                if tok_arg == "--":
+                    idx_arg += 1
+                    break
+                if (
+                    tok_arg == "-m"
+                    or (tok_arg.startswith("-m") and not tok_arg.startswith("--"))
+                    or bool(re.match(r"^-[BbIdEisSuqvVxOP]*c", tok_arg))
+                ):
                     saw_inline_or_mod = True
                     break
                 if tok_arg in ("-X", "-W", "-Q", "--check-hash-based-pycs"):
                     idx_arg += 2
                     continue
-                if tok_arg.startswith("-"):
+                if tok_arg == "--safe-path" or tok_arg.startswith(("-X", "-W", "-Q", "--check-hash-based-pycs=")):
+                    idx_arg += 1
+                    continue
+                if tok_arg.startswith("-") and tok_arg != "-":
                     idx_arg += 1
                     continue
                 break
@@ -881,10 +875,10 @@ def _classify_run_command(cmd_str: str, is_daemon: bool = False, _depth: int = 0
                 script_name = Path(_strip_token_quotes(py_args[idx_arg]).replace("\\", "/")).name.lower()
                 if script_name == "cae_harness.py":
                     sub_tokens = [_strip_token_quotes(st) for st in py_args[idx_arg + 1 :]]
-                    if (
-                        not has_redir
-                        and sub_tokens and sub_tokens[0] in ("check-grounding", "assess", "probe", "plan", "--help", "-h", "status")
-                    ):
+                    if not has_redir and _is_readonly_harness_subcommand(sub_tokens):
+                        continue
+                    if sub_tokens and sub_tokens[0] in ("check-grounding", "assess", "probe", "plan", "--help", "-h", "status"):
+                        has_mutating = True
                         continue
                     return "blocked_always"
 
@@ -1002,7 +996,7 @@ def _workflow_handoff_present(text: str, tickets) -> bool:
         if match:
             if not fence:
                 fence = match[1]
-            elif match[1][0] == fence[0] and len(match[1]) >= len(fence):
+            elif match[1][0] == fence[0] and len(match[1]) >= len(fence) and not match[2].strip():
                 fence = ""
         if (not fence and re.match(r"^\s*#{1,6}\s+", line)
                 and not re.match(r"^\s*#### 流 .+（14 项完整参数明细）\s*$", line)):
@@ -1083,7 +1077,7 @@ def _workflow_handoff_notice(tickets) -> str:
     if not tickets:
         return ""
     return ("\n必须将以下未决重负载工作流的背景、要做什么、预计后果、14项全字段参数表、"
-            "离线性能更新时间及选项卡完整写入【新对话提示词】，由新对话读取磁盘票据再请用户拍板。\n"
+            "离线性能更新时间及选项卡完整写入【新对话提示词】，由新对话读取磁盘票据再请用户确认。\n"
             + "\n\n".join(user_words.render_pending_workflow_block(ticket, for_handoff=True) for ticket in tickets))
 
 
@@ -1500,8 +1494,14 @@ def evaluate_pre_invocation_locked(
     state_dir: Path,
     compaction_state: Dict[str, Any],
     transcript_path: Optional[Path] = None,
+    payload: Optional[Dict[str, Any]] = None,
+    model_name: str = "",
+    effort: str = "",
 ) -> Dict[str, Any]:
     """评估遥测并更新门禁。调用方在同一会话锁内提交压缩状态。"""
+    if not model_name and not effort:
+        model_name, effort = _extract_runtime_model_and_effort("antigravity", payload)
+    _sync_handoff_tunables("antigravity", model_name, effort)
     gate_state = load_gate_state(state_dir, conversation_id)
     tel = _merge_telemetry(compaction_state, gate_state, transcript_path=transcript_path)
     user_text = tel["latestUserInputPreview"]
@@ -1560,6 +1560,8 @@ def check_pre_tool_use_locked(payload: Dict[str, Any], state_dir: Path,
     conversation_id = str(payload.get("conversationId") or "").strip()
     if not conversation_id:
         return None
+    model_name, effort = _extract_runtime_model_and_effort("antigravity", payload)
+    _sync_handoff_tunables("antigravity", model_name, effort)
 
     compaction_state_file = state_dir / f"{conversation_id}_compaction.json"
     compaction_state = {}
@@ -1628,11 +1630,16 @@ def check_pre_tool_use_locked(payload: Dict[str, Any], state_dir: Path,
     # 1. 绝不允许的派工与常驻/外推工具（drain 与 freeze 均阻断）
     if tool_name in DELEGATION_TOOLS or tool_name in MEDIA_TOOLS or tool_name.startswith("browser_"):
         save_gate_state(state_dir, conversation_id, gate_state)
+        media_note = (
+            "收口期禁止看图或生成多模态图片（图片会急剧消耗剩余上下文窗口并加剧压缩丢历史风险），请改用已有文本/脚本输出核对；"
+            if tool_name in MEDIA_TOOLS
+            else ""
+        )
         return {
             "decision": "deny",
             "reason": (
                 f"【user-guard 长会话交接门禁 ({phase})】当前会话已进入交接停机收口期（{_format_telemetry_brief(tel)}），"
-                    f"收口期禁用 `{tool_name}`。"
+                f"收口期禁用 `{tool_name}`。{media_note}"
                 "请仅完成本地原子收口并整理交接文档与新对话提示词后立即停机。"
             ),
         }
@@ -1652,7 +1659,8 @@ def check_pre_tool_use_locked(payload: Dict[str, Any], state_dir: Path,
                 "decision": "deny",
                 "reason": (
                     f"【user-guard 长会话交接门禁 ({phase})】当前图片遥测（{_format_telemetry_brief(tel)}）。"
-                    "收口期内禁止继续调用 `read_file` 看图，请改用文本摘要/脚本输出核对后完成交接。"
+                    "收口期内禁止继续调用 `read_file` 看图（多模态图片会急剧占用剩余上下文配额并触发二次压缩），"
+                    "请改用文本摘要或脚本输出核对后完成交接。"
                 ),
             }
         return None
@@ -1741,8 +1749,8 @@ def check_pre_tool_use_locked(payload: Dict[str, Any], state_dir: Path,
             return {
                 "decision": "deny",
                 "reason": (
-                    f"【user-guard 长会话交接门禁 ({phase})】收口期禁用派工、推送、读图和常驻进程。"
-                    "仅允许本地只读核对、运行本地验收与本地 `git add`/`git commit`。"
+                    f"【user-guard 长会话交接门禁 ({phase})】收口期禁用派工、推送、读图（防止多模态图片耗尽剩余上下文窗口）和常驻进程。"
+                    "仅允许本地非图片只读核对、运行本地验收与本地 `git add`/`git commit`。"
                 ),
             }
 
@@ -1833,7 +1841,11 @@ def check_stop_handoff_locked(
                          and _workflow_handoff_present(latest_reply, tickets))
     if not has_file and not has_prompt_inline:
         missing_parts.append(
-            "尚未落盘非空交接文档且最终回复中缺少可直接复制粘贴到新对话的完整【新对话提示词】（含已验证进度、Git 状态与未完成事项）"
+            "尚未落盘非空交接文档，且最终回复未同时满足 4 项必需交接章节要素："
+            "① 已验证进展（含“已验证/已完成”）；"
+            "② Git/工作区状态（含“Git/提交/工作区”）；"
+            "③ 未完成事项与下一步待办（含“未完成/待办/下一步”）；"
+            "④ 独立【新对话提示词】章节（如 `## 新对话提示词`，正文不少于 15 字且可直接复制粘贴）"
         )
         if tickets:
             missing_parts.append("【新对话提示词】遗漏未决票据的完整工作流详述、矩阵或选项卡")
@@ -1882,7 +1894,7 @@ def _codex_notice(phase: str, count: int, mode: str, client_label: str = "Codex"
         return (prefix + "请收尾当前小步，核对用户原话与最新裁定，整理已验证进展、Git/工作区状态、"
                 "未完成事项及可复制的新对话提示词。结束当前回合不等于取消目标循环或终止后台任务；"
                 "须如实登记其状态，不得把未完成目标标成完成。"
-                + ("当前仅提醒，不阻断工具。" if mode == "advisory" else "暂停新派工和推送；冻结后仅允许核对与交接。"))
+                + ("当前仅提醒，不阻断工具。" if mode == "advisory" else "暂停新派工、读图和推送；冻结后仅允许非图片只读核对与交接。"))
     return prefix + "先核对压缩恢复的原话与当前状态，再继续工作；本提醒不表示上下文已失效。"
 
 
@@ -2053,25 +2065,32 @@ def _reconcile_codex_compactions(payload: Dict[str, Any], transcript: Path, stat
 
 
 def _codex_handoff_patch_paths(command: str, cwd: str) -> List[Path]:
-    """获取项目内的交接补丁目标，移动源和目标均须通过路径核验。"""
+    """获取项目内的交接补丁目标，兼容软链 cwd 并防止软链逃逸，移动源和目标均须通过路径核验。"""
     edits = re.findall(r"^\*\*\* (Add File|Update File|Delete File|Move to): (.+)$", command, re.MULTILINE)
-    if not edits or not cwd:
+    if not edits or not cwd or not cwd.strip():
         return []
     try:
-        base = Path(cwd).resolve()
+        cwd_expanded = Path(os.path.expanduser(cwd.strip()))
+        lex_base = Path(os.path.abspath(str(cwd_expanded)))
+        base = cwd_expanded.resolve()
         targets: List[Path] = []
         for kind, raw in edits:
-            path = Path(raw.strip())
-            path = path if path.is_absolute() else base / path
+            cleaned = os.path.expanduser(raw.strip().strip("\"'"))
+            if not cleaned:
+                return []
+            cand = Path(cleaned)
+            path = Path(os.path.abspath(str(cand if cand.is_absolute() else lex_base / cand)))
             resolved = path.resolve()
-            if (not path.is_relative_to(base) or not resolved.is_relative_to(base)
-                    or resolved.suffix.lower() not in (".md", ".txt", ".rst")
-                    or not HANDOFF_FILENAME_RE.search(resolved.name)):
+            rel_dirs = [part.lower() for part in resolved.relative_to(base).parts[:-1]] if resolved.is_relative_to(base) else []
+            if (not (path.is_relative_to(lex_base) or path.is_relative_to(base))
+                    or not resolved.is_relative_to(base)
+                    or resolved.suffix.lower() not in (".md", ".markdown", ".txt", ".rst")
+                    or not (HANDOFF_FILENAME_RE.search(resolved.name) or "handoff" in rel_dirs)):
                 return []
             if kind != "Delete File":
                 targets.append(path)
         return targets
-    except (OSError, RuntimeError):
+    except (OSError, RuntimeError, ValueError):
         return []
 
 
@@ -2084,8 +2103,16 @@ def _codex_tool_kind(payload: Dict[str, Any]) -> Tuple[str, List[Path]]:
         return "blocked_always", []
     if name in CODEX_READ_TOOLS:
         return "readonly_inspect", []
-    if name in ("bash", "exec_command", "run_command"):
-        return _classify_run_command(str(args.get("command") or args.get("cmd") or args.get("CommandLine") or "")), []
+    if name in ("bash", "exec_command", "run_command", "shell", "shell_command"):
+        raw_cmd = args.get("command")
+        if raw_cmd is None:
+            raw_cmd = args.get("cmd") or args.get("CommandLine") or args.get("command_line") or ""
+        cmd_str = (
+            " ".join(shlex.quote(str(part)) for part in raw_cmd)
+            if isinstance(raw_cmd, list)
+            else str(raw_cmd or "")
+        )
+        return _classify_run_command(cmd_str), []
     if name in ("apply_patch", "edit", "write"):
         command = str(args.get("command") or args.get("patch") or args.get("patch_text") or
                       (raw_input if isinstance(raw_input, str) else ""))
@@ -2171,28 +2198,43 @@ def _reconcile_claude_compactions(payload: Dict[str, Any], transcript: Path, sta
 
 
 def _claude_handoff_targets(raw_paths: List[str], cwd: str) -> List[Path]:
-    if not cwd or not raw_paths:
+    if not cwd or not cwd.strip() or not raw_paths:
         return []
-    base = Path(cwd).resolve()
-    targets = []
-    for raw in raw_paths:
-        path = _resolve_candidate_path(raw, cwd)
-        resolved = path.resolve()
-        if (not path.is_relative_to(base) or not resolved.is_relative_to(base)
-                or resolved.suffix.lower() not in (".md", ".markdown", ".txt", ".rst")
-                or not HANDOFF_FILENAME_RE.search(resolved.name)):
-            return []
-        targets.append(path)
-    return targets
+    try:
+        cwd_expanded = Path(os.path.expanduser(cwd.strip()))
+        lex_base = Path(os.path.abspath(str(cwd_expanded)))
+        base = cwd_expanded.resolve()
+        targets = []
+        for raw in raw_paths:
+            if not raw or not str(raw).strip():
+                return []
+            raw_path = _resolve_candidate_path(raw, cwd)
+            path = Path(os.path.abspath(str(raw_path)))
+            resolved = path.resolve()
+            rel_dirs = [part.lower() for part in resolved.relative_to(base).parts[:-1]] if resolved.is_relative_to(base) else []
+            if (not (path.is_relative_to(lex_base) or path.is_relative_to(base))
+                    or not resolved.is_relative_to(base)
+                    or resolved.suffix.lower() not in (".md", ".markdown", ".txt", ".rst")
+                    or not (HANDOFF_FILENAME_RE.search(resolved.name) or "handoff" in rel_dirs)):
+                return []
+            targets.append(path)
+        return targets
+    except (OSError, RuntimeError, ValueError):
+        return []
 
 
 def _claude_tool_kind(payload: Dict[str, Any]) -> Tuple[str, List[Path]]:
-    name = str(payload.get("tool_name") or "").strip()
+    raw_name = str(payload.get("tool_name") or "").strip()
+    name = raw_name.rsplit(".", 1)[-1].rsplit("__", 1)[-1]
     args = payload.get("tool_input") if isinstance(payload.get("tool_input"), dict) else {}
     cwd = str(payload.get("cwd") or "")
-    if name in ("Agent", "Task", "Subagent"):
+    if name in ("Agent", "Task", "Subagent", "dispatch_agent"):
         return "blocked_always", []
-    if name in ("Read", "Grep", "Glob", "LS", "ToolSearch", "TodoRead", "TodoWrite", "AskUserQuestion"):
+    if name == "Read":
+        if is_image_path(str(args.get("file_path") or args.get("path") or "")):
+            return "blocked_always", []
+        return "readonly", []
+    if name in ("Grep", "Glob", "LS", "ToolSearch", "TodoRead", "TodoWrite", "AskUserQuestion"):
         return "readonly", []
     if name in ("Write", "Edit", "MultiEdit"):
         targets = _claude_handoff_targets([str(args.get("file_path") or args.get("path") or "")], cwd)
@@ -2203,18 +2245,139 @@ def _claude_tool_kind(payload: Dict[str, Any]) -> Tuple[str, List[Path]]:
         kind = _classify_run_command(command)
         if kind != "mutating_other":
             return kind, []
-        redirects = re.compile(r'''(?<![>])(?:\d*)>{1,2}(?![>&])\s*("[^"]+"|'[^']+'|[^\s;|&<>]+)''')
-        raw_paths = [match[1].strip("\"'") for match in redirects.finditer(command)]
-        if raw_paths and _classify_run_command(redirects.sub("", command)) == "readonly_inspect":
-            targets = _claude_handoff_targets(raw_paths, cwd)
-            if targets:
-                return "handoff_document", targets
+        unquoted = _strip_quoted_segments(command)
+        redir_ops = re.compile(r"(?:&>{1,2}|(?<![>&0-9])(?:\d*)>{1,2})(?![>&])")
+        arg_pat = re.compile(r"""\s*((?:\$'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|'(?:''|[^'])*'|\\.|[^\s;|&<>])+)""")
+        raw_paths: List[str] = []
+        spans: List[Tuple[int, int]] = []
+        valid_redirs = True
+        for op_m in redir_ops.finditer(unquoted):
+            arg_m = arg_pat.match(command, op_m.end())
+            if not arg_m:
+                valid_redirs = False
+                break
+            tok = _strip_token_quotes(arg_m.group(1).strip())
+            spans.append((op_m.start(), arg_m.end()))
+            if tok.lower() not in ("/dev/null", "nul", "$null"):
+                raw_paths.append(tok)
+        if valid_redirs and raw_paths:
+            kept_parts: List[str] = []
+            cursor_idx = 0
+            for sp_start, sp_end in spans:
+                kept_parts.append(command[cursor_idx:sp_start])
+                cursor_idx = sp_end
+            kept_parts.append(command[cursor_idx:])
+            if _classify_run_command("".join(kept_parts)) == "readonly_inspect":
+                targets = _claude_handoff_targets(raw_paths, cwd)
+                if targets:
+                    return "handoff_document", targets
     return "mutating_other", []
+
+
+def _extract_native_turn_latest_reply(transcript: Path, client: str) -> str:
+    """当 Stop 事件未携带 last_assistant_message 时，从轨迹提取当前回合最新助手文本回复。"""
+    max_tail_bytes = 2 * 1024 * 1024
+    try:
+        if not transcript or not transcript.is_file():
+            return ""
+        with open(transcript, "rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            size = stream.tell()
+            start = max(0, size - max_tail_bytes)
+            stream.seek(start)
+            buf = stream.read(max_tail_bytes)
+    except OSError:
+        return ""
+    if start > 0:
+        first_nl = buf.find(b"\n")
+        buf = buf[first_nl + 1 :] if first_nl != -1 else b""
+    raw_lines = [line.rstrip(b"\r") for line in buf.split(b"\n")]
+    if client == "claude":
+        chunks: List[str] = []
+        for raw in reversed(raw_lines):
+            if not raw.strip():
+                continue
+            try:
+                entry = json.loads(user_words.decode_jsonl_line(raw))
+            except (ValueError, RecursionError):
+                continue
+            if not isinstance(entry, dict) or entry.get("isSidechain") is True or entry.get("isMeta") is True:
+                continue
+            u_text, u_kind = user_words.claude_user_content(entry)
+            if u_text and u_kind in ("user_input", "queued_command", "ask_question_answer"):
+                break
+            if entry.get("type") == "user" and (
+                user_words._claude_tool_result_ids(entry) or isinstance(entry.get("toolUseResult"), dict)
+            ):
+                break
+            if entry.get("type") == "assistant":
+                msg = entry.get("message")
+                content = msg.get("content") if isinstance(msg, dict) else None
+                if isinstance(content, list):
+                    has_tool_use = any(isinstance(b, dict) and b.get("type") == "tool_use" for b in content)
+                    text = "\n".join(
+                        b["text"] for b in content
+                        if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str)
+                    )
+                    if has_tool_use:
+                        if not chunks:
+                            return ""
+                        break
+                    if text.strip():
+                        chunks.append(text.strip())
+                elif isinstance(content, str) and content.strip():
+                    chunks.append(content.strip())
+        return "\n".join(reversed(chunks)).strip()
+
+    codex_chunks: List[str] = []
+    for index, raw in enumerate(raw_lines):
+        if not raw.strip():
+            continue
+        try:
+            entry = json.loads(user_words.decode_jsonl_line(raw))
+        except (ValueError, RecursionError):
+            continue
+        if not isinstance(entry, dict):
+            continue
+        typ = entry.get("type")
+        rec = entry.get("payload") if typ == "response_item" else None
+        is_user = typ == "USER_INPUT" or entry.get("source") == "USER_EXPLICIT"
+        if isinstance(rec, dict) and rec.get("type") == "message" and rec.get("role") == "user":
+            _, word = user_words._extract_codex_record(entry, index)
+            if word:
+                word["source_path"] = str(transcript)
+            is_user = bool(word and user_words._codex_word_from_record(word))
+        if is_user:
+            codex_chunks.clear()
+            continue
+        if isinstance(rec, dict) and rec.get("type") == "message" and rec.get("role") == "assistant":
+            text = "\n".join(
+                b.get("text", "") for b in rec.get("content", [])
+                if isinstance(b, dict) and isinstance(b.get("text"), str)
+            )
+            if text.strip():
+                codex_chunks.append(text.strip())
+        elif (
+            isinstance(rec, dict)
+            and rec.get("type")
+            in (
+                "function_call",
+                "function_call_output",
+                "custom_tool_call",
+                "custom_tool_call_output",
+                "local_shell_call",
+                "local_shell_call_output",
+                "web_search_call",
+                "web_search_call_output",
+            )
+        ) or typ in ("TOOL_CALL", "TOOL_RESULT", "TOOL_RESPONSE", "GENERIC"):
+            codex_chunks.clear()
+    return "\n".join(codex_chunks).strip()
 
 
 def handle_codex_handoff(payload: Dict[str, Any], state_dir: Path, mode: str = "advisory",
                          compact_limit: int = 0) -> Dict[str, Any]:
-    """Codex 原生协议入口。advisory 永不阻断；enforce 只采用显式策略。"""
+    """Codex 原生协议入口。advisory 永不阻断；支持运行期自适应策略升级。"""
     return _handle_native_handoff(payload, state_dir, mode, compact_limit, "codex")
 
 
@@ -2224,14 +2387,16 @@ def handle_claude_handoff(payload: Dict[str, Any], state_dir: Path, mode: str = 
     return _handle_native_handoff(payload, state_dir, mode, compact_limit, "claude")
 
 
-def _handle_native_handoff(payload: Dict[str, Any], state_dir: Path, mode: str,
-                           compact_limit: int, client: str) -> Dict[str, Any]:
-    _sync_handoff_tunables()
-    client_drain_actions = (
-        CODEX_DRAIN_ACTIONS
-        if CODEX_DRAIN_ACTIONS != _ACTIVE_HANDOFF_BASELINE["CODEX_DRAIN_ACTIONS"]
-        else (_CLAUDE_DRAIN_ACTIONS if client == "claude" else CODEX_DRAIN_ACTIONS)
-    )
+def _handle_native_handoff(
+    payload: Dict[str, Any],
+    state_dir: Path,
+    mode: str,
+    compact_limit: int,
+    client: str,
+    *,
+    _mode_explicit: Optional[bool] = None,
+    _limit_explicit: Optional[bool] = None,
+) -> Dict[str, Any]:
     label = "Claude" if client == "claude" else "Codex"
     event = str(payload.get("hook_event_name") or "")
     if event not in CODEX_EVENTS or mode == "off":
@@ -2242,14 +2407,28 @@ def _handle_native_handoff(payload: Dict[str, Any], state_dir: Path, mode: str,
     sid, transcript, identity_error, skip = resolver(payload)
     if skip:
         return {}
+    state_dir = Path(state_dir)
     if transcript is None:
+        raw_tp = user_words.strip_win_extended_prefix(str(payload.get("transcript_path") or "")).strip()
+        missing_tp = not raw_tp or not Path(raw_tp).expanduser().exists()
+        is_compact_or_resume = (
+            event == "PostCompact"
+            or str(payload.get("source") or "").strip().lower() in ("compact", "resume")
+        )
+        if (
+            user_words.valid_session_id(sid)
+            and missing_tp
+            and not is_compact_or_resume
+            and not _gate_state_path(state_dir, sid).exists()
+        ):
+            return {}
         return {"systemMessage": f"{label} 长会话门禁未更新。{identity_error}。"}
     if not user_words.valid_session_id(sid):
         return {}
-    state_dir = Path(state_dir)
     with user_words.session_state_lock(state_dir, sid):
         state_path = _gate_state_path(state_dir, sid)
-        if state_path.exists():
+        state_existed = state_path.exists()
+        if state_existed:
             state = json.loads(state_path.read_text(encoding="utf-8-sig"))
             if (not isinstance(state, dict) or state.get("client") != client or state.get("version") != 1
                     or state.get("conversationId") != sid or not isinstance(state.get("observedEvents"), list)
@@ -2267,11 +2446,45 @@ def _handle_native_handoff(payload: Dict[str, Any], state_dir: Path, mode: str,
         else:
             state = {"client": client, "version": 1, "conversationId": sid, "phase": "normal",
                      "compactionKeys": [], "compactionCount": 0, "observedEvents": [],
-                     "drainActionsRemaining": client_drain_actions, "overrideUntilCount": -1,
+                     "drainActionsRemaining": 0, "overrideUntilCount": -1,
                      "lastUserEvent": "", "stopCorrectionRequested": False, "handoffRecorded": False}
+
+        raw_m, _e = _extract_runtime_model_and_effort(client, payload)
+        clean_m = "" if raw_m.lower() == "unknown" else raw_m
+        stored_m = str(state.get("lastModel") or "").strip()
+        if stored_m.lower() == "unknown":
+            stored_m = ""
+        eff_model = clean_m or stored_m
+
+        _sync_handoff_tunables(client, eff_model, _e)
+        client_drain_actions = (
+            CODEX_DRAIN_ACTIONS
+            if CODEX_DRAIN_ACTIONS != _ACTIVE_HANDOFF_BASELINE["CODEX_DRAIN_ACTIONS"]
+            else (_CLAUDE_DRAIN_ACTIONS if client == "claude" else CODEX_DRAIN_ACTIONS)
+        )
+        if not state_existed:
+            state["drainActionsRemaining"] = client_drain_actions
+
+        client_cfg = _adaptive_policy.resolve_adaptive_handoff_policy(
+            user_words.load_fleet_profile(HOOKS_DIR), client, eff_model, _e
+        )
+        cfg_mode = str(client_cfg.get("default_mode") or "advisory").strip().lower()
+        resolved_mode = cfg_mode if cfg_mode in ("advisory", "enforce", "off") else "advisory"
+        resolved_limit = user_words._coerce_pos_int(client_cfg.get("default_compact_limit"), 0, minimum=0)
+
+        is_default_pair = (mode == "advisory" and compact_limit == 0)
+        limit_explicit = (not is_default_pair) if _limit_explicit is None else bool(_limit_explicit)
+
+        if mode == "advisory" and resolved_mode != "advisory":
+            mode = resolved_mode
+        if mode == "off":
+            return {}
+        if (not limit_explicit or is_default_pair) and compact_limit == 0 and resolved_limit > 0:
+            compact_limit = resolved_limit
+
         if event not in state["observedEvents"]:
             state["observedEvents"].append(event)
-        state.update(mode=mode, compactLimit=compact_limit, lastModel=str(payload.get("model") or "unknown"))
+        state.update(mode=mode, compactLimit=compact_limit, lastModel=eff_model or "unknown")
         if mode == "advisory" and state["phase"] in ("drain", "freeze"):
             state["phase"] = "advisory"
         if client == "claude":
@@ -2328,8 +2541,25 @@ def _handle_native_handoff(payload: Dict[str, Any], state_dir: Path, mode: str,
                 return previous[tool_id]
             kind, targets = _claude_tool_kind(payload) if client == "claude" else _codex_tool_kind(payload)
             if kind == "blocked_always" or (phase == "freeze" and kind == "mutating_other"):
+                raw_tname = str(payload.get("tool_name") or "").strip()
+                short_tname = re.split(r"[.:]|__", raw_tname)[-1]
+                t_args = payload.get("tool_input") if isinstance(payload.get("tool_input"), dict) else {}
+                raw_sh = t_args.get("command") or t_args.get("cmd") or ""
+                sh_str = " ".join(str(x) for x in raw_sh) if isinstance(raw_sh, list) else str(raw_sh)
+                is_img_block = (
+                    short_tname.lower() in ("view_image", "open_image", "imagegen", "generate_image")
+                    or (short_tname.lower() == "read" and is_image_path(str(t_args.get("file_path") or t_args.get("path") or "")))
+                    or (
+                        kind == "blocked_always"
+                        and short_tname.lower() in ("bash", "powershell", "exec_command", "run_command", "shell", "shell_command")
+                        and any(is_image_path(tok.strip("\"'")) for tok in sh_str.split()[1:])
+                    )
+                )
+                deny_reason = notice
+                if is_img_block:
+                    deny_reason += " 收口/冻结期禁止读图或看图（多模态图片会急剧消耗剩余上下文窗口并加剧二次压缩风险），请改用已有文本摘要或脚本日志核对。"
                 response = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
-                            "permissionDecisionReason": notice}}
+                            "permissionDecisionReason": deny_reason}}
             elif kind == "mutating_other":
                 if consume_drain_action(state):
                     notice = _codex_notice(state["phase"], count, mode, client_label=client_label)
@@ -2345,6 +2575,8 @@ def _handle_native_handoff(payload: Dict[str, Any], state_dir: Path, mode: str,
                 state["toolDecisions"] = dict(list(previous.items())[-512:])
         elif event == "Stop" and mode == "enforce" and phase in ("drain", "freeze"):
             reply = str(payload.get("last_assistant_message") or "")
+            if not reply.strip():
+                reply = _extract_native_turn_latest_reply(transcript, client)
             if ((_handoff_structure_present(reply) and _workflow_handoff_present(reply, tickets))
                     or _has_valid_handoff_file(state, tickets)):
                 state.update(phase="freeze", handoffRecorded=True)
@@ -2356,7 +2588,14 @@ def _handle_native_handoff(payload: Dict[str, Any], state_dir: Path, mode: str,
                              "systemMessage": "交接未通过结构检查，不能报告为已完成。"})
             else:
                 state["stopCorrectionRequested"] = True
-                response = {"decision": "block", "reason": notice + "请补齐交接后结束；本次仅补正一次。"}
+                four_elements = (
+                    "请补齐以下 4 个必需交接章节要素后结束（本次仅补正一次）："
+                    "① 已验证进展（含“已验证/已完成”）；"
+                    "② Git/工作区状态（含“Git/提交/工作区”）；"
+                    "③ 未完成事项与下一步待办（含“未完成/待办/下一步”）；"
+                    "④ 独立【新对话提示词】章节（如 `## 新对话提示词`，正文不少于 15 字且可直接复制粘贴）。"
+                )
+                response = {"decision": "block", "reason": notice + four_elements}
         save_gate_state(state_dir, sid, state)
         return response
 
@@ -2378,20 +2617,22 @@ def main() -> None:
     parser.add_argument("--compact-limit", type=int, default=None)
     parser.add_argument("--state-dir", default=None)
     args = parser.parse_args()
-    ht = _sync_handoff_tunables()
-    client_cfg = ht.get(args.client) if isinstance(ht.get(args.client), dict) else {}
-    cfg_mode = str(client_cfg.get("default_mode") or "advisory").strip().lower()
-    mode = args.mode if args.mode is not None else (cfg_mode if cfg_mode in ("advisory", "enforce", "off") else "advisory")
-    compact_limit = (
-        args.compact_limit
-        if args.compact_limit is not None
-        else user_words._coerce_pos_int(client_cfg.get("default_compact_limit"), 0, minimum=0)
-    )
     try:
         payload = user_words.read_hook_payload()
-        handler = handle_claude_handoff if args.client == "claude" else handle_codex_handoff
+        mode_explicit = args.mode is not None
+        limit_explicit = args.compact_limit is not None
+        raw_mode = args.mode if mode_explicit else "advisory"
+        raw_limit = args.compact_limit if limit_explicit else 0
         state_dir = Path(args.state_dir).expanduser() if args.state_dir else _default_native_state_dir(args.client)
-        response = handler(payload, state_dir, mode, compact_limit)
+        response = _handle_native_handoff(
+            payload,
+            state_dir,
+            raw_mode,
+            raw_limit,
+            args.client,
+            _mode_explicit=mode_explicit,
+            _limit_explicit=limit_explicit,
+        )
     except Exception as exc:
         # 状态/协议异常时不伪装已受保护，不在失败的钩子中无限继续。
         label = "Claude" if args.client == "claude" else "Codex"

@@ -35,7 +35,7 @@ description: >
 
 第一道门在独立的 `fleet-evolve` 流程中完成。维护者联网评估能力，同时展示本机当前能否使用及本机配置的额度类型，由用户决定哪些 agent 与 LLM 启用或停用，写入 `subscription_matrix.agents` 和 `subscription_matrix.models`。退订项设 `enabled: false`，全局选路跳过。一次任务批准不授权修改长期矩阵或 `runtime_tunables`。
 
-第二道门由 `plan` 在重负载弹卡前纯离线复查。检查本机程序、凭据配置、所需路由存活和可读取的额度状态，按实际配置读取滚动窗口百分比与重置时间、卡片套餐或余额类型、日月限额以及配额冷却，过滤不可用或超限通道。本地回环路由健康检查不等于查询外部服务余额。未暴露的信息保持未知，本地记录未显示超限也不能证明服务端尚有足额余额。
+第二道门由 `plan` 在生成重负载确认单前纯离线复查。检查本机程序、凭据配置、所需路由存活和可读取的额度状态，按实际配置读取滚动窗口百分比与重置时间、卡片套餐或余额类型、日月限额以及配额冷却，过滤不可用或超限通道。本地回环路由健康检查不等于查询外部服务余额。未暴露的信息保持未知，本地记录未显示超限也不能证明服务端尚有足额余额。
 
 日常派工不联网更新性能。确认单展示 `capability_ledger.last_online_refresh_at` 和 `capability_ledger.local_bench_verified_at`，联网刷新仅由 `fleet-evolve` 负责。派工读取当前配置与本地记录，不把维护阶段的历史实测当成本轮服务端验证。
 
@@ -47,7 +47,7 @@ description: >
 
 `plan` 可接收单流参数，也可通过 `--spec-file` 读取非空对象列表。流内字段覆盖相应公共默认值。通道有 `cae_harness_headless`、`native_subagent`、`native_workflow`、`native_swarm`。原生通道必须指定或识别 `--caller`，默认模型为 `inherit`；确认单显示配置解析出的实际模型，无法解析时保留未解析状态。原生通道不属于无头调用，也不提供净室隔离。
 
-重负载确认单先说明工作流背景、要做什么和预计后果，再输出 4 列各路总览表与每路纵向展开的 14 项完整参数表。不能省略未知字段，也不能以角色槽位代替实际模型。
+重负载确认单先说明工作流背景、要做什么和预计后果，再输出 4 列各路总览表与每路纵向展开的 14 项完整参数表（保存票据时先写 `<ticket_id>.json` 再写 `<ticket_id>_card.md` 明细文件，并附精简摘要 `compact_summary_card`）。不能省略未知字段，也不能以角色槽位代替实际模型。
 
 | 序号 | 参数项 | 应显示的内容 |
 | --- | --- | --- |
@@ -70,26 +70,42 @@ description: >
 
 ## 批准、执行与跨中断恢复
 
-用户批准后运行 `plan --approve-ticket` 登记。`--override-json` 按 `stream_id` 提供微调，只允许 `engine`、`tier`、`timeout`；调整须符合用户选择，批准前脚本重新离线解析并核查可用性。执行通过 `--ticket` 绑定内容一致且有效的 `APPROVED` 票据，不能借用其他任务的票据。
+用户批准后运行 `plan --approve-ticket` 登记。`--override-json` 按 `stream_id` 提供微调，外部无头通道只允许 `engine`、`tier`、`timeout`，内部原生通道流仅支持微调 `tier` 与 `timeout`（禁止微调 `engine`）；调整须符合用户选择，批准前脚本重新离线解析并核查可用性。执行通过 `--ticket` 绑定内容一致且有效的 `APPROVED` 票据，不能借用其他任务的票据。
 
 `status_guard.py` 在工具执行前核验获批票据，拦截未经确认的重负载和裸 CLI 旁路。不要直接启动原始客户端命令绕过窗口、快照、额度或确认检查。`batch` 只执行 `cae_harness_headless`；含原生通道的计划由对应客户端按获批内容调用，不能整份交给 `batch`。在工作流中声明 `kind: gate` 时仍须提供范围与验收命令，不把批处理标签本身当作已完成验证。
 
-等待弹卡期间发生自动压缩，钩子从磁盘未决票据独立加载背景、要做什么、预计后果、完整 14 项参数表和选项卡。恢复时分成两块：常规用户原话及子代理摘要；未决重负载工作流与完整确认单。票据缺失时报告缺口，不凭印象补写，也不把压缩或超时当作批准。
+等待用户确认期间发生自动压缩，钩子按 `hooks/_lib/adaptive_policy.py` 根据模型与推理强度动态调整恢复预算并用 `collapse_historical_cards` 折叠历史明细表，同时从磁盘未决票据独立加载背景、要做什么、预计后果、完整 14 项参数表（或 `<ticket_id>_card.md`）和选项卡。恢复时分成两块：常规用户原话及子代理摘要；未决重负载工作流与完整确认单。票据缺失时报告缺口，不凭印象补写，也不把压缩或超时当作批准。
 
 进入 `drain` 或 `freeze` 强制交接时，`handoff_gate.py` 放行 `check-grounding --strict`，并在 `Stop` 硬门禁要求把完整工作流、14 项全字段参数表、性能更新时间、选项卡和票据写入【新对话提示词】。Codex 与 Claude Code 默认是 `advisory` 提醒，强制行为以实际模式为准。
 
 新会话先用 `plan --resume-ticket` 读取并重新核对完整确认内容。该接口保留原票据的 `session_id`，不会因传入新会话标识自动改绑；跨会话接力应据原流内容和当前会话标识重新生成确认票据，再按用户选择登记批准。内容变化、过期或校验失败时重新形成确认单，恢复本身不代表批准。
 
-`reply_repeat_guard.py` 在完工 `Stop` 检查回复中是否含有成败词，以及 Token 用量或无法统计说明。外部任务还须覆盖各流标识和账单中的实际回执文件名；单路 `task` 或 `gate` 可用模型名或任务状态代替默认流号。原生任务须覆盖完成数量、各流标识或各角色名中的一项，并提供日志或轨迹说明。流标识和外部回执文件名按完整词项匹配。漏报时同一回合单次阻断并附上磁盘账单。主会话仍须自行逐路核对具体状态、Token 明细与汇总算术，静态检查不核实这些内容的语义和计算结果。
+`reply_repeat_guard.py` 在完工 `Stop` 检查回复中是否含有成败词，以及 Token 用量或无法统计说明。外部任务还须覆盖各流标识和账单中的实际回执文件名；单路 `task` 或 `gate` 省略默认流号 `S1` 时须匹配具体模型名，仅在未记录具体模型名时可用任务状态词替代。原生任务须覆盖完成数量、各流标识或各角色名中的一项，并提供日志或轨迹说明。流标识和外部回执文件名按完整词项匹配。漏报时同一回合单次阻断并附上磁盘账单。主会话仍须自行逐路核对具体状态、Token 明细与汇总算术，静态检查不核实这些内容的语义和计算结果。
 
 ## 命令示例
 
-以下从技能目录运行。Windows 使用 `python -B -X utf8`，WSL2 与 Linux 改用 `python3 -B -X utf8`。占位符须替换为实际值，输入文件须已获授权准备，所有输出均须落在本轮允许范围。示例参数仅作覆盖演示，角色、挡位、窗口、超时、并发和轻重阈值默认由 `fleet_profile.json` 驱动，不应抄成固定策略。
+以下在业务课题工作区根目录运行（保持当前工作目录不变，避免切入全局技能目录导致 `probe` 工作区模式与相对路径失准），先将 `HARNESS` 指向本机已安装客户端对应的技能脚本路径（四选一；若在上游配置仓库维护模式下直接运行，可设为 `template/user-guard/skills/cae-harness/scripts/cae_harness.py`）。Windows 使用 `python -B -X utf8`，WSL2 与 Linux 改用 `python3 -B -X utf8`。占位符须替换为实际值，输入文件须已获授权准备，所有输出均须落在本轮允许范围。示例参数仅作覆盖演示，角色、挡位、窗口、超时、并发和轻重阈值默认由 `fleet_profile.json` 驱动，不应抄成固定策略。
 
 ```powershell
-python -B -X utf8 scripts/cae_harness.py probe --caller auto
-python -B -X utf8 scripts/cae_harness.py assess --caller auto
-python -B -X utf8 scripts/cae_harness.py check-grounding --target "<项目根目录>" --strict
+# Windows PowerShell（按本机已安装的任意一端设置 HARNESS）：
+$HARNESS = "$HOME\.codex\skills\cae-harness\scripts\cae_harness.py"                        # Codex
+# $HARNESS = "$HOME\.claude\skills\cae-harness\scripts\cae_harness.py"                     # Claude Code
+# $HARNESS = "$HOME\.dsh\skills\cae-harness\scripts\cae_harness.py"                        # DSH
+# $HARNESS = "$HOME\.gemini\config\plugins\user-guard\skills\cae-harness\scripts\cae_harness.py" # Antigravity
+```
+
+```bash
+# WSL2 与 Linux Bash（按本机已安装的任意一端设置 HARNESS）：
+HARNESS="$HOME/.codex/skills/cae-harness/scripts/cae_harness.py"                           # Codex
+# HARNESS="$HOME/.claude/skills/cae-harness/scripts/cae_harness.py"                        # Claude Code
+# HARNESS="$HOME/.dsh/skills/cae-harness/scripts/cae_harness.py"                           # DSH
+# HARNESS="$HOME/.gemini/config/plugins/user-guard/skills/cae-harness/scripts/cae_harness.py"    # Antigravity
+```
+
+```powershell
+python -B -X utf8 "$HARNESS" probe --caller auto --redact
+python -B -X utf8 "$HARNESS" assess --caller auto --redact
+python -B -X utf8 "$HARNESS" check-grounding --target "<项目根目录>" --strict
 ```
 
 多路只读检查的 `--spec-file` 可使用以下对象列表。每路目标互不依赖，子任务边界清楚；两个 `role:review` 并不保证来自不同客户端，需要双源独立审查时另用 `audit` 明确两路来源。
@@ -104,14 +120,14 @@ python -B -X utf8 scripts/cae_harness.py check-grounding --target "<项目根目
 先生成确认单。`--tier high` 只演示显式覆盖，实际挡位应与用户意图及批准计划一致：
 
 ```powershell
-python -B -X utf8 scripts/cae_harness.py plan --spec-file "<工作流文件路径>" --tier high --session-id "<当前会话标识>" --workflow-bg "核心文档已重写，需要核对实现" --workflow-goal "分路检查指定文件" --workflow-impact "只读核查并生成回执，不修改源文件"
+python -B -X utf8 "$HARNESS" plan --spec-file "<工作流文件路径>" --tier high --session-id "<当前会话标识>" --workflow-bg "核心文档已重写，需要核对实现" --workflow-goal "分路检查指定文件" --workflow-impact "只读核查并生成回执，不修改源文件"
 ```
 
 完整展示参数表及选项，待用户明确批准后登记，再执行外部批处理：
 
 ```powershell
-python -B -X utf8 scripts/cae_harness.py plan --approve-ticket "<票据标识>" --session-id "<当前会话标识>"
-python -B -X utf8 scripts/cae_harness.py batch --ticket "<票据标识>" --session-id "<当前会话标识>" --output "<授权回执路径>" --redact
+python -B -X utf8 "$HARNESS" plan --approve-ticket "<票据标识>" --session-id "<当前会话标识>"
+python -B -X utf8 "$HARNESS" batch --ticket "<票据标识>" --session-id "<当前会话标识>" --output "<授权回执路径>" --redact
 ```
 
 如用户有点名要求，在形成计划和执行任务时通过 `--user-prompt "<用户点名原话>"` 保留同一约束。不要在执行时增加会改变已批准模型或挡位的参数。
@@ -119,19 +135,19 @@ python -B -X utf8 scripts/cae_harness.py batch --ticket "<票据标识>" --sessi
 原生只读代理可先用以下入口形成计划，`plan` 不会启动代理。多路时通过同一 `--spec-file` 列全所有流，并按当前客户端自动识别或显式设置 `--caller`：
 
 ```powershell
-python -B -X utf8 scripts/cae_harness.py plan --channel native_subagent --caller auto --agent-type readonly-auditor --model inherit --kind review --target "<目标文件路径>" --session-id "<当前会话标识>" --save-ticket --workflow-bg "需要原文行号复核" --workflow-goal "读取目标并返回原文行号" --workflow-impact "只读，不运行构建或测试"
+python -B -X utf8 "$HARNESS" plan --channel native_subagent --caller auto --agent-type readonly-auditor --model inherit --kind review --target "<目标文件路径>" --session-id "<当前会话标识>" --save-ticket --workflow-bg "需要原文行号复核" --workflow-goal "读取目标并返回原文行号" --workflow-impact "只读，不运行构建或测试"
 ```
 
 跨会话先读取旧票据；此命令不转移会话归属：
 
 ```powershell
-python -B -X utf8 scripts/cae_harness.py plan --resume-ticket "<票据标识>"
+python -B -X utf8 "$HARNESS" plan --resume-ticket "<票据标识>"
 ```
 
-单流可写任务需要强制验收时使用 `gate`，执行内容、目标、模型、挡位和超时须与确认票据一致。`--task-file` 中的任务也应与票据子任务一致：
+单流可写任务需要强制验收时使用 `gate`；持票据执行时，除核验执行内容、目标、模型、挡位与超时外，还会校验 `--write-scope`（须为获批范围子集）与 `--verify-cmd` 一致性，`--task-file` 中的任务也须与票据子任务一致：
 
 ```powershell
-python -B -X utf8 scripts/cae_harness.py gate --worker role:code --target "<项目根目录>" --write-scope "<授权相对路径>" --verify-cmd "<实际验收命令>" --task-file "<任务文件路径>" --ticket "<票据标识>" --session-id "<当前会话标识>"
+python -B -X utf8 "$HARNESS" gate --worker role:code --target "<项目根目录>" --write-scope "<授权相对路径>" --verify-cmd "<实际验收命令>" --task-file "<任务文件路径>" --ticket "<票据标识>" --session-id "<当前会话标识>"
 ```
 
 ## 只读隔离与结果验收

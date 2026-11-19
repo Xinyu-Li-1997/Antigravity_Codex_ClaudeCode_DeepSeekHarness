@@ -16,6 +16,5 @@
   },
   "ccswitch_db": "~/.cc-switch/cc-switch.db",
   "log": "~/.claude/router/logs/router.log",
-  "timeout_s": 900,
   "default_key_from_card": "Kimi"
 }

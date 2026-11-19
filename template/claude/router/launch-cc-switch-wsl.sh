@@ -4,17 +4,32 @@
 set -euo pipefail
 
 APP=/usr/bin/cc-switch
-PAT="^$APP( |\$)"
+PAT='(^|/)cc-switch( |$)'
 UID_CUR="$(id -u)"
 LOG_DIR="$HOME/.claude/router/logs"
 LOG_FILE="$LOG_DIR/cc-switch-gui.log"
+WINDOWS_POWERSHELL="/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+
+resolve_powershell() {
+    local ps_bin
+    if ps_bin="$(command -v powershell.exe 2>/dev/null)" && [ -n "$ps_bin" ]; then
+        printf '%s\n' "$ps_bin"
+        return 0
+    fi
+    if [ -x "$WINDOWS_POWERSHELL" ]; then
+        printf '%s\n' "$WINDOWS_POWERSHELL"
+        return 0
+    fi
+    return 1
+}
 if [ ! -x "$APP" ]; then
     echo "CC Switch binary not found or not executable: $APP" >&2
     exit 1
 fi
 
 window_state() {
-    local enc
+    local ps_bin enc ps_cwd
+    ps_bin="$(resolve_powershell)" || return 0
     enc=$(cat <<'PS' | iconv -f UTF-8 -t UTF-16LE | base64 -w0
 $ProgressPreference = 'SilentlyContinue'
 Add-Type -TypeDefinition 'using System;
@@ -64,14 +79,17 @@ if (TestVis) {
 PS
 ) || return 0
     [ -n "$enc" ] || return 0
-    powershell.exe -NoProfile -EncodedCommand "$enc" 2>/dev/null \
-        | tr -d '\r' | grep '^RESULT:' | tail -1 | cut -d: -f2 || true
+    ps_cwd="/mnt/c/Windows/System32"
+    [ -d "$ps_cwd" ] || ps_cwd="/"
+    (
+        cd "$ps_cwd" && timeout 8s "$ps_bin" -NoLogo -NoProfile -NonInteractive -EncodedCommand "$enc"
+    ) 2>/dev/null | tr -d '\r' | grep '^RESULT:' | tail -1 | cut -d: -f2 || true
 }
 
 start_app() {
     mkdir -p -m 700 "$LOG_DIR"
     cd "$HOME" || exit 1
-    setsid nohup env -u LD_LIBRARY_PATH DISPLAY=:0 LIBGL_ALWAYS_SOFTWARE=1 \
+    setsid nohup env -u LD_LIBRARY_PATH DISPLAY="${DISPLAY:-:0}" LIBGL_ALWAYS_SOFTWARE=1 \
         WEBKIT_DISABLE_DMABUF_RENDERER=1 WEBKIT_DISABLE_COMPOSITING_MODE=1 \
         GDK_BACKEND=x11 GDK_SCALE=1 GDK_DPI_SCALE=1 \
         "$APP" >>"$LOG_FILE" 2>&1 </dev/null &
@@ -125,12 +143,12 @@ else
 fi
 
 echo "Window still hidden; restarting CC Switch once."
-for p in $(pgrep -u "$UID_CUR" -f "$PAT" || true); do kill "$p" 2>/dev/null || true; done
+for p in $(pgrep -u "$UID_CUR" -f "$PAT" || true); do [ "$p" = "$$" ] && continue; kill "$p" 2>/dev/null || true; done
 for i in $(seq 1 10); do
     sleep 1
     pgrep -u "$UID_CUR" -f "$PAT" >/dev/null || break
 done
-if pgrep -u "$UID_CUR" -f "$PAT" >/dev/null; then pkill -9 -u "$UID_CUR" -f "$PAT" 2>/dev/null || true; fi
+for p in $(pgrep -u "$UID_CUR" -f "$PAT" || true); do [ "$p" = "$$" ] && continue; kill -9 "$p" 2>/dev/null || true; done
 sleep 1
 start_app
 

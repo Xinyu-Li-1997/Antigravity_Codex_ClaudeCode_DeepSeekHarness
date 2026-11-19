@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional, Tuple
 HOOKS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(HOOKS_DIR))
 import user_words  # noqa: E402
+from _lib import adaptive_policy as _adaptive_policy  # noqa: E402
 
 user_words.ensure_utf8_stdio()
 
@@ -42,9 +43,12 @@ MAX_TRANSCRIPT_TRACKED_IMAGES = _DEFAULT_MAX_TRANSCRIPT_TRACKED_IMAGES
 ARCHIVE_RETRY_INTERVAL_SEC = _DEFAULT_ARCHIVE_RETRY_INTERVAL_SEC
 
 
-def _resolve_loader_policy(client: str = "") -> Dict[str, Any]:
-    """合并 fleet_profile.json 中按主会话客户端校准的恢复参数，并兼容单测模块级常量覆盖。"""
-    policy = user_words.get_compaction_tunables(client, HOOKS_DIR)
+_extract_runtime_model_and_effort = _adaptive_policy.extract_runtime_model_and_effort
+
+
+def _resolve_loader_policy(client: str = "", model_name: str = "", effort: str = "") -> Dict[str, Any]:
+    """合并 fleet_profile.json 中按主会话客户端与模型校准的恢复参数，并兼容单测模块级常量覆盖。"""
+    policy = user_words.get_compaction_tunables(client, HOOKS_DIR, model_name=model_name, effort=effort)
     if MAX_INLINE_TOTAL_CHARS != _DEFAULT_MAX_INLINE_TOTAL_CHARS:
         policy["inline_total_chars"] = max(400, int(MAX_INLINE_TOTAL_CHARS))
     if MAX_INLINE_ITEM_CHARS != _DEFAULT_MAX_INLINE_ITEM_CHARS:
@@ -176,15 +180,7 @@ def _append_codex_log(log_path: Path, entry: Dict[str, Any]) -> None:
 
 def _decode_proto_str(raw: Any) -> str:
     """还原 protojson 参数里带外层引号与转义反斜杠的字符串值。"""
-    s = str(raw or "").strip()
-    if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
-        try:
-            decoded = json.loads(s)
-            if isinstance(decoded, str):
-                s = decoded
-        except (ValueError, RecursionError):
-            s = s[1:-1]
-    return s.strip().strip("\"'")
+    return user_words._unquote_proto_scalar(raw).strip("\"'")
 
 
 def _reconcile_agy_controls(transcript_path: Path, state: Dict[str, Any], steps: List[Dict[str, Any]]) -> bool:
@@ -294,8 +290,9 @@ def _scan_transcript_incrementally(
             stream.seek(max(0, offset - 128))
             scanned_tail = stream.read(min(128, offset))
             anchor = hashlib.sha256(scanned_tail).hexdigest()
-            rewritten = (file_size < offset or (offset and state.get("scannedTranscriptAnchor") not in (None, "", anchor))
-                         or (file_size == offset and state.get("scannedTranscriptMtimeNs") not in (None, -1, opened.st_mtime_ns)))
+            rewritten = file_size < offset or bool(
+                offset and state.get("scannedTranscriptAnchor") not in (None, "", anchor)
+            )
             if rewritten:
                 state.update(_default_compaction_state(state["conversationId"]))
                 state.pop("pendingArchive", None)
@@ -303,14 +300,22 @@ def _scan_transcript_incrementally(
                 scanned_tail = b""
                 changed = True
             if file_size == offset:
-                metadata = {
-                    "scannedTranscriptName": transcript_path.name,
-                    "scannedTranscriptIdentity": identity,
-                    "scannedTranscriptAnchor": hashlib.sha256(scanned_tail).hexdigest(),
-                    "scannedTranscriptMtimeNs": opened.st_mtime_ns,
-                }
-                if any(state.get(key) != value for key, value in metadata.items()):
-                    state.update(metadata)
+                tail_anchor = hashlib.sha256(scanned_tail).hexdigest()
+                core_same = (
+                    state.get("scannedTranscriptName") == transcript_path.name
+                    and state.get("scannedTranscriptIdentity") == identity
+                    and state.get("scannedTranscriptAnchor") == tail_anchor
+                    and state.get("scannedTranscriptMtimeNs") not in (None, -1)
+                )
+                if not core_same:
+                    state.update(
+                        {
+                            "scannedTranscriptName": transcript_path.name,
+                            "scannedTranscriptIdentity": identity,
+                            "scannedTranscriptAnchor": tail_anchor,
+                            "scannedTranscriptMtimeNs": opened.st_mtime_ns,
+                        }
+                    )
                     changed = True
                 return _reconcile_agy_controls(transcript_path, state, []) or changed
             stream.seek(offset)
@@ -536,7 +541,8 @@ def _format_inline_subagent_section(
         trunc_tag = " | 轨迹截断" if item.get("truncated") else ""
         log_hint = f"\n原始日志：{item['log_path']}" if item.get("log_path") else ""
         raw_sub_text = item.get("raw_body") if isinstance(item.get("raw_body"), str) and item.get("raw_body") else item.get("content", "")
-        body = _close_unbalanced_fence(user_words.summarize_subagent_return(raw_sub_text, sub_item_cap, sub_head_ratio))
+        collapsed_sub_text = user_words.collapse_historical_cards(raw_sub_text)
+        body = _close_unbalanced_fence(user_words.summarize_subagent_return(collapsed_sub_text, sub_item_cap, sub_head_ratio))
         blk = f"· [{label} | Step {item['step_index']}{trunc_tag}]{log_hint}\n{body}"
         cost = len(blk) + (2 if chosen_blocks else 1)
         if used + cost > sub_total_cap:
@@ -567,7 +573,7 @@ def build_compaction_system_message(
     total_cap = int(cfg["inline_total_chars"])
     user_item_cap = int(cfg["inline_user_item_chars"])
     head_turns = max(1, int(cfg.get("inline_guaranteed_head_turns", 1)))
-    archive_str = str(saved_md_path) if saved_md_path else "未落盘"
+    archive_str = str(saved_md_path) if saved_md_path else "未保存归档文件"
     total_turns = len(words)
     recent_returns = list(subagent_returns or [])
 
@@ -603,16 +609,23 @@ def build_compaction_system_message(
             kind_label += " [截断正文待补]"
         if w.get("provenance_verified") is False:
             kind_label += " [用户角色，来源未核实]"
-        body = _truncate_single_item(w["content"], w["turn"], user_item_cap)
+        body = _truncate_single_item(user_words.collapse_historical_cards(w["content"]), w["turn"], user_item_cap)
         if w.get("attachments") and w.get("source_path"):
             body += f"\n附件来源：{w['source_path']}"
         block = f"【第 {w['turn']} 轮指令】{kind_label} (Step {w['step_index']}{time_tag})\n{body}"
         formatted_blocks.append(block)
 
+    def _merge_preserving_subagents(words_part: str) -> str:
+        if len(words_part) + len(subagent_section) <= total_cap:
+            return words_part + subagent_section
+        if subagent_section and words_total_budget >= 80:
+            compressed_words = _close_unbalanced_fence(words_part, words_total_budget)
+            return compressed_words + subagent_section
+        return _close_unbalanced_fence(words_part + subagent_section, total_cap)
+
     joined_all = "\n\n".join(formatted_blocks)
     if len(header_text) + len(joined_all) <= words_total_budget or not formatted_blocks:
-        combined = header_text + joined_all + subagent_section
-        return combined if len(combined) <= total_cap else _close_unbalanced_fence(header_text + joined_all, total_cap)
+        return _merge_preserving_subagents(header_text + joined_all)
 
     # 超出总预算时：按策略保留开篇立项轮次 + 逆序尽可能多地保留最近定论轮次
     kept_head = formatted_blocks[:1]
@@ -643,12 +656,9 @@ def build_compaction_system_message(
             "请按 R9 查阅轨迹和已保存的归档）..."
         )
         words_rendered = header_text + "\n\n".join(kept_head + [omit_notice] + tail_blocks)
-        if len(words_rendered) + len(subagent_section) <= total_cap:
-            return words_rendered + subagent_section
-        return _close_unbalanced_fence(words_rendered, total_cap)
+        return _merge_preserving_subagents(words_rendered)
 
-    combined_fallback = header_text + joined_all + subagent_section
-    return _close_unbalanced_fence(combined_fallback, total_cap)
+    return _merge_preserving_subagents(header_text + joined_all)
 
 
 # ⑤ Antigravity 恢复流程与兼容入口
@@ -676,7 +686,8 @@ def _workflow_recovery_blocks(session_id: str, state_dir: Path, ticket=None) -> 
 
 
 def _handle_context_locked(conversation_id: str, event_name: str, explicit_source: str,
-                           transcript_path: Path, state_dir: Path) -> Dict[str, Any]:
+                           transcript_path: Path, state_dir: Path,
+                           payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     state_file = state_dir / f"{conversation_id}_compaction.json"
     state = _load_compaction_state(state_file, conversation_id)
 
@@ -694,6 +705,7 @@ def _handle_context_locked(conversation_id: str, event_name: str, explicit_sourc
 
     pending_ticket = user_words.find_session_pending_ticket(conversation_id, state_dir)
     # Antigravity 专属长会话“原子收口 + 交接停机”硬门禁评估（懒加载以保持 --client codex 零依赖隔离）
+    _agy_m, _agy_e = _extract_runtime_model_and_effort("antigravity", payload)
     import handoff_gate  # noqa: E402
 
     try:
@@ -703,12 +715,14 @@ def _handle_context_locked(conversation_id: str, event_name: str, explicit_sourc
             state_dir=state_dir,
             compaction_state=state,
             transcript_path=transcript_path,
+            payload=payload,
+            model_name=_agy_m,
+            effort=_agy_e,
         )
     except (ValueError, TypeError, OSError) as exc:
         log_event(f"{event_name}:handoff_gate_error", conversation_id, f"交接门禁状态异常，继续原话恢复（{exc}）")
         gate_res = {"phase": "normal", "advisoryNotice": None, "mandateMessage": None}
-
-    agy_policy = _resolve_loader_policy("antigravity")
+    agy_policy = _resolve_loader_policy("antigravity", _agy_m, _agy_e)
     trigger_reason: Optional[str] = None
     pending = state.get("pendingArchive")
     pending = pending if isinstance(pending, dict) else {}
@@ -731,7 +745,7 @@ def _handle_context_locked(conversation_id: str, event_name: str, explicit_sourc
 
     if trigger_reason:
         # 确证发生新的上下文压缩或首次显式恢复：提取纯净用户原话与最近子代理返回摘要（严格与人类原话分区）
-        archive = user_words.extract_agy_archive(str(transcript_path), include_subagent_msgs=False)
+        archive = user_words.extract_agy_archive(str(transcript_path), include_subagent_msgs=False, policy=agy_policy)
         words = archive["words"]
         subagent_returns = archive.get("subagent_returns") or []
         unresolved_steps = archive["unresolved_steps"]
@@ -823,6 +837,9 @@ def handle_context_check(payload: Dict[str, Any], event_name: str = "PreInvocati
     explicit_source = str(payload.get("source") or payload.get("eventSource") or "").strip().lower()
 
     if explicit_source in ("startup", "fresh", "new"):
+        if event_name == "SessionStart":
+            state_dir, _ = get_data_dirs()
+            user_words.sweep_stale_lock_files(state_dir, HOOKS_DIR)
         log_event(event_name, conversation_id, f"Explicit {explicit_source} start. Skipping injection.")
         return {"injectSteps": []}
 
@@ -838,7 +855,9 @@ def handle_context_check(payload: Dict[str, Any], event_name: str = "PreInvocati
         user_words.sweep_stale_lock_files(state_dir, HOOKS_DIR)
     try:
         with user_words.session_state_lock(state_dir, conversation_id):
-            return _handle_context_locked(conversation_id, event_name, explicit_source, transcript_path, state_dir)
+            return _handle_context_locked(
+                conversation_id, event_name, explicit_source, transcript_path, state_dir, payload=payload
+            )
     except (TimeoutError, OSError) as exc:
         log_event(event_name, conversation_id, f"上下文状态未更新（{exc}）")
         return {"injectSteps": []}
@@ -877,8 +896,10 @@ def handle_codex_session_start(
         return {}
     cwd_str = str(payload.get("cwd") or os.getcwd())
 
+    _cx_m, _cx_e = _extract_runtime_model_and_effort("codex", payload)
+    codex_policy = _resolve_loader_policy("codex", _cx_m, _cx_e)
     result = user_words.refresh_codex_session_archive(
-        str(transcript) if transcript else "", user_words_dir, session_id, identity_error=identity_error,
+        str(transcript) if transcript else "", user_words_dir, session_id, identity_error=identity_error, policy=codex_policy,
     )
 
     saved = result.get("saved") or {}
@@ -914,7 +935,6 @@ def handle_codex_session_start(
         lines.append("本会话用户原话文件：尚无已确认可读的归档文档")
         lines.append("已保存记录范围：尚未核实")
 
-    codex_policy = _resolve_loader_policy("codex")
     codex_cap = int(codex_policy["inline_total_chars"])
     source_paths = result["segments"] or [item["path"] for item in saved.get("sources") or []]
     full_context = build_compaction_system_message(
@@ -960,7 +980,9 @@ def handle_claude_session_start(
     home = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude").expanduser()
     state_dir = Path(state_dir_str).expanduser() if state_dir_str else home / "hooks" / "state" / "session-context"
     user_words.sweep_stale_lock_files(state_dir.parent if state_dir.name == "session-context" else state_dir, HOOKS_DIR)
-    result = user_words.archive_claude_session_words(payload, state_dir)
+    _cl_m, _cl_e = _extract_runtime_model_and_effort("claude", payload)
+    claude_policy = _resolve_loader_policy("claude", _cl_m, _cl_e)
+    result = user_words.archive_claude_session_words(payload, state_dir, policy=claude_policy)
     if result.get("skipped"):
         return {}
     saved = result["saved"]
@@ -979,7 +1001,6 @@ def handle_claude_session_start(
         lines.append("文件状态：归档完整性未验证")
     if saved.get("available"):
         lines.append(f"校验清单：{result['meta_path']}")
-    claude_policy = _resolve_loader_policy("claude")
     claude_cap = int(claude_policy["inline_total_chars"])
     full_context = build_compaction_system_message(
         result["words"], Path(saved["file"]) if saved.get("available") else None, f"Claude {source}",
@@ -1018,7 +1039,8 @@ def main() -> None:
         payload = user_words.read_hook_payload()
     except (OSError, ValueError) as e:
         if args.client in ("codex", "claude"):
-            sys.stderr.write(f"session_context_loader JSON parse error: {e}\n")
+            client_label = "Codex" if args.client == "codex" else "Claude"
+            sys.stderr.write(f"{client_label} session_context_loader JSON parse error: {e}\n")
             sys.exit(2)
         log_event(args.event or "Unknown", "unknown", f"Failed to parse stdin JSON: {e}")
 
@@ -1027,15 +1049,14 @@ def main() -> None:
             handler = handle_claude_session_start if args.client == "claude" else handle_codex_session_start
             response = handler(payload, state_dir_str=args.state_dir, log_path_str=args.log)
         except Exception as e:
+            err_cap = int(_resolve_loader_policy(args.client)["inline_total_chars"])
+            err_text = f"恢复来源：{'Claude ' if args.client == 'claude' else 'Codex '}{payload.get('source', 'unknown')}\n提取状态：异常（{e}）"
             response = {
                 "hookSpecificOutput": {
                     "hookEventName": "SessionStart",
-                    "additionalContext": f"恢复来源：{'Claude ' if args.client == 'claude' else ''}{payload.get('source', 'unknown')}\n提取状态：异常（{e}）",
+                    "additionalContext": err_text[:err_cap],
                 }
             }
-            if args.client == "claude":
-                err_cap = int(_resolve_loader_policy("claude")["inline_total_chars"])
-                response["hookSpecificOutput"]["additionalContext"] = response["hookSpecificOutput"]["additionalContext"][:err_cap]
         sys.stdout.write(json.dumps(response, ensure_ascii=False) + "\n")
         sys.stdout.flush()
         return

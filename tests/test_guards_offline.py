@@ -23,7 +23,62 @@ import unittest.mock
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-HOOKS_DIR = Path(os.environ.get("USER_GUARD_INSTALLED_DIR", str(REPO_ROOT / "template" / "user-guard"))) / "hooks"
+def _resolve_hooks_dir(raw_env_val=None) -> Path:
+    default_base = REPO_ROOT / "template" / "user-guard"
+    raw_installed = (
+        os.environ.get("USER_GUARD_INSTALLED_DIR", "")
+        if raw_env_val is None
+        else str(raw_env_val)
+    ).strip()
+    if raw_installed:
+        cand = Path(raw_installed).expanduser()
+        if (cand / "hooks").is_dir():
+            return (cand / "hooks").resolve()
+        if cand.is_dir() and (cand / "user_words.py").is_file():
+            return cand.resolve()
+    return (default_base / "hooks").resolve()
+
+
+_ISOLATED_STRIP_EXACT = frozenset({
+    "PLUGIN_DATA",
+    "OPENAI_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+    "PYTHONPATH",
+})
+_ISOLATED_STRIP_PREFIXES = (
+    "AGY_",
+    "ANTIGRAVITY_",
+    "CODEX_",
+    "CLAUDE",
+    "ANTHROPIC_",
+    "DSH_",
+    "CAE_",
+    "GIT_",
+    "XDG_",
+)
+
+
+def _scrub_host_env(**overrides: str) -> dict:
+    cleaned = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in _ISOLATED_STRIP_EXACT
+        and not k.startswith(_ISOLATED_STRIP_PREFIXES)
+        and not (k.startswith("USER_GUARD_") and k != "USER_GUARD_INSTALLED_DIR")
+    }
+    cleaned.update(overrides)
+    return cleaned
+
+
+HOOKS_DIR = _resolve_hooks_dir()
 sys.path.insert(0, str(HOOKS_DIR))
 
 import reply_repeat_guard  # noqa: E402
@@ -40,25 +95,27 @@ def _append_jsonl(path: Path, obj: dict) -> None:
 class TestGuardsOffline(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp_obj = tempfile.TemporaryDirectory()
-        self.tmp_root = Path(self.tmp_obj.name)
+        sandbox_root = Path(self.tmp_obj.name).resolve()
+        self.tmp_root = sandbox_root / "workspace"
+        self.tmp_root.mkdir(parents=True, exist_ok=True)
+        self.fake_home = sandbox_root / "home"
+        self.fake_home.mkdir(parents=True, exist_ok=True)
         self.plugin_data = self.tmp_root / "plugin_data"
-        self.old_plugin_data = os.environ.get("PLUGIN_DATA")
-        self.old_harness_depth = os.environ.pop("CAE_HARNESS_DEPTH", None)
-        os.environ["PLUGIN_DATA"] = str(self.plugin_data)
         # 原有夹具独立验证路径、交接和轮询；派工票据由下方专用测试启用并覆盖。
-        self.ticket_gate_env = unittest.mock.patch.dict(os.environ, {"USER_GUARD_DISABLE_TICKET_GATE": "1"})
+        clean_env = _scrub_host_env(
+            HOME=str(self.fake_home),
+            USERPROFILE=str(self.fake_home),
+            PLUGIN_DATA=str(self.plugin_data),
+            USER_GUARD_DISABLE_TICKET_GATE="1",
+        )
+        self.ticket_gate_env = unittest.mock.patch.dict(os.environ, clean_env, clear=True)
         self.ticket_gate_env.start()
+        self._home_patch = unittest.mock.patch.object(Path, "home", return_value=self.fake_home)
+        self._home_patch.start()
 
     def tearDown(self) -> None:
+        self._home_patch.stop()
         self.ticket_gate_env.stop()
-        if self.old_plugin_data is None:
-            os.environ.pop("PLUGIN_DATA", None)
-        else:
-            os.environ["PLUGIN_DATA"] = self.old_plugin_data
-        if self.old_harness_depth is None:
-            os.environ.pop("CAE_HARNESS_DEPTH", None)
-        else:
-            os.environ["CAE_HARNESS_DEPTH"] = self.old_harness_depth
         self.tmp_obj.cleanup()
 
     def test_dsh_installer_sandbox_requires_explicit_contained_peer_directories(self):
@@ -1882,27 +1939,40 @@ class TestGuardsOffline(unittest.TestCase):
 
 class TestDispatchAndBillingGuards(unittest.TestCase):
     def setUp(self):
-        cache_dir = REPO_ROOT / ".pytest_cache"
-        cache_dir.mkdir(exist_ok=True)
-        self.temp = tempfile.TemporaryDirectory(dir=cache_dir)
-        self.root = Path(self.temp.name)
+        try:
+            self.temp = tempfile.TemporaryDirectory(prefix="guards-dispatch-")
+        except OSError:
+            cache_dir = (REPO_ROOT / ".pytest_cache" / "guards_dispatch").resolve()
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            self.temp = tempfile.TemporaryDirectory(prefix="guards-dispatch-", dir=cache_dir)
+        self.addCleanup(self.temp.cleanup)
+        sandbox_root = Path(self.temp.name).resolve()
+        self.root = sandbox_root / "workspace"
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.fake_home = sandbox_root / "home"
+        self.fake_home.mkdir(parents=True, exist_ok=True)
         self.state = self.root / "state"
         self.logs = self.root / "logs"
         self.project = self.root / "project"
         self.project.mkdir()
         self.trace = self.root / "transcript.jsonl"
-        self.env = unittest.mock.patch.dict(os.environ, {
-            "USER_GUARD_STATE_DIR": str(self.state), "USER_GUARD_LOGS_DIR": str(self.logs),
-            "CAE_PLAN_STATE_DIR": str(self.state / "dispatch_plans"),
-            "USER_GUARD_ENFORCE_TICKET_GATE": "1", "USER_GUARD_DISABLE_TICKET_GATE": "0",
-            "CAE_HARNESS_DEPTH": "",
-        })
+        clean_env = _scrub_host_env(
+            HOME=str(self.fake_home),
+            USERPROFILE=str(self.fake_home),
+            USER_GUARD_STATE_DIR=str(self.state),
+            USER_GUARD_LOGS_DIR=str(self.logs),
+            CAE_PLAN_STATE_DIR=str(self.state / "dispatch_plans"),
+            USER_GUARD_ENFORCE_TICKET_GATE="1",
+            USER_GUARD_DISABLE_TICKET_GATE="0",
+            CAE_HARNESS_DEPTH="",
+        )
+        self.env = unittest.mock.patch.dict(os.environ, clean_env, clear=True)
         self.env.start()
+        self.addCleanup(self.env.stop)
+        self._home_patch = unittest.mock.patch.object(Path, "home", return_value=self.fake_home)
+        self._home_patch.start()
+        self.addCleanup(self._home_patch.stop)
         _append_jsonl(self.trace, {"type": "USER_INPUT", "step_index": 1, "content": "检查工程"})
-
-    def tearDown(self):
-        self.env.stop()
-        self.temp.cleanup()
 
     def pre(self, name, args=None, sid="fixture"):
         return status_guard.handle_pre_tool_use({"conversationId": sid,
@@ -2115,10 +2185,10 @@ class TestDispatchAndBillingGuards(unittest.TestCase):
         except OSError:
             # Windows 无软链接权限时核对目录联接等价的解析差异。
             original = status_guard._resolve_nearest_existing
-            def resolve(raw, base):
+            def resolve(raw, base, *, from_shell=False):
                 if str(raw).startswith(str(link)):
                     return physical / Path(str(raw)).relative_to(link)
-                return original(raw, base)
+                return original(raw, base, from_shell=from_shell)
             patch = unittest.mock.patch.object(status_guard, "_resolve_nearest_existing", side_effect=resolve)
         else:
             patch = unittest.mock.patch.object(status_guard, "_resolve_nearest_existing", wraps=status_guard._resolve_nearest_existing)
@@ -2138,7 +2208,7 @@ class TestDispatchAndBillingGuards(unittest.TestCase):
             payload = {"session_id": "codex-fixture", "tool_name": "exec_command", "tool_input": {"cmd": command}, "cwd": str(self.project)}
             result = subprocess.run([sys.executable, "-B", "-X", "utf8", str(script), "--client", "codex",
                                      "--state-dir", str(self.state), "--log-dir", str(self.logs)],
-                                    input=json.dumps(payload), text=True, encoding="utf-8", capture_output=True, check=True)
+                                    input=json.dumps(payload), text=True, encoding="utf-8", capture_output=True, check=True, timeout=15)
             response = json.loads(result.stdout)
             if expected:
                 specific = response["hookSpecificOutput"]
@@ -2295,7 +2365,7 @@ class TestDispatchAndBillingGuards(unittest.TestCase):
         payload = {"session_id": "cli-fixture", "transcript_path": str(self.trace), "last_assistant_message": "结束"}
         result = subprocess.run([sys.executable, "-B", "-X", "utf8", str(HOOKS_DIR / "reply_repeat_guard.py"),
                                  "--client", "codex", "--state-dir", str(self.state), "--log-dir", str(self.logs)],
-                                input=json.dumps(payload), text=True, encoding="utf-8", capture_output=True, check=True)
+                                input=json.dumps(payload), text=True, encoding="utf-8", capture_output=True, check=True, timeout=15)
         self.assertEqual(json.loads(result.stdout)["decision"], "block")
 
     def test_handoff_allow_still_requires_completion_bill(self):
@@ -2396,6 +2466,797 @@ class TestDispatchAndBillingGuards(unittest.TestCase):
         with unittest.mock.patch.object(status_guard, "_WIN_GET_LONG_PATH", side_effect=expand):
             self.assertEqual(status_guard._win_expand_short_path("C:\\fixture\\LONG~1"), "C:\\fixture\\long-path")
         self.assertEqual(len(calls), 2)
+
+
+    def test_v1152_wrapper_flags_uv_run_dispatch_and_polling_unwrapping(self):
+        for cmd in (
+            'env -u FOO codex exec "task"',
+            'env -i claude -p "task"',
+            'env -S "codex exec task"',
+            'command -p dsh --profile headless "task"',
+            'uv run codex exec "task"',
+            'uv run --python 3.11 python3 tools/cae_harness.py gate --worker role:code',
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(self.pre("run_command", {"CommandLine": cmd})["decision"], "deny")
+        self.assertEqual(self.pre("run_command", {"CommandLine": "command -v codex"})["decision"], "allow")
+        self.assertEqual(status_guard.parse_run_command_evidence("env -u LC_ALL cat build.log")[0], "build.log")
+        self.assertEqual(status_guard.parse_run_command_evidence("sudo -u root tail -n 20 run.log")[0], "run.log")
+
+    def test_v1152_codex_stop_turn_reset_subagent_skip_and_heavy_ok_word_boundary(self):
+        # 1) Codex 第 2 轮未刷盘短等待不得卡在第 1 轮 step，且日志记录真实 client="codex"
+        rollout = self.root / "rollout-main.jsonl"
+        for row in (
+            {"type": "session_meta", "payload": {"id": "codex-main-1", "source": "cli", "cwd": str(self.project)}},
+            {"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "第一轮"}]}},
+            {"type": "response_item", "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "第一轮完整实质回复结论。"}]}},
+            {"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "第二轮"}]}},
+        ):
+            _append_jsonl(rollout, row)
+        _, empty_step, empty_reply, _ = reply_repeat_guard._codex_turn_reply({"session_id": "codex-main-1", "transcript_path": str(rollout)})
+        self.assertIsNone(empty_step)
+        self.assertEqual(empty_reply, "")
+        decisions = []
+        for idx in range(3):
+            resp = reply_repeat_guard.handle_claude_stop_repeat_guard(
+                {"_client": "codex", "session_id": "codex-main-1", "transcript_path": str(rollout), "last_assistant_message": "正在等待编译完成，请稍候..."},
+                state_dir=self.state, logs_dir=self.logs,
+            )
+            decisions.append(resp.get("decision"))
+            _append_jsonl(rollout, {"type": "response_item", "payload": {"type": "function_call_output", "call_id": f"c{idx}", "output": "running"}})
+        self.assertEqual(decisions, [None, None, "block"])
+        log_rows = [json.loads(line) for line in (self.logs / "lifecycle.log").read_text(encoding="utf-8").splitlines() if line.strip()]
+        self.assertTrue(any(r.get("event") == "Stop:reply_repeat_guard" and r.get("client") == "codex" for r in log_rows))
+        # 2) Codex 子代理 rollout 必须跳过主会话 Stop 门禁
+        sub_rollout = self.root / "rollout-sub.jsonl"
+        _append_jsonl(sub_rollout, {"type": "session_meta", "payload": {"id": "codex-sub-1", "source": "subagent", "parent_thread_id": "codex-main-1", "cwd": str(self.project)}})
+        for _ in range(4):
+            sub_resp = reply_repeat_guard.handle_claude_stop_repeat_guard(
+                {"_client": "codex", "session_id": "codex-sub-1", "transcript_path": str(sub_rollout), "last_assistant_message": "正在等待编译完成，请稍候..."},
+                state_dir=self.state, logs_dir=self.logs,
+            )
+            self.assertEqual(sub_resp, {})
+        # 3) 重负载单流 task 状态 "ok" 不得因命中 "tokens" 子串而绕过模型与流号绑定
+        ledger = self.completion("single-ok-sub")
+        entries = json.loads(ledger.read_text(encoding="utf-8"))
+        entries[0]["streams"] = [{"stream_id": "S1", "engine": "codex", "model": "fixture-target-model", "succeeded": True, "status": "ok", "token_usage": {"total_tokens": 120}}]
+        entries[0]["subcommand"] = "task"
+        ledger.write_text(json.dumps(entries), encoding="utf-8")
+        wrong_model_resp = self.stop("codex", "single-ok-sub", "验证已完成，共消耗 120 tokens，回执 receipt.json（使用 wrong-other-model）。")
+        self.assertEqual(wrong_model_resp.get("decision"), "block")
+        self.assertFalse(json.loads(ledger.read_text(encoding="utf-8"))[0]["reported_to_user"])
+        right_model_resp = self.stop("codex", "single-ok-sub", "fixture-target-model 验证已完成，共消耗 120 tokens，回执 receipt.json。")
+        self.assertEqual(right_model_resp, {})
+        self.assertTrue(json.loads(ledger.read_text(encoding="utf-8"))[0]["reported_to_user"])
+
+
+    def test_v1152_wrapper_bypasses_blocked_in_boundary_and_handoff_gate(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_root = Path(td).resolve()
+            ws = td_root / "workspace"
+            ws.mkdir()
+            outside = "/opt/outside_project/secret_target"
+            for cmd in (
+                f'env -S "rm -rf {outside}"',
+                f'env --split-string="rm -rf {outside}"',
+                f'nohup rm -rf {outside}',
+                f'nice -n 5 mv {outside} {outside}_2',
+                f'uv run rm -rf {outside}',
+            ):
+                with self.subTest(cmd=cmd), unittest.mock.patch.dict(os.environ, {"CAE_HARNESS_DEPTH": "1"}):
+                    resp = status_guard.handle_claude_pre_tool_use(
+                        {"hook_event_name": "PreToolUse", "session_id": "wrap-b1", "cwd": str(ws),
+                         "tool_name": "Bash", "tool_input": {"command": cmd}},
+                        td_root / "sg_state", td_root / "sg_logs",
+                    )
+                    self.assertEqual(resp.get("hookSpecificOutput", {}).get("permissionDecision"), "deny")
+
+        script_p = REPO_ROOT / "template/user-guard/skills/cae-harness/scripts/cae_harness.py"
+        m1 = status_guard._load_harness_metrics_module(script_p)
+        m2 = status_guard._load_harness_metrics_module(script_p)
+        self.assertIs(m1, m2)
+
+        for cmd in (
+            'env -S "git push origin main"',
+            'env --split-string="git push origin main"',
+            'env -S "rm -rf src"',
+            'env -S "python3 cae_harness.py task --target . --kind code --task hi"',
+            'uv run git push origin main',
+            'nohup git push origin main',
+            'nice -n 5 git push origin main',
+        ):
+            with self.subTest(handoff_cmd=cmd):
+                kind = status_guard.handoff_gate._classify_run_command(cmd)
+                self.assertNotEqual(kind, "readonly_inspect")
+                if "git push" in cmd or "cae_harness.py" in cmd:
+                    self.assertEqual(kind, "blocked_always")
+                else:
+                    self.assertEqual(kind, "mutating_other")
+
+    def test_v1153_h1_d1_prefixed_tools_lowercase_apply_patch_and_codex_readonly_subagent(self):
+        outside = self.root / "outside_h1"
+        outside.mkdir()
+        log_file = self.project / "solver_run.log"
+        log_file.write_text("step 1\n", encoding="utf-8")
+
+        def pre_native(client, tool_name, tool_input, transcript=None, sid="h1-sess"):
+            payload = {
+                "_client": client,
+                "session_id": sid,
+                "cwd": str(self.project),
+                "tool_name": tool_name,
+                "tool_input": tool_input,
+            }
+            if transcript is not None:
+                payload["transcript_path"] = str(transcript)
+            return status_guard.handle_claude_pre_tool_use(payload, self.state, self.logs)
+
+        # 1) H1: functions. / mcp__ 前缀剥离、小写 write/edit、apply_patch 多头核验与未解析补丁拦截
+        self.assertEqual(pre_native("codex", "functions.write", {"file_path": str(self.project / "ok.py")}), {})
+        self.assertEqual(
+            pre_native("codex", "functions.write", {"file_path": str(outside / "bad.py")})["hookSpecificOutput"]["permissionDecision"],
+            "ask",
+        )
+        self.assertEqual(
+            pre_native("claude", "mcp__fs__edit", {"path": str(outside / "bad.py")})["hookSpecificOutput"]["permissionDecision"],
+            "ask",
+        )
+        valid_patch = (
+            "*** Begin Patch\n"
+            "*** Add File: src/new_mod.py\n+x = 1\n"
+            "*** Update File: src/old_mod.py\n*** Move to: src/renamed_mod.py\n"
+            "*** Delete File: src/obsolete.py\n"
+            "*** End Patch\n"
+        )
+        self.assertEqual(pre_native("codex", "functions.apply_patch", {"patch": valid_patch}), {})
+        for bad_patch in (
+            "*** Begin Patch\n*** Add File: src/ok.py\n*** Update File: ../outside_h1/leak.py\n*** End Patch\n",
+            "*** Begin Patch\n*** Update File: src/ok.py\n*** Move to: ../outside_h1/moved.py\n*** End Patch\n",
+            "--- a/src/ok.py\n+++ b/src/ok.py\n@@ -1 +1 @@\n-old\n+new\n",
+        ):
+            res_patch = pre_native("codex", "functions.apply_patch", {"patch": bad_patch})
+            self.assertEqual(res_patch["hookSpecificOutput"]["permissionDecision"], "ask", bad_patch)
+
+        # _claude_check_polling 前缀剥离
+        self.assertEqual(pre_native("codex", "functions.exec_command", {"cmd": "tail -n 5 solver_run.log"}, sid="poll-codex"), {})
+        self.assertEqual(
+            pre_native("codex", "functions.exec_command", {"cmd": "tail -n 5 solver_run.log"}, sid="poll-codex")["hookSpecificOutput"]["permissionDecision"],
+            "deny",
+        )
+        self.assertEqual(pre_native("claude", "mcp__acp__Read", {"file_path": str(log_file)}, sid="poll-claude"), {})
+        self.assertEqual(
+            pre_native("claude", "mcp__acp__Read", {"file_path": str(log_file)}, sid="poll-claude")["hookSpecificOutput"]["permissionDecision"],
+            "deny",
+        )
+
+        # 2) D1 钩子侧：Codex readonly-* 子代理会话严禁项目内外写文件、apply_patch 与写删命令，不影响普通父会话或可写子代理
+        for idx, meta_payload in enumerate((
+            {"id": f"ro-{idx_s}", **extra}
+            for idx_s, extra in enumerate((
+                {"source": "subagent", "agent_nickname": "readonly-auditor", "cwd": str(self.project)},
+                {"source": "subagent", "agent_role": "readonly-reader", "cwd": str(self.project)},
+                {"subagent": "readonly-collaborator", "cwd": str(self.project)},
+                {"source": {"subagent": {"thread_spawn": {"parent_thread_id": "main-1", "agent_role": "readonly-auditor"}}}, "cwd": str(self.project)},
+            ))
+        )):
+            ro_tp = self.root / f"rollout-ro-{idx}.jsonl"
+            _append_jsonl(ro_tp, {"type": "session_meta", "payload": meta_payload})
+            for tool_nm, t_inp in (
+                ("functions.write", {"file_path": str(self.project / "inside.py")}),
+                ("Edit", {"file_path": str(outside / "ext.py")}),
+                ("functions.apply_patch", {"patch": "*** Begin Patch\n*** Update File: inside.py\n*** End Patch\n"}),
+                ("functions.exec_command", {"cmd": "rm -f inside.py"}),
+                ("functions.exec_command", {"cmd": "echo hi > inside.py"}),
+                ("functions.exec_command", {"cmd": 'python3 -c "open(\'inside.py\', \'w\')"'}),
+                ("functions.exec_command", {"cmd": "git commit -m test"}),
+                ("functions.exec_command", {"cmd": "sed -i 's/a/b/' inside.py"}),
+            ):
+                denied = pre_native("codex", tool_nm, t_inp, transcript=ro_tp, sid=f"ro-{idx}")
+                self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny", (idx, tool_nm, t_inp))
+            for ro_idx, ro_ok_cmd in enumerate(("rg step solver_run.log", "sed -n '1,5p' solver_run.log", "git status", 'python3 -c "print(1 + 1)"')):
+                self.assertEqual(
+                    pre_native("codex", "functions.exec_command", {"cmd": ro_ok_cmd}, transcript=ro_tp, sid=f"ro-ok-{idx}-{ro_idx}"),
+                    {},
+                )
+
+        parent_tp = self.root / "rollout-parent-ok.jsonl"
+        _append_jsonl(parent_tp, {"type": "session_meta", "payload": {"id": "parent-1", "source": "cli", "cwd": str(self.project)}})
+        writable_sub_tp = self.root / "rollout-writable-sub.jsonl"
+        _append_jsonl(writable_sub_tp, {"type": "session_meta", "payload": {"id": "wsub-1", "source": "subagent", "agent_role": "worker", "cwd": str(self.project)}})
+        for ok_tp, ok_sid in ((parent_tp, "parent-1"), (writable_sub_tp, "wsub-1")):
+            self.assertEqual(pre_native("codex", "functions.write", {"file_path": str(self.project / "inside.py")}, transcript=ok_tp, sid=ok_sid), {})
+            self.assertEqual(pre_native("codex", "functions.apply_patch", {"patch": valid_patch}, transcript=ok_tp, sid=ok_sid), {})
+            self.assertEqual(pre_native("codex", "functions.exec_command", {"cmd": "touch inside.py"}, transcript=ok_tp, sid=ok_sid), {})
+
+    def test_v1153_h2_inline_py_flags_ansic_concat_ast_os_subprocess_and_max_depth(self):
+        outside = self.root / "outside_h2"
+        outside.mkdir()
+        out_posix = (outside / "target.txt").as_posix()
+
+        def run_agy(cmd: str) -> str:
+            with unittest.mock.patch.dict(os.environ, {"USER_GUARD_DISABLE_TICKET_GATE": "1"}):
+                return status_guard.handle_pre_tool_use({
+                    "conversationId": "h2-conv",
+                    "cwd": str(self.project),
+                    "workspacePaths": [str(self.project)],
+                    "toolCall": {"name": "run_command", "args": {"CommandLine": cmd}},
+                })["decision"]
+
+        # 1) 连写 -Wignore / -Xutf8 / --check-hash-based-pycs 及 ANSI-C $'...' 与复合拼接参数
+        for blocked_py_cmd in (
+            f'python3 -Wignore -Xutf8 --check-hash-based-pycs=never -c "open(\'{out_posix}\', \'w\')"',
+            f"python3 --check-hash-based-pycs always -Bc$'import os\\nos.remove(\\x27{out_posix}\\x27)'",
+            f"python3 -Wignore -c $'open(\"{out_posix}\", \"w\")'",
+            f"python3 -c 'import os; os.remove('\"'{out_posix}'\"',)'",
+        ):
+            self.assertEqual(run_agy(blocked_py_cmd), "force_ask", blocked_py_cmd)
+        self.assertEqual(
+            run_agy("python3 -Wignore -Xutf8 --check-hash-based-pycs=default -c $'x = [1, 2].copy()\nprint(len(x))'"),
+            "allow",
+        )
+
+        # 2) AST os 权限/属主/时间、Path.chmod/lchmod、popen、getoutput/getstatusoutput、exec*/spawn*/posix_spawn*
+        keys = [status_guard._normalize_cross_env_lexical(str(self.project))]
+        for bad_ast in (
+            f"import os\nos.chmod('{out_posix}', 0o600)",
+            f"import os\nos.lchmod('{out_posix}', 0o600)",
+            f"import os\nos.chown('{out_posix}', 0, 0)",
+            f"import os\nos.lchown('{out_posix}', 0, 0)",
+            f"import os\nos.utime('{out_posix}', None)",
+            f"from pathlib import Path\nPath('{out_posix}').chmod(0o644)",
+            f"from pathlib import Path\nPath('{out_posix}').lchmod(0o644)",
+            f"import os\nos.popen('touch {out_posix}')",
+            f"import subprocess\nsubprocess.getoutput('rm -f {out_posix}')",
+            f"import subprocess\nsubprocess.getstatusoutput('touch {out_posix}')",
+            "import os\nos.execvp('sh', ['sh', '-c', 'echo hi'])",
+            "import os\nos.spawnlp(os.P_WAIT, 'sh', 'sh', '-c', 'echo hi')",
+            "import os\nos.posix_spawnp('sh', ['sh'], os.environ)",
+            "import os\ndef f():\n    os.execv('/bin/sh', ['sh'])\nf()",
+        ):
+            self.assertIsNotNone(
+                status_guard._scan_inline_python_code(bad_ast, str(self.project), keys, keys, False),
+                bad_ast,
+            )
+        for safe_ast in (
+            "import os\nos.chmod('inside.txt', 0o600)",
+            "from pathlib import Path\nPath('inside.txt').chmod(0o644)",
+            "import os\ndef unused_helper():\n    os.execvp('sh', ['sh'])",
+            "import subprocess\nsubprocess.getoutput('git status')",
+            "import os\nos.popen('git status')",
+        ):
+            self.assertIsNone(
+                status_guard._scan_inline_python_code(safe_ast, str(self.project), keys, keys, False),
+                safe_ast,
+            )
+
+        # 3) depth == MAX_WRAPPER_DEPTH 闭路阻断
+        for wrapper_call in (
+            "import os\nos.system('git status')",
+            "import os\nos.popen('git status')",
+            "import subprocess\nsubprocess.run(['git', 'status'])",
+            "import subprocess\nsubprocess.getoutput('git status')",
+        ):
+            hit_max = status_guard._scan_inline_python_code(
+                wrapper_call, str(self.project), keys, keys, False, depth=status_guard.MAX_WRAPPER_DEPTH
+            )
+            self.assertIsNotNone(hit_max, wrapper_call)
+            self.assertEqual(hit_max[1], "<NESTED_DEPTH_EXCEEDED>")
+
+    def test_v1153_h3_h4_proc_subst_control_flow_worktree_concat_redirect_and_dyn_vars(self):
+        outside = self.root / "outside_h34"
+        outside.mkdir()
+        (self.project / "sub").mkdir(exist_ok=True)
+        out_posix = outside.as_posix()
+
+        # H3: _dispatch_commands 递归扫描进程替换 <(...) / >(...) 与控制流关键字
+        for dispatch_bypass in (
+            "cat <(codex exec work)",
+            "tee >(claude -p work)",
+            "if codex exec work; then echo ok; fi",
+            "while false; do dsh --profile headless work; done",
+            "if false; then echo no; elif python cae_harness.py batch; then echo yes; fi",
+        ):
+            self.assertEqual(self.pre("run_command", {"CommandLine": dispatch_bypass})["decision"], "deny", dispatch_bypass)
+
+        def boundary_decide(cmd: str) -> str:
+            with unittest.mock.patch.dict(os.environ, {"USER_GUARD_DISABLE_TICKET_GATE": "1"}):
+                return status_guard.handle_pre_tool_use({
+                    "conversationId": "h4-conv",
+                    "cwd": str(self.project),
+                    "workspacePaths": [str(self.project)],
+                    "toolCall": {"name": "run_command", "args": {"CommandLine": cmd}},
+                })["decision"]
+
+        # H4-1: git worktree add 结合子句 cd / env -C / git -C / --work-tree
+        for wt_bad in (
+            "echo pre && cd .. && git worktree add outside_h34/wt1",
+            f"git -C {out_posix} worktree add wt2",
+            f"git -C{out_posix} worktree add wt3",
+            f"git --work-tree={out_posix} worktree add wt4",
+            f"env -C {out_posix} git worktree add wt5",
+            "git -C $UNKNOWN_REPO worktree add wt6",
+        ):
+            self.assertEqual(boundary_decide(wt_bad), "force_ask", wt_bad)
+        self.assertEqual(boundary_decide("git -C sub worktree add ../wt_inside"), "allow")
+
+        # H4-2: 复合拼接引号重定向与 $ / % 未解析动态变量拦截（保留空设备放行）
+        for redir_bad in (
+            'echo pwn > "."/../outside_h34/leak.txt',
+            "echo pwn > ''../outside_h34/leak2.txt",
+            "echo pwn > $'../outside_h34/leak3.txt'",
+            "echo pwn > $OUT",
+            'echo pwn > "$DST_PATH"',
+            "echo pwn > %CUSTOM_OUT%",
+        ):
+            self.assertEqual(boundary_decide(redir_bad), "force_ask", redir_bad)
+        for dyn_write_target in ("$OUT", "${STAGE_DIR}/a.txt", "%CUSTOM_OUT%/a.txt"):
+            with unittest.mock.patch.dict(os.environ, {"USER_GUARD_DISABLE_TICKET_GATE": "1"}):
+                self.assertEqual(
+                    status_guard.handle_pre_tool_use({
+                        "conversationId": "h4-conv",
+                        "cwd": str(self.project),
+                        "workspacePaths": [str(self.project)],
+                        "toolCall": {"name": "write_file", "args": {"Path": dyn_write_target, "Content": "x"}},
+                    })["decision"],
+                    "force_ask",
+                    dyn_write_target,
+                )
+        for redir_ok in ("git status 2>/dev/null", "git status 2>$null", "echo ok > inside_out.txt"):
+            self.assertEqual(boundary_decide(redir_ok), "allow", redir_ok)
+
+    def test_v1153_h6_h7_h8_h10_repeat_guard_unflushed_tail_cursor_raw_decode_and_client_logs(self):
+        # 1) H6: Claude 与 Codex 首条短等待已刷盘后，后续未刷盘短等待（有新工具结果或文本变化）正常累加至阻断
+        for client in ("claude", "codex"):
+            tp = self.root / f"h6-{client}.jsonl"
+            sid = f"h6-{client}-sid"
+            if client == "claude":
+                _append_jsonl(tp, {"type": "user", "uuid": "u1", "message": {"role": "user", "content": "跑算例"}})
+                _append_jsonl(tp, {"type": "assistant", "uuid": "a1", "message": {"content": [{"type": "text", "text": "后台仍在运行，请稍候。"}]}})
+            else:
+                _append_jsonl(tp, {"type": "session_meta", "payload": {"id": sid, "source": "cli", "cwd": str(self.project)}})
+                _append_jsonl(tp, {"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "跑算例"}]}})
+                _append_jsonl(tp, {"type": "response_item", "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "后台仍在运行，请稍候。"}]}})
+
+            r1 = reply_repeat_guard.handle_claude_stop_repeat_guard(
+                {"_client": client, "session_id": sid, "transcript_path": str(tp), "last_assistant_message": "后台仍在运行，请稍候。"},
+                self.state, self.logs,
+            )
+            r1_dup = reply_repeat_guard.handle_claude_stop_repeat_guard(
+                {"_client": client, "session_id": sid, "transcript_path": str(tp), "last_assistant_message": "后台仍在运行，请稍候。"},
+                self.state, self.logs,
+            )
+            self.assertEqual(r1, {})
+            self.assertEqual(r1_dup, {})
+
+            r2 = reply_repeat_guard.handle_claude_stop_repeat_guard(
+                {"_client": client, "session_id": sid, "transcript_path": str(tp), "last_assistant_message": "后台仍在运行，请耐心等待。"},
+                self.state, self.logs,
+            )
+            self.assertEqual(r2, {})
+
+            if client == "claude":
+                _append_jsonl(tp, {"type": "user", "uuid": "tr1", "message": {"content": [{"type": "tool_result", "tool_use_id": "tc1", "content": "still running"}]}})
+            else:
+                _append_jsonl(tp, {"type": "response_item", "payload": {"type": "function_call_output", "call_id": "tc1", "output": "still running"}})
+            r3 = reply_repeat_guard.handle_claude_stop_repeat_guard(
+                {"_client": client, "session_id": sid, "transcript_path": str(tp), "last_assistant_message": "后台仍在运行，请稍候。"},
+                self.state, self.logs,
+            )
+            self.assertEqual(r3.get("decision"), "block", client)
+
+        # 2) H7: 缺失 step_index 滑窗 row_offset 单调游标、主会话忽略子代理 SYSTEM_MESSAGE 边界、超长回复截断回查
+        tp_nostep = self.root / "h7-nostep.jsonl"
+        _append_jsonl(tp_nostep, {"type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "主会话监控"})
+        steps_init, _ = reply_repeat_guard._read_tail_steps_with_offset(tp_nostep)
+        self.assertEqual(steps_init[0]["row_offset"], 0)
+        decisions = []
+        for i in range(3):
+            _append_jsonl(tp_nostep, {"type": "GENERIC", "content": "pad_" + ("X" * (reply_repeat_guard.TAIL_SCAN_BYTES // 2 + 1024))})
+            _append_jsonl(tp_nostep, {"type": "SYSTEM_MESSAGE", "content": f"<SYSTEM_MESSAGE>\n[Message] sender=subagent-{i} content=阶段反馈\n</SYSTEM_MESSAGE>"})
+            _append_jsonl(tp_nostep, {"type": "PLANNER_RESPONSE", "source": "MODEL", "content": "仍在等待全部子任务完成，请稍候。"})
+            res = reply_repeat_guard.handle_stop_repeat_guard({
+                "conversationId": "h7-main-sid", "terminationReason": "model_stop", "transcriptPath": str(tp_nostep),
+            })
+            decisions.append(res["decision"])
+        self.assertEqual(decisions, ["allow", "allow", "continue"])
+
+        tp_sub_only = self.root / "h7-sub-only.jsonl"
+        _append_jsonl(tp_sub_only, {"type": "SYSTEM_MESSAGE", "content": "<SYSTEM_MESSAGE>\n[Message] sender=parent content=请只读核查\n</SYSTEM_MESSAGE>"})
+        _append_jsonl(tp_sub_only, {"type": "PLANNER_RESPONSE", "source": "MODEL", "content": "核查完毕。"})
+        sub_turn_key, _, sub_reply = reply_repeat_guard.extract_current_turn_latest_reply(str(tp_sub_only))
+        self.assertNotEqual(sub_turn_key, "turn_0_initial")
+        self.assertEqual(sub_reply, "核查完毕。")
+
+        tp_huge = self.root / "h7-huge-dropped.jsonl"
+        _append_jsonl(tp_huge, {"type": "USER_INPUT", "step_index": 1, "content": "输出完整报告"})
+        huge_body = "报告正文：" + ("R" * (reply_repeat_guard.TAIL_SCAN_BYTES + 4096))
+        _append_jsonl(tp_huge, {"type": "PLANNER_RESPONSE", "source": "MODEL", "step_index": 2, "content": huge_body})
+        _append_jsonl(tp_huge, {"type": "CHECKPOINT", "step_index": 3})
+        h_turn, h_step, h_text = reply_repeat_guard.extract_current_turn_latest_reply(str(tp_huge))
+        self.assertTrue(h_turn.startswith("turn_1_"))
+        self.assertEqual(h_step, 2)
+        self.assertEqual(h_text, huge_body)
+
+        # 3) H8: parse_agy_created_subagent 兼容嵌套对象与尾随花括号；_native_completion_bill 按 len(completed) 判重负载
+        raw_created = (
+            'Created the following subagent: {"conversationId": "ag-nested-1", '
+            '"config": {"nested": {"depth": 1}}, "logAbsoluteUri": "/tmp/ag1.jsonl"}\nTrailing note {ok}'
+        )
+        parsed_created = user_words.parse_agy_created_subagent(raw_created)
+        self.assertEqual(parsed_created["conversationId"], "ag-nested-1")
+
+        tp_bill = self.root / "h8-bill.jsonl"
+        _append_jsonl(tp_bill, {"type": "USER_INPUT", "step_index": 1, "content": "并行读取"})
+        for idx in range(2):
+            _append_jsonl(tp_bill, {"type": "PLANNER_RESPONSE", "tool_calls": [{"id": f"c-{idx}", "name": "invoke_subagent", "args": {"TypeName": "readonly-reader"}}]})
+            _append_jsonl(tp_bill, {"type": "GENERIC", "tool_result": {"call_id": f"c-{idx}"},
+                                    "content": f'Created the following subagent: {{"conversationId": "ag-{idx}", "meta": {{"k": 1}}}} trailing {{brace}}'})
+            _append_jsonl(tp_bill, {"type": "SYSTEM_MESSAGE", "content": f"<SYSTEM_MESSAGE>\n[Message] sender=ag-{idx} content=完成{idx}\n</SYSTEM_MESSAGE>"})
+        bill = reply_repeat_guard._native_completion_bill({"transcriptPath": str(tp_bill)}, state={"reported_native_ids": ["c-0"]})
+        self.assertIsNotNone(bill)
+        self.assertEqual([r["native_id"] for r in bill["streams"]], ["c-1"])
+
+        # 4) H10: status_guard.log_event 与 reply_repeat_guard._load_repeat_state 透传真实 client="codex"
+        bad_repeat = self.state / "codex-err-sid_repeat_guard.json"
+        bad_repeat.parent.mkdir(parents=True, exist_ok=True)
+        bad_repeat.write_text("{corrupted", encoding="utf-8")
+        codex_tp = self.root / "h10-codex.jsonl"
+        _append_jsonl(codex_tp, {"type": "session_meta", "payload": {"id": "codex-err-sid", "source": "cli", "cwd": str(self.project)}})
+        reply_repeat_guard.handle_claude_stop_repeat_guard(
+            {"_client": "codex", "session_id": "codex-err-sid", "transcript_path": str(codex_tp), "last_assistant_message": "请稍候"},
+            self.state, self.logs,
+        )
+        status_guard.handle_claude_pre_tool_use(
+            {"_client": "codex", "session_id": "codex-err-sid", "cwd": str(self.project), "tool_name": "functions.write", "tool_input": {"file_path": "../outside_h10/x.py"}},
+            self.state, self.logs,
+        )
+        entries = [json.loads(ln) for ln in (self.logs / "lifecycle.log").read_text(encoding="utf-8").splitlines() if ln.strip()]
+        self.assertTrue(any(e.get("event") == "Stop:repeat_state_error" and e.get("client") == "codex" for e in entries))
+        self.assertTrue(any(e.get("event") == "PreToolUse:workspace_boundary" and e.get("client") == "codex" for e in entries))
+
+    def test_r2_s2_01_ansi_c_quotes_clause_split_and_quoted_strip(self):
+        outside = self.root / "outside_r2_01"
+        outside.mkdir()
+        out_posix = outside.as_posix()
+
+        # 1) ANSI-C $'...' 转义单引号不得吞并后续 && 子句（R4 写边界 / 裸 CLI 派工 / 交接门禁三处同步拦截）
+        with unittest.mock.patch.dict(os.environ, {"USER_GUARD_DISABLE_TICKET_GATE": "1"}):
+            res_r4 = status_guard.handle_pre_tool_use({
+                "conversationId": "r2-ansi-r4",
+                "cwd": str(self.project),
+                "workspacePaths": [str(self.project)],
+                "toolCall": {"name": "run_command", "args": {"CommandLine": f"echo $'it\\'s' && rm -rf {out_posix}"}},
+            })
+            self.assertEqual(res_r4["decision"], "force_ask")
+
+        res_disp = self.pre("run_command", {"CommandLine": r"echo $'it\'s' && codex exec work"})
+        self.assertEqual(res_disp["decision"], "deny")
+
+        self.assertEqual(
+            status_guard.handoff_gate._classify_run_command(r"echo $'it\'s' && git push origin main"),
+            "blocked_always",
+        )
+        # ANSI-C $'...' 内部含 `>` 时不得被误判为输出重定向
+        self.assertEqual(
+            status_guard.handoff_gate._classify_run_command(r"echo $'it\'s a > b'"),
+            "readonly_inspect",
+        )
+
+    def test_r2_s2_02_inline_python_posix_dquote_nul_ast_and_flags(self):
+        import subprocess
+
+        outside = self.root / "outside_r2_02"
+        outside.mkdir()
+        out_file = (outside / "pwn.txt").as_posix()
+
+        def decide_cmd(cmd: str) -> str:
+            with unittest.mock.patch.dict(os.environ, {"USER_GUARD_DISABLE_TICKET_GATE": "1"}):
+                return status_guard.handle_pre_tool_use({
+                    "conversationId": "r2-py-conv",
+                    "cwd": str(self.project),
+                    "workspacePaths": [str(self.project)],
+                    "toolCall": {"name": "run_command", "args": {"CommandLine": cmd}},
+                })["decision"]
+
+        # 1) POSIX 双引号保留 \n / \t 字面量，print('\n') 不破坏 ast.parse，数组 .copy() 零误报，真实外部写精准拦截
+        self.assertEqual(decide_cmd(r'''python3 -c "print('\n\t'); arr = [1, 2].copy()"'''), "allow")
+        self.assertEqual(
+            decide_cmd(rf'''python3 -c "print('\n'); import os as o; o.remove('{out_file}')"'''),
+            "force_ask",
+        )
+
+        # 2) _decode_ansi_c_quotes 在 \0 / \x00 处截断有效载荷
+        self.assertEqual(status_guard._decode_ansi_c_quotes(r"$'abc\x00def'", 0), ("abc", 13))
+        self.assertEqual(status_guard._decode_ansi_c_quotes(r"$'xy\0zz'", 0), ("xy", 9))
+        self.assertEqual(decide_cmd(r"python3 -c $'print(1)\x00(((syntax_err'"), "allow")
+        self.assertEqual(
+            decide_cmd(rf"python3 -c $'import os as o; o.remove(\"{out_file}\")\x00(((syntax_err'"),
+            "force_ask",
+        )
+
+        # 3) 原始 \x00 空字节与超深 AST 递归严禁穿透 main() 造成 Fail-Open
+        keys = [status_guard._normalize_cross_env_lexical(str(self.project))]
+        nul = chr(0)
+        self.assertIsNotNone(
+            status_guard._scan_inline_python_code(f"import os as o; o.remove('{out_file}'){nul}", str(self.project), keys, keys, False)
+        )
+        self.assertIsNotNone(
+            status_guard._scan_inline_python_code(f"print(1){nul}", str(self.project), keys, keys, False)
+        )
+        deep_expr = "import os as o; x=1" + "+1" * 600 + f"; o.remove('{out_file}')"
+        self.assertIsNotNone(
+            status_guard._scan_inline_python_code(deep_expr, str(self.project), keys, keys, False)
+        )
+        with unittest.mock.patch.dict(os.environ, {"CAE_HARNESS_DEPTH": "1"}):
+            proc = subprocess.run(
+                [sys.executable, "-B", str(HOOKS_DIR / "status_guard.py"), "--client", "claude",
+                 "--state-dir", str(self.state), "--log-dir", str(self.logs)],
+                input=json.dumps({
+                    "session_id": "nul-cli-check",
+                    "cwd": str(self.project),
+                    "tool_name": "Bash",
+                    "tool_input": {"command": f"python3 -c \"import os as o; o.remove('{out_file}'){nul}\""},
+                }),
+                capture_output=True, text=True, timeout=10,
+            )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        cli_out = json.loads(proc.stdout)
+        self.assertEqual(cli_out.get("hookSpecificOutput", {}).get("permissionDecision"), "deny")
+
+        # 4) --safe-path、"-c" / '-c'、未闭合 -c $'...' 哨兵阻断、子进程列表连写 -c<code> 与首个脚本名 break
+        for blocked_cmd in (
+            f'''python3 --safe-path -c "open('{out_file}', 'w')"''',
+            f'''python3 "-c" "open('{out_file}', 'w')"''',
+            f'''python3 '-c' "open('{out_file}', 'w')"''',
+            f'''python3 "-copen('{out_file}', 'w')"''',
+            f"python3 -c $'open(\"{out_file}\", \"w\")",
+        ):
+            self.assertEqual(decide_cmd(blocked_cmd), "force_ask", blocked_cmd)
+
+        self.assertIsNotNone(
+            status_guard._scan_inline_python_code(
+                f"import subprocess\nsubprocess.run(['python3', '--safe-path', \"-copen('{out_file}', 'w')\"])",
+                str(self.project), keys, keys, False,
+            )
+        )
+        # 首个非选项脚本名后出现的 -c 属于脚本自身参数，不得误判为 python -c 代码
+        self.assertIsNone(
+            status_guard._scan_inline_python_code(
+                f"import subprocess\nsubprocess.run(['python3', 'runner.py', '-c', \"open('{out_file}', 'w')\"])",
+                str(self.project), keys, keys, False,
+            )
+        )
+        self.assertEqual(
+            status_guard.handoff_gate._classify_run_command("python3 --safe-path cae_harness.py probe -c dummy"),
+            "readonly_inspect",
+        )
+        self.assertEqual(
+            status_guard.handoff_gate._classify_run_command('python3 -c"import cae_harness" cae_harness.py probe'),
+            "blocked_always",
+        )
+
+    def test_r2_s2_03_unquoted_backslash_escape_shell_unwrap_write_stdin_and_list_shell(self):
+        outside = self.root / "outside_r2_03"
+        outside.mkdir()
+        out_file = (outside / "pwn.txt").as_posix()
+
+        def decide_agy(cmd: str) -> str:
+            with unittest.mock.patch.dict(os.environ, {"USER_GUARD_DISABLE_TICKET_GATE": "1"}):
+                return status_guard.handle_pre_tool_use({
+                    "conversationId": "r2-sh-conv",
+                    "cwd": str(self.project),
+                    "workspacePaths": [str(self.project)],
+                    "toolCall": {"name": "run_command", "args": {"CommandLine": cmd}},
+                })["decision"]
+
+        # 1) 引号外反斜杠转义（#3）：printf \" > /outside/pwn.txt 绝不翻转引号状态
+        for esc_cmd in (
+            rf'printf \" > {out_file}',
+            rf"printf \' > {out_file}",
+            rf"echo \$ > {out_file}",
+        ):
+            self.assertEqual(decide_agy(esc_cmd), "force_ask", esc_cmd)
+
+        # 2) _unwrap_shell_script_layer 支持路径前缀与尾随重定向/位置参数同时扫描（#4）
+        for wrapped_cmd in (
+            f'/bin/bash -c "rm -rf {out_file}" 2>&1',
+            f'/bin/sh -c "echo ok" > {out_file}',
+            '/bin/bash -c \'rm -rf "$1"\' _ /outside',
+            f'/bin/sh -c "echo ok" _ "$(touch {out_file})"',
+        ):
+            self.assertEqual(decide_agy(wrapped_cmd), "force_ask", wrapped_cmd)
+        self.assertEqual(decide_agy('/bin/bash -c "echo ok" 2>&1'), "allow")
+
+        # 3) Codex readonly-* 子代理无条件拒绝 write_stdin；普通会话对 write_stdin 的 chars/input 执行 R4 扫描（#4）
+        ro_tp = self.root / "ro-stdin.jsonl"
+        _append_jsonl(ro_tp, {"type": "session_meta", "payload": {"id": "ro-stdin-1", "source": "subagent", "agent_role": "readonly-auditor", "cwd": str(self.project)}})
+        for ws_input in ({"session_id": 7}, {"session_id": 7, "chars": "ls\n"}):
+            ro_res = status_guard.handle_claude_pre_tool_use(
+                {"_client": "codex", "session_id": "ro-stdin-1", "cwd": str(self.project), "transcript_path": str(ro_tp),
+                 "tool_name": "functions.write_stdin", "tool_input": ws_input},
+                self.state, self.logs,
+            )
+            self.assertEqual(ro_res.get("hookSpecificOutput", {}).get("permissionDecision"), "deny")
+
+        main_tp = self.root / "main-stdin.jsonl"
+        _append_jsonl(main_tp, {"type": "session_meta", "payload": {"id": "main-stdin-1", "source": "cli", "cwd": str(self.project)}})
+        self.assertEqual(
+            status_guard.handle_claude_pre_tool_use(
+                {"_client": "codex", "session_id": "main-stdin-1", "cwd": str(self.project), "transcript_path": str(main_tp),
+                 "tool_name": "functions.write_stdin", "tool_input": {"session_id": 7, "chars": ""}},
+                self.state, self.logs,
+            ),
+            {},
+        )
+        for field in ("chars", "input"):
+            ws_hit = status_guard.handle_claude_pre_tool_use(
+                {"_client": "codex", "session_id": "main-stdin-1", "cwd": str(self.project), "transcript_path": str(main_tp),
+                 "tool_name": "functions.write_stdin", "tool_input": {"session_id": 7, field: f"rm -rf {out_file}\n"}},
+                self.state, self.logs,
+            )
+            self.assertEqual(ws_hit.get("hookSpecificOutput", {}).get("permissionDecision"), "ask", field)
+
+        # 4) _check_dispatch_locked 纳入 shell / shell_command 并兼容列表态 command；轮询传入 base_cwd or cwd
+        for s_tool, s_input in (
+            ("functions.shell", {"command": ["codex", "exec", "work"]}),
+            ("shell_command", {"command": ["/bin/bash", "-lc", "claude -p work"]}),
+        ):
+            d_res = status_guard.handle_claude_pre_tool_use(
+                {"_client": "codex", "session_id": "main-stdin-1", "cwd": str(self.project), "transcript_path": str(main_tp),
+                 "tool_name": s_tool, "tool_input": s_input},
+                self.state, self.logs,
+            )
+            self.assertEqual(d_res.get("hookSpecificOutput", {}).get("permissionDecision"), "deny", s_tool)
+
+        sub_dir = self.project / "sub_poll"
+        sub_dir.mkdir(exist_ok=True)
+        (sub_dir / "solver.log").write_text("iter 1\n", encoding="utf-8")
+        poll_payload = {
+            "_client": "codex", "session_id": "poll-workdir-sid", "cwd": str(self.project),
+            "transcript_path": str(main_tp), "tool_name": "functions.shell",
+            "tool_input": {"command": ["tail", "-n", "5", "solver.log"], "workdir": "sub_poll"},
+        }
+        self.assertEqual(status_guard.handle_claude_pre_tool_use(poll_payload, self.state, self.logs), {})
+        self.assertEqual(
+            status_guard.handle_claude_pre_tool_use(poll_payload, self.state, self.logs)["hookSpecificOutput"]["permissionDecision"],
+            "deny",
+        )
+
+    def test_r2_s2_04_cd_tracking_from_shell_diff_host_vars_and_empty_patch(self):
+        outside = self.root / "outside_r2_04"
+        outside.mkdir()
+        out_posix = outside.as_posix()
+        in_posix = (self.project / "anchored_ok.txt").as_posix()
+
+        def decide_agy(cmd: str) -> str:
+            with unittest.mock.patch.dict(os.environ, {"USER_GUARD_DISABLE_TICKET_GATE": "1"}):
+                return status_guard.handle_pre_tool_use({
+                    "conversationId": "r2-cd-conv",
+                    "cwd": str(self.project),
+                    "workspacePaths": [str(self.project)],
+                    "toolCall": {"name": "run_command", "args": {"CommandLine": cmd}},
+                })["decision"]
+
+        # 1) 移除递归 cd 剥离后：cd "./$(...)" 必被扫描，连续多层 cd . 不触发深度超限
+        self.assertEqual(decide_agy(f'cd "./$(touch {out_posix}/pwn)" && echo ok'), "force_ask")
+        self.assertEqual(decide_agy("cd . && cd . && cd . && cd . && cd . && cd . && cd . && echo ok"), "allow")
+        # 裸 cd / pushd 切至 Path.home()；cd - 与 cd "$OUT" 将 clause_cwd 置为 None 拦截后续相对写删
+        for cd_bad in (
+            "cd && touch leak_in_home.txt",
+            "pushd && touch leak_in_home.txt",
+            "cd - && rm -f rel_target.txt",
+            'cd "$OUT_DIR" && touch rel_target.txt',
+            '''cd "${WORK:-/outside}" && python3 -c "open('rel.txt', 'w')"''',
+        ):
+            self.assertEqual(decide_agy(cd_bad), "force_ask", cd_bad)
+        self.assertEqual(decide_agy(f'cd - && touch "{in_posix}"'), "allow")
+
+        # 2) _is_write_target_allowed(..., from_shell=False) 不剥离尾随 ;,) 或单引号（防软链同名绕过）
+        self.assertFalse(hasattr(status_guard, "_LOCAL_VAR_TOKEN_RE"))
+        symlink_ok = True
+        try:
+            (self.project / "safe_base").write_text("ok", encoding="utf-8")
+            (self.project / "safe_base)").symlink_to(outside / "secret_paren.txt")
+            (self.project / "safe_quote'").symlink_to(outside / "secret_quote.txt")
+        except OSError:
+            symlink_ok = False
+        if symlink_ok:
+            for tricky_name in ("safe_base)", "safe_quote'"):
+                ag_w = status_guard.handle_pre_tool_use({
+                    "conversationId": "r2-from-shell",
+                    "cwd": str(self.project),
+                    "workspacePaths": [str(self.project)],
+                    "toolCall": {"name": "write_to_file", "args": {"TargetFile": str(self.project / tricky_name), "CodeContent": "x"}},
+                })
+                self.assertEqual(ag_w["decision"], "force_ask", tricky_name)
+                cl_w = status_guard.handle_claude_pre_tool_use(
+                    {"_client": "claude", "session_id": "r2-fs-cl", "cwd": str(self.project),
+                     "tool_name": "Write", "tool_input": {"file_path": str(self.project / tricky_name)}},
+                    self.state, self.logs,
+                )
+                self.assertEqual(cl_w.get("hookSpecificOutput", {}).get("permissionDecision"), "ask", tricky_name)
+
+        # 3) 非首字符 ${OUT:-...} 与 $1 拦截；$PWD / $TMP / ${env:TEMP} 放行；POSIX %20 文件名不误拦；空 apply_patch 保守拦截
+        for dyn_bad in (
+            "echo hi > ./${OUT:-/outside/a}",
+            "rm -rf sub/$1",
+            'touch "prefix_${TARGET_DIR}/a.txt"',
+        ):
+            self.assertEqual(decide_agy(dyn_bad), "force_ask", dyn_bad)
+        os_tmp = self.root / "isolated_os_tmp"
+        os_tmp.mkdir(exist_ok=True)
+        with unittest.mock.patch.object(tempfile, "tempdir", str(os_tmp)), \
+                unittest.mock.patch.dict(os.environ, {"TMPDIR": str(os_tmp), "TEMP": str(os_tmp), "TMP": str(os_tmp)}):
+            for env_ok in (
+                'echo hi > "$PWD/inside.txt"',
+                'touch "${PWD}/inside2.txt"',
+                'echo hi > "$TMP/tmp_ok.txt"',
+                'echo hi > "${TMP}/tmp_ok2.txt"',
+                'echo hi > "${env:TEMP}/tmp_ok3.txt"',
+                'echo hi > "${env:TMP}/tmp_ok4.txt"',
+                'echo hi > "${env:TMPDIR}/tmp_ok5.txt"',
+                'echo hi > "my%20file%20name.txt"',
+                'echo hi > "%20leading_space.txt"',
+            ):
+                self.assertEqual(decide_agy(env_ok), "allow", env_ok)
+            pct_utf8_cmd = 'echo hi > "%E4%B8%AD%E6%96%87.md"'
+            with unittest.mock.patch.object(status_guard.os, "name", "posix"):
+                self.assertFalse(status_guard._has_unexpanded_dynamic_var("%E4%B8%AD%E6%96%87.md"))
+            if os.name != "nt":
+                self.assertEqual(decide_agy(pct_utf8_cmd), "allow", pct_utf8_cmd)
+            else:
+                # Windows 下 %E4% 与 cmd.exe 环境变量语法重叠，按保守策略交由人工确认
+                self.assertEqual(decide_agy(pct_utf8_cmd), "force_ask", pct_utf8_cmd)
+
+        for empty_patch_inp in ({}, {"patch": ""}, {"patch": "   \n  "}):
+            ap_res = status_guard.handle_claude_pre_tool_use(
+                {"_client": "codex", "session_id": "r2-empty-patch", "cwd": str(self.project),
+                 "tool_name": "functions.apply_patch", "tool_input": empty_patch_inp},
+                self.state, self.logs,
+            )
+            self.assertEqual(ap_res.get("hookSpecificOutput", {}).get("permissionDecision"), "ask", empty_patch_inp)
+
+    def test_r2_s2_05_ux_messages_pending_ticket_codex_stderr_and_env_isolation(self):
+        import subprocess
+
+        # 1) reply_repeat_guard 在 claude/codex 下不提 Reactive Wakeup，Antigravity 下保留
+        self.assertIn("Reactive Wakeup", reply_repeat_guard._build_block_reason_text("antigravity"))
+        self.assertEqual(reply_repeat_guard._build_block_reason_text("claude"), reply_repeat_guard.BLOCK_REASON_TEXT)
+        self.assertEqual(reply_repeat_guard._build_block_reason_text("codex"), reply_repeat_guard.BLOCK_REASON_TEXT)
+
+        # 2) _ticket_required_reason 区分已有未过期 PENDING 票据与完全无票据，且使用完整脚本路径而非裸 cae_harness.py
+        no_ticket_msg = status_guard._ticket_required_reason("fixture", self.state)
+        self.assertIn("尚无有效且未过期的批次票据", no_ticket_msg)
+        self.assertIn(str(HOOKS_DIR.parent / "skills" / "cae-harness" / "scripts" / "cae_harness.py"), no_ticket_msg)
+        self.approve(status="PENDING")
+        pending_msg = status_guard._ticket_required_reason("fixture", self.state)
+        self.assertIn("ticket-fixture", pending_msg)
+        self.assertIn("PENDING", pending_msg)
+        self.assertIn("--approve-ticket ticket-fixture", pending_msg)
+
+        # 3) --client codex 下 stderr 标签为 Codex，且显式传入沙箱目录避免触碰真实 ~/.codex
+        for script_name, expected_tag in (
+            ("status_guard.py", "Codex PreToolUse"),
+            ("reply_repeat_guard.py", "Codex Stop"),
+        ):
+            proc = subprocess.run(
+                [
+                    sys.executable, "-B", str(HOOKS_DIR / script_name), "--client", "codex",
+                    "--state-dir", str(self.state), "--log-dir", str(self.logs),
+                ],
+                input="{not-valid-json",
+                capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(proc.returncode, 0)
+            self.assertIn(expected_tag, proc.stderr)
+            self.assertNotIn("Claude ", proc.stderr)
+        self.assertFalse((self.fake_home / ".codex").exists())
+
+        # 4) USER_GUARD_INSTALLED_DIR 空串或不存在目录时安全回退
+        expected_hooks = (REPO_ROOT / "template" / "user-guard" / "hooks").resolve()
+        self.assertEqual(_resolve_hooks_dir(""), expected_hooks)
+        self.assertEqual(_resolve_hooks_dir("   "), expected_hooks)
+        self.assertEqual(_resolve_hooks_dir(str(self.root / "nonexistent_install_dir")), expected_hooks)
 
 
 if __name__ == "__main__":

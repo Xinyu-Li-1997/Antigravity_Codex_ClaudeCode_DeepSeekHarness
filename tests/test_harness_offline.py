@@ -7,7 +7,6 @@ import io
 import json
 import os
 import re
-import signal
 import sqlite3
 import stat
 import subprocess
@@ -54,12 +53,45 @@ AUDIT = {'summary': '已核对', 'findings': [], 'read_files': ['a.py'], 'unread
 TASK = {'summary': '已推导', 'content': '证明正文', 'evidence': ['输入定义'], 'unverified': []}
 
 
+_INSTALLED_GUARD_ENV_KEYS = frozenset({
+    'USER_GUARD_INSTALLED_CODEX_DIR',
+    'USER_GUARD_INSTALLED_CLAUDE_DIR',
+    'USER_GUARD_INSTALLED_DSH_DIR',
+    'USER_GUARD_INSTALLED_DIR',
+})
+_STRIPPED_ENV_PREFIXES = (
+    'CAE_', 'AGY_', 'ANTIGRAVITY_', 'CODEX_', 'CLAUDE', 'ANTHROPIC_', 'DSH_', 'XDG_',
+)
+_STRIPPED_ENV_EXACT = frozenset({
+    'PLUGIN_DATA', 'OPENAI_API_KEY', 'DEEPSEEK_API_KEY', 'PYTHONPATH',
+    'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY',
+    'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_COMMON_DIR', 'GIT_CEILING_DIRECTORIES', 'GIT_PREFIX',
+})
+_STRIPPED_PROXY_UPPER = frozenset({'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY'})
+
+
+def _is_stripped_host_env(key):
+    if key in _STRIPPED_ENV_EXACT or key.upper() in _STRIPPED_PROXY_UPPER:
+        return True
+    if key.startswith('USER_GUARD_'):
+        return key not in _INSTALLED_GUARD_ENV_KEYS
+    return key.startswith(_STRIPPED_ENV_PREFIXES)
+
+
 class HarnessTests(unittest.TestCase):
     def setUp(self):
         harness._CANCELLED.clear()
         harness._SESSION_QUOTA_BLOCKED.clear()
         self.temp = tempfile.TemporaryDirectory(prefix='cae-test-')
         self.root = Path(self.temp.name).resolve()
+        clean_env = {
+            k: v for k, v in os.environ.items()
+            if not _is_stripped_host_env(k)
+        }
+        clean_env['USER_GUARD_STATE_DIR'] = str(self.root / 'state')
+        env_patch = patch.dict(os.environ, clean_env, clear=True)
+        env_patch.start()
+        self.addCleanup(env_patch.stop)
         home_patch = patch.object(harness.Path, 'home', return_value=self.root)
         home_patch.start()
         self.addCleanup(home_patch.stop)
@@ -2833,7 +2865,7 @@ else:
                 'codex': {
                     'workhorse_families': ['gauss', 'euler'],
                     'deep_tags': ['euler'],
-                    'fast_tags': ['spark', 'lite'],
+                    'fast_tags': ['boson9', 'lite'],
                 },
                 'claude': {
                     'default_fallback_alias': 'kimi-k9-max[2m]',
@@ -2870,7 +2902,7 @@ else:
              'supported_efforts': ['low', 'medium', 'high', 'max']},
             {'slug': 'gpt-9.1-euler', 'context_window': 1200000, 'max_context_window': 1200000,
              'supported_efforts': ['low', 'medium', 'high', 'max']},
-            {'slug': 'gpt-9.0-spark', 'context_window': 400000, 'max_context_window': 400000,
+            {'slug': 'gpt-9.0-boson9', 'context_window': 400000, 'max_context_window': 400000,
              'supported_efforts': ['low', 'medium', 'high']},
         ]
         engines['codex']['model'] = 'gpt-9.2-gauss'
@@ -2905,7 +2937,7 @@ else:
             self.assertEqual(p_math['capacity']['selected_window_tokens'], 1200000)
             self.assertEqual(p_code['model'], 'gpt-9.2-gauss')
             self.assertEqual(p_fast['model'], 'deepseek-v9-nano')
-            self.assertEqual(p_cx_fast['model'], 'gpt-9.0-spark')
+            self.assertEqual(p_cx_fast['model'], 'gpt-9.0-boson9')
             self.assertEqual(p_cc_fast['model'], 'deepseek-v9-nano')
             self.assertEqual(harness.select_task_tier('auto', 'review', '快速扫一眼', engine='role:fast'), ('low', 'role_fast_low'))
 
@@ -3295,10 +3327,10 @@ else:
 
         doc_proj = self.root / 'doc-stage-proj'
         doc_proj.mkdir()
-        for fname in ('NOTICE', 'LICENSE', 'Dockerfile', 'arch.svg'):
+        for fname in ('NOTICE', 'LICENSE', 'Dockerfile', 'diagram9.svg'):
             (doc_proj / fname).write_text('sample content\n', encoding='utf-8')
         collected_rels = {item['rel_path'] for item in harness.collect_target_files(doc_proj)}
-        self.assertEqual(collected_rels, {'NOTICE', 'LICENSE', 'Dockerfile', 'arch.svg'})
+        self.assertEqual(collected_rels, {'NOTICE', 'LICENSE', 'Dockerfile', 'diagram9.svg'})
 
         alias_stub = fake_home / 'AppData' / 'Local' / 'Microsoft' / 'WindowsApps' / 'codex.exe'
         alias_stub.parent.mkdir(parents=True)
@@ -4386,7 +4418,8 @@ else:
         engines = self.four_backends()
         target = self.root / 'a.py'
         target.write_text('x=1', encoding='utf-8')
-        args = self.args('batch', '--caller', 'antigravity', '--plan-dir', str(self.root / 'plans'))
+        args = self.args('batch', '--caller', 'antigravity', '--plan-dir', str(self.root / 'plans'),
+                         '--user-prompt', '省额度，只看拼写')
         streams, _ = harness._resolve_plan_streams(args, [{'target': str(target), 'engine': 'codex:review'}], engines)
         ticket = {'streams': streams, 'user_prompt': '省额度，只看拼写'}
         harness._record_quota_exhausted('codex', engines['codex'], 'quota exceeded')
@@ -4445,6 +4478,1248 @@ else:
                 '--spec-file', str(spec), '--plan-dir', str(self.root / 'plans')))
         self.assertTrue(all(stream['succeeded'] for stream in result['streams']))
         self.assertEqual([stream['stream_id'] for stream in result['streams']], [str(i) for i in range(len(specs))])
+
+
+    def test_v1152_latex_escapes_batch_workspace_contention_and_handed_off_resume(self):
+        raw_latex = (
+            '{"win_root": "C:\\\\", "lines": "row1\\nrow2\\tcol2", '
+            '"pde": "\\alpha + \\beta + \\frac{\\partial \\rho}{\\partial t} + \\nabla \\cdot \\tau + \\theta \\times \\text{const} + \\right)"}'
+        )
+        parsed = harness._loads_relaxed_dict(raw_latex)
+        self.assertEqual(parsed['win_root'], 'C:\\')
+        self.assertEqual(parsed['lines'], 'row1\nrow2\tcol2')
+        for macro in ('\\alpha', '\\beta', '\\frac', '\\rho', '\\nabla', '\\tau', '\\theta', '\\times', '\\text{const}', '\\right)'):
+            self.assertIn(macro, parsed['pde'])
+
+        engines = self.four_backends()
+        proj = self.root / 'shared-ws'
+        proj.mkdir()
+        (proj / 'a.py').write_text('x = 1\n', encoding='utf-8')
+        (proj / 'b.py').write_text('y = 2\n', encoding='utf-8')
+        spec = self.root / 'shared_spec.json'
+        spec.write_text(json.dumps([
+            {'stream_id': 'S1', 'channel': 'cae_harness_headless', 'kind': 'code', 'engine': 'codex:code',
+             'target': str(proj), 'write_scope': ['a.py'], 'subtask': '修改 a.py'},
+            {'stream_id': 'S2', 'channel': 'cae_harness_headless', 'kind': 'review', 'engine': 'dsh:review',
+             'target': str(proj / 'b.py'), 'subtask': '审查 b.py'},
+        ]), encoding='utf-8')
+
+        def invoke_shared(spec_str, root, prompt, backends_arg, schema, readonly=True, *a, **kw):
+            if not readonly:
+                time.sleep(0.03)
+                (Path(root) / 'a.py').write_text('x = 2\n', encoding='utf-8')
+            else:
+                time.sleep(0.03)
+            return dict(TASK)
+
+        with patch.object(harness, '_args_backends', return_value=engines), \
+             patch.object(harness, 'invoke_engine', side_effect=invoke_shared), \
+             patch.dict(os.environ, {'CAE_DISABLE_HEAVY_COMPLETIONS': '1'}):
+            rc, batch_out = self.capture(harness.cmd_batch, self.args(
+                'batch', '--caller', 'antigravity', '--spec-file', str(spec), '--plan-dir', str(self.root / 'plans')))
+        self.assertEqual(rc, 0)
+        self.assertEqual([s['status'] for s in batch_out['streams']], ['ok', 'ok'])
+
+        plans = self.root / 'resume-plans'
+        with patch.object(harness, '_args_backends', return_value=engines):
+            _, ticket = self.capture(harness.cmd_plan, self.args(
+                'plan', '--caller', 'antigravity', '--target', str(proj / 'b.py'), '--engine', 'codex:review',
+                '--session-id', 'old_sess', '--plan-dir', str(plans), '--save-ticket',
+                '--workflow-bg', '背景', '--workflow-goal', '目标', '--workflow-impact', '只读'))
+            tid = ticket['ticket_id']
+            self.capture(harness.cmd_plan, self.args('plan', '--mark-handed-off', tid, '--plan-dir', str(plans)))
+            with patch.object(harness, 'inspect_backend_quota_and_availability', return_value={
+                'currently_available': True, 'unavailable_reason': '', 'quota_exceeded': False,
+                'quota_scheme': 'rolling', 'quota_summary': '5h 已用 19%'
+            }):
+                _, resumed = self.capture(harness.cmd_plan, self.args('plan', '--resume-ticket', tid, '--plan-dir', str(plans)))
+        self.assertEqual(resumed['status'], 'HANDED_OFF')
+        self.assertEqual(json.loads((plans / 'session_old_sess_pending.json').read_text(encoding='utf-8'))['status'], 'HANDED_OFF')
+
+    def test_v1152_scope_dir_globstar_plugin_data_align_and_router_defaults(self):
+        # 1) --write-scope 目录前缀与零层 /**/ 通配匹配
+        dir_scopes = harness._scope_patterns(['src/', 'include', 'lib/**/*.py'])
+        for allowed in ('src/solver.py', 'src/sub/flux.py', 'src/', 'include/header.h', 'lib/top.py', 'lib/a/b/deep.py'):
+            self.assertTrue(harness._scope_matches(allowed, dir_scopes), allowed)
+        for forbidden in ('src_other/solver.py', 'include_bak/a.h', 'tests/top.py'):
+            self.assertFalse(harness._scope_matches(forbidden, dir_scopes), forbidden)
+        # 2) PLUGIN_DATA / USER_GUARD_STATE_DIR 与 resolve_dispatch_plan_dir 对齐
+        custom_pd = self.root / 'custom-plugin-data'
+        with patch.dict(os.environ, {'PLUGIN_DATA': str(custom_pd)}, clear=True):
+            self.assertEqual(harness.resolve_dispatch_plan_dir(), (custom_pd / 'state' / 'dispatch_plans').resolve())
+        custom_st = self.root / 'custom-state'
+        with patch.dict(os.environ, {'PLUGIN_DATA': str(custom_pd), 'USER_GUARD_STATE_DIR': str(custom_st)}, clear=True):
+            self.assertEqual(harness.resolve_dispatch_plan_dir(), (custom_st / 'dispatch_plans').resolve())
+        # 3) 局部覆盖 router.json 合并默认路由表且 _claude_card_quota 展开简称别名
+        cl_home = self.root / 'partial-router-claude'
+        (cl_home / 'router').mkdir(parents=True)
+        db_p = self.root / 'partial-cc.db'
+        with contextlib.closing(sqlite3.connect(db_p)) as con, con:
+            con.execute('CREATE TABLE providers (id TEXT, app_type TEXT, name TEXT, is_current INT, settings_config TEXT, meta TEXT)')
+            con.execute('INSERT INTO providers VALUES (?,?,?,?,?,?)', ('k1', 'claude', 'Kimi', 0, json.dumps({'env': {'ANTHROPIC_AUTH_TOKEN': 'PASTE_KIMI_API_KEY_HERE'}}), json.dumps({'usage_script': {'templateType': 'token_plan'}})))
+            con.execute('INSERT INTO providers VALUES (?,?,?,?,?,?)', ('d1', 'claude', 'DeepSeek', 0, json.dumps({'env': {'ANTHROPIC_AUTH_TOKEN': 'tok_ds_real_99'}}), json.dumps({'usage_script': {'templateType': 'balance'}})))
+        (cl_home / 'router/router.json').write_text(json.dumps({'port': 8255, 'ccswitch_db': str(db_p)}), encoding='utf-8')
+        r_info = {'config_home': str(cl_home), 'uses_local_router': True, 'model': 'k3.1-pro[1m]'}
+        with self.assertRaisesRegex(harness.HarnessError, 'Kimi'):
+            harness._verify_claude_router_card_key(r_info, 'kimi')
+        harness._verify_claude_router_card_key(r_info, 'ds')
+        self.assertEqual(harness._claude_card_quota(r_info, 'ds')['quota_scheme'], 'balance')
+
+    def test_v1152_override_json_validation_snapshot_build_and_ticket_scope(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / 'src').mkdir()
+            (root / 'src' / 'safe.py').write_text('x = 1\n', encoding='utf-8')
+            (root / 'src' / 'critical.py').write_text('y = 2\n', encoding='utf-8')
+            (root / 'build').mkdir()
+            (root / 'build' / 'verify.sh').write_text('exit 1\n', encoding='utf-8')
+
+            # B5: build/ & authorized ignored dirs must not be blind-spotted
+            scopes = harness._scope_patterns(['src/*'])
+            gate_ignored = harness._snapshot_ignore_dirs_for(scopes, include_build=True)
+            before = harness.snapshot_files(root, ignore_dirs=gate_ignored)
+            (root / 'build' / 'verify.sh').write_text('exit 0\n', encoding='utf-8')
+            rep = harness._safe_changes_report(before, root, scopes, readonly=False, ignore_dirs=gate_ignored)
+            self.assertEqual(rep['changed_files'], ['build/verify.sh'])
+            self.assertEqual(rep['scope_violations'], ['build/verify.sh'])
+
+            # B7: _check_ticket_execution must reject tampered write_scope or verify_cmd
+            class FakeArgs:
+                timeout = 600
+                _approved_ticket = {
+                    'streams': [{
+                        'channel': 'cae_harness_headless',
+                        'target': str(root),
+                        'kind': 'gate',
+                        'execution_profile': {'spec': 'codex:gpt-5.4'},
+                        'tier': 'max',
+                        'timeout': 600,
+                        'subtask': 'fix safe',
+                        'write_scope': ['src/safe.py'],
+                        'verify_cmd': 'pytest -q',
+                    }]
+                }
+            prof = {'spec': 'codex:gpt-5.4', 'tier': 'max'}
+            harness._check_ticket_execution(FakeArgs(), prof, root, 'gate', 'fix safe',
+                                            write_scope=['src/safe.py'], verify_cmd='pytest -q')
+            with self.assertRaisesRegex(harness.HarnessError, '写入范围.*src/safe.py'):
+                harness._check_ticket_execution(FakeArgs(), prof, root, 'gate', 'fix safe',
+                                                write_scope=['src/critical.py'], verify_cmd='pytest -q')
+            with self.assertRaisesRegex(harness.HarnessError, '验收命令.*pytest -q'):
+                harness._check_ticket_execution(FakeArgs(), prof, root, 'gate', 'fix safe',
+                                                write_scope=['src/safe.py'], verify_cmd='true')
+
+            # B4: cmd_plan --approve-ticket --override-json rejects unknown stream_id, null value, bogus tier
+            plan_dir = root / 'plans'
+            ticket = {
+                'ticket_id': 't_b4_01',
+                'status': 'PENDING',
+                'created_at': 1.0,
+                'expires_at': 9999999999.0,
+                'session_id': 's1',
+                'workflow_bg': 'bg',
+                'user_prompt': '',
+                'workflow_goal': 'goal',
+                'workflow_impact': 'impact',
+                'streams': [{
+                    'stream_id': 'S1', 'subtask': 'check', 'target': str(root), 'kind': 'review',
+                    'channel': 'cae_harness_headless', 'engine': 'codex:gpt-5.4', 'requested_engine': 'codex:gpt-5.4',
+                    'requested_model': '', 'model': 'gpt-5.4', 'model_display': 'gpt-5.4', 'tier': 'max',
+                    'timeout': 600, 'context_window': 200000, 'currently_available': True,
+                    'unavailable_reason': None, 'quota_exceeded': False, 'quota_scheme': 'x',
+                    'quota_summary': 'ok', 'client': 'codex', 'agent_type': 'readonly-collaborator',
+                    'headless': True, 'clean_room': False, 'access_mode': '只读', 'write_scope': [],
+                    'verify_cmd': '', 'inline_readonly': True, 'receipt_location': 'r',
+                    'execution_profile': {'spec': 'codex:gpt-5.4', 'model': 'gpt-5.4', 'reasoning_effort': 'high', 'cli_effort': 'high'},
+                }],
+                'is_heavy': False,
+                'capability_ledger': {},
+            }
+            harness._save_plan(ticket, plan_dir)
+            for bad_ov in ('{"s1": {"tier": "low"}}', '{"S1": null}', '{"S1": {"tier": "bogus"}}', '{"S1": {"timeout": -5}}'):
+                with self.subTest(bad_ov=bad_ov), self.assertRaises(harness.HarnessError):
+                    harness.cmd_plan(self.args('plan', '--plan-dir', str(plan_dir), '--approve-ticket', 't_b4_01', '--override-json', bad_ov))
+
+    def test_v1152_heavy_completion_cross_process_lock_and_batch_verify_tail(self):
+        import concurrent.futures
+        with tempfile.TemporaryDirectory() as td:
+            td_p = Path(td)
+            plan_dir = td_p / 'state' / 'dispatch_plans'
+            plan_dir.mkdir(parents=True)
+            (td_p / 'state' / 'heavy_completions').mkdir(parents=True)
+            ws = td_p / 'ws'
+            ws.mkdir()
+            (ws / 'a.py').write_text('x = 1\n', encoding='utf-8')
+            worker_code = (
+                "import importlib.util, os, sys; from types import SimpleNamespace; "
+                "spec = importlib.util.spec_from_file_location('ch', sys.argv[1]); "
+                "ch = importlib.util.module_from_spec(spec); spec.loader.exec_module(ch); "
+                "args = SimpleNamespace(dry_run=False, subcommand='gate', ticket='', kind='code', target=sys.argv[3], "
+                "user_prompt='hi', timeout=600, output='', session_id=sys.argv[4], plan_dir=sys.argv[2]); "
+                "p = {'status': 'ok', 'engine': 'codex:gpt-5.4', 'model': 'gpt-5.4', 'token_usage_summary': {'total_tokens': 10}}; "
+                "[ch.record_heavy_completion_for_stop_hook(args, dict(p)) for _ in range(6)]"
+            )
+            script_path = str(Path(harness.__file__).resolve())
+            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+                futs = [pool.submit(subprocess.run, [sys.executable, '-B', '-c', worker_code, script_path, str(plan_dir), str(ws), 'race-o1'],
+                                    capture_output=True, text=True) for _ in range(3)]
+                for f in futs:
+                    self.assertEqual(f.result().returncode, 0, f.result().stderr)
+            hc_entries = json.loads((td_p / 'state' / 'heavy_completions' / 'race-o1.json').read_text(encoding='utf-8'))
+            self.assertEqual(len(hc_entries), 18)
+
+            # O3: cmd_batch gate failure retains verify_exit_code and verify_output_tail
+            spec_file = td_p / 'spec.json'
+            spec_file.write_text(json.dumps([{
+                'stream_id': 'S1', 'target': str(ws), 'kind': 'gate', 'engine': 'codex:gpt-5.4',
+                'write_scope': ['a.py'], 'verify_cmd': f'"{sys.executable}" -c "import sys; print(\'boom-diag\'); sys.exit(7)"',
+            }]), encoding='utf-8')
+            codex_home = td_p / 'codex_home'
+            codex_home.mkdir()
+            (codex_home / 'auth.json').write_text(json.dumps({'tokens': {'access_token': 'tok_valid_123456'}}), encoding='utf-8')
+            (codex_home / 'config.toml').write_text('model = "gpt-5.4"\n', encoding='utf-8')
+            (codex_home / 'models_cache.json').write_text(json.dumps({
+                'models': [{'slug': 'gpt-5.4', 'supported_reasoning_levels': [{'effort': 'high'}]}]
+            }), encoding='utf-8')
+            fake_bin = td_p / 'codex'
+            fake_bin.write_text('#!/bin/sh\nexit 0\n', encoding='utf-8')
+            fake_bin.chmod(0o755)
+            with unittest.mock.patch.dict(os.environ, {'CODEX_HOME': str(codex_home), 'CAE_CODEX_BINARY': str(fake_bin), 'CAE_PLAN_STATE_DIR': str(plan_dir)}),                  unittest.mock.patch.object(harness, 'invoke_engine', return_value={'summary': 'ok', 'content': 'done', 'evidence': [], 'unverified': []}):
+                code, out = self.capture(harness.cmd_batch, self.args('batch', '--spec-file', str(spec_file), '--caller', 'claude'))
+            self.assertNotEqual(code, 0)
+            self.assertEqual(out['streams'][0]['status'], 'verification_failed')
+            self.assertEqual(out['streams'][0]['verify_exit_code'], 7)
+            self.assertIn('boom-diag', out['streams'][0]['verify_output_tail'])
+
+    def test_shard1_f1_f4_agentignore_pinning_and_wildcard_ignore_dirs(self):
+        ws = self.root / 'f1-ws'
+        ws.mkdir()
+        (ws / 'safe.py').write_text('x = 1\n', encoding='utf-8')
+        (ws / '.agentignore').write_text('*\n.agentignore\n', encoding='utf-8')
+        snap_star = harness.snapshot_files(ws)
+        self.assertIn('.agentignore', snap_star)
+        self.assertNotIn('safe.py', snap_star)
+
+        # F1(2): 子进程运行期篡改/新建 .agentignore 不得掩盖越界写入
+        ws2 = self.root / 'f1-tamper'
+        ws2.mkdir()
+        (ws2 / 'safe.py').write_text('x = 1\n', encoding='utf-8')
+
+        def sneaky_worker(*_a, **_kw):
+            (ws2 / '.agentignore').write_text('*\nevil.py\n.agentignore\n', encoding='utf-8')
+            (ws2 / 'evil.py').write_text('pwned = True\n', encoding='utf-8')
+            return dict(TASK)
+
+        with patch.object(harness, '_args_backends', return_value=backends()), \
+             patch.object(harness, 'invoke_engine', side_effect=sneaky_worker):
+            rc, rep = self.capture(harness.cmd_task, self.args(
+                'task', '--target', str(ws2), '--caller', 'antigravity', '--kind', 'code',
+                '--write-scope', 'safe.py', '--task', '只改 safe.py'))
+        self.assertEqual(rc, harness.EXIT_CODES['scope_violation'])
+        self.assertEqual(rep['status'], 'scope_violation')
+        self.assertIn('.agentignore', rep['scope_violations'])
+        self.assertIn('evil.py', rep['scope_violations'])
+
+        # F4: 通配首段目录解封 + cmd_gate/cmd_task 统一透传 ignore_dirs/ignore_patterns
+        ign = harness._snapshot_ignore_dirs_for(['dist*/*'], include_build=True)
+        self.assertNotIn('dist', ign)
+        self.assertNotIn('build', ign)
+        self.assertIn('.git', ign)
+
+        ws3 = self.root / 'f4-ws'
+        (ws3 / 'dist').mkdir(parents=True)
+        (ws3 / 'build').mkdir(parents=True)
+        (ws3 / 'dist' / 'artifact.py').write_text('a = 1\n', encoding='utf-8')
+        (ws3 / 'build' / 'existing.o').write_text('obj\n', encoding='utf-8')
+        (ws3 / '.agentignore').write_text('ignored_note.txt\n', encoding='utf-8')
+        (ws3 / 'ignored_note.txt').write_text('note\n', encoding='utf-8')
+
+        calls = []
+        def invoke_fallback(spec_str, *_a, receipt=None, **_kw):
+            calls.append(spec_str)
+            if spec_str.startswith('codex:'):
+                if receipt is not None:
+                    receipt['startup_only'] = True
+                raise harness.HarnessError('quota', 'quota_exhausted', preflight_blocked=True)
+            return dict(TASK)
+
+        with patch.object(harness, '_args_backends', return_value=backends()), \
+             patch.object(harness, 'invoke_engine', side_effect=invoke_fallback):
+            rc_ok, rep_ok = self.capture(harness.cmd_task, self.args(
+                'task', '--target', str(ws3), '--caller', 'antigravity', '--kind', 'code',
+                '--write-scope', 'dist*/*', '--fallback-on-quota', '--task', '更新 dist'))
+        self.assertEqual(rc_ok, 0)
+        self.assertEqual(rep_ok['status'], 'ok')
+        self.assertTrue(rep_ok['engine'].startswith('agy:'))
+        self.assertEqual(len(calls), 2)
+
+        gate_before = harness.snapshot_files(ws3, ignore_dirs=ign, ignore_patterns=harness.read_agentignore_patterns(ws3))
+        (ws3 / 'build' / 'dirty.o').write_text('dirty\n', encoding='utf-8')
+        fake_gate_res = {
+            'status': 'quota_exhausted', 'scope_verified': True, 'changed_files': [],
+            'worker_changed_files': [], 'verification_changed_files': [], 'rounds_used': 1,
+            'history': [{'verification_executed': False, 'verify_exit_code': None, 'preflight_blocked': True, 'invocation': {}}],
+        }
+        self.assertFalse(harness._gate_can_replay(fake_gate_res, gate_before, ws3, ignore_dirs=ign))
+
+    def test_shard1_f2_subscription_model_case_insensitive_and_1m_suffix(self):
+        fp = json.loads(json.dumps(harness._fleet_profile()))
+        fp.setdefault('subscription_matrix', {}).setdefault('models', {})['k3.1-pro'] = {
+            'agent': 'claude', 'enabled': False, 'quota_scheme': 'token_plan',
+        }
+        fp['subscription_matrix']['models']['deepseek-r2-pro'] = {
+            'agent': 'dsh', 'enabled': True, 'quota_scheme': 'api_balance',
+        }
+        engines = self.four_backends()
+        with patch.object(harness, '_fleet_profile', return_value=fp):
+            self.assertIs(harness._subscription_model('K3.1-Pro[1m]').get('enabled'), False)
+            self.assertIs(harness._subscription_model('k3.1-pro[1M]').get('enabled'), False)
+            self.assertFalse(harness._is_subscription_enabled('claude', 'K3.1-Pro[1m]'))
+            with self.assertRaises(harness.HarnessError) as ctx:
+                harness.choose_engine(engines, 'antigravity', 'claude:K3.1-Pro[1m]')
+            self.assertEqual(ctx.exception.status, 'subscription_disabled')
+            self.assertEqual(harness._prompt_engine_spec(engines, '请使用 DeepSeek-R2-Pro[1m] 检查'), 'dsh:DeepSeek-R2-Pro[1m]')
+            with self.assertRaises(harness.HarnessError) as ctx2:
+                harness.choose_engine(engines, 'antigravity', '', user_prompt='请用 K3.1-Pro[1m] 审查')
+            self.assertEqual(ctx2.exception.status, 'subscription_disabled')
+
+    def test_shard1_f3_plan_override_native_engine_user_prompt_agy_family_and_batch_ticket(self):
+        engines = self.four_backends()
+        engines['agy']['models'] = [
+            {'slug': 'gemini-7-pro-low', 'display_name': 'Gemini 7 Pro Low'},
+            {'slug': 'gemini-7-pro-high', 'display_name': 'Gemini 7 Pro High'},
+            {'slug': 'gemini-7-flash-low', 'display_name': 'Gemini 7 Flash Low'},
+        ]
+        engines['codex']['models'] = [
+            {'slug': 'gpt-5.4-mini', 'provider': 'openai', 'model_specialty': 'fast',
+             'context_window': 128000, 'max_context_window': 128000, 'supported_efforts': ['low', 'medium']},
+            {'slug': 'gpt-5.4-sol', 'provider': 'openai', 'model_specialty': 'engineering',
+             'context_window': 800000, 'max_context_window': 800000, 'supported_efforts': ['low', 'high', 'max']},
+        ]
+        target = self.root / 'solver.py'
+        target.write_text('u = 1\n', encoding='utf-8')
+        plans = self.root / 'f3-plans'
+
+        with patch.object(harness, '_args_backends', return_value=engines), \
+             patch.dict(os.environ, {'CAE_DISABLE_HEAVY_COMPLETIONS': '1'}):
+            _, native_ticket = self.capture(harness.cmd_plan, self.args(
+                'plan', '--caller', 'codex', '--channel', 'native_subagent', '--target', str(target),
+                '--plan-dir', str(plans), '--save-ticket'))
+            with self.assertRaises(harness.HarnessError) as nat_err:
+                harness.cmd_plan(self.args(
+                    'plan', '--caller', 'codex', '--plan-dir', str(plans),
+                    '--approve-ticket', native_ticket['ticket_id'],
+                    '--override-json', json.dumps({'S1': {'engine': 'dsh:default'}})))
+            self.assertEqual(nat_err.exception.status, 'ticket_invalid')
+
+            _, prompt_ticket = self.capture(harness.cmd_plan, self.args(
+                'plan', '--caller', 'antigravity', '--target', str(target), '--plan-dir', str(plans),
+                '--user-prompt', '用 dsh 低挡快速看一下拼写', '--save-ticket'))
+            self.assertEqual(prompt_ticket['streams'][0]['tier'], 'low')
+            _, approved = self.capture(harness.cmd_plan, self.args(
+                'plan', '--caller', 'antigravity', '--plan-dir', str(plans),
+                '--approve-ticket', prompt_ticket['ticket_id'],
+                '--override-json', json.dumps({'S1': {'engine': 'codex:default', 'tier': 'max'}})))
+            self.assertEqual(approved['status'], 'APPROVED')
+            self.assertEqual(approved['streams'][0]['tier'], 'max')
+            self.assertEqual(approved['streams'][0]['model'], 'gpt-5.4-sol')
+            saved_raw = json.loads((plans / f"{prompt_ticket['ticket_id']}.json").read_text(encoding='utf-8'))
+            self.assertFalse(any(k.startswith('_') for k in saved_raw['streams'][0]))
+            saved_raw['streams'][0]['estimated_tokens'] = 300000
+            harness._save_plan(saved_raw, plans)
+
+            seen_profiles = []
+            def fake_invoke(_spec, *_a, profile=None, **_kw):
+                seen_profiles.append(profile)
+                return dict(TASK)
+
+            with patch.object(harness, 'invoke_engine', side_effect=fake_invoke):
+                rc_b, batch_ok = self.capture(harness.cmd_batch, self.args(
+                    'batch', '--caller', 'antigravity', '--plan-dir', str(plans), '--ticket', prompt_ticket['ticket_id']))
+            self.assertEqual(rc_b, 0)
+            self.assertEqual(batch_ok['streams'][0]['status'], 'ok')
+            self.assertEqual(seen_profiles[-1]['tier'], 'max')
+            self.assertEqual(seen_profiles[-1]['cli_effort'], 'max')
+
+            drifted_engines = json.loads(json.dumps(engines))
+            drifted_engines['codex']['models'][1]['supported_efforts'] = ['low', 'high']
+            with patch.object(harness, '_args_backends', return_value=drifted_engines), \
+                 patch.object(harness, 'invoke_engine', side_effect=fake_invoke):
+                rc_drift, batch_drift = self.capture(harness.cmd_batch, self.args(
+                    'batch', '--caller', 'antigravity', '--plan-dir', str(plans), '--ticket', prompt_ticket['ticket_id']))
+            self.assertNotEqual(rc_drift, 0)
+            self.assertEqual(batch_drift['streams'][0]['status'], 'ticket_invalid')
+
+            _, agy_ticket = self.capture(harness.cmd_plan, self.args(
+                'plan', '--caller', 'codex', '--engine', 'agy:default', '--target', str(target),
+                '--plan-dir', str(plans), '--save-ticket'))
+            self.assertEqual(agy_ticket['streams'][0]['model'], 'gemini-7-pro-high')
+            _, agy_approved = self.capture(harness.cmd_plan, self.args(
+                'plan', '--caller', 'codex', '--plan-dir', str(plans),
+                '--approve-ticket', agy_ticket['ticket_id'],
+                '--override-json', json.dumps({'S1': {'tier': 'low'}})))
+            self.assertEqual(agy_approved['status'], 'APPROVED')
+            self.assertEqual(agy_approved['streams'][0]['model'], 'gemini-7-pro-low')
+            self.assertEqual(agy_approved['streams'][0]['execution_profile']['spec'], 'agy:gemini-7-pro-low')
+            with patch.object(harness, 'invoke_engine', return_value=dict(TASK)):
+                rc_agy, batch_agy = self.capture(harness.cmd_batch, self.args(
+                    'batch', '--caller', 'codex', '--plan-dir', str(plans), '--ticket', agy_ticket['ticket_id']))
+            self.assertEqual(rc_agy, 0)
+            self.assertEqual(batch_agy['streams'][0]['status'], 'ok')
+
+    def test_shard1_f5_pure_control_collision_latex_escapes_repaired(self):
+        formula = r'\frac{\rho}{\beta} + \nabla \cdot \tau + \theta \times \text{flux} + \right)'
+        raw_json = (
+            '{"summary": "已核验", "content": "' + formula + '", '
+            '"evidence": ["line1\\nline2\\tcol"], "unverified": []}'
+        )
+        self.assertIn(r'\frac', raw_json)
+        self.assertNotIn(r'\\frac', raw_json)
+        self.assertTrue(harness._has_unrepaired_latex_escape(raw_json))
+        self.assertFalse(harness._has_unrepaired_latex_escape(json.dumps({'content': r'\frac{1}{2}'})))
+
+        expected_macros = (r'\frac', r'\rho', r'\beta', r'\nabla', r'\tau', r'\theta', r'\times', r'\text{flux}', r'\right)')
+        for variant in (
+            raw_json,
+            '```json\n' + raw_json + '\n```',
+            '说明文字 "未闭合引号:\n' + raw_json,
+        ):
+            decoded = harness._extract_json_object(variant, harness.TASK_JSON_SCHEMA)
+            for macro in expected_macros:
+                self.assertIn(macro, decoded['content'])
+            self.assertEqual(decoded['evidence'], ['line1\nline2\tcol'])
+        relaxed = harness._loads_relaxed_dict(raw_json)
+        for macro in expected_macros:
+            self.assertIn(macro, relaxed['content'])
+
+    def test_shard1_f6_input_type_guards_router_corruption_and_ccswitch_null_meta(self):
+        self.assertEqual(harness._scope_patterns(None), [])
+        self.assertEqual(harness._scope_patterns('src/a.py'), ['src/a.py'])
+        for bad_scope in (123, {'a': 'b'}, [123], [None]):
+            with self.subTest(bad_scope=bad_scope), self.assertRaises(harness.HarnessError):
+                harness._scope_patterns(bad_scope)
+
+        for bad_tier in ('bogus', 'minimal', 123):
+            with self.subTest(bad_tier=bad_tier), self.assertRaises(harness.HarnessError):
+                harness.select_task_tier(bad_tier)
+
+        engines = self.four_backends()
+        target = self.root / 'ok.py'
+        target.write_text('x = 1\n', encoding='utf-8')
+        plan_args = self.args('plan', '--caller', 'antigravity', '--target', str(target))
+        for bad_stream in (
+            {'target': 123},
+            {'engine': ['codex']},
+            {'model': 456},
+            {'subtask': ['not-str']},
+            {'agent_type': 789},
+            {'tier': 'bogus'},
+            {'tier': 10},
+        ):
+            with self.subTest(bad_stream=bad_stream), self.assertRaises(harness.HarnessError):
+                harness._resolve_plan_streams(plan_args, [bad_stream], engines)
+
+        cl_home = self.root / 'corrupt-router-claude'
+        (cl_home / 'router').mkdir(parents=True)
+        (cl_home / 'router' / 'router.json').write_text('{corrupt json', encoding='utf-8')
+        with self.assertRaises(harness.HarnessError):
+            harness._load_claude_router_config(cl_home, require_valid_file=True)
+        fallback_cfg = harness._load_claude_router_config(cl_home, require_valid_file=False)
+        self.assertEqual(fallback_cfg['default_key_from_card'], 'Kimi')
+
+        db_p = self.root / 'null-meta.db'
+        with contextlib.closing(sqlite3.connect(db_p)) as con, con:
+            con.execute('CREATE TABLE providers (id TEXT, app_type TEXT, name TEXT, is_current INT, meta TEXT)')
+            con.execute('INSERT INTO providers VALUES (?,?,?,?,?)', ('p1', 'claude', 'Kimi', 1, 'null'))
+            con.execute('INSERT INTO providers VALUES (?,?,?,?,?)', ('p2', 'claude', 'BadUsage', 0, json.dumps({'usage_script': 'str-val'})))
+        (cl_home / 'router' / 'router.json').write_text(json.dumps({'ccswitch_db': str(db_p)}), encoding='utf-8')
+        q1 = harness._claude_card_quota({'config_home': str(cl_home)}, 'kimi-k3')
+        self.assertEqual(q1['quota_scheme'], 'ccswitch_card_dependent')
+        with contextlib.closing(sqlite3.connect(db_p)) as con, con:
+            con.execute("UPDATE providers SET is_current=0")
+            con.execute("UPDATE providers SET is_current=1 WHERE name='BadUsage'")
+        q2 = harness._claude_card_quota({'config_home': str(cl_home)}, '')
+        self.assertEqual(q2['quota_scheme'], 'ccswitch_card_dependent')
+
+    def test_shard1_f7_f9_batch_quota_short_reset_preservation_and_claude_errors_list(self):
+        claude_err_env = {'type': 'result', 'subtype': 'error_during_execution', 'is_error': True,
+                          'errors': ['API Error: Credit balance is too low']}
+        with self.assertRaises(harness.HarnessError) as c_exc:
+            harness._check_output_status(claude_err_env)
+        self.assertEqual(c_exc.exception.status, 'quota_exhausted')
+        self.assertIn('Credit balance is too low', c_exc.exception.details['error'])
+
+        proc = subprocess.CompletedProcess(['claude'], 1, json.dumps(claude_err_env), '')
+        diag = harness._backend_diagnostics(proc, structured_only=True)
+        self.assertTrue(harness._is_quota_exhausted(diag))
+
+        ok_env = {'type': 'result', 'is_error': False, 'errors': [], 'structured_output': dict(TASK)}
+        self.assertEqual(harness._extract_json_object(json.dumps(ok_env), harness.TASK_JSON_SCHEMA), TASK)
+
+        engines = self.four_backends()
+        ws = self.root / 'f7-ws'
+        ws.mkdir()
+        (ws / 'a.py').write_text('x = 1\n', encoding='utf-8')
+        spec = self.root / 'f7-spec.json'
+        spec.write_text(json.dumps([
+            {'stream_id': 'S1', 'target': str(ws / 'a.py'), 'engine': 'codex:review', 'subtask': '审1'},
+            {'stream_id': 'S2', 'target': str(ws / 'a.py'), 'engine': 'codex:review', 'subtask': '审2'},
+        ]), encoding='utf-8')
+        hd = {**harness._headless_tunables(), 'batch_max_workers_per_backend': {'codex': 1}}
+
+        def invoke_short_quota(_spec, *_a, batch=None, **_kw):
+            cd = harness._record_quota_exhausted('codex', engines['codex'], 'usage limit reached, resets in 2m', batch=batch)
+            raise harness.HarnessError('codex 额度不足', 'quota_exhausted', preflight_blocked=False,
+                                       **harness._quota_user_choices('codex', cd))
+
+        with patch.object(harness, '_args_backends', return_value=engines), \
+             patch.object(harness, '_headless_tunables', return_value=hd), \
+             patch.object(harness, 'invoke_engine', side_effect=invoke_short_quota), \
+             patch.dict(os.environ, {'CAE_DISABLE_HEAVY_COMPLETIONS': '1'}):
+            _, res = self.capture(harness.cmd_batch, self.args('batch', '--caller', 'antigravity', '--spec-file', str(spec)))
+        self.assertEqual([s['status'] for s in res['streams']], ['quota_exhausted', 'quota_exhausted'])
+        self.assertTrue(res['streams'][1].get('queue_aborted'))
+        active_cd = harness._active_quota_record('codex', engines['codex'])
+        self.assertLess(active_cd['cooldown_until_epoch'] - time.time(), 300)
+
+        approved_f7 = {
+            'streams': [{
+                'stream_id': 'S1', 'channel': 'cae_harness_headless', 'target': str(ws / 'a.py'),
+                'kind': 'review', 'engine': 'codex:fixture-code', 'tier': 'max', 'timeout': 60, 'subtask': '审1',
+                'execution_profile': {'spec': 'codex:fixture-code', 'model': 'fixture-code', 'cli_effort': 'max'},
+            }],
+            'user_prompt': '',
+        }
+        with patch.object(harness, '_begin_dispatch', side_effect=lambda a: setattr(a, '_approved_ticket', approved_f7)), \
+             patch.object(harness, '_args_backends', return_value=engines), \
+             patch.object(harness, 'invoke_engine') as never_inv, \
+             patch.dict(os.environ, {'CAE_DISABLE_HEAVY_COMPLETIONS': '1'}):
+            _, res2 = self.capture(harness.cmd_batch, self.args('batch', '--caller', 'antigravity'))
+        never_inv.assert_not_called()
+        self.assertTrue(res2['streams'][0].get('preflight_blocked'))
+        active_cd2 = harness._active_quota_record('codex', engines['codex'])
+        self.assertLess(active_cd2['cooldown_until_epoch'] - time.time(), 300)
+
+    def test_shard1_f8_redact_public_hyphen_keys_unc_macos_paths_and_quota_summary(self):
+        sample = {
+            'x-api-key': 'secret-val-1',
+            'auth-token': 'secret-val-2',
+            'access-token': 'secret-val-3',
+            'private-key': 'secret-val-4',
+            'win_multi': r'C:\\Users\\alice\\project\\main.py',
+            'wsl_loc': r'\\wsl.localhost\Ubuntu-24.04\home\alice\solver\run.py',
+            'wsl_dollar': r'\\wsl$\Debian\home\bob\mesh.py',
+            'mac_home': '/Users/charlie/Documents/paper.tex',
+            'mixed_summary': 'field quota_summary shows 5h_window:42.5% used',
+        }
+        redacted = harness._redact_public(sample)
+        for k in ('x-api-key', 'auth-token', 'access-token', 'private-key'):
+            self.assertEqual(redacted[k], '<redacted>')
+        for path_key, leaked_user in (('win_multi', 'alice'), ('wsl_loc', 'alice'), ('wsl_dollar', 'bob'), ('mac_home', 'charlie')):
+            self.assertIn('<HOME>', redacted[path_key])
+            self.assertNotIn(leaked_user, redacted[path_key])
+        self.assertNotIn('42.5%', redacted['mixed_summary'])
+        self.assertIn('<USAGE>', redacted['mixed_summary'])
+
+    def test_shard1_f10_grounding_git_anchor_root_validation_base_ref_and_baseline_exemptions(self):
+        repo_dir = self.root / 'f10-git-proj'
+        (repo_dir / 'src').mkdir(parents=True)
+        (repo_dir / 'docs' / 'guide').mkdir(parents=True)
+        (repo_dir / 'src' / 'flux_solver.py').write_text(
+            'parser.add_argument("--cfl-max")\nDGSEM_FLUX_LIMIT = 4096\n', encoding='utf-8'
+        )
+        doc_file = repo_dir / 'docs' / 'guide' / 'manual.md'
+        doc_file.write_text('使用 `flux_solver.py --cfl-max` 与历史参数 `runner --legacy-flag` 及 `legacy_cfg.toml`（阈值 4096 tokens）。\n', encoding='utf-8')
+        subprocess.run(['git', 'init'], cwd=repo_dir, check=True, capture_output=True, timeout=15)
+        subprocess.run(['git', 'config', 'user.email', 'test@example.com'], cwd=repo_dir, check=True, capture_output=True, timeout=15)
+        subprocess.run(['git', 'config', 'user.name', 'Test'], cwd=repo_dir, check=True, capture_output=True, timeout=15)
+        subprocess.run(['git', 'add', '.'], cwd=repo_dir, check=True, capture_output=True, timeout=15)
+        subprocess.run(['git', 'commit', '-m', 'init'], cwd=repo_dir, check=True, capture_output=True, timeout=15)
+
+        self.assertEqual(harness._infer_project_anchor_root(doc_file), repo_dir.resolve())
+
+        rep_clean = harness.audit_doc_grounding(doc_file, root_dir=repo_dir / 'docs', base_ref='HEAD',
+                                                allow_files=[repo_dir / 'src' / 'flux_solver.py'])
+        self.assertTrue(rep_clean['ok'], rep_clean['findings'])
+
+        with self.assertRaises(harness.HarnessError):
+            harness.audit_doc_grounding(doc_file, root_dir=self.root / 'no-such-root')
+        with self.assertRaises(harness.HarnessError):
+            harness.audit_doc_grounding(doc_file, allow_files=[self.root / 'no-such-allow.txt'])
+        for bad_ref in ('nonexistent_branch_xyz', '-bad-opt'):
+            with self.assertRaises(harness.HarnessError):
+                harness.audit_doc_grounding(doc_file, base_ref=bad_ref)
+
+        polished_ok = {'summary': '润色完成', 'content': doc_file.read_text(encoding='utf-8'), 'evidence': [], 'unverified': []}
+        polished_bad = {'summary': '润色完成', 'content': doc_file.read_text(encoding='utf-8') + '新增 `runner --invented-flag` 与 `ghost_cfg.toml`。\n',
+                        'evidence': [], 'unverified': []}
+        with patch.object(harness, '_args_backends', return_value=backends()), \
+             patch.object(harness, 'invoke_engine', return_value=polished_ok):
+            _, pol_rep1 = self.capture(harness.cmd_task, self.args(
+                'task', '--target', str(doc_file), '--caller', 'antigravity', '--kind', 'polish', '--task', '润色文档'))
+        self.assertTrue(pol_rep1['grounding_audit']['ok'], pol_rep1['grounding_audit']['findings'])
+
+        with patch.object(harness, '_args_backends', return_value=backends()), \
+             patch.object(harness, 'invoke_engine', return_value=polished_bad):
+            _, pol_rep2 = self.capture(harness.cmd_task, self.args(
+                'task', '--target', str(doc_file), '--caller', 'antigravity', '--kind', 'polish', '--task', '润色文档'))
+        self.assertFalse(pol_rep2['grounding_audit']['ok'])
+        tokens_hit = {f['token'] for f in pol_rep2['grounding_audit']['findings']}
+        self.assertIn('--invented-flag', tokens_hit)
+        self.assertIn('ghost_cfg.toml', tokens_hit)
+
+    def test_shard1_f11_f12_i1_clean_room_four_files_batch_scope_heavy_hook_and_interop_stdin(self):
+        cr_dir = self.root / 'f11-dir'
+        cr_dir.mkdir()
+        (cr_dir / 'solver.py').write_text('k = 1\n', encoding='utf-8')
+        instr_names = ('AGENTS.md', 'AGENTS.override.md', 'CLAUDE.md', 'CLAUDE.local.md')
+        for fn in instr_names:
+            (cr_dir / fn).write_text(f'rule in {fn}\n', encoding='utf-8')
+
+        staged_dir = harness._stage_wsl_readonly_workspace(cr_dir, self.root / 'f11-stage-dir', None, exclude_agent_instructions=True)
+        self.assertTrue((staged_dir / 'solver.py').is_file())
+        for fn in instr_names:
+            self.assertFalse((staged_dir / fn).exists(), fn)
+        dir_prompt = harness._inline_readonly_prompt('检查', cr_dir, None, exclude_agent_instructions=True)
+        self.assertIn('=== FILE: solver.py ===', dir_prompt)
+        for fn in instr_names:
+            self.assertNotIn(f'=== FILE: {fn} ===', dir_prompt)
+
+        for idx, fn in enumerate(instr_names):
+            single_stage = harness._stage_wsl_readonly_workspace(
+                cr_dir, self.root / f'f11-single-{idx}', [fn], exclude_agent_instructions=True
+            )
+            self.assertFalse((single_stage / fn).exists())
+            staged_files = [p.name for p in single_stage.iterdir()]
+            self.assertEqual(len(staged_files), 1)
+            neutral_name = staged_files[0]
+            self.assertNotIn(neutral_name.upper(), harness._AGENT_INSTRUCTION_FILENAMES)
+            single_prompt = harness._inline_readonly_prompt('单文件检查', single_stage, [fn], exclude_agent_instructions=True)
+            self.assertIn(f'=== FILE: {fn} ===', single_prompt)
+            self.assertIn(f'rule in {fn}', single_prompt)
+            rewritten = harness._rewrite_staged_paths({
+                'read_files': [neutral_name],
+                'unread_files': [{'file': neutral_name, 'reason': 'none'}],
+                'findings': [{'file': neutral_name, 'line_start': 1, 'line_end': 1, 'severity': 'low',
+                              'category': 'doc', 'description': 'd', 'evidence': 'e'}],
+                'evidence': [f'{neutral_name}:1'],
+            }, single_stage)
+            self.assertEqual(rewritten['read_files'], [fn])
+            self.assertEqual(rewritten['unread_files'][0]['file'], fn)
+            self.assertEqual(rewritten['findings'][0]['file'], fn)
+            self.assertEqual(rewritten['evidence'], [f'{fn}:1'])
+
+        engines = self.four_backends()
+        fake_ticket = {
+            'streams': [{
+                'stream_id': 'M1', 'channel': 'cae_harness_headless', 'target': str(self.root / 'does_not_exist.py'),
+                'kind': 'review', 'engine': 'codex:fixture-code', 'tier': 'max', 'timeout': 30, 'subtask': '读',
+                'execution_profile': {'spec': 'codex:fixture-code', 'model': 'fixture-code', 'cli_effort': 'max'},
+            }],
+            'user_prompt': '',
+        }
+        with patch.object(harness, '_begin_dispatch', side_effect=lambda a: setattr(a, '_approved_ticket', fake_ticket)), \
+             patch.object(harness, '_args_backends', return_value=engines), \
+             patch.dict(os.environ, {'CAE_DISABLE_HEAVY_COMPLETIONS': '1'}):
+            rc_m, res_m = self.capture(harness.cmd_batch, self.args('batch'))
+        self.assertNotEqual(rc_m, 0)
+        self.assertEqual(res_m['streams'][0]['status'], 'failed')
+        self.assertIn('不存在', res_m['streams'][0]['error'])
+
+        b_ws = self.root / 'f12-merge-ws'
+        b_ws.mkdir()
+        (b_ws / 'a.py').write_text('a = 1\n', encoding='utf-8')
+        merge_spec = self.root / 'f12-merge.json'
+        merge_spec.write_text(json.dumps([
+            {'stream_id': 'S1', 'target': str(b_ws / 'a.py'), 'kind': 'review', 'engine': 'codex:review', 'subtask': '审'}
+        ]), encoding='utf-8')
+
+        def touch_both(*_a, receipt=None, **_kw):
+            (b_ws / 'host_leak.py').write_text('1\n', encoding='utf-8')
+            receipt['staged_scope'] = {
+                'scope_verified': True, 'changed_files': ['staged_leak.py'], 'scope_violations': ['staged_leak.py'],
+            }
+            return dict(TASK)
+
+        with patch.object(harness, '_args_backends', return_value=engines), \
+             patch.object(harness, 'invoke_engine', side_effect=touch_both), \
+             patch.dict(os.environ, {'CAE_DISABLE_HEAVY_COMPLETIONS': '1'}):
+            _, merge_out = self.capture(harness.cmd_batch, self.args('batch', '--caller', 'antigravity', '--spec-file', str(merge_spec)))
+        s0 = merge_out['streams'][0]
+        self.assertEqual(s0['status'], 'scope_violation')
+        self.assertEqual(s0['changed_files'], ['host_leak.py', 'staged_leak.py'])
+        self.assertNotIn('staged_scope', s0['invocation'])
+
+        plans_dir = self.root / 'f12-state' / 'dispatch_plans'
+        small_file = self.root / 'tiny.py'
+        small_file.write_text('x = 1\n', encoding='utf-8')
+        huge_task = '推导通量守恒条件 ' * 6000
+        task_args = self.args('task', '--target', str(small_file), '--kind', 'math', '--task', huge_task,
+                              '--plan-dir', str(plans_dir), '--session-id', 'sess_heavy_task')
+        task_payload = {'status': 'ok', 'engine': 'codex:fixture-code', 'model': 'fixture-code',
+                        'token_usage_summary': {'total_tokens': 100}}
+        harness.record_heavy_completion_for_stop_hook(task_args, task_payload)
+        hc_task = json.loads((plans_dir.parent / 'heavy_completions' / 'sess_heavy_task.json').read_text(encoding='utf-8'))
+        self.assertEqual(len(hc_task), 1)
+
+        audit_args = self.args('audit', '--target', str(small_file), '--plan-dir', str(plans_dir), '--session-id', 'sess_dual_audit')
+        audit_payload = {
+            'status': 'ok',
+            'completed_units': [
+                {'side': 'left', 'shard_id': 1, 'engine': 'codex:fixture-code', 'model': 'fixture-code', 'status': 'ok'},
+                {'side': 'right', 'shard_id': 1, 'engine': 'agy:gemini-7-pro-high', 'model': 'gemini-7-pro-high', 'status': 'ok'},
+            ],
+            'errors': [],
+            'token_usage_summary': {'total_tokens': 50},
+        }
+        harness.record_heavy_completion_for_stop_hook(audit_args, audit_payload)
+        hc_audit = json.loads((plans_dir.parent / 'heavy_completions' / 'sess_dual_audit.json').read_text(encoding='utf-8'))
+        self.assertEqual([s['stream_id'] for s in hc_audit[0]['streams']], ['left-S1', 'right-S1'])
+
+        with patch.object(harness, '_wsl_path', side_effect=lambda p, windows=True: 'Z:\\tmp\\' + Path(p).name):
+            cmd_buf, _ = harness._interop_command(['codex.exe', 'exec'], self.root, self.root, '输入文本')
+            cmd_stream, _ = harness._interop_command(['codex.exe', 'app-server'], self.root, self.root, None)
+        for encoded_cmd in (cmd_buf, cmd_stream):
+            ps_src = base64.b64decode(encoded_cmd[-1]).decode('utf-16le')
+            self.assertIn('catch [System.IO.IOException] {}', ps_src)
+            self.assertLess(ps_src.index('$p.StandardInput.Close()'), ps_src.index('catch [System.IO.IOException] {}'))
+            self.assertLess(ps_src.index('catch [System.IO.IOException] {}'), ps_src.index('$p.WaitForExit()'))
+
+    def test_r2_01_plan_override_deepcopy_profile_guard_non_agy_tier_lock_and_batch_subtask(self):
+        engines = self.four_backends()
+        engines['codex']['models'] = [
+            {'slug': 'gpt-5.4-deep', 'provider': 'openai', 'model_specialty': 'reasoning',
+             'description': 'Deep math reasoning model', 'context_window': 400000, 'max_context_window': 400000,
+             'supported_efforts': ['low', 'medium', 'high', 'max']},
+            {'slug': 'gpt-5.4-sol', 'provider': 'openai', 'model_specialty': 'engineering',
+             'description': 'Agentic coding model', 'context_window': 400000, 'max_context_window': 400000,
+             'supported_efforts': ['low', 'medium', 'high', 'max']},
+            {'slug': 'gpt-5.4-mini', 'provider': 'openai', 'model_specialty': 'fast',
+             'description': 'Fast lightweight model', 'context_window': 128000, 'max_context_window': 128000,
+             'supported_efforts': ['high'], 'delegating_efforts': ['high']},
+        ]
+        target = self.root / 'r2_01_solver.py'
+        target.write_text('u = 1.0\n', encoding='utf-8')
+        plans = self.root / 'r2-01-plans'
+
+        with patch.object(harness, '_args_backends', return_value=engines):
+            _, tk = self.capture(harness.cmd_plan, self.args(
+                'plan', '--caller', 'antigravity', '--engine', 'codex:default', '--kind', 'code',
+                '--write-scope', 'r2_01_solver.py', '--target', str(target), '--plan-dir', str(plans), '--save-ticket'))
+            tid = tk['ticket_id']
+            disk_before = json.loads((plans / f'{tid}.json').read_text(encoding='utf-8'))
+            self.assertEqual(disk_before['streams'][0]['model'], 'gpt-5.4-sol')
+
+            # 1) Override engine to unavailable backend or delegating-only profile must re-raise without dirtying disk
+            unavail_engines = json.loads(json.dumps(engines))
+            unavail_engines['dsh']['available'] = False
+            with patch.object(harness, '_args_backends', return_value=unavail_engines):
+                with self.assertRaises(harness.HarnessError):
+                    harness.cmd_plan(self.args(
+                        'plan', '--caller', 'antigravity', '--plan-dir', str(plans),
+                        '--approve-ticket', tid,
+                        '--override-json', json.dumps({'S1': {'engine': 'dsh:default'}})))
+            disk_after_fail1 = json.loads((plans / f'{tid}.json').read_text(encoding='utf-8'))
+            self.assertEqual(disk_after_fail1['streams'], disk_before['streams'])
+            self.assertEqual(disk_after_fail1['status'], 'PENDING')
+
+            with self.assertRaises(harness.HarnessError):
+                harness.cmd_plan(self.args(
+                    'plan', '--caller', 'antigravity', '--plan-dir', str(plans),
+                    '--approve-ticket', tid,
+                    '--override-json', json.dumps({'S1': {'engine': 'codex:gpt-5.4-mini', 'tier': 'high'}})))
+            disk_after_fail2 = json.loads((plans / f'{tid}.json').read_text(encoding='utf-8'))
+            self.assertEqual(disk_after_fail2['streams'], disk_before['streams'])
+
+            # 2) Tier-only override on non-agy (codex:default & dsh:default) locks orig_model without false ticket_changed
+            _, codex_low = self.capture(harness.cmd_plan, self.args(
+                'plan', '--caller', 'antigravity', '--plan-dir', str(plans),
+                '--approve-ticket', tid, '--override-json', json.dumps({'S1': {'tier': 'low'}})))
+            self.assertEqual(codex_low['status'], 'APPROVED')
+            self.assertEqual(codex_low['streams'][0]['model'], 'gpt-5.4-sol')
+            self.assertEqual(codex_low['streams'][0]['tier'], 'low')
+
+            _, dsh_tk = self.capture(harness.cmd_plan, self.args(
+                'plan', '--caller', 'antigravity', '--engine', 'dsh:default', '--kind', 'review',
+                '--target', str(target), '--plan-dir', str(plans), '--save-ticket'))
+            orig_dsh_model = dsh_tk['streams'][0]['model']
+            _, dsh_low = self.capture(harness.cmd_plan, self.args(
+                'plan', '--caller', 'antigravity', '--plan-dir', str(plans),
+                '--approve-ticket', dsh_tk['ticket_id'], '--override-json', json.dumps({'S1': {'tier': 'low'}})))
+            self.assertEqual(dsh_low['status'], 'APPROVED')
+            self.assertEqual(dsh_low['streams'][0]['model'], orig_dsh_model)
+
+            # External catalog drift at original tier still triggers ticket_changed
+            _, drift_tk = self.capture(harness.cmd_plan, self.args(
+                'plan', '--caller', 'antigravity', '--engine', 'codex:default', '--kind', 'code',
+                '--write-scope', 'r2_01_solver.py', '--target', str(target), '--plan-dir', str(plans), '--save-ticket'))
+            drifted_cat = json.loads(json.dumps(engines))
+            drifted_cat['codex']['models'].insert(0, {
+                'slug': 'gpt-6.0-sol', 'provider': 'openai', 'model_specialty': 'engineering',
+                'description': 'Newer coding model', 'context_window': 400000, 'max_context_window': 400000,
+                'supported_efforts': ['low', 'high', 'max'],
+            })
+            with patch.object(harness, '_args_backends', return_value=drifted_cat):
+                with self.assertRaises(harness.HarnessError) as drift_exc:
+                    harness.cmd_plan(self.args(
+                        'plan', '--caller', 'antigravity', '--plan-dir', str(plans),
+                        '--approve-ticket', drift_tk['ticket_id'],
+                        '--override-json', json.dumps({'S1': {'tier': 'low'}})))
+                self.assertEqual(drift_exc.exception.status, 'ticket_changed')
+
+            # 3) cmd_batch --ticket with residual HIGH_COMPLEXITY_CUES in user_prompt re-checks subtask
+            engines['agy']['models'] = [
+                {'slug': 'gemini-7-pro-low', 'display_name': 'Gemini 7 Pro Low'},
+                {'slug': 'gemini-7-pro-high', 'display_name': 'Gemini 7 Pro High'},
+                {'slug': 'gemini-7-flash-low', 'display_name': 'Gemini 7 Flash Low'},
+            ]
+            spec_p = self.root / 'r2-01-spec.json'
+            spec_p.write_text(json.dumps([
+                {'stream_id': 'S1', 'target': str(target), 'kind': 'review', 'engine': 'dsh:default', 'subtask': '检查注释拼写'}
+            ]), encoding='utf-8')
+            _, hc_tk = self.capture(harness.cmd_plan, self.args(
+                'plan', '--caller', 'codex', '--spec-file', str(spec_p), '--plan-dir', str(plans),
+                '--user-prompt', '推导黎曼通量守恒条件并检查注释', '--save-ticket'))
+            _, hc_app = self.capture(harness.cmd_plan, self.args(
+                'plan', '--caller', 'codex', '--plan-dir', str(plans),
+                '--approve-ticket', hc_tk['ticket_id'],
+                '--override-json', json.dumps({'S1': {'engine': 'agy:default', 'tier': 'medium'}})))
+            self.assertEqual(hc_app['status'], 'APPROVED')
+            with patch.object(harness, 'invoke_engine', return_value=dict(TASK)):
+                rc_b, batch_res = self.capture(harness.cmd_batch, self.args(
+                    'batch', '--caller', 'codex', '--plan-dir', str(plans), '--ticket', hc_tk['ticket_id']))
+            self.assertEqual(rc_b, 0, batch_res)
+            self.assertEqual(batch_res['streams'][0]['status'], 'ok')
+
+    def test_r2_02_ticket_raw_task_body_scope_subset_and_explicit_engine_tier_prompt_skip(self):
+        ws = self.root / 'r2-02-ws'
+        (ws / 'src' / 'flux').mkdir(parents=True)
+        f_flux = ws / 'src' / 'flux' / 'hllc.py'
+        f_flux.write_text('u = 0\n', encoding='utf-8')
+        plans = self.root / 'r2-02-plans'
+        engines = self.four_backends()
+
+        self.assertTrue(harness._scope_subset_of(['src/flux/hllc.py'], ['src/*'], target_root=ws))
+        self.assertTrue(harness._scope_subset_of(['src/flux/hllc.py'], ['src/flux/*.py'], target_root=ws))
+        self.assertTrue(harness._scope_subset_of(['src/flux/*.py'], ['src/**'], target_root=ws))
+        self.assertTrue(harness._scope_subset_of([], [], target_root=ws))
+        self.assertFalse(harness._scope_subset_of(['src/flux/hllc.py'], [], target_root=ws))
+        self.assertFalse(harness._scope_subset_of([], ['src/*'], target_root=ws))
+        self.assertFalse(harness._scope_subset_of(['tests/test_a.py'], ['src/*'], target_root=ws))
+        self.assertFalse(harness._scope_subset_of(['src/flux'], ['src/flux/*.py'], target_root=ws))
+
+        with patch.object(harness, '_args_backends', return_value=engines):
+            _, tk = self.capture(harness.cmd_plan, self.args(
+                'plan', '--caller', 'antigravity', '--kind', 'gate', '--target', str(ws),
+                '--engine', 'dsh:default', '--write-scope', 'src/*', '--verify-cmd', 'python3 -c "pass"',
+                '--workflow-goal', '实现 HLLC 通量修复', '--user-prompt', '用 dsh 低挡省额度看一下',
+                '--plan-dir', str(plans), '--save-ticket'))
+            tid = tk['ticket_id']
+            _, app = self.capture(harness.cmd_plan, self.args(
+                'plan', '--caller', 'antigravity', '--plan-dir', str(plans), '--approve-ticket', tid,
+                '--override-json', json.dumps({'S1': {'engine': 'codex:fixture-code', 'tier': 'max'}})))
+            self.assertEqual(app['status'], 'APPROVED')
+
+            # Narrowed write_scope + carrying original --user-prompt + explicit --worker / --tier succeeds
+            with patch.object(harness, 'invoke_edit_worker', return_value=json.dumps(TASK)), \
+                 patch.object(harness, 'run_process', return_value=subprocess.CompletedProcess(['sh'], 0, 'ok', '')):
+                rc_g, rep_g = self.capture(harness.cmd_gate, self.args(
+                    'gate', '--caller', 'antigravity', '--target', str(ws),
+                    '--worker', 'codex:fixture-code', '--tier', 'max',
+                    '--write-scope', 'src/flux/hllc.py', '--verify-cmd', 'python3 -c "pass"',
+                    '--user-prompt', '用 dsh 低挡省额度看一下', '--task', '实现 HLLC 通量修复',
+                    '--plan-dir', str(plans), '--ticket', tid, '--dry-run'))
+            self.assertEqual(rc_g, 0, rep_g)
+            self.assertEqual(rep_g['engine'], 'codex:fixture-code')
+            self.assertEqual(rep_g['selected_tier'], 'max')
+
+            # Ticket without write_scope rejects non-empty req_scopes
+            _, no_scope_tk = self.capture(harness.cmd_plan, self.args(
+                'plan', '--caller', 'antigravity', '--kind', 'code', '--target', str(ws),
+                '--engine', 'codex:fixture-code', '--workflow-goal', '修文件',
+                '--plan-dir', str(plans), '--save-ticket'))
+            self.capture(harness.cmd_plan, self.args(
+                'plan', '--caller', 'antigravity', '--plan-dir', str(plans),
+                '--approve-ticket', no_scope_tk['ticket_id']))
+            with self.assertRaises(harness.HarnessError) as ns_err:
+                harness.cmd_task(self.args(
+                    'task', '--caller', 'antigravity', '--kind', 'code', '--target', str(ws),
+                    '--engine', 'codex:fixture-code', '--write-scope', 'src/flux/hllc.py',
+                    '--task', '修文件', '--plan-dir', str(plans), '--ticket', no_scope_tk['ticket_id'], '--dry-run'))
+            self.assertEqual(ns_err.exception.status, 'ticket_invalid')
+
+    def test_r2_03_json_escape_preserve_valid_newlines_brace_slice_win_drive_and_latex_macros(self):
+        # 1) Valid JSON newlines followed by u_t, eq = 0, and :\\d+\\nu_i must never be corrupted
+        valid_obj = {
+            'summary': '已核对代码行',
+            'content': 'u = 0.0\nu_t = -c * u_x\na = 1\neq = 0',
+            'evidence': ['src/flux.py:42\nu_i = 0.5', 'src/flux.py:108\nnorm = 1.0'],
+            'unverified': [],
+        }
+        valid_raw = json.dumps(valid_obj, ensure_ascii=False)
+        self.assertFalse(harness._has_unrepaired_latex_escape(valid_raw))
+        self.assertEqual(harness._extract_json_object(valid_raw, harness.TASK_JSON_SCHEMA), valid_obj)
+
+        # 2) Odd unclosed quote + \\frac in preamble before { must not invert string polarity inside JSON slice
+        preamble_odd_quote = (
+            '前置说明含奇数引号 "未闭合且带 \\frac{1}{2}:\n'
+            '{\n'
+            '  "summary": "公式与路径通过",\n'
+            '  "content": "$\\lvert u \\rvert + \\lVert u \\rVert_2 + {\\rm d}x + \\tanh x + \\tan x + A^\\top '
+            '+ x \\to 0 + \\therefore + \\textstyle + \\norm{u} + A \\ni x + x \\nleq y + x \\ngeq y '
+            '+ a \\neq 0 + b \\ne c + \\nu_{t} + \\textbf{B} + \\textit{I} + \\texttt{T} + \\textrm{R} '
+            '+ \\textsf{S} + \\textsc{C} + \\textnormal{N} + \\tag{1}$",\n'
+            '  "evidence": ["C:\\Users\\alice\\temp\\test.py", "D:\\build\\foo\\norm\\raw\\test.py:15\\nu_i = 1"],\n'
+            '  "unverified": []\n'
+            '}'
+        )
+        parsed = harness._extract_json_object(preamble_odd_quote, harness.TASK_JSON_SCHEMA)
+        for macro in (
+            r'\lvert', r'\rvert', r'\rVert', r'\rm', r'\tanh', r'\tan', r'\top', r'\to',
+            r'\therefore', r'\textstyle', r'\norm{u}', r'\ni', r'\nleq', r'\ngeq',
+            r'\neq 0', r'\ne c', r'\nu_{t}', r'\textbf{B}', r'\textit{I}', r'\texttt{T}',
+            r'\textrm{R}', r'\textsf{S}', r'\textsc{C}', r'\textnormal{N}', r'\tag{1}',
+        ):
+            self.assertIn(macro, parsed['content'], macro)
+        self.assertEqual(parsed['evidence'][0], r'C:\Users\alice\temp\test.py')
+        self.assertEqual(parsed['evidence'][1], 'D:\\build\\foo\\norm\\raw\\test.py:15\nu_i = 1')
+
+    def test_r2_04_role_cooldown_metadata_retry_quota_and_audit_fallback_prefix(self):
+        engines = self.four_backends()
+        role_prof = json.loads(json.dumps(harness._fleet_profile()))
+        role_prof['roles']['review']['candidates'] = ['codex:review']
+        harness._record_quota_exhausted('codex', engines['codex'], 'usage limit reached, resets in 10m')
+
+        with patch.object(harness, '_fleet_profile', return_value=role_prof):
+            with self.assertRaises(harness.HarnessError) as r_err:
+                harness._resolve_role_engine(engines, 'antigravity', 'role:review')
+            self.assertEqual(r_err.exception.status, 'quota_exhausted')
+            self.assertTrue(r_err.exception.details.get('preflight_blocked'))
+            self.assertEqual(r_err.exception.details.get('quota_backend'), 'codex')
+            self.assertIn('user_choices', r_err.exception.details)
+
+            # --retry-quota forwards ignore_cooldown across _choose_dispatch_engine, _audit_engines, cmd_audit
+            t_file = self.root / 'r2_04.py'
+            t_file.write_text('x = 1\n', encoding='utf-8')
+            retry_task_args = self.args('task', '--caller', 'antigravity', '--kind', 'review',
+                                        '--engine', 'role:review', '--retry-quota', '--target', str(t_file), '--task', '审')
+            self.assertEqual(
+                harness._choose_dispatch_engine(retry_task_args, engines, 'antigravity', 'role:review', '审'),
+                'codex:review',
+            )
+            self.assertEqual(
+                harness._audit_engines(engines, False, 'role:review', '', False, 'antigravity', ignore_cooldown=True),
+                ('codex:review', None),
+            )
+            with patch.object(harness, '_args_backends', return_value=engines):
+                rc_r, rep_r = self.capture(harness.cmd_audit, self.args(
+                    'audit', '--single', '--left', 'role:review', '--retry-quota',
+                    '--caller', 'antigravity', '--target', str(t_file), '--dry-run'))
+            self.assertEqual(rc_r, 0, rep_r)
+            self.assertEqual(rep_r['plan']['left_engine'], 'codex:review')
+
+        # cmd_audit --fallback-on-quota does not crash with NoneType when quota_backend is omitted
+        t_file = self.root / 'r2_04_fb.py'
+        t_file.write_text('y = 2\n', encoding='utf-8')
+        bare_quota_exc = harness.HarnessError('cooled', 'quota_exhausted')
+        with patch.object(harness, '_args_backends', return_value=engines), \
+             patch.object(harness, '_audit_engines', side_effect=bare_quota_exc):
+            rc_fb, rep_fb = self.capture(harness.cmd_audit, self.args(
+                'audit', '--single', '--fallback-on-quota', '--caller', 'antigravity',
+                '--target', str(t_file), '--dry-run'))
+        self.assertEqual(rc_fb, 0, rep_fb)
+        self.assertEqual(rep_fb['plan']['left_engine'], 'agy:default')
+
+    def test_r2_05_host_env_and_git_dir_isolation(self):
+        self.assertEqual(os.environ.get('USER_GUARD_STATE_DIR'), str(self.root / 'state'))
+        self.assertNotIn('PLUGIN_DATA', os.environ)
+        self.assertNotIn('GIT_DIR', os.environ)
+        for bad_k in ('PLUGIN_DATA', 'AGY_CONVERSATION_ID', 'CLAUDECODE', 'GIT_DIR', 'HTTPS_PROXY', 'https_proxy'):
+            self.assertTrue(_is_stripped_host_env(bad_k), bad_k)
+        self.assertFalse(_is_stripped_host_env('USER_GUARD_INSTALLED_DIR'))
+        self.assertTrue(_is_stripped_host_env('USER_GUARD_STATE_DIR'))
+
+        repo_dir = self.root / 'r2-05-git'
+        repo_dir.mkdir()
+        (repo_dir / 'solver.py').write_text('parser.add_argument("--dt-max")\n', encoding='utf-8')
+        (repo_dir / 'README.md').write_text('支持 `solver.py --dt-max`。\n', encoding='utf-8')
+        subprocess.run(['git', 'init'], cwd=repo_dir, check=True, capture_output=True, timeout=15)
+        subprocess.run(['git', 'config', 'user.email', 't@example.com'], cwd=repo_dir, check=True, capture_output=True, timeout=15)
+        subprocess.run(['git', 'config', 'user.name', 'Tester'], cwd=repo_dir, check=True, capture_output=True, timeout=15)
+        subprocess.run(['git', 'add', '.'], cwd=repo_dir, check=True, capture_output=True, timeout=15)
+        subprocess.run(['git', 'commit', '-m', 'init'], cwd=repo_dir, check=True, capture_output=True, timeout=15)
+
+        poison_git = {
+            'GIT_DIR': str(self.root / 'nonexistent-git-dir'),
+            'GIT_WORK_TREE': str(self.root / 'nonexistent-wt'),
+            'GIT_INDEX_FILE': str(self.root / 'nonexistent-idx'),
+        }
+        with patch.dict(os.environ, poison_git):
+            head = harness._git_head(repo_dir)
+            self.assertIsNotNone(head)
+            self.assertEqual(len(head), 40)
+            rev = harness._local_command(['git', '-C', str(repo_dir), 'rev-parse', 'HEAD'])
+            self.assertEqual(rev, head)
+            rep = harness.audit_doc_grounding(repo_dir / 'README.md', root_dir=repo_dir, base_ref='HEAD')
+            self.assertTrue(rep['ok'], rep['findings'])
+
+    def test_r2_06_scope_matches_multi_globstar_closure_and_agentignore_normalization(self):
+        multi_pat = ['a/**/b/**/c.py']
+        for valid_p in ('a/b/c.py', 'a/x/b/c.py', 'a/b/y/c.py', 'a/x/u/b/y/v/c.py'):
+            self.assertTrue(harness._scope_matches(valid_p, multi_pat), valid_p)
+        self.assertFalse(harness._scope_matches('a/x/d/c.py', multi_pat))
+
+        for dir_self in ('src', 'src/', 'src/a.py', 'src/sub/deep.py'):
+            self.assertTrue(harness._scope_matches(dir_self, ['src/**']), dir_self)
+
+        ig_root = self.root / 'r2-06-ig'
+        ig_root.mkdir()
+        (ig_root / '.agentignore').write_text(
+            '\ufeff# BOM 注释行不应作为模式\n'
+            '\ufeff./cache\\sub/\n'
+            '.\\logs\\\n'
+            './tmp/out.dat\n',
+            encoding='utf-8',
+        )
+        pats = harness.read_agentignore_patterns(ig_root)
+        self.assertEqual(pats, ['cache/sub', 'logs', 'tmp/out.dat'])
+
+    def test_r2_07_clean_room_subpath_slashes_full_field_neutral_restore_and_instr_only_dir_hint(self):
+        only_instr = self.root / 'r2-07-only-instr'
+        only_instr.mkdir()
+        (only_instr / 'AGENTS.md').write_text('agent rules\n', encoding='utf-8')
+        (only_instr / 'CLAUDE.md').write_text('claude rules\n', encoding='utf-8')
+        with self.assertRaisesRegex(harness.HarnessError, '--target.*单文件'):
+            harness._stage_wsl_readonly_workspace(only_instr, self.root / 'r2-07-s0', None, exclude_agent_instructions=True)
+        with self.assertRaisesRegex(harness.HarnessError, '--target.*单文件'):
+            harness._inline_readonly_prompt('检查', only_instr, None, exclude_agent_instructions=True)
+        with patch.object(harness, '_args_backends', return_value=self.four_backends()):
+            with self.assertRaisesRegex(harness.HarnessError, '--target.*单文件'):
+                harness.cmd_task(self.args(
+                    'task', '--caller', 'antigravity', '--kind', 'review', '--engine', 'codex:default',
+                    '--clean-room', '--target', str(only_instr), '--task', '检查目录', '--dry-run'))
+
+        ws = self.root / 'r2-07-sub'
+        (ws / 'sub').mkdir(parents=True)
+        (ws / 'sub' / 'AGENTS.md').write_text('nested agent line\n', encoding='utf-8')
+        stage_dir = harness._stage_wsl_readonly_workspace(
+            ws, self.root / 'r2-07-stage', [r'sub\AGENTS.md'], exclude_agent_instructions=True
+        )
+        neutral_name = f'{harness._STAGED_NEUTRAL_PREFIX}AGENTS.md{harness._STAGED_NEUTRAL_SUFFIX}'
+        self.assertTrue((stage_dir / 'sub' / neutral_name).is_file())
+        inlined = harness._inline_readonly_prompt('审', stage_dir, [r'sub\AGENTS.md'], exclude_agent_instructions=True)
+        self.assertIn('=== FILE: sub/AGENTS.md ===', inlined)
+        self.assertIn('nested agent line', inlined)
+
+        raw_parsed = {
+            'summary': f'已核查 sub/{neutral_name} 与 {neutral_name}',
+            'content': f'Windows 路径 sub\\{neutral_name} 与基名 {neutral_name} 一致',
+            'read_files': [neutral_name],
+            'unread_files': [{'file': f'sub\\{neutral_name}', 'reason': f'skip {neutral_name}'}],
+            'evidence': [f'sub/{neutral_name}:1', f'sub\\{neutral_name}:1', f'{neutral_name}:1'],
+            'unverified': [f'待复核 sub\\{neutral_name}'],
+            'findings': [{
+                'file': f'sub\\{neutral_name}', 'line_start': 1, 'line_end': 1, 'severity': 'low',
+                'category': 'doc', 'description': f'{neutral_name} 描述', 'evidence': f'sub/{neutral_name}#L1',
+            }],
+        }
+        restored = harness._rewrite_staged_paths(raw_parsed, stage_dir)
+        self.assertNotIn(neutral_name, json.dumps(restored, ensure_ascii=False))
+        self.assertEqual(restored['read_files'], ['sub/AGENTS.md'])
+        self.assertEqual(restored['unread_files'][0]['file'], 'sub/AGENTS.md')
+        self.assertEqual(restored['findings'][0]['file'], 'sub/AGENTS.md')
+        self.assertEqual(restored['evidence'], ['sub/AGENTS.md:1', 'sub/AGENTS.md:1', 'sub/AGENTS.md:1'])
+
+    def test_r2_08_stop_roots_agents_audit_codex_toml_fenced_script_flags_and_changelog_head(self):
+        # 1) stop_roots prevents climbing into $HOME/.git or TMPDIR/.git
+        fake_home = self.root / 'fake-home'
+        (fake_home / '.git').mkdir(parents=True)
+        sub_proj = fake_home / 'notes'
+        sub_proj.mkdir()
+        (sub_proj / 'memo.md').write_text('# Memo\n', encoding='utf-8')
+        with patch.object(harness.Path, 'home', return_value=fake_home):
+            self.assertEqual(harness._infer_project_anchor_root(sub_proj / 'memo.md'), sub_proj.resolve())
+        fake_tmp = self.root / 'fake-tmp'
+        (fake_tmp / '.git').mkdir(parents=True)
+        tmp_sub = fake_tmp / 'work'
+        tmp_sub.mkdir()
+        (tmp_sub / 'memo.md').write_text('# Work\n', encoding='utf-8')
+        with patch.object(harness.tempfile, 'gettempdir', return_value=str(fake_tmp)):
+            self.assertEqual(harness._infer_project_anchor_root(tmp_sub / 'memo.md'), tmp_sub.resolve())
+
+        # 2) Fake upstream repo: agents/*.md, codex/agents/*.toml, fenced bash/ps1 flags, CHANGELOG latest section
+        up = self.root / 'r2-08-upstream'
+        (up / 'template' / 'user-guard' / 'agents').mkdir(parents=True)
+        (up / 'template' / 'claude' / 'agents').mkdir(parents=True)
+        (up / 'template' / 'codex' / 'agents').mkdir(parents=True)
+        (up / 'install.py').write_text('p.add_argument("--dry-run")\n', encoding='utf-8')
+        (up / 'template' / 'user-guard' / 'plugin.json').write_text('{"name":"user-guard"}\n', encoding='utf-8')
+        (up / 'template' / 'user-guard' / 'agents' / 'readonly-auditor.md').write_text(
+            '仅使用 `view_file`、`grep_search`、`find_by_name`、`Read`、`Grep`、`Glob`。\n', encoding='utf-8'
+        )
+        (up / 'template' / 'codex' / 'agents' / 'readonly-auditor.toml').write_text(
+            'name = "readonly-auditor"\n'
+            'description = "仅使用 Get-Content、Select-String、Get-ChildItem 只读工具。"\n'
+            'developer_instructions = "严禁修改文件。"\n'
+            '[features]\nrequest_permissions_tool = false\n',
+            encoding='utf-8',
+        )
+        (up / 'README.md').write_text(
+            '支持 `request_permissions_tool` 配置。\n\n```powershell\npython "$HARNESS" --dry-run\n```\n',
+            encoding='utf-8',
+        )
+        (up / 'CHANGELOG.md').write_text(
+            '# 更新日志\n\n## [2.0.0] - 2026-11-17\n\n支持 `install.py --dry-run`。\n\n'
+            '## [1.0.0] - 2025-01-01\n\n旧版曾有 `install.py --retired-ancient-flag` 与 NURBS 刀轨。\n',
+            encoding='utf-8',
+        )
+        clean_up = harness.audit_doc_grounding(up)
+        self.assertTrue(clean_up['ok'], clean_up['findings'])
+        self.assertIn('CHANGELOG.md', clean_up['checked_files'])
+        self.assertIn('template/user-guard/agents/readonly-auditor.md', clean_up['checked_files'])
+        self.assertIn('template/codex/agents/readonly-auditor.toml', clean_up['checked_files'])
+
+        # Inject ungrounded items into agent md, codex toml instructions, fenced block, and latest CHANGELOG
+        (up / 'template' / 'claude' / 'agents' / 'bad.md').write_text('处理 NURBS 曲面。\n', encoding='utf-8')
+        (up / 'template' / 'codex' / 'agents' / 'readonly-auditor.toml').write_text(
+            'name = "readonly-auditor"\n'
+            'description = "调用 `status_guard.py --ghost-guard-flag`。"\n',
+            encoding='utf-8',
+        )
+        (up / 'README.md').write_text(
+            '```bash\nbash install.sh \\\n  --ghost-bash-flag\n```\n'
+            '```powershell\npython "$HARNESS" `\n  --ghost-ps-flag\n```\n',
+            encoding='utf-8',
+        )
+        (up / 'CHANGELOG.md').write_text(
+            '# 更新日志\n\n## [2.0.0] - 2026-11-17\n\n新增 `launch-cc-switch-wsl.sh --ghost-cl-flag`。\n\n'
+            '## [1.0.0] - 2025-01-01\n\n旧版 `install.py --retired-ancient-flag`。\n',
+            encoding='utf-8',
+        )
+        bad_up = harness.audit_doc_grounding(up)
+        found_tokens = {f['token'] for f in bad_up['findings']}
+        self.assertIn('NURBS', found_tokens)
+        self.assertIn('--ghost-guard-flag', found_tokens)
+        self.assertIn('--ghost-bash-flag', found_tokens)
+        self.assertIn('--ghost-ps-flag', found_tokens)
+        self.assertIn('--ghost-cl-flag', found_tokens)
+        self.assertNotIn('--retired-ancient-flag', found_tokens)
+
+    def test_r2_09_redact_public_nested_secret_leaves_and_heavy_completion_symlink_inode_lock(self):
+        nested_payload = {
+            'Authorization': 'CustomSecretHeader 12345',
+            'authorizations': ['tok-alpha-1', 'tok-beta-2'],
+            'api_keys': ['raw-key-1', {'backup': 'raw-key-2', 'empty': ''}],
+            'apiKeys': ['camel-1'],
+            'credentials': {'primary_secret_val': 'opaque-secret', 'enabled': True, 'count': 2},
+            'token': '--keep-grounding-token',
+            'input_tokens': 42,
+        }
+        redacted = harness._redact_public(nested_payload)
+        self.assertEqual(redacted['Authorization'], '<redacted>')
+        self.assertEqual(redacted['authorizations'], ['<redacted>', '<redacted>'])
+        self.assertEqual(redacted['api_keys'], ['<redacted>', {'backup': '<redacted>', 'empty': ''}])
+        self.assertEqual(redacted['apiKeys'], ['<redacted>'])
+        self.assertEqual(redacted['credentials'], {'primary_secret_val': '<redacted>', 'enabled': True, 'count': 2})
+        self.assertEqual(redacted['token'], '--keep-grounding-token')
+        self.assertEqual(redacted['input_tokens'], 42)
+
+        # Symlink / reparse-point rejection in record_heavy_completion_for_stop_hook
+        victim = self.root / 'victim.json'
+        victim.write_text('{"safe": true}\n', encoding='utf-8')
+        plans_dir = self.root / 'r2-09-state' / 'dispatch_plans'
+        hc_dir = plans_dir.parent / 'heavy_completions'
+        hc_dir.mkdir(parents=True)
+        sym_hc = hc_dir / 'sess_sym.json'
+        symlink_ok = True
+        try:
+            sym_hc.symlink_to(victim)
+        except OSError:
+            symlink_ok = False
+        t_file = self.root / 'r2_09.py'
+        t_file.write_text('x = 1\n', encoding='utf-8')
+        gate_args = self.args('gate', '--target', str(t_file), '--verify-cmd', 'true', '--task', 'fix',
+                              '--plan-dir', str(plans_dir), '--session-id', 'sess_sym')
+        payload = {'status': 'ok', 'engine': 'codex:fixture-code', 'model': 'fixture-code',
+                   'token_usage_summary': {'total_tokens': 10}}
+        if symlink_ok:
+            with self.assertRaisesRegex(harness.HarnessError, '符号链接'):
+                harness.record_heavy_completion_for_stop_hook(gate_args, payload)
+            self.assertEqual(json.loads(victim.read_text(encoding='utf-8')), {'safe': True})
+        else:
+            sym_hc.write_text('[]\n', encoding='utf-8')
+            from types import SimpleNamespace as _NS
+            orig_lstat = Path.lstat
+            def _fake_reparse_lstat(path_self):
+                if path_self.name == 'sess_sym.json':
+                    return _NS(st_mode=0o100644, st_file_attributes=0x400)
+                return orig_lstat(path_self)
+            with patch.object(Path, 'lstat', autospec=True, side_effect=_fake_reparse_lstat):
+                with self.assertRaisesRegex(harness.HarnessError, '符号链接'):
+                    harness.record_heavy_completion_for_stop_hook(gate_args, payload)
+
+        # POSIX flock inode verification retries when lock file is unlinked once during flock
+        if os.name != 'nt':
+            import fcntl as real_fcntl
+            lock_dir = self.root / 'r2-09-locks'
+            unlinked_once = {'done': False}
+            orig_flock = real_fcntl.flock
+
+            def racing_flock(fd, op):
+                orig_flock(fd, op)
+                if (op & real_fcntl.LOCK_EX) and not unlinked_once['done']:
+                    unlinked_once['done'] = True
+                    (lock_dir / '.sess_race.lock').unlink(missing_ok=True)
+
+            with patch.object(real_fcntl, 'flock', side_effect=racing_flock):
+                with harness._heavy_completion_file_lock(lock_dir, 'sess_race'):
+                    self.assertTrue((lock_dir / '.sess_race.lock').is_file())
+            self.assertTrue(unlinked_once['done'])
+
+    def test_r2_10_cli_misuse_guards_unavailable_stream_msg_and_batch_kind_choices(self):
+        t_file = self.root / 'r2_10.py'
+        t_file.write_text('x = 1\n', encoding='utf-8')
+        plans = self.root / 'r2-10-plans'
+
+        with self.assertRaisesRegex(harness.HarnessError, '不支持 --ticket.*--approve-ticket') as e1:
+            harness.cmd_plan(self.args('plan', '--ticket', 'abc123'))
+        self.assertEqual(e1.exception.status, 'ticket_invalid')
+
+        with self.assertRaisesRegex(harness.HarnessError, '--override-json 仅可配合 --approve-ticket') as e2:
+            harness.cmd_plan(self.args('plan', '--override-json', '{"S1":{"tier":"low"}}'))
+        self.assertEqual(e2.exception.status, 'ticket_invalid')
+
+        # Headless stream unavailable at approval reports stream_id, channel, and reason (not "原生通道")
+        engines = self.four_backends()
+        with patch.object(harness, '_args_backends', return_value=engines):
+            _, tk = self.capture(harness.cmd_plan, self.args(
+                'plan', '--caller', 'antigravity', '--engine', 'codex:fixture-code',
+                '--target', str(t_file), '--plan-dir', str(plans), '--save-ticket'))
+        # Simulate pre-resolved unavailable headless stream where expected also had unavailable state
+        saved = json.loads((plans / f"{tk['ticket_id']}.json").read_text(encoding='utf-8'))
+        saved['streams'][0].update(currently_available=False, unavailable_reason='quota_exhausted', quota_exceeded=True)
+        harness._save_plan(saved, plans)
+        harness._record_quota_exhausted('codex', engines['codex'], 'quota exceeded')
+        with patch.object(harness, '_args_backends', return_value=engines), \
+             patch.object(harness, '_resolve_plan_streams', return_value=(saved['streams'], False)):
+            with self.assertRaises(harness.HarnessError) as unavail_exc:
+                harness.cmd_plan(self.args('plan', '--caller', 'antigravity', '--plan-dir', str(plans),
+                                           '--approve-ticket', tk['ticket_id']))
+        msg = str(unavail_exc.exception)
+        self.assertNotIn('原生通道', msg)
+        self.assertIn('S1', msg)
+        self.assertIn('cae_harness_headless', msg)
+        self.assertIn('quota_exhausted', msg)
+
+        # batch --kind choices validation and help text presence
+        parser = harness.build_arg_parser()
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            parser.parse_args(['batch', '--kind', 'invalid_kind'])
+        for sub_name in ('plan', 'batch', 'task', 'gate', 'audit', 'probe'):
+            sub_parser = parser._subparsers._group_actions[0].choices[sub_name]
+            help_txt = sub_parser.format_help()
+            self.assertIn('--redact', help_txt)
+            self.assertIn('脱敏', help_txt)
 
 
 if __name__ == '__main__':

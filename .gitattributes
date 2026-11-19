@@ -9,4 +9,5 @@
 *.yaml text eol=lf
 *.svg text eol=lf
 *.ps1 text eol=crlf
-
+*.tsq binary
+*.tsr binary

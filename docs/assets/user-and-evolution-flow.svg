@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1440" height="880" viewBox="0 0 1440 880" role="img" aria-labelledby="title desc">
-  <title id="title">用户层总览：日常课题协作与配置仓库自我更新双闭环</title>
-  <desc id="desc">左侧为日常业务课题仓的点名与角色选路闭环，右侧为上游配置仓的自我更新闭环，中间以工作区模式隔离。</desc>
+  <title id="title">日常课题协作与配置仓库维护流程</title>
+  <desc id="desc">左侧为日常课题目录中的指定模型与角色选路流程，右侧为本配置仓库的维护与更新流程，中间按工作区模式隔离。</desc>
   <defs>
     <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
       <path d="M 0 1 L 8 5 L 0 9" fill="none" stroke="#64748b" stroke-width="1.6"/>
@@ -18,12 +18,12 @@
     .link { fill: none; stroke: #64748b; stroke-width: 2; marker-end: url(#arrow); }
   </style>
   <rect width="1440" height="880" rx="18" fill="#f4f7fb"/>
-  <text x="36" y="48" class="title">用户层总览：日常课题怎么用 · 配置仓库怎么自我更新</text>
-  <text x="36" y="78" class="subtitle">一次运行 install.py 同步至宿主机全局目录后，系统按工作区身份自动进入日常课题模式或配置仓自维护模式。</text>
+  <text x="36" y="48" class="title">日常课题协作与配置仓库维护流程</text>
+  <text x="36" y="78" class="subtitle">一次运行 install.py 同步至本机客户端配置目录后，系统按工作区模式自动区分日常课题开发与配置仓库维护。</text>
 
   <!-- Left Lane Container: general_project -->
   <rect x="28" y="102" width="668" height="748" rx="16" fill="#eaf2ff" stroke="#adc6eb" stroke-width="1.5"/>
-  <text x="52" y="138" class="lane">日常业务课题仓（general_project）</text>
+  <text x="52" y="138" class="lane">日常业务课题目录（general_project）</text>
   <text x="52" y="163" class="lane-sub">任意 C++、Fortran、Rust、Python 课题目录直接使用，无需复制配置文件</text>
 
   <g>
@@ -59,17 +59,17 @@
 
   <g>
     <rect x="50" y="508" width="624" height="142" rx="12" fill="#ffffff" stroke="#b8cde8"/>
-    <text x="72" y="540" class="heading">3. 轻任务静默执行 · 重负载先弹纵向 14 项确认单</text>
+    <text x="72" y="540" class="heading">3. 轻任务静默执行 · 重负载先生成纵向 14 项确认单</text>
     <text x="72" y="568" class="body">小范围单路检查静默执行；内部原生与外部无头重负载统一先运行 plan。</text>
-    <text x="72" y="594" class="body">展示背景、要做什么、预计后果、4 列总览与每路纵向 14 项参数表。</text>
-    <text x="72" y="620" class="body">压缩或交接打断时原样恢复或写入提示词；获批后核验 --ticket 放行。</text>
+    <text x="72" y="594" class="body">输出 compact_summary_card，完整 14 项参数写入 &lt;ticket_id&gt;_card.md。</text>
+    <text x="72" y="620" class="body">压缩时按窗口缩放预算并折叠历史确认单明细；获批后凭 --ticket 放行。</text>
   </g>
 
   <path class="link" d="M 362 650 L 362 680"/>
 
   <g>
     <rect x="50" y="680" width="624" height="146" rx="12" fill="#eefaf4" stroke="#82bfa0"/>
-    <text x="72" y="712" class="heading">4. 定量验证、完工词项检查与主会话原文终审</text>
+    <text x="72" y="712" class="heading">4. 定量验证、完成回执检查与主会话原文终审</text>
     <text x="72" y="740" class="body">只读任务比对哈希快照；可写 gate 锁范围并强制跑通 --verify-cmd。</text>
     <text x="72" y="766" class="body">严禁放宽容差与守恒判据；文档润色配合 --clean-room 与事实锚定。</text>
     <text x="72" y="792" class="body">Stop 检查成败词、Token 说明与回执标识；主会话亲自核对行号与算术。</text>
@@ -78,29 +78,29 @@
   <!-- Center Workspace Mode Isolation Divider -->
   <line x1="720" y1="108" x2="720" y2="846" stroke="#94a3b8" stroke-width="2.5" stroke-dasharray="8 7"/>
   <rect x="699" y="428" width="42" height="118" rx="10" fill="#e2e8f0" stroke="#94a3b8"/>
-  <text x="720" y="458" text-anchor="middle" class="badge">硬</text>
-  <text x="720" y="480" text-anchor="middle" class="badge">隔</text>
-  <text x="720" y="502" text-anchor="middle" class="badge">离</text>
-  <text x="720" y="528" text-anchor="middle" class="badge">2</text>
+  <text x="720" y="456" text-anchor="middle" class="badge">模</text>
+  <text x="720" y="478" text-anchor="middle" class="badge">式</text>
+  <text x="720" y="500" text-anchor="middle" class="badge">隔</text>
+  <text x="720" y="522" text-anchor="middle" class="badge">离</text>
 
   <!-- Right Lane Container: upstream_config_repo -->
   <rect x="744" y="102" width="668" height="748" rx="16" fill="#f4effc" stroke="#bdaae0" stroke-width="1.5"/>
-  <text x="768" y="138" class="lane">本配置仓库自我更新（upstream_config_repo）</text>
-  <text x="768" y="163" class="lane-sub">模型换代或订阅变化时直接在本仓库对话演进；普通课题误调返回退出码 2</text>
+  <text x="768" y="138" class="lane">本配置仓库维护与更新（upstream_config_repo）</text>
+  <text x="768" y="163" class="lane-sub">模型换代或订阅变化时直接在本仓库维护更新；普通课题误调返回退出码 2</text>
 
   <g>
     <rect x="766" y="184" width="624" height="122" rx="12" fill="#ffffff" stroke="#c5b6e3"/>
     <text x="788" y="216" class="heading">1. 按维护需求选择 fleet-evolve 三种模式</text>
     <text x="788" y="244" class="body">全面更新（full）：核查客户端与模型换代，重算五角色与运行参数。</text>
-    <text x="788" y="270" class="body">全量优化（hygiene）：选型已定，基于现有配置加固代码与重写文档。</text>
-    <text x="788" y="294" class="body">只读巡检（audit）：只读检查配置漂移与 ABI 风险，全程零写入。</text>
+    <text x="788" y="270" class="body">代码与文档整理（hygiene）：选型不变，修复代码问题并同步文档。</text>
+    <text x="788" y="294" class="body">只读检查（audit）：只读检查配置漂移与 ABI 风险，全程零写入。</text>
   </g>
 
   <path class="link" d="M 1078 306 L 1078 336"/>
 
   <g>
     <rect x="766" y="336" width="624" height="142" rx="12" fill="#ffffff" stroke="#c5b6e3"/>
-    <text x="788" y="368" class="heading">2. 第一道门评估（full 模式联网核查 + 本机探测）</text>
+    <text x="788" y="368" class="heading">2. 联网能力核查与本机可用性探测（full 模式）</text>
     <text x="788" y="396" class="body">结合官方资料、本机报错与实测证据，同时标明模型优势与已知短板。</text>
     <text x="788" y="422" class="body">同步展示本机各端与模型是否就绪、配置的额度类型及退订候选。</text>
     <text x="788" y="448" class="body">在 capability_ledger 记录评估日期，日常派工无需联网查榜单。</text>
@@ -110,19 +110,19 @@
 
   <g>
     <rect x="766" y="508" width="624" height="142" rx="12" fill="#fff8e8" stroke="#dbb464"/>
-    <text x="788" y="540" class="heading">3. 四个必停拍板节点（full / hygiene 涉及变更时）</text>
-    <text x="788" y="568" class="body">① 拍板推荐矩阵、运行参数与 subscription_matrix 启停；</text>
-    <text x="788" y="594" class="body">② 写入宿主机全局目录（先 --dry-run 预览）或切换主客户端；</text>
-    <text x="788" y="620" class="body">③ Python、CUDA、WSL 等 ABI 强耦合升级；④ 执行 git push。</text>
+    <text x="788" y="540" class="heading">3. 四项人工确认要求（full / hygiene 涉及变更时）</text>
+    <text x="788" y="568" class="body">① 审定推荐配置、运行参数与 subscription_matrix 启停；</text>
+    <text x="788" y="594" class="body">② 写入本机全局配置目录（先 --dry-run 预览）或切换主客户端；</text>
+    <text x="788" y="620" class="body">③ Python、CUDA、WSL 等编译型科学计算包 ABI 升级；④ git push。</text>
   </g>
 
   <path class="link" d="M 1078 650 L 1078 680"/>
 
   <g>
     <rect x="766" y="680" width="624" height="146" rx="12" fill="#eefaf4" stroke="#82bfa0"/>
-    <text x="788" y="712" class="heading">4. 获批同步、主客户端重启接力验收与锚定归位</text>
-    <text x="788" y="740" class="body">获批后由 install.py 同步宿主机目录并核验 all_aligned。</text>
-    <text x="788" y="766" class="body">涉及主客户端更新时经 record-pass1 与 verify-pass2 重启验收。</text>
+    <text x="788" y="712" class="heading">4. 确认同步、主客户端重启核验与文档一致性校验</text>
+    <text x="788" y="740" class="body">确认后由 install.py 同步本机目录并核验 all_aligned。</text>
+    <text x="788" y="766" class="body">涉及主客户端更新时经 record-pass1 与 verify-pass2 重启核验。</text>
     <text x="788" y="792" class="body">最终运行 clear --verified --readback-done 通过事实锚定后归位。</text>
   </g>
 </svg>

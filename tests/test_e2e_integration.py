@@ -11,6 +11,7 @@ test_e2e_integration.py - 全系统端到端集成验证、隐私脱敏审计与
 import ast
 import contextlib
 import datetime
+import fnmatch
 import getpass
 import io
 import json
@@ -23,6 +24,8 @@ import socket
 import subprocess
 import sys
 import tempfile
+import tomllib
+import unicodedata
 import unittest
 import urllib.parse
 from pathlib import Path
@@ -30,7 +33,20 @@ from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TEMPLATE_DIR = REPO_ROOT / "template" / "user-guard"
-ACTIVE_PLUGIN_DIR = Path(os.environ.get("USER_GUARD_INSTALLED_DIR", str(TEMPLATE_DIR)))
+def _resolve_active_plugin_dir(env: dict[str, str] | None = None) -> Path:
+    source = os.environ if env is None else env
+    raw = source.get("USER_GUARD_INSTALLED_DIR", "").strip()
+    if raw:
+        candidate = Path(raw).expanduser()
+        try:
+            if candidate.is_dir():
+                return candidate
+        except OSError:
+            pass
+    return TEMPLATE_DIR
+
+
+ACTIVE_PLUGIN_DIR = _resolve_active_plugin_dir()
 INSTALLER_SPEC = importlib.util.spec_from_file_location("user_guard_installer", REPO_ROOT / "install.py")
 INSTALLER = importlib.util.module_from_spec(INSTALLER_SPEC)
 INSTALLER_SPEC.loader.exec_module(INSTALLER)
@@ -64,6 +80,158 @@ HARDWARE_PATTERNS = (
 )
 UUID_PATTERN = re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.I)
 POSIX_DEVICE_PATTERN = re.compile("/de" + r"v/(?:null|zero|full|random|urandom|tty|stdin|stdout|stderr|fd|shm|pts)\b", re.I)
+SEASONAL_MODEL_PATTERN = re.compile(
+    r"\b(?:astra|sol|terra|carbon|argon|hydrogen|luna|k3\.1-pro|deepseek-v4|deepseek-flash)\b",
+    re.I,
+)
+GIT_ENV_KEYS = frozenset({
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_PREFIX",
+})
+PROXY_ENV_KEYS = frozenset({
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+})
+USER_GUARD_INSTALL_ENV_KEYS = frozenset({
+    "USER_GUARD_INSTALLED_DIR",
+    "USER_GUARD_INSTALLED_CODEX_DIR",
+    "USER_GUARD_INSTALLED_CLAUDE_DIR",
+    "USER_GUARD_INSTALLED_DSH_DIR",
+})
+STRIPPED_HOST_ENV_PREFIXES = (
+    "CAE_",
+    "AGY_",
+    "ANTIGRAVITY_",
+    "CODEX_",
+    "CLAUDE",
+    "ANTHROPIC_",
+    "DSH_",
+    "XDG_",
+)
+STRIPPED_HOST_ENV_KEYS = (
+    frozenset({
+        "OPENAI_API_KEY",
+        "DEEPSEEK_API_KEY",
+        "PLUGIN_DATA",
+        "PYTHONPATH",
+        "CODEX_HOME",
+        "CLAUDE_CONFIG_DIR",
+        "CLAUDECODE",
+        "DSH_HOME",
+        "USER_GUARD_STATE_DIR",
+        "USER_GUARD_LOGS_DIR",
+        "USER_GUARD_DISABLE_TICKET_GATE",
+        "USER_GUARD_ENFORCE_TICKET_GATE",
+    })
+    | GIT_ENV_KEYS
+    | PROXY_ENV_KEYS
+)
+
+
+def _should_strip_host_env(key: str, value: str | None = None) -> bool:
+    upper_key = key.upper()
+    if key in STRIPPED_HOST_ENV_KEYS or upper_key in STRIPPED_HOST_ENV_KEYS:
+        return True
+    if upper_key.startswith(STRIPPED_HOST_ENV_PREFIXES):
+        return True
+    if upper_key.startswith("USER_GUARD_"):
+        if upper_key not in USER_GUARD_INSTALL_ENV_KEYS:
+            return True
+        if value is not None:
+            stripped = value.strip()
+            if not stripped:
+                return True
+            try:
+                if not Path(stripped).expanduser().is_dir():
+                    return True
+            except OSError:
+                return True
+        return False
+    return False
+
+
+def _without_git_env(env: dict[str, str] | None = None) -> dict[str, str]:
+    source = os.environ if env is None else env
+    return {k: v for k, v in source.items() if k.upper() not in GIT_ENV_KEYS}
+HTML_ANCHOR_ATTR_PATTERN = re.compile('<a\\b[^>]*\\b(?:id|name)=["\']([^"\']+)["\']', re.I)
+
+
+def _collect_repo_benign_tokens(repo_root: Path) -> set[str]:
+    sources: list[Path] = [repo_root / "install.py"]
+    for folder, patterns in (
+        (repo_root / "template", ("*.py", "*.toml", "*.json", "*.sh", "*.ps1")),
+        (repo_root / ".github", ("*.yml", "*.yaml")),
+    ):
+        if folder.is_dir():
+            for pat in patterns:
+                sources.extend(sorted(folder.rglob(pat)))
+    tokens: set[str] = set()
+    for src_path in sources:
+        if not src_path.is_file():
+            continue
+        text = src_path.read_text(encoding="utf-8")
+        for raw_tok in re.findall(r"[A-Za-z_][A-Za-z0-9_-]{2,}", text):
+            lowered = raw_tok.casefold()
+            tokens.add(lowered)
+            if "-" in lowered:
+                for stem in lowered.split("-"):
+                    if len(stem) >= 3:
+                        tokens.add(stem)
+    return tokens
+
+
+def _extract_md_heading_anchors(markdown_text: str) -> set[str]:
+    anchors: set[str] = set()
+    counts: dict[str, int] = {}
+    fence = ""
+    for line in markdown_text.splitlines():
+        m_fence = re.match(r"^ {0,3}(`{3,}|~{3,})", line)
+        if m_fence:
+            marker = m_fence.group(1)
+            if not fence:
+                if marker[0] not in line[m_fence.end():]:
+                    fence = marker
+                continue
+            if marker[0] == fence[0] and len(marker) >= len(fence) and not line[m_fence.end():].strip():
+                fence = ""
+            continue
+        if fence:
+            continue
+        for attr_id in HTML_ANCHOR_ATTR_PATTERN.findall(line):
+            if attr_id.strip():
+                anchors.add(urllib.parse.unquote(attr_id.strip()).lower())
+        m_head = re.match(r"^ {0,3}#{1,6}[ \t]+(.+?)(?:[ \t]+#+[ \t]*)?$", line)
+        if not m_head:
+            continue
+        heading = m_head.group(1)
+        heading = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", heading)
+        heading = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", heading)
+        heading = heading.replace("`", "").replace("*", "").replace("~", "")
+        slug_chars: list[str] = []
+        for ch in heading.strip().lower():
+            if ch in (" ", "\t"):
+                slug_chars.append("-")
+            elif ch in ("-", "_") or unicodedata.category(ch)[0] in ("L", "N", "M"):
+                slug_chars.append(ch)
+        base_slug = "".join(slug_chars)
+        if not base_slug:
+            continue
+        seen = counts.get(base_slug, 0)
+        anchors.add(base_slug if seen == 0 else f"{base_slug}-{seen}")
+        counts[base_slug] = seen + 1
+    return anchors
 
 
 def _path_spelling_variants(paths):
@@ -161,7 +329,7 @@ def _create_directory_link(link: Path, target: Path) -> None:
 
 
 def _system_temp_is_usable() -> bool:
-    # 仓库内临时目录需要复制安装器源码，避免安装目标与源码重叠。
+    # 仓库内临时目录需要复制安装器源码，避免安装目标与源码重叠；含祖先软链的 TMPDIR 亦走仓内真实路径回退。
     if REPO_ROOT == Path(tempfile.gettempdir()).resolve() or REPO_ROOT in Path(tempfile.gettempdir()).resolve().parents:
         return False
     try:
@@ -169,9 +337,10 @@ def _system_temp_is_usable() -> bool:
             probe = Path(tmp) / "probe.tmp"
             target = Path(tmp) / "probe.ok"
             probe.write_bytes(b"ok")
+            INSTALLER._validate_path(probe, directory=False)
             os.replace(probe, target)
             return target.read_bytes() == b"ok"
-    except OSError:
+    except (OSError, ValueError):
         return False
 
 
@@ -185,8 +354,8 @@ class TestEndToEndIntegration(unittest.TestCase):
         if _system_temp_is_usable():
             cls.installer_root = REPO_ROOT
             return
-        # 受限沙箱（如禁止写入系统 %TEMP% 的 workspace-write 环境）下回退至 .pytest_cache 内隔离运行。
-        fallback_base = REPO_ROOT / ".pytest_cache" / "e2e_sandbox"
+        # 受限沙箱（如禁止写入系统 %TEMP% 或系统临时目录含祖先链接）下回退至 .pytest_cache 内真实路径运行。
+        fallback_base = (REPO_ROOT / ".pytest_cache" / "e2e_sandbox").resolve()
         fallback_base.mkdir(parents=True, exist_ok=True)
         temp_patch = mock.patch.object(tempfile, "tempdir", str(fallback_base))
         temp_patch.start()
@@ -209,28 +378,47 @@ class TestEndToEndIntegration(unittest.TestCase):
         cls.addClassCleanup(installer_patch.stop)
 
     def setUp(self) -> None:
-        self._old_harness_depth = os.environ.pop("CAE_HARNESS_DEPTH", None)
+        clean_env = {
+            k: v for k, v in os.environ.items()
+            if not _should_strip_host_env(k, v)
+        }
+        self._env_patch = mock.patch.dict(os.environ, clean_env, clear=True)
+        self._env_patch.start()
 
     def tearDown(self) -> None:
-        if self._old_harness_depth is None:
-            os.environ.pop("CAE_HARNESS_DEPTH", None)
-        else:
-            os.environ["CAE_HARNESS_DEPTH"] = self._old_harness_depth
+        self._env_patch.stop()
 
     def _managed_repo_files(self, pattern=None):
         if (REPO_ROOT / ".git").exists():
             cmd = ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"]
             if pattern:
                 cmd.extend(["--", pattern])
-            proc = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True)
+            proc = subprocess.run(
+                cmd, cwd=REPO_ROOT, env=_without_git_env(), capture_output=True, timeout=15
+            )
             if proc.returncode == 0:
                 return [item for item in proc.stdout.decode("utf-8").split("\0") if item]
         ignored = {".git", ".pytest_cache", "__pycache__", ".venv", "venv"}
-        return sorted(
-            path.relative_to(REPO_ROOT).as_posix()
-            for path in REPO_ROOT.rglob(pattern or "*")
-            if path.is_file() and not any(part in ignored for part in path.relative_to(REPO_ROOT).parts)
-        )
+        pat = pattern.replace("\\", "/").removeprefix("./").rstrip("/") if pattern else None
+        if pat in ("", "."):
+            pat = None
+        has_glob = bool(pat and any(ch in pat for ch in ("*", "?", "[")))
+        matched: list[str] = []
+        for path in REPO_ROOT.rglob("*"):
+            if not path.is_file():
+                continue
+            rel = path.relative_to(REPO_ROOT)
+            if any(part in ignored for part in rel.parts):
+                continue
+            rel_posix = rel.as_posix()
+            if pat is None:
+                matched.append(rel_posix)
+            elif has_glob:
+                if fnmatch.fnmatch(rel_posix, pat) or ("/" not in pat and fnmatch.fnmatch(path.name, pat)):
+                    matched.append(rel_posix)
+            elif rel_posix == pat or rel_posix.startswith(pat + "/"):
+                matched.append(rel_posix)
+        return sorted(matched)
 
     def test_markdown_tables_never_exceed_five_columns(self):
         managed = self._managed_repo_files("*.md")
@@ -341,6 +529,11 @@ class TestEndToEndIntegration(unittest.TestCase):
             self.assertIn("subagent: true", agent_text)
             self.assertIn("mainAgent: true", agent_text, "agy CLI --agent 需要 mainAgent: true 方可识别")
             self.assertNotIn("hidden: true", agent_text, "App v2.32.0 下 hidden: true 会将子代理从 <subagents> 目录隐藏")
+            self.assertIn("#L10-L25", agent_text)
+            self.assertIsNone(SEASONAL_MODEL_PATTERN.search(agent_text))
+            if agent_name == "readonly-collaborator.md":
+                self.assertIn("计算与内存开销", agent_text)
+                self.assertIn("引用外部或本地文献须注明出处", agent_text)
 
         skill_md = ACTIVE_PLUGIN_DIR / "skills" / "cae-harness" / "SKILL.md"
         skill_script = ACTIVE_PLUGIN_DIR / "skills" / "cae-harness" / "scripts" / "cae_harness.py"
@@ -375,18 +568,80 @@ class TestEndToEndIntegration(unittest.TestCase):
 
         codex_tpl = REPO_ROOT / "template" / "codex"
         self.assertTrue((codex_tpl / "hooks.json").is_file())
-        for toml_name in ("readonly-auditor.toml", "readonly-reader.toml", "readonly-collaborator.toml"):
+        expected_codex_tomls = ("readonly-auditor.toml", "readonly-reader.toml", "readonly-collaborator.toml")
+        actual_codex_tomls = sorted(p.name for p in (codex_tpl / "agents").glob("*.toml"))
+        self.assertEqual(set(actual_codex_tomls), set(expected_codex_tomls))
+        expected_codex_features = {
+            "request_permissions_tool": False,
+            "apps": False,
+            "plugins": False,
+            "memories": False,
+        }
+        for toml_name in expected_codex_tomls:
             toml_path = codex_tpl / "agents" / toml_name
             self.assertTrue(toml_path.is_file(), f"缺少 Codex 只读子代理模板: {toml_name}")
             toml_text = toml_path.read_text(encoding="utf-8")
-            self.assertIn('name = "readonly-', toml_text)
-            self.assertIn("严禁修改任何文件", toml_text)
+            self.assertIsNone(SEASONAL_MODEL_PATTERN.search(toml_text), f"{toml_name} 严禁硬编码季节性模型名")
+            parsed_toml = tomllib.loads(toml_text)
+            self.assertEqual(
+                set(parsed_toml.keys()),
+                {"name", "description", "sandbox_mode", "developer_instructions", "features"},
+                f"{toml_name} 顶层标量键必须位于所有 [table] 段之前且集合精确匹配",
+            )
+            self.assertEqual(parsed_toml["name"], toml_path.stem)
+            self.assertTrue(isinstance(parsed_toml["description"], str) and parsed_toml["description"].strip())
+            self.assertEqual(parsed_toml["sandbox_mode"], "read-only")
+            dev_inst = parsed_toml["developer_instructions"]
+            self.assertTrue(isinstance(dev_inst, str) and "严禁修改任何文件" in dev_inst)
+            self.assertIn("#L10-L25", dev_inst)
+            if toml_name == "readonly-auditor.toml":
+                self.assertIn("需要编译、运行算例或执行脚本才能确认的事项统一交回主会话处理。", dev_inst)
+                self.assertNotIn("需要执行命令才能确认的事项", dev_inst)
+            if toml_name == "readonly-collaborator.toml":
+                self.assertIn("计算与内存开销", dev_inst)
+                self.assertIn("引用外部或本地文献须注明出处", dev_inst)
+            self.assertEqual(parsed_toml["features"], expected_codex_features)
+
+        claude_tpl = REPO_ROOT / "template" / "claude"
+        claude_hooks_file = claude_tpl / "hooks.json"
+        self.assertTrue(claude_hooks_file.is_file(), "缺少 Claude 生命周期钩子模板 template/claude/hooks.json")
+        claude_hooks_doc = json.loads(claude_hooks_file.read_text(encoding="utf-8"))
+        claude_events = claude_hooks_doc.get("hooks", {})
+        self.assertEqual(
+            set(claude_events.keys()),
+            {"SessionStart", "PostCompact", "UserPromptSubmit", "PreToolUse", "Stop"},
+        )
+        claude_cmds = [
+            handler["command"]
+            for groups in claude_events.values()
+            for group in groups
+            for handler in group.get("hooks", [])
+        ]
+        for script_name in ("session_context_loader.py", "status_guard.py", "reply_repeat_guard.py", "handoff_gate.py"):
+            self.assertTrue(any(script_name in cmd for cmd in claude_cmds), f"Claude hooks.json 缺少 {script_name}")
+        for md_name in ("readonly-auditor.md", "readonly-reader.md", "readonly-collaborator.md"):
+            claude_agent_path = claude_tpl / "agents" / md_name
+            self.assertTrue(claude_agent_path.is_file(), f"缺少 Claude 只读子代理模板: {md_name}")
+            claude_agent_text = claude_agent_path.read_text(encoding="utf-8")
+            self.assertTrue(claude_agent_text.startswith(f"---\nname: {claude_agent_path.stem}\n"))
+            self.assertIn("tools: Read, Grep, Glob", claude_agent_text)
+            self.assertIn("model: inherit", claude_agent_text)
+            self.assertIn("严禁修改任何文件", claude_agent_text)
+            self.assertIn("#L10-L25", claude_agent_text)
+            self.assertIsNone(SEASONAL_MODEL_PATTERN.search(claude_agent_text), f"Claude {md_name} 严禁硬编码季节性模型名")
+            if md_name == "readonly-collaborator.md":
+                self.assertIn("计算与内存开销", claude_agent_text)
+                self.assertIn("引用外部或本地文献须注明出处", claude_agent_text)
 
     def test_02_repository_personal_path_hardware_and_credential_patterns(self) -> None:
         """扫描仓库文本中与个人路径、具体硬件型号和常见凭据匹配的内容。"""
-        home_variants = _path_spelling_variants((Path.home(), REPO_ROOT))
-        user_name = getpass.getuser()
-        hostname = os.environ.get("COMPUTERNAME") or socket.gethostname()
+        variant_roots = [Path.home()] + ([REPO_ROOT] if len(REPO_ROOT.parts) > 2 else [])
+        home_variants = _path_spelling_variants(variant_roots)
+        raw_user_name = getpass.getuser()
+        raw_hostname = os.environ.get("COMPUTERNAME") or socket.gethostname()
+        code_tokens = _collect_repo_benign_tokens(REPO_ROOT)
+        user_name = "" if raw_user_name.casefold() in code_tokens else raw_user_name
+        hostname = "" if raw_hostname.casefold() in code_tokens else raw_hostname
         checked_count = 0
         for path in REPO_ROOT.rglob("*"):
             rel_parts = path.relative_to(REPO_ROOT).parts
@@ -1088,7 +1343,7 @@ class TestEndToEndIntegration(unittest.TestCase):
     def test_wp3b_rules_preserve_full_template_and_only_rename_local_collisions(self):
         template = TEMPLATE_DIR / "rules/AGENTS.md"
         expected = template.read_text(encoding="utf-8").rstrip()
-        with tempfile.TemporaryDirectory(dir=REPO_ROOT / "tests") as tmp:
+        with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp) / "AGENTS.md"
             for newline in ("\n", "\r\n"):
                 with self.subTest(newline=repr(newline)):
@@ -1707,6 +1962,8 @@ class TestEndToEndIntegration(unittest.TestCase):
                 scripts.mkdir()
                 for name in ("session_context_loader.py", "user_words.py"):
                     shutil.copy2(TEMPLATE_DIR / "hooks" / name, scripts / name)
+                if (TEMPLATE_DIR / "hooks" / "_lib").is_dir():
+                    shutil.copytree(TEMPLATE_DIR / "hooks" / "_lib", scripts / "_lib")
                 installed = json.loads(first.change.content)["hooks"]["SessionStart"][0]["hooks"][0]["command"]
                 payload = {"hook_event_name": "SessionStart", "session_id": "fallback-round-trip", "source": "startup"}
                 result = subprocess.run(["/bin/sh", "-c", installed], input=json.dumps(payload), cwd=root,
@@ -2347,7 +2604,7 @@ class TestEndToEndIntegration(unittest.TestCase):
         if (REPO_ROOT / ".git").exists():
             git_proc = subprocess.run(
                 ["git", "-c", "core.quotepath=false", "ls-files", "--cached", "--others", "--exclude-standard"],
-                cwd=REPO_ROOT, capture_output=True, text=True, encoding="utf-8", check=False,
+                cwd=REPO_ROOT, env=_without_git_env(), capture_output=True, text=True, encoding="utf-8", check=False, timeout=15,
             )
             if git_proc.returncode == 0:
                 repo_files = [REPO_ROOT / line for line in git_proc.stdout.splitlines() if line and (REPO_ROOT / line).is_file()]
@@ -2367,11 +2624,34 @@ class TestEndToEndIntegration(unittest.TestCase):
         version_token_re = re.compile(rf"(?<![\d.]){re.escape(plugin_version)}(?![\d.])")
         static_date_re = re.compile(r"\b202\d-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])\b")
         patch_prefix_re = re.compile(r"(?m)^\s*(?:>\s*)?(?:\*{0,2})(?:补充说明|更新说明|补丁说明|历史补丁)\s*[：:]")
+        anchor_cache: dict[Path, set[str]] = {}
+
+        def anchors_for_md(md_file: Path) -> set[str]:
+            resolved_md = md_file.resolve()
+            if resolved_md not in anchor_cache:
+                anchor_cache[resolved_md] = _extract_md_heading_anchors(resolved_md.read_text(encoding="utf-8"))
+            return anchor_cache[resolved_md]
+
         checked_md_count = 0
+        checked_svg_count = 0
+        checked_anchor_count = 0
         for path in repo_files:
             rel_posix = path.relative_to(REPO_ROOT).as_posix()
             self.assertTrue(rel_posix.isascii(), f"仓库文件路径须为纯 ASCII 以免跨平台转义: {rel_posix}")
-            if path.suffix.lower() != ".md":
+            suffix_low = path.suffix.lower()
+            if rel_posix.startswith("docs/assets/") and suffix_low == ".svg":
+                checked_svg_count += 1
+                svg_text = path.read_text(encoding="utf-8")
+                self.assertIsNone(
+                    version_token_re.search(svg_text),
+                    f"{rel_posix} 不应硬编码当前插件版本号 {plugin_version}",
+                )
+                self.assertIsNone(
+                    static_date_re.search(svg_text),
+                    f"{rel_posix} 不应硬编码静态日期戳",
+                )
+                continue
+            if suffix_low != ".md":
                 continue
             checked_md_count += 1
             md_text = path.read_text(encoding="utf-8")
@@ -2389,8 +2669,17 @@ class TestEndToEndIntegration(unittest.TestCase):
                     f"{rel_posix} 检出补丁式堆叠抬头，请整篇通顺重写而非追加附注",
                 )
             for raw_target in extract_md_targets(md_text):
-                target = urllib.parse.unquote(raw_target.split("#", 1)[0].split("?", 1)[0].strip())
-                if not target or target.startswith("//") or re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", target):
+                stripped_raw = raw_target.strip()
+                if not stripped_raw or stripped_raw.startswith("//") or re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", stripped_raw):
+                    continue
+                path_part, has_hash, frag_part = stripped_raw.partition("#")
+                target = urllib.parse.unquote(path_part.split("?", 1)[0].strip())
+                anchor = urllib.parse.unquote(frag_part.strip()).lower() if has_hash else ""
+                if not target:
+                    if has_hash:
+                        self.assertTrue(bool(anchor), f"{rel_posix} 包含空页内锚点: {raw_target}")
+                        self.assertIn(anchor, anchors_for_md(path), f"{rel_posix} 页内标题锚点不存在: #{frag_part}")
+                        checked_anchor_count += 1
                     continue
                 self.assertFalse(target.startswith("/"), f"{rel_posix} 本地链接不应使用根前导斜杠: {raw_target}")
                 resolved = (path.parent / target).resolve()
@@ -2399,7 +2688,13 @@ class TestEndToEndIntegration(unittest.TestCase):
                     f"{rel_posix} 本地链接越出仓库根目录: {raw_target}",
                 )
                 self.assertTrue(resolved.exists(), f"{rel_posix} 存在失效的本地链接: {raw_target}")
+                if has_hash and resolved.is_file() and resolved.suffix.lower() == ".md":
+                    if not re.fullmatch(r"l\d+(?:-l?\d+)?", anchor):
+                        self.assertIn(anchor, anchors_for_md(resolved), f"{rel_posix} 跨文档标题锚点不存在: {raw_target}")
+                        checked_anchor_count += 1
         self.assertGreaterEqual(checked_md_count, 6)
+        self.assertGreaterEqual(checked_svg_count, 3)
+        self.assertGreaterEqual(checked_anchor_count, 8)
 
     @unittest.skipUnless(os.name == "nt", "验证 Windows NTFS 8.3 短路径下 Codex 托管钩子升级不重复追加")
     def test_42_windows_8dot3_short_path_codex_hook_upgrade(self) -> None:
@@ -2892,6 +3187,146 @@ raise SystemExit(module.main(sys.argv[3:]))
             with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(fake_home / ".claude"), "CAE_HARNESS_DEPTH": "1"}, clear=True):
                 self.assertTrue(uw_mod.claude_hook_session({"session_id": "sess-headless-01"})[3])
                 self.assertTrue(uw_mod.codex_hook_session({"session_id": "sess-headless-01"})[3])
+
+
+    def test_50_v1152_shard4_env_isolation_ci_and_anchor_contracts(self) -> None:
+        for stripped_key in STRIPPED_HOST_ENV_KEYS:
+            self.assertNotIn(stripped_key, os.environ)
+        self.assertFalse(any(k.upper().startswith(STRIPPED_HOST_ENV_PREFIXES) for k in os.environ))
+        self.assertFalse(any(
+            k.upper().startswith("USER_GUARD_") and k.upper() not in USER_GUARD_INSTALL_ENV_KEYS
+            for k in os.environ
+        ))
+
+
+        benign = _collect_repo_benign_tokens(REPO_ROOT)
+        for expected_tok in ("ubuntu-latest", "persist-credentials", "persist", "readonly-auditor", "workspace-write"):
+            self.assertIn(expected_tok, benign)
+        sample_yml = "with:\n  persist-credentials: false\nruns-on: ubuntu-latest\n"
+        for colliding in ("persist-credentials", "persist", "ubuntu-latest", "readonly-auditor"):
+            u = "" if colliding.casefold() in benign else colliding
+            h = "" if colliding.casefold() in benign else colliding
+            self.assertEqual(_sensitive_findings(sample_yml, user_name=u, hostname=h), [])
+            self.assertIn("未脱敏主目录", _sensitive_findings("/home/" + colliding + "/solver", user_name=u, hostname=h))
+            fake_home_vars = _path_spelling_variants(["/home/" + colliding])
+            self.assertIn("本机路径", _sensitive_findings("cwd=" + "/home/" + colliding + "/proj", home_variants=fake_home_vars, user_name=u, hostname=h))
+
+        md_sample = "# 导言\n## 一、一键安装与课题接入\n### 1. 常驻机制层（`fleet_profile.json`）\n## 导言\n"
+        anchors = _extract_md_heading_anchors(md_sample)
+        self.assertIn("导言", anchors)
+        self.assertIn("导言-1", anchors)
+        self.assertIn("一一键安装与课题接入", anchors)
+        self.assertIn("1-常驻机制层fleet_profilejson", anchors)
+        self.assertNotIn("不存在的锚点", anchors)
+
+        ci_text = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        self.assertIn('.replace("%", "%25")', ci_text)
+        self.assertIn('"check-grounding", "--target", ".", "--strict"', ci_text)
+        self.assertIn('report.get("errors") == []', ci_text)
+        self.assertIn('set(report["summary"]["recommended_actions"]) <= {"refresh_codex_model_catalog"}', ci_text)
+        self.assertIn('["git", "status", "--porcelain"]', ci_text)
+
+
+    def test_51_v1152_r2_doc_skill_auditor_and_env_contracts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            existing_dir = Path(tmp) / "installed_plugin"
+            existing_dir.mkdir()
+            existing_file = Path(tmp) / "not_a_dir.txt"
+            existing_file.write_text("x", encoding="utf-8")
+            self.assertEqual(_resolve_active_plugin_dir({}), TEMPLATE_DIR)
+            self.assertEqual(_resolve_active_plugin_dir({"USER_GUARD_INSTALLED_DIR": ""}), TEMPLATE_DIR)
+            self.assertEqual(_resolve_active_plugin_dir({"USER_GUARD_INSTALLED_DIR": "   "}), TEMPLATE_DIR)
+            self.assertEqual(_resolve_active_plugin_dir({"USER_GUARD_INSTALLED_DIR": str(Path(tmp) / "missing")}), TEMPLATE_DIR)
+            self.assertEqual(_resolve_active_plugin_dir({"USER_GUARD_INSTALLED_DIR": str(existing_file)}), TEMPLATE_DIR)
+            self.assertEqual(_resolve_active_plugin_dir({"USER_GUARD_INSTALLED_DIR": str(existing_dir)}), existing_dir)
+            self.assertFalse(_should_strip_host_env("USER_GUARD_INSTALLED_DIR", str(existing_dir)))
+            self.assertFalse(_should_strip_host_env("USER_GUARD_INSTALLED_CODEX_DIR", str(existing_dir)))
+            self.assertTrue(_should_strip_host_env("USER_GUARD_INSTALLED_DIR", ""))
+            self.assertTrue(_should_strip_host_env("USER_GUARD_INSTALLED_DIR", str(Path(tmp) / "missing")))
+
+        for polluted_key in (
+            "PLUGIN_DATA", "USER_GUARD_STATE_DIR", "USER_GUARD_CUSTOM_FLAG",
+            "AGY_CONVERSATION_ID", "ANTIGRAVITY_AGENT", "CODEX_THREAD_ID",
+            "CLAUDECODE", "CLAUDE_SESSION_ID", "ANTHROPIC_API_KEY", "DSH_HOME",
+            "OPENAI_API_KEY", "DEEPSEEK_API_KEY", "GIT_DIR", "GIT_WORK_TREE",
+            "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_COMMON_DIR", "GIT_CEILING_DIRECTORIES", "GIT_PREFIX",
+            "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+            "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+            "XDG_STATE_HOME", "PYTHONPATH",
+        ):
+            self.assertTrue(_should_strip_host_env(polluted_key, "polluted"), polluted_key)
+
+        with mock.patch.dict(os.environ, {
+            "GIT_DIR": "/bad", "GIT_WORK_TREE": "/bad", "GIT_INDEX_FILE": "/bad",
+            "GIT_COMMON_DIR": "/bad", "GIT_OBJECT_DIRECTORY": "/bad",
+        }):
+            self.assertEqual(self._managed_repo_files("README.md"), ["README.md"])
+
+        orig_exists = Path.exists
+
+        def _hide_dot_git(path_obj: Path) -> bool:
+            if path_obj == REPO_ROOT / ".git":
+                return False
+            return orig_exists(path_obj)
+
+        with mock.patch.object(Path, "exists", autospec=True, side_effect=_hide_dot_git):
+            self.assertEqual(self._managed_repo_files("README.md"), ["README.md"])
+            self.assertEqual(
+                self._managed_repo_files("template/user-guard/README.md"),
+                ["template/user-guard/README.md"],
+            )
+            docs_only = self._managed_repo_files("docs")
+            self.assertIn("docs/architecture-and-hooks.md", docs_only)
+            self.assertIn("docs/workflow-guide.md", docs_only)
+            self.assertTrue(all(item.startswith("docs/") for item in docs_only))
+            wildcard_mds = self._managed_repo_files("*.md")
+            self.assertIn("README.md", wildcard_mds)
+            self.assertIn("template/user-guard/README.md", wildcard_mds)
+            all_managed = self._managed_repo_files()
+            self.assertIn("install.py", all_managed)
+            self.assertIn("README.md", all_managed)
+
+        s1_clause = "省略默认流号 `S1` 时须匹配具体模型名，仅在未记录具体模型名时可用任务状态词替代"
+        s1_docs = (
+            TEMPLATE_DIR / "rules" / "AGENTS.md",
+            REPO_ROOT / "AGENTS.md",
+            TEMPLATE_DIR / "README.md",
+            REPO_ROOT / "docs" / "workflow-guide.md",
+            TEMPLATE_DIR / "skills" / "cae-harness" / "SKILL.md",
+            TEMPLATE_DIR / "skills" / "fleet-evolve" / "SKILL.md",
+        )
+        for doc_path in s1_docs:
+            rel_doc = doc_path.relative_to(REPO_ROOT).as_posix()
+            doc_body = doc_path.read_text(encoding="utf-8")
+            self.assertIn(s1_clause, doc_body, f"{rel_doc} 缺少统一的单流省略 S1 销账契约表述")
+            self.assertNotIn("可用模型名或任务状态替代", doc_body, f"{rel_doc} 残留旧版 S1 销账表述")
+            self.assertNotIn("可用模型名或任务状态代替默认流号", doc_body, f"{rel_doc} 残留旧版 S1 销账表述")
+
+        wf_text = (REPO_ROOT / "docs" / "workflow-guide.md").read_text(encoding="utf-8")
+        self.assertIn("单路 `gate`", wf_text)
+        self.assertNotIn("单轮 `gate`", wf_text)
+
+        harness_skill_text = (TEMPLATE_DIR / "skills" / "cae-harness" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn("禁止微调 `engine`", harness_skill_text)
+        self.assertIn('"$HARNESS" probe --caller auto --redact', harness_skill_text)
+        self.assertIn('"$HARNESS" assess --caller auto --redact', harness_skill_text)
+        self.assertIn("还会校验 `--write-scope`（须为获批范围子集）与 `--verify-cmd` 一致性", harness_skill_text)
+        self.assertNotIn("以下从技能目录运行", harness_skill_text)
+
+        auditor_toml = tomllib.loads((REPO_ROOT / "template" / "codex" / "agents" / "readonly-auditor.toml").read_text(encoding="utf-8"))
+        self.assertIn("需要编译、运行算例或执行脚本才能确认的事项统一交回主会话处理。", auditor_toml["developer_instructions"])
+        self.assertNotIn("需要执行命令才能确认的事项", auditor_toml["developer_instructions"])
+
+        arch_text = (REPO_ROOT / "docs" / "architecture-and-hooks.md").read_text(encoding="utf-8")
+        self.assertIn("两侧均保留双引号内的 `$HOME`", arch_text)
+        self.assertNotIn("改用 `python3 -B -X utf8` 与 `~`", arch_text)
+        self.assertIsNone(re.search(r'"~[/\\]', arch_text))
+        self.assertIn("活跃 `AWAITING_MASTER_RELOAD` Pass 2 重启锁及损坏状态文件", arch_text)
+
+        readme_text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn("`sync_codex_model_defaults`", readme_text)
+        self.assertIn("`sync_claude_model_defaults`", readme_text)
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@
 $ErrorActionPreference = "Stop"
 $PSNativeCommandUseErrorActionPreference = $false
 
-[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch [System.IO.IOException] {} catch [System.Security.SecurityException] {}
 $env:PYTHONDONTWRITEBYTECODE = "1"
 
 function Find-WorkingPython {
@@ -39,6 +39,8 @@ function Find-WorkingPython {
             }
         } catch [System.ComponentModel.Win32Exception] {
             continue
+        } catch [System.UnauthorizedAccessException] {
+            continue
         } catch [System.InvalidOperationException] {
             continue
         } catch [System.AggregateException] {
@@ -50,9 +52,21 @@ function Find-WorkingPython {
 }
 
 $python = Find-WorkingPython "python.exe"
-$launcher = if (-not $python) { Find-WorkingPython "py.exe" @("-3") }
+$launcher = $null
+$launcherArgs = @()
+if (-not $python) {
+    foreach ($pyFlag in @("-3", "-3.14", "-3.13", "-3.12", "-3.11")) {
+        $foundLauncher = Find-WorkingPython "py.exe" @($pyFlag)
+        if ($foundLauncher) {
+            $launcher = $foundLauncher
+            $launcherArgs = @($pyFlag)
+            break
+        }
+    }
+}
 if (-not $python -and -not $launcher) {
-    Write-Error "[!] 错误：未在 PATH 中找到可执行的 Python 3.11+。" -ErrorAction Continue
+    Write-Error ("[!] 错误：未在 PATH 或 py.exe 启动器中找到可执行的 Python 3.11+（请安装 Python 3.11+ 并勾选 Add python.exe to PATH，或运行 py -0p 排查）。`r`n" +
+        "[!] Error: Python 3.11+ executable not found in PATH or via py.exe launcher (install Python 3.11+ with 'Add python.exe to PATH' or check 'py -0p').") -ErrorAction Continue
     exit 1
 }
 
@@ -69,17 +83,28 @@ function Quote-WindowsArg {
     return '"' + $escaped + '"'
 }
 
-# 直接继承控制台标准流启动 Python：既保留无换行交互提示即时输出，又避免 PowerShell 5.1 将原生 stderr 误判为终止异常。
+# 常规交互模式直接继承控制台标准流（保留无换行提示即时输出并兼容 2>&1 零误判）；只读 JSON 模式重定向标准输出以支持管道捕获。
 $exePath = if ($python) { $python } else { $launcher }
-$fullArgs = @(if (-not $python) { '-3' }) + @('-B', '-X', 'utf8', "$PSScriptRoot\install.py") + @($args)
+$fullArgs = @($launcherArgs) + @('-B', '-X', 'utf8', "$PSScriptRoot\install.py") + @($args)
+$captureJsonStdout = (@($args) -contains '--probe-apps') -or (@($args) -contains '--audit-upgrade')
 $installerExitCode = 1
 $proc = [System.Diagnostics.Process]::new()
 try {
     $proc.StartInfo.FileName = $exePath
     $proc.StartInfo.Arguments = ($fullArgs | ForEach-Object { Quote-WindowsArg ([string]$_) }) -join ' '
     $proc.StartInfo.UseShellExecute = $false
+    if ($captureJsonStdout) {
+        $proc.StartInfo.RedirectStandardOutput = $true
+        $proc.StartInfo.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false)
+    }
     $null = $proc.Start()
-    $proc.WaitForExit()
+    if ($captureJsonStdout) {
+        $stdoutText = $proc.StandardOutput.ReadToEnd()
+        $proc.WaitForExit()
+        if ($stdoutText.Length -gt 0) { Write-Output $stdoutText.TrimEnd("`r", "`n") }
+    } else {
+        $proc.WaitForExit()
+    }
     $installerExitCode = $proc.ExitCode
 } catch [System.ComponentModel.Win32Exception] {
     Write-Error "[!] 无法启动 Python 安装器。$($_.Exception.Message)" -ErrorAction Continue

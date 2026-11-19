@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 from contextlib import contextmanager
 import hashlib
 import json
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -25,15 +27,46 @@ def _side() -> str:
     return "windows" if os.name == "nt" else "posix"
 
 
+_GIT_ENV_SCRUB = frozenset({
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_PREFIX",
+})
+
+
+def _is_reparse_or_symlink(path: Path) -> bool:
+    try:
+        st = path.lstat()
+    except OSError:
+        return False
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_file_attributes", 0) & reparse_flag)
+
+
+def _reject_symlink_chain(path: Path) -> Path:
+    target = path.expanduser().absolute()
+    if ".." in target.parts:
+        raise ValueError(f"Refusing parent traversal in fleet-evolve state path: {path}")
+    for candidate in (*reversed(target.parents), target):
+        if _is_reparse_or_symlink(candidate):
+            raise ValueError(f"Refusing symbolic link or reparse point in fleet-evolve state path: {candidate}")
+    return target
+
+
 def _default_state_dir() -> Path:
     override = os.environ.get("CAE_FLEET_STATE_DIR", "").strip()
     if override:
-        return Path(override).expanduser().resolve()
+        return _reject_symlink_chain(Path(override)).resolve()
     if os.name == "nt":
         base = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local"))
     else:
         base = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
-    return (base / "cae-harness" / "fleet-evolve").expanduser().resolve()
+    return _reject_symlink_chain(base / "cae-harness" / "fleet-evolve").resolve()
 
 
 def _overlaps(left: Path, right: Path) -> bool:
@@ -55,7 +88,12 @@ def _validated_state_file(repo_root: Path) -> Path:
     forbidden = tuple(item.expanduser().resolve() for item in raw_forbidden)
     if any(_overlaps(state_dir, root) for root in forbidden):
         raise ValueError(f"fleet-evolve state dir overlaps repo or client config root: {state_dir}")
-    return state_dir / f"state.{_side()}.json"
+    state_file = state_dir / f"state.{_side()}.json"
+    lock_path = state_file.with_suffix(state_file.suffix + ".lock")
+    for candidate in (state_file, lock_path):
+        if _is_reparse_or_symlink(candidate):
+            raise ValueError(f"Refusing symbolic link or reparse point in fleet-evolve state path: {candidate}")
+    return state_file
 
 
 class NotUpstreamRepoError(ValueError):
@@ -98,27 +136,32 @@ def _run_repo_grounding_gate(repo_root: Path) -> Dict[str, Any]:
         if not isinstance(result, dict) or not isinstance(result.get("ok"), bool):
             raise ValueError("grounding gate returned an invalid result")
         return result
-    except Exception as exc:
+    except (OSError, ImportError, SyntaxError, ValueError, TypeError, AttributeError, RuntimeError) as exc:
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
 def _default_ttl_seconds(repo_root: Path | None = None) -> int:
-    candidates: list[Path] = []
     env_profile = os.environ.get("CAE_FLEET_PROFILE", "").strip()
     if env_profile:
-        candidates.append(Path(env_profile).expanduser())
-    if repo_root is not None:
-        candidates.append(repo_root / "template" / "user-guard" / "skills" / "cae-harness" / "fleet_profile.json")
-    candidates.append(Path(__file__).resolve().parents[2] / "cae-harness" / "fleet_profile.json")
+        candidates: list[Path] = [Path(env_profile).expanduser()]
+    else:
+        candidates = []
+        if repo_root is not None:
+            candidates.append(repo_root / "template" / "user-guard" / "skills" / "cae-harness" / "fleet_profile.json")
+        candidates.append(Path(__file__).resolve().parents[2] / "cae-harness" / "fleet_profile.json")
     for candidate in candidates:
         try:
-            if candidate.is_file():
+            if candidate.is_file() and not _is_reparse_or_symlink(candidate):
                 raw = json.loads(candidate.read_text(encoding="utf-8-sig"))
-                hd = ((raw.get("runtime_tunables") or {}).get("headless_dispatch") or {}) if isinstance(raw, dict) else {}
+                if not isinstance(raw, dict):
+                    continue
+                if "schema_version" in raw and (isinstance(raw["schema_version"], bool) or raw["schema_version"] != 1):
+                    continue
+                hd = (raw.get("runtime_tunables") or {}).get("headless_dispatch") or {}
                 val = hd.get("fleet_state_ttl_sec") if isinstance(hd, dict) else None
                 if isinstance(val, int) and not isinstance(val, bool) and val > 0:
                     return val
-        except (OSError, ValueError):
+        except (OSError, UnicodeError, ValueError, RecursionError):
             continue
     return 86400
 
@@ -127,7 +170,15 @@ def _repo_meta(repo_root: Path) -> Dict[str, str]:
     plugin_json = repo_root / "template" / "user-guard" / "plugin.json"
     skill_md = repo_root / "template" / "user-guard" / "skills" / "fleet-evolve" / "SKILL.md"
     profile_json = repo_root / "template" / "user-guard" / "skills" / "cae-harness" / "fleet_profile.json"
-    plugin_version = json.loads(plugin_json.read_text(encoding="utf-8-sig")).get("version", "") if plugin_json.is_file() else ""
+    plugin_version = ""
+    if plugin_json.is_file():
+        try:
+            parsed_plugin = json.loads(plugin_json.read_text(encoding="utf-8-sig"))
+        except RecursionError as exc:
+            raise ValueError("corrupt plugin.json") from exc
+        if not isinstance(parsed_plugin, dict):
+            raise ValueError("plugin.json root must be a JSON object")
+        plugin_version = parsed_plugin.get("version", "")
     skill_sha256 = hashlib.sha256(skill_md.read_bytes()).hexdigest() if skill_md.is_file() else ""
     profile_sha256 = hashlib.sha256(profile_json.read_bytes()).hexdigest() if profile_json.is_file() else ""
     core_digest = hashlib.sha256()
@@ -143,9 +194,16 @@ def _repo_meta(repo_root: Path) -> Dict[str, str]:
         if target.is_file():
             core_digest.update(hashlib.sha256(target.read_bytes()).digest())
     commit = ""
+    git_env = {k: v for k, v in os.environ.items() if k not in _GIT_ENV_SCRUB}
     try:
         proc = subprocess.run(
-            ["git", "rev-parse", "HEAD"], cwd=repo_root, capture_output=True, text=True, encoding="utf-8", timeout=5
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_root,
+            env=git_env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=5,
         )
         if proc.returncode == 0:
             commit = proc.stdout.strip()
@@ -176,46 +234,106 @@ def _is_aligned_with_repo(saved: Dict[str, Any], meta: Dict[str, str]) -> bool:
 
 @contextmanager
 def _state_lock(state_file: Path) -> Iterator[None]:
-    state_file.parent.mkdir(parents=True, exist_ok=True)
-    if os.name == "posix":
-        state_file.parent.chmod(0o700)
+    _reject_symlink_chain(state_file)
     lock_path = state_file.with_suffix(state_file.suffix + ".lock")
-    with open(lock_path, "a+b") as handle:
-        if os.name == "nt":
-            handle.seek(0, os.SEEK_END)
-            if handle.tell() == 0:
-                handle.write(b"\0")
-                handle.flush()
-            handle.seek(0)
-            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
-        else:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    if _is_reparse_or_symlink(lock_path):
+        raise ValueError(f"Refusing symbolic link or reparse point in fleet-evolve state path: {lock_path}")
+    leaf_created = not state_file.parent.exists()
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+    _reject_symlink_chain(state_file)
+    if leaf_created and os.name == "posix":
+        state_file.parent.chmod(0o700)
+    if _is_reparse_or_symlink(state_file) or _is_reparse_or_symlink(lock_path):
+        raise ValueError(f"Refusing symbolic link or reparse point in fleet-evolve state path: {lock_path}")
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    for _attempt in range(8):
+        if _is_reparse_or_symlink(lock_path):
+            raise ValueError(f"Refusing symbolic link or reparse point in fleet-evolve state path: {lock_path}")
+        fd = os.open(lock_path, flags, 0o600)
+        locked = False
         try:
-            yield
-        finally:
+            opened_st = os.fstat(fd)
+            if not stat.S_ISREG(opened_st.st_mode) or opened_st.st_nlink > 1:
+                raise ValueError(f"Refusing non-regular or hardlinked fleet-evolve lock file: {lock_path}")
             if os.name == "nt":
-                handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+                locked = True
             else:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                locked = True
+            opened_after = os.fstat(fd)
+            try:
+                path_st = lock_path.lstat()
+            except FileNotFoundError:
+                path_st = None
+            if path_st is not None and _is_reparse_or_symlink(lock_path):
+                raise ValueError(f"Refusing symbolic link or reparse point in fleet-evolve state path: {lock_path}")
+            if (
+                not stat.S_ISREG(opened_after.st_mode)
+                or opened_after.st_nlink > 1
+                or (path_st is not None and not stat.S_ISREG(path_st.st_mode))
+            ):
+                raise ValueError(f"Refusing non-regular or hardlinked fleet-evolve lock file: {lock_path}")
+            if (
+                path_st is None
+                or ((os.name != "nt" and opened_after.st_nlink == 0) or opened_after.st_nlink > 1)
+                or (
+                    (opened_after.st_dev or path_st.st_dev or opened_after.st_ino or path_st.st_ino)
+                    and (opened_after.st_dev, opened_after.st_ino) != (path_st.st_dev, path_st.st_ino)
+                )
+            ):
+                continue
+            yield
+            return
+        finally:
+            if locked:
+                with contextlib.suppress(OSError):
+                    if os.name == "nt":
+                        os.lseek(fd, 0, os.SEEK_SET)
+                        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                    else:
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+            if fd >= 0:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+    raise ValueError(f"Lock file replaced concurrently while acquiring fleet-evolve lock: {lock_path}")
 
 
 def _atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
+    _reject_symlink_chain(path)
+    data = (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    leaf_created = not path.parent.exists()
     path.parent.mkdir(parents=True, exist_ok=True)
-    if os.name == "posix":
+    _reject_symlink_chain(path)
+    if leaf_created and os.name == "posix":
         path.parent.chmod(0o700)
     fd, tmp = tempfile.mkstemp(prefix=".fleet-state-", suffix=".json", dir=str(path.parent))
+    fd_open = True
     try:
-        data = (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
-        with os.fdopen(fd, "wb") as handle:
+        handle = os.fdopen(fd, "wb")
+        fd_open = False
+        with handle:
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
         if os.name == "posix":
             os.chmod(tmp, 0o600)
-        os.replace(tmp, path)
+        if _is_reparse_or_symlink(path) or _is_reparse_or_symlink(path.parent):
+            raise ValueError(f"Refusing symbolic link or reparse point in fleet-evolve state path: {path}")
+        for attempt in range(5):
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:
+                if attempt >= 4:
+                    raise
+                time.sleep(0.02)
     finally:
-        if os.path.exists(tmp):
+        if fd_open:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        with contextlib.suppress(OSError):
             os.unlink(tmp)
 
 
@@ -234,7 +352,12 @@ def _int_field(data: Dict[str, Any], key: str, default: int, *, positive: bool =
     return parsed
 
 
+def _reject_json_constant(_const: str) -> Any:
+    raise ValueError("corrupt state JSON")
+
+
 def _load_state(path: Path, default_ttl: int = 86400) -> Dict[str, Any]:
+    _reject_symlink_chain(path)
     raw = ""
     for attempt in range(3):
         try:
@@ -246,10 +369,15 @@ def _load_state(path: Path, default_ttl: int = 86400) -> Dict[str, Any]:
             if attempt == 2:
                 raise
             time.sleep(0.02)
-    loaded = json.loads(raw)
+    try:
+        loaded = json.loads(raw, parse_constant=_reject_json_constant)
+    except (ValueError, RecursionError) as exc:
+        raise ValueError("corrupt state JSON") from exc
     if not isinstance(loaded, dict):
         raise ValueError("state file root must be a JSON object")
     if loaded:
+        if "schema_version" in loaded and (isinstance(loaded["schema_version"], bool) or loaded["schema_version"] != 1):
+            raise ValueError("unsupported state schema_version")
         _int_field(loaded, "ttl_seconds", default_ttl, positive=True)
         _int_field(loaded, "updated_at_epoch", 0)
         _int_field(loaded, "last_verified_epoch", 0)
@@ -269,6 +397,7 @@ def main(argv: list[str] | None = None) -> int:
     p_prop.add_argument("--session-id", required=True)
     p_prop.add_argument("--summary", required=True, help="Brief summary of proposed role/model changes requiring user approval")
     p_prop.add_argument("--ttl", type=int, default=None)
+    p_prop.add_argument("--force", action="store_true", help="Overwrite even if an active Pass 1/Pass 2 reload lock or corrupt state exists")
 
     p_app = sub.add_parser("approve", help="Record explicit user sign-off on the proposed client-model table")
     p_app.add_argument("--session-id", required=True)
@@ -277,14 +406,14 @@ def main(argv: list[str] | None = None) -> int:
     p_rec.add_argument("--session-id", required=True)
     p_rec.add_argument("--target-master", required=True)
     p_rec.add_argument("--ttl", type=int, default=None)
-    p_rec.add_argument("--force", action="store_true", help="Overwrite even if an active Pass 2 session has claimed the lock")
+    p_rec.add_argument("--force", action="store_true", help="Overwrite even if an active proposal, Pass 2 session lock, or corrupt state exists")
 
     p_ver = sub.add_parser("verify-pass2", help="Validate Pass 2 re-entry from a reloaded Master session")
     p_ver.add_argument("--session-id", required=True)
 
     p_clr = sub.add_parser("clear", help="Reset bootstrap state lock to IDLE (optionally recording last_verified metadata)")
     p_clr.add_argument("--verified", action="store_true")
-    p_clr.add_argument("--force", action="store_true", help="Allow clearing an active user approval proposal")
+    p_clr.add_argument("--force", action="store_true", help="Allow clearing an active user approval proposal, active Pass 1/Pass 2 reload lock, or corrupt state")
     p_clr.add_argument("--readback-done", action="store_true", help="Confirm cold full-file readback pass completed")
 
     args = parser.parse_args(argv)
@@ -307,9 +436,8 @@ def main(argv: list[str] | None = None) -> int:
     except (ValueError, OSError) as exc:
         print(json.dumps({"ok": False, "reason": "invalid_state_or_repo", "error": str(exc)}, ensure_ascii=False, indent=2))
         return 2
-    now = int(time.time())
-
     if args.cmd == "status":
+        now = int(time.time())
         corrupt = False
         try:
             saved = _load_state(state_file, default_ttl)
@@ -346,181 +474,223 @@ def main(argv: list[str] | None = None) -> int:
         }, ensure_ascii=False, indent=2))
         return 0
 
-    if args.cmd == "propose":
-        sid = args.session_id.strip()
-        summary = args.summary.strip()
-        if not sid or not summary or args.ttl <= 0:
-            print(json.dumps({"ok": False, "reason": "invalid_arguments", "error": "session-id and summary must be non-empty and ttl must be positive"}, ensure_ascii=False, indent=2))
-            return 2
-        payload = {
-            "schema_version": 1,
-            "phase": "AWAITING_USER_APPROVAL",
-            "execution_side": _side(),
-            "proposing_session_id": sid,
-            "proposal_summary": summary,
-            "updated_at_epoch": now,
-            "ttl_seconds": args.ttl,
-            **meta,
-        }
-        with _state_lock(state_file):
-            _atomic_write_json(state_file, payload)
-        print(json.dumps({"ok": True, "user_approval_required": True, "state_file": str(state_file), "state": payload}, ensure_ascii=False, indent=2))
-        return 0
+    try:
+        if args.cmd == "propose":
+            sid = args.session_id.strip()
+            summary = args.summary.strip()
+            if not sid or not summary or args.ttl <= 0:
+                print(json.dumps({"ok": False, "reason": "invalid_arguments", "error": "session-id and summary must be non-empty and ttl must be positive"}, ensure_ascii=False, indent=2))
+                return 2
+            with _state_lock(state_file):
+                now = int(time.time())
+                payload = {
+                    "schema_version": 1,
+                    "phase": "AWAITING_USER_APPROVAL",
+                    "execution_side": _side(),
+                    "proposing_session_id": sid,
+                    "proposal_summary": summary,
+                    "updated_at_epoch": now,
+                    "ttl_seconds": args.ttl,
+                    **meta,
+                }
+                if not args.force:
+                    try:
+                        existing = _load_state(state_file, default_ttl)
+                    except (ValueError, OSError) as exc:
+                        print(json.dumps({"ok": False, "reason": "corrupt_state", "error": str(exc)}, ensure_ascii=False, indent=2))
+                        return 2
+                    if (
+                        existing.get("phase") == "AWAITING_MASTER_RELOAD"
+                        and now - _int_field(existing, "updated_at_epoch", 0) <= _int_field(existing, "ttl_seconds", default_ttl, positive=True)
+                        and _is_aligned_with_repo(existing, meta)
+                    ):
+                        reason = "active_pass2_claimed" if existing.get("claimed_by_session_id") else "active_master_reload"
+                        print(json.dumps({"ok": False, "reason": reason, "saved": existing}, ensure_ascii=False, indent=2))
+                        return 2
+                _atomic_write_json(state_file, payload)
+            print(json.dumps({"ok": True, "user_approval_required": True, "state_file": str(state_file), "state": payload}, ensure_ascii=False, indent=2))
+            return 0
 
-    if args.cmd == "approve":
-        sid = args.session_id.strip()
-        if not sid:
-            print(json.dumps({"ok": False, "reason": "invalid_arguments", "error": "session-id must be non-empty"}, ensure_ascii=False, indent=2))
-            return 2
-        with _state_lock(state_file):
-            try:
-                saved = _load_state(state_file)
-            except ValueError:
-                print(json.dumps({"ok": False, "reason": "corrupt_state"}, ensure_ascii=False, indent=2))
+        if args.cmd == "approve":
+            sid = args.session_id.strip()
+            if not sid:
+                print(json.dumps({"ok": False, "reason": "invalid_arguments", "error": "session-id must be non-empty"}, ensure_ascii=False, indent=2))
                 return 2
-            if saved.get("phase") != "AWAITING_USER_APPROVAL":
-                print(json.dumps({"ok": False, "reason": "no_pending_proposal", "saved": saved or None}, ensure_ascii=False, indent=2))
-                return 2
-            if saved.get("execution_side") != _side():
-                print(json.dumps({"ok": False, "reason": "side_mismatch", "saved": saved}, ensure_ascii=False, indent=2))
-                return 2
-            if not _is_aligned_with_repo(saved, meta):
-                print(json.dumps({"ok": False, "reason": "repo_or_profile_changed_since_propose", "saved": saved, "current": meta}, ensure_ascii=False, indent=2))
-                return 2
-            if now - _int_field(saved, "updated_at_epoch", 0) > _int_field(saved, "ttl_seconds", 86400, positive=True):
-                print(json.dumps({"ok": False, "reason": "expired_ttl", "saved": saved}, ensure_ascii=False, indent=2))
-                return 2
-            payload = {
-                "schema_version": 1,
-                "phase": "IDLE",
-                "user_approved": True,
-                "approved_by_session_id": sid,
-                "approved_at_epoch": now,
-                "approved_proposal_summary": saved.get("proposal_summary"),
-                "updated_at_epoch": now,
-                "ttl_seconds": _int_field(saved, "ttl_seconds", 86400, positive=True),
-                "execution_side": _side(),
-                **meta,
-            }
-            _atomic_write_json(state_file, payload)
-        print(json.dumps({"ok": True, "phase": "IDLE", "user_approved": True, "state": payload}, ensure_ascii=False, indent=2))
-        return 0
+            with _state_lock(state_file):
+                now = int(time.time())
+                try:
+                    saved = _load_state(state_file, default_ttl)
+                except (ValueError, OSError):
+                    print(json.dumps({"ok": False, "reason": "corrupt_state"}, ensure_ascii=False, indent=2))
+                    return 2
+                if saved.get("phase") != "AWAITING_USER_APPROVAL":
+                    print(json.dumps({"ok": False, "reason": "no_pending_proposal", "saved": saved or None}, ensure_ascii=False, indent=2))
+                    return 2
+                if saved.get("execution_side") != _side():
+                    print(json.dumps({"ok": False, "reason": "side_mismatch", "saved": saved}, ensure_ascii=False, indent=2))
+                    return 2
+                if not _is_aligned_with_repo(saved, meta):
+                    print(json.dumps({"ok": False, "reason": "repo_or_profile_changed_since_propose", "saved": saved, "current": meta}, ensure_ascii=False, indent=2))
+                    return 2
+                if now - _int_field(saved, "updated_at_epoch", 0) > _int_field(saved, "ttl_seconds", default_ttl, positive=True):
+                    print(json.dumps({"ok": False, "reason": "expired_ttl", "saved": saved}, ensure_ascii=False, indent=2))
+                    return 2
+                payload = {
+                    "schema_version": 1,
+                    "phase": "IDLE",
+                    "user_approved": True,
+                    "approved_by_session_id": sid,
+                    "approved_at_epoch": now,
+                    "approved_proposal_summary": saved.get("proposal_summary"),
+                    "updated_at_epoch": now,
+                    "ttl_seconds": _int_field(saved, "ttl_seconds", default_ttl, positive=True),
+                    "execution_side": _side(),
+                    **meta,
+                }
+                _atomic_write_json(state_file, payload)
+            print(json.dumps({"ok": True, "phase": "IDLE", "user_approved": True, "state": payload}, ensure_ascii=False, indent=2))
+            return 0
 
-    if args.cmd == "record-pass1":
-        sid = args.session_id.strip()
-        if not sid or args.ttl <= 0:
-            print(json.dumps({"ok": False, "reason": "invalid_arguments", "error": "session-id must be non-empty and ttl must be positive"}, ensure_ascii=False, indent=2))
-            return 2
-        payload = {
-            "schema_version": 1,
-            "phase": "AWAITING_MASTER_RELOAD",
-            "execution_side": _side(),
-            "pass1_session_id": sid,
-            "target_master": args.target_master.strip(),
-            "updated_at_epoch": now,
-            "ttl_seconds": args.ttl,
-            **meta,
-        }
+        if args.cmd == "record-pass1":
+            sid = args.session_id.strip()
+            target_master = args.target_master.strip()
+            if not sid or not target_master or args.ttl <= 0:
+                print(json.dumps({"ok": False, "reason": "invalid_arguments", "error": "session-id and target-master must be non-empty and ttl must be positive"}, ensure_ascii=False, indent=2))
+                return 2
+            with _state_lock(state_file):
+                now = int(time.time())
+                payload = {
+                    "schema_version": 1,
+                    "phase": "AWAITING_MASTER_RELOAD",
+                    "execution_side": _side(),
+                    "pass1_session_id": sid,
+                    "target_master": target_master,
+                    "updated_at_epoch": now,
+                    "ttl_seconds": args.ttl,
+                    **meta,
+                }
+                if not args.force:
+                    try:
+                        existing = _load_state(state_file, default_ttl)
+                    except (ValueError, OSError) as exc:
+                        print(json.dumps({"ok": False, "reason": "corrupt_state", "error": str(exc)}, ensure_ascii=False, indent=2))
+                        return 2
+                    claimed_by = existing.get("claimed_by_session_id")
+                    if (existing.get("phase") == "AWAITING_USER_APPROVAL"
+                            and now - _int_field(existing, "updated_at_epoch", 0) <= _int_field(existing, "ttl_seconds", default_ttl, positive=True)):
+                        print(json.dumps({"ok": False, "reason": "active_user_approval", "saved": existing}, ensure_ascii=False, indent=2))
+                        return 2
+                    if (
+                        existing.get("phase") == "AWAITING_MASTER_RELOAD"
+                        and claimed_by
+                        and claimed_by != sid
+                        and now - _int_field(existing, "updated_at_epoch", 0) <= _int_field(existing, "ttl_seconds", default_ttl, positive=True)
+                        and _is_aligned_with_repo(existing, meta)
+                    ):
+                        print(json.dumps({"ok": False, "reason": "active_pass2_claimed", "saved": existing}, ensure_ascii=False, indent=2))
+                        return 2
+                _atomic_write_json(state_file, payload)
+            print(json.dumps({"ok": True, "state_file": str(state_file), "state": payload}, ensure_ascii=False, indent=2))
+            return 0
+
+        if args.cmd == "verify-pass2":
+            sid = args.session_id.strip()
+            if not sid:
+                print(json.dumps({"ok": False, "reason": "invalid_arguments", "error": "session-id must be non-empty"}, ensure_ascii=False, indent=2))
+                return 2
+            with _state_lock(state_file):
+                now = int(time.time())
+                try:
+                    saved = _load_state(state_file, default_ttl)
+                except (ValueError, OSError):
+                    print(json.dumps({"ok": False, "reason": "corrupt_state"}, ensure_ascii=False, indent=2))
+                    return 2
+                reason = None
+                if saved.get("phase") != "AWAITING_MASTER_RELOAD":
+                    reason = "idle_state"
+                elif saved.get("execution_side") != _side():
+                    reason = "side_mismatch"
+                elif now - _int_field(saved, "updated_at_epoch", 0) > _int_field(saved, "ttl_seconds", default_ttl, positive=True):
+                    reason = "expired_ttl"
+                elif saved.get("pass1_session_id") == sid:
+                    reason = "same_session_loop"
+                elif saved.get("claimed_by_session_id") and saved.get("claimed_by_session_id") != sid:
+                    reason = "already_claimed"
+                elif not _is_aligned_with_repo(saved, meta):
+                    reason = "repo_drift"
+                ok = reason is None
+                if ok and saved.get("claimed_by_session_id") != sid:
+                    saved = {**saved, "claimed_by_session_id": sid}
+                    _atomic_write_json(state_file, saved)
+            print(json.dumps({"ok": ok, "reason": reason or "ready_for_pass2", "saved": saved}, ensure_ascii=False, indent=2))
+            return 0 if ok else 2
+
         with _state_lock(state_file):
+            now = int(time.time())
             if not args.force:
                 try:
-                    existing = _load_state(state_file)
-                except ValueError:
-                    existing = {}
-                claimed_by = existing.get("claimed_by_session_id")
-                if (existing.get("phase") == "AWAITING_USER_APPROVAL"
-                        and now - _int_field(existing, "updated_at_epoch", 0) <= _int_field(existing, "ttl_seconds", 86400, positive=True)):
-                    print(json.dumps({"ok": False, "reason": "active_user_approval", "saved": existing}, ensure_ascii=False, indent=2))
-                    return 2
+                    saved = _load_state(state_file, default_ttl)
+                except (ValueError, OSError) as exc:
+                    print(json.dumps({"ok": False, "reason": "corrupt_state", "error": str(exc)}, ensure_ascii=False, indent=2))
+                    return 1
+                within_ttl = (
+                    bool(saved)
+                    and now - _int_field(saved, "updated_at_epoch", 0)
+                    <= _int_field(saved, "ttl_seconds", default_ttl, positive=True)
+                )
+                if saved.get("phase") == "AWAITING_USER_APPROVAL" and within_ttl:
+                    print(json.dumps({"ok": False, "reason": "active_user_approval", "error": "An active proposal requires user approval; use --force to explicitly override"}, ensure_ascii=False, indent=2))
+                    return 1
                 if (
-                    existing.get("phase") == "AWAITING_MASTER_RELOAD"
-                    and claimed_by
-                    and claimed_by != sid
-                    and now - _int_field(existing, "updated_at_epoch", 0) <= _int_field(existing, "ttl_seconds", 86400, positive=True)
-                    and _is_aligned_with_repo(existing, meta)
+                    saved.get("phase") == "AWAITING_MASTER_RELOAD"
+                    and within_ttl
+                    and _is_aligned_with_repo(saved, meta)
                 ):
-                    print(json.dumps({"ok": False, "reason": "active_pass2_claimed", "saved": existing}, ensure_ascii=False, indent=2))
+                    if saved.get("claimed_by_session_id"):
+                        reason = "active_pass2_claimed"
+                        err_msg = "An active Pass 2 session has claimed the lock; use --force to explicitly override"
+                    else:
+                        reason = "active_master_reload"
+                        err_msg = "An active Pass 1 reload lock is awaiting Master reload; use --force to explicitly override"
+                    print(json.dumps({"ok": False, "reason": reason, "error": err_msg}, ensure_ascii=False, indent=2))
+                    return 1
+            if args.verified and args.readback_done:
+                grounding = _run_repo_grounding_gate(repo_root)
+                if grounding.get("ok") is not True:
+                    print(json.dumps({
+                        "ok": False,
+                        "readback_verified": False,
+                        "reason": "grounding_check_failed",
+                        "error": grounding.get("error"),
+                        "finding_count": grounding.get("finding_count", 0),
+                        "findings": grounding.get("findings", []),
+                    }, ensure_ascii=False, indent=2))
                     return 2
-            _atomic_write_json(state_file, payload)
-        print(json.dumps({"ok": True, "state_file": str(state_file), "state": payload}, ensure_ascii=False, indent=2))
+            if args.verified:
+                payload = {
+                    "schema_version": 1,
+                    "phase": "IDLE",
+                    "last_verified_epoch": now,
+                    "readback_verified": bool(args.readback_done),
+                    "execution_side": _side(),
+                    **meta,
+                }
+                _atomic_write_json(state_file, payload)
+            else:
+                state_file.unlink(missing_ok=True)
+        out: Dict[str, Any] = {
+            "ok": True,
+            "phase": "IDLE",
+            "verified": bool(args.verified),
+            "readback_verified": bool(args.verified and args.readback_done),
+        }
+        if args.verified and not args.readback_done:
+            out["notice"] = "pending_cold_readback"
+        print(json.dumps(out, ensure_ascii=False, indent=2))
         return 0
-
-    if args.cmd == "verify-pass2":
-        sid = args.session_id.strip()
-        with _state_lock(state_file):
-            try:
-                saved = _load_state(state_file)
-            except ValueError:
-                print(json.dumps({"ok": False, "reason": "corrupt_state"}, ensure_ascii=False, indent=2))
-                return 2
-            reason = None
-            if saved.get("phase") != "AWAITING_MASTER_RELOAD":
-                reason = "idle_state"
-            elif saved.get("execution_side") != _side():
-                reason = "side_mismatch"
-            elif now - _int_field(saved, "updated_at_epoch", 0) > _int_field(saved, "ttl_seconds", 86400, positive=True):
-                reason = "expired_ttl"
-            elif saved.get("pass1_session_id") == sid or not sid:
-                reason = "same_session_loop"
-            elif saved.get("claimed_by_session_id") and saved.get("claimed_by_session_id") != sid:
-                reason = "already_claimed"
-            elif not _is_aligned_with_repo(saved, meta):
-                reason = "repo_drift"
-            ok = reason is None
-            if ok and saved.get("claimed_by_session_id") != sid:
-                saved = {**saved, "claimed_by_session_id": sid}
-                _atomic_write_json(state_file, saved)
-        print(json.dumps({"ok": ok, "reason": reason or "ready_for_pass2", "saved": saved}, ensure_ascii=False, indent=2))
-        return 0 if ok else 2
-
-    with _state_lock(state_file):
-        if args.verified and not args.force:
-            try:
-                saved = _load_state(state_file, default_ttl)
-            except (ValueError, OSError) as exc:
-                print(json.dumps({"ok": False, "reason": "invalid_state", "error": str(exc)}, ensure_ascii=False, indent=2))
-                return 1
-            if (
-                saved.get("phase") == "AWAITING_USER_APPROVAL"
-                and int(time.time()) - _int_field(saved, "updated_at_epoch", 0)
-                <= _int_field(saved, "ttl_seconds", default_ttl, positive=True)
-            ):
-                print(json.dumps({"ok": False, "reason": "active_user_approval", "error": "An active proposal requires user approval; use --force to explicitly override"}, ensure_ascii=False, indent=2))
-                return 1
-        if args.verified and args.readback_done:
-            grounding = _run_repo_grounding_gate(repo_root)
-            if grounding.get("ok") is not True:
-                print(json.dumps({
-                    "ok": False,
-                    "readback_verified": False,
-                    "reason": "grounding_check_failed",
-                    "error": grounding.get("error"),
-                    "finding_count": grounding.get("finding_count", 0),
-                    "findings": grounding.get("findings", []),
-                }, ensure_ascii=False, indent=2))
-                return 2
-        if args.verified:
-            payload = {
-                "schema_version": 1,
-                "phase": "IDLE",
-                "last_verified_epoch": now,
-                "readback_verified": bool(args.readback_done),
-                "execution_side": _side(),
-                **meta,
-            }
-            _atomic_write_json(state_file, payload)
-        else:
-            state_file.unlink(missing_ok=True)
-    out: Dict[str, Any] = {
-        "ok": True,
-        "phase": "IDLE",
-        "verified": bool(args.verified),
-        "readback_verified": bool(args.verified and args.readback_done),
-    }
-    if args.verified and not args.readback_done:
-        out["notice"] = "pending_cold_readback"
-    print(json.dumps(out, ensure_ascii=False, indent=2))
-    return 0
+    except (ValueError, OSError) as exc:
+        print(json.dumps({"ok": False, "reason": "invalid_state_or_repo", "error": str(exc)}, ensure_ascii=False, indent=2))
+        return 2
 
 
 if __name__ == "__main__":

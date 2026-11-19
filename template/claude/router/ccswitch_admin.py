@@ -16,6 +16,7 @@ import copy
 from contextlib import closing
 import json
 import os
+import re
 import shutil
 import sqlite3
 import stat
@@ -26,6 +27,8 @@ import urllib.error
 from urllib.parse import urlsplit
 import urllib.request
 import uuid
+
+_STDLIB_URLOPEN = urllib.request.urlopen
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -67,48 +70,67 @@ RESIDUE_ENV = (
 
 
 def default_router_port() -> int:
-    here = Path(__file__).resolve()
-    candidates: List[Path] = []
-    env_override = os.environ.get("CAE_FLEET_PROFILE", "").strip()
-    if env_override:
-        candidates.append(Path(env_override).expanduser())
-    candidates.append(here.parent.parent / "skills" / "cae-harness" / "fleet_profile.json")
-    candidates.append(here.parents[2] / "user-guard" / "skills" / "cae-harness" / "fleet_profile.json")
-    for candidate in candidates:
-        try:
-            if candidate.is_file() and not _is_reparse_or_symlink(candidate):
-                doc = json.loads(candidate.read_text(encoding="utf-8-sig"))
-                rt = (((doc.get("runtime_tunables") or {}).get("headless_dispatch") or {}).get("router") or {})
-                if isinstance(rt, dict):
-                    key = "port" if os.name == "nt" else "wsl_port"
-                    val = rt.get(key)
-                    if isinstance(val, int) and not isinstance(val, bool) and 1 <= val <= 65535:
-                        return val
-        except (OSError, UnicodeError, ValueError, AttributeError):
-            continue
+    doc = _load_fleet_profile_doc()
+    if isinstance(doc, dict):
+        rt = (((doc.get("runtime_tunables") or {}).get("headless_dispatch") or {}).get("router") or {})
+        if isinstance(rt, dict):
+            key = "port" if os.name == "nt" else "wsl_port"
+            val = rt.get(key)
+            if isinstance(val, int) and not isinstance(val, bool) and 1 <= val <= 65535:
+                return val
     return 8240 if os.name == "nt" else 8241
 
 
-def _claude_profile_defaults() -> Dict[str, str]:
-    here = Path(__file__).resolve()
-    candidates: List[Path] = []
+def _read_fleet_profile_candidate(candidate: Path) -> Optional[Dict[str, Any]]:
+    try:
+        if not candidate.is_file() or _is_reparse_or_symlink(candidate):
+            return None
+        doc = json.loads(candidate.read_text(encoding="utf-8-sig"))
+        if not isinstance(doc, dict):
+            return None
+        if "schema_version" in doc and (isinstance(doc["schema_version"], bool) or doc["schema_version"] != 1):
+            return None
+        return doc
+    except (OSError, UnicodeError, ValueError, RecursionError):
+        return None
+
+
+def _load_fleet_profile_doc() -> Dict[str, Any]:
     env_override = os.environ.get("CAE_FLEET_PROFILE", "").strip()
     if env_override:
-        candidates.append(Path(env_override).expanduser())
-    candidates.append(here.parent.parent / "skills" / "cae-harness" / "fleet_profile.json")
-    candidates.append(here.parents[2] / "user-guard" / "skills" / "cae-harness" / "fleet_profile.json")
-    cl_rules: Dict[str, Any] = {}
+        doc = _read_fleet_profile_candidate(Path(env_override).expanduser())
+        return doc if doc is not None else {}
+    here = Path(os.path.realpath(__file__))
+    home = Path.home()
+    codex_env = os.environ.get("CODEX_HOME", "").strip()
+    dsh_env = os.environ.get("DSH_HOME", "").strip()
+    codex_root = Path(codex_env).expanduser() if codex_env else (home / ".codex")
+    dsh_root = Path(dsh_env).expanduser() if dsh_env else (home / ".dsh")
+    candidates: List[Path] = [
+        here.parent.parent / "skills" / "cae-harness" / "fleet_profile.json",
+    ]
+    if len(here.parents) > 2:
+        candidates.append(here.parents[2] / "user-guard" / "skills" / "cae-harness" / "fleet_profile.json")
+    candidates.extend([
+        home / ".gemini" / "config" / "plugins" / "user-guard" / "skills" / "cae-harness" / "fleet_profile.json",
+        home / ".gemini" / "antigravity" / "plugins" / "user-guard" / "skills" / "cae-harness" / "fleet_profile.json",
+        codex_root / "skills" / "cae-harness" / "fleet_profile.json",
+        dsh_root / "skills" / "cae-harness" / "fleet_profile.json",
+    ])
     for candidate in candidates:
-        try:
-            if candidate.is_file() and not _is_reparse_or_symlink(candidate):
-                doc = json.loads(candidate.read_text(encoding="utf-8-sig"))
-                if isinstance(doc, dict) and isinstance(doc.get("client_catalog_rules"), dict):
-                    raw_cl = doc["client_catalog_rules"].get("claude")
-                    if isinstance(raw_cl, dict):
-                        cl_rules = raw_cl
-                        break
-        except (OSError, UnicodeError, ValueError):
-            continue
+        doc = _read_fleet_profile_candidate(candidate)
+        if doc is not None:
+            return doc
+    return {}
+
+
+def _claude_profile_defaults() -> Dict[str, str]:
+    doc = _load_fleet_profile_doc()
+    cl_rules: Dict[str, Any] = {}
+    if isinstance(doc, dict) and isinstance(doc.get("client_catalog_rules"), dict):
+        raw_cl = doc["client_catalog_rules"].get("claude")
+        if isinstance(raw_cl, dict):
+            cl_rules = raw_cl
     fields = {
         "kimi_model": "router_primary_model",
         "deepseek_model": "router_subagent_model",
@@ -163,9 +185,20 @@ def _sanitize_url(raw_url: Any) -> Optional[str]:
         return "<redacted-url>"
 
 
+def _validate_nonlink_path(path: Path) -> Path:
+    target = path.expanduser().absolute()
+    if ".." in target.parts:
+        raise ValueError(f"Refusing to write through parent traversal path: {path}")
+    for candidate in (*reversed(target.parents), target):
+        if _is_reparse_or_symlink(candidate):
+            raise ValueError(f"Refusing to write through symbolic link or reparse point: {candidate}")
+    return target
+
+
 def atomic_write_bytes(path: Path, data: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary = tempfile.mkstemp(prefix=".claude-switch-", suffix=".json", dir=str(path.parent))
+    target = _validate_nonlink_path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".claude-switch-", suffix=".json", dir=str(target.parent))
     try:
         with os.fdopen(fd, "wb") as handle:
             handle.write(data)
@@ -173,7 +206,7 @@ def atomic_write_bytes(path: Path, data: bytes) -> None:
             os.fsync(handle.fileno())
         if os.name == "posix":
             os.chmod(temporary, 0o600)
-        os.replace(temporary, path)
+        os.replace(temporary, target)
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
@@ -184,6 +217,8 @@ def atomic_write_json(path: Path, data: Dict[str, Any]) -> None:
 
 
 def backup_sqlite_database(db_path: Path, backup_path: Path) -> None:
+    _validate_nonlink_path(db_path)
+    _validate_nonlink_path(backup_path)
     fd = os.open(str(backup_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     os.close(fd)
     try:
@@ -254,10 +289,43 @@ def _build_card_templates(
     compact_window: Optional[str] = None,
 ) -> Dict[str, Tuple[Any, Optional[str], str]]:
     defaults = _claude_profile_defaults()
-    kimi_model = kimi_model or defaults["kimi_model"]
-    deepseek_model = deepseek_model or defaults["deepseek_model"]
-    max_context = max_context or defaults["max_context"]
-    compact_window = compact_window or defaults["compact_window"]
+    profile_doc = _load_fleet_profile_doc()
+    sub_models = ((profile_doc or {}).get("subscription_matrix") or {}).get("models")
+    has_kimi_sub = isinstance(sub_models, dict) and any(
+        isinstance(m, dict)
+        and m.get("agent") == "claude"
+        and m.get("enabled") is not False
+        and m.get("enabled_in_profile") is not False
+        and (str(m.get("card") or "").strip().lower() == "kimi" or "kimi" in str(k).strip().lower() or bool(re.match(r"^k\d", str(k).strip().lower())))
+        for k, m in sub_models.items()
+    )
+    has_ds_sub = isinstance(sub_models, dict) and any(
+        isinstance(m, dict)
+        and m.get("agent") == "claude"
+        and m.get("enabled") is not False
+        and m.get("enabled_in_profile") is not False
+        and ("deepseek" in str(k).lower() or str(m.get("card") or "").strip().lower() == "deepseek")
+        for k, m in sub_models.items()
+    )
+    has_claude_sub = has_kimi_sub or has_ds_sub
+    if has_claude_sub:
+        adaptive = derive_adaptive_card_defaults(
+            profile_doc,
+            port=port,
+            kimi_model=kimi_model if kimi_model is not None else (None if has_kimi_sub else defaults["kimi_model"]),
+            deepseek_model=deepseek_model if deepseek_model is not None else (None if has_ds_sub else defaults["deepseek_model"]),
+            max_context=max_context,
+            compact_window=compact_window,
+        )
+        kimi_model = str(adaptive["kimi_model"])
+        deepseek_model = str(adaptive["deepseek_model"])
+        max_context = str(adaptive["max_context"])
+        compact_window = str(adaptive["compact_window"])
+    else:
+        kimi_model = kimi_model or defaults["kimi_model"]
+        deepseek_model = deepseek_model or defaults["deepseek_model"]
+        max_context = max_context or defaults["max_context"]
+        compact_window = compact_window or defaults["compact_window"]
     router_card_name = defaults["router_card_name"]
     ds_base = deepseek_model.replace("[1m]", "").replace("[1M]", "")
     ds_main = f"{ds_base}[1M]"
@@ -367,6 +435,10 @@ def inspect_status(
     settings_path: Optional[Path] = None,
     router_port: Optional[int] = None,
 ) -> Dict[str, Any]:
+    if router_port is not None and (
+        isinstance(router_port, bool) or not isinstance(router_port, int) or not (1 <= router_port <= 65535)
+    ):
+        raise ValueError("router_port must be between 1 and 65535")
     report: Dict[str, Any] = {
         "db_path": str(db_path),
         "db_exists": db_path.is_file(),
@@ -518,7 +590,16 @@ def inspect_status(
     if router_port is not None:
         url = f"http://127.0.0.1:{router_port}/__router/health"
         try:
-            with urllib.request.urlopen(url, timeout=2.0) as resp:
+            open_fn = (
+                urllib.request.build_opener(
+                    urllib.request.ProxyHandler({}),
+                    urllib.request.HTTPHandler(),
+                    urllib.request.HTTPSHandler(),
+                ).open
+                if urllib.request.urlopen is _STDLIB_URLOPEN
+                else urllib.request.urlopen
+            )
+            with open_fn(url, timeout=2.0) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
                 report["router_health"] = {
                     "ok": bool(resp.status == 200 and payload.get("ok") is True),
@@ -530,6 +611,150 @@ def inspect_status(
     return report
 
 
+def _resolve_card_params(
+    profile: Dict[str, Any],
+    port: int = 8241,
+    kimi_model: Optional[str] = None,
+    deepseek_model: Optional[str] = None,
+    max_context: Optional[str] = None,
+    compact_window: Optional[str] = None,
+) -> Dict[str, Any]:
+    sub = profile.get("subscription_matrix") if isinstance(profile.get("subscription_matrix"), dict) else {}
+    models = sub.get("models") if isinstance(sub.get("models"), dict) else {}
+    cat_rules = profile.get("client_catalog_rules") if isinstance(profile.get("client_catalog_rules"), dict) else {}
+    cl_rules = cat_rules.get("claude") if isinstance(cat_rules.get("claude"), dict) else {}
+    tunables = profile.get("runtime_tunables") if isinstance(profile.get("runtime_tunables"), dict) else {}
+    hd = tunables.get("headless_dispatch") if isinstance(tunables.get("headless_dispatch"), dict) else {}
+    router_cfg = hd.get("router") if isinstance(hd.get("router"), dict) else {}
+
+    def_kimi = str(cl_rules.get("router_primary_model") or "").strip() or "kimi-k2.5"
+    def_ds = str(cl_rules.get("router_subagent_model") or "").strip() or "deepseek-chat"
+    rk = str(kimi_model or def_kimi)
+    rd = str(deepseek_model or def_ds)
+
+    raw_rule_max = cl_rules.get("max_context_tokens")
+    rule_max = (
+        int(raw_rule_max)
+        if isinstance(raw_rule_max, int) and not isinstance(raw_rule_max, bool) and raw_rule_max >= 32000
+        else None
+    )
+    one_m_ctx = rule_max if (rule_max is not None and rule_max >= 1_000_000) else 1_000_000
+    k_ctx = rule_max if rule_max is not None else 262144
+    d_ctx = 128000
+    kimi_matched = False
+    ds_matched = False
+
+    for name, meta in models.items():
+        if (
+            not isinstance(meta, dict)
+            or meta.get("agent") != "claude"
+            or meta.get("enabled") is False
+            or meta.get("enabled_in_profile") is False
+        ):
+            continue
+        nl = str(name).strip().lower()
+        card = str(meta.get("card") or "").strip().lower()
+        cw = meta.get("context_window")
+        is_kimi = card == "kimi" or "kimi" in nl or bool(re.match(r"^k\d", nl))
+        if is_kimi and kimi_model is None:
+            kimi_matched = True
+            rk = str(meta.get("provider_model") or name)
+            if isinstance(cw, int) and not isinstance(cw, bool) and cw >= 32000:
+                k_ctx = int(cw)
+            elif "[1m]" in nl or "[1m]" in rk.lower():
+                k_ctx = one_m_ctx
+            else:
+                k_ctx = 262144
+        elif (card == "deepseek" or "deepseek" in nl) and deepseek_model is None:
+            ds_matched = True
+            rd = str(meta.get("provider_model") or name)
+            if isinstance(cw, int) and not isinstance(cw, bool) and cw >= 32000:
+                d_ctx = int(cw)
+            elif "[1m]" in nl or "[1m]" in rd.lower():
+                d_ctx = one_m_ctx
+            else:
+                d_ctx = 128000
+
+    if not kimi_matched and "[1m]" in rk.lower():
+        k_ctx = max(k_ctx, one_m_ctx)
+    if not ds_matched and "[1m]" in rd.lower():
+        d_ctx = max(d_ctx, one_m_ctx)
+
+    fallback_ctx = max(k_ctx, d_ctx) if (kimi_matched or ds_matched or rule_max is None) else max(rule_max, k_ctx, d_ctx)
+    eff_max_int = fallback_ctx
+    if max_context is not None and not isinstance(max_context, bool) and str(max_context).strip():
+        try:
+            parsed_max = int(str(max_context).strip())
+            if parsed_max > 0:
+                eff_max_int = parsed_max
+        except (TypeError, ValueError):
+            pass
+    eff_max = str(eff_max_int)
+
+    default_cmp_int = max(65536, int(round(eff_max_int * 0.72)))
+    eff_cmp_int = default_cmp_int
+    if compact_window is not None and not isinstance(compact_window, bool) and str(compact_window).strip():
+        try:
+            parsed_cmp = int(str(compact_window).strip())
+            if parsed_cmp > 0:
+                eff_cmp_int = parsed_cmp
+        except (TypeError, ValueError):
+            pass
+    eff_cmp = str(eff_cmp_int)
+
+    raw_timeout = router_cfg.get("timeout_sec")
+    timeout_s = 900
+    if raw_timeout is not None and not isinstance(raw_timeout, bool):
+        try:
+            parsed_timeout = int(raw_timeout)
+            if parsed_timeout > 0:
+                timeout_s = parsed_timeout
+        except (TypeError, ValueError):
+            pass
+
+    eff_port = 8241 if isinstance(port, bool) or not isinstance(port, int) else port
+    return {
+        "port": eff_port,
+        "kimi_model": rk,
+        "deepseek_model": rd,
+        "max_context": eff_max,
+        "compact_window": eff_cmp,
+        "timeout_sec": timeout_s,
+    }
+
+
+def derive_adaptive_card_defaults(
+    fleet_profile: Optional[Dict[str, Any]],
+    port: int = 8241,
+    kimi_model: Optional[str] = None,
+    deepseek_model: Optional[str] = None,
+    max_context: Optional[str] = None,
+    compact_window: Optional[str] = None,
+) -> Dict[str, Any]:
+    """结合 fleet_profile.json 启用模型矩阵动态派生代理卡默认模型与上下文窗口。"""
+    profile = fleet_profile if isinstance(fleet_profile, dict) else {}
+    here = Path(os.path.realpath(__file__))
+    hook_candidates = [here.parent, here.parent.parent / "hooks"]
+    if len(here.parents) > 2:
+        hook_candidates.append(here.parents[2] / "user-guard" / "hooks")
+    for hooks_dir in hook_candidates:
+        if (hooks_dir / "_lib" / "adaptive_policy.py").is_file():
+            if str(hooks_dir) not in sys.path:
+                sys.path.insert(0, str(hooks_dir))
+            break
+    try:
+        from _lib import adaptive_policy  # type: ignore
+        return adaptive_policy.resolve_adaptive_card_params(
+            profile, port=port, kimi_model=kimi_model, deepseek_model=deepseek_model,
+            max_context=max_context, compact_window=compact_window,
+        )
+    except ImportError:
+        return _resolve_card_params(
+            profile, port=port, kimi_model=kimi_model, deepseek_model=deepseek_model,
+            max_context=max_context, compact_window=compact_window,
+        )
+
+
 def prepare_cards(
     db_path: Path,
     port: int,
@@ -539,8 +764,10 @@ def prepare_cards(
     compact_window: Optional[str] = None,
     dry_run: bool = False,
 ) -> Dict[str, Any]:
-    if not 1 <= port <= 65535:
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
         raise ValueError("port must be between 1 and 65535")
+    if not dry_run:
+        _validate_nonlink_path(db_path)
     if not db_path.is_file():
         raise FileNotFoundError(f"Database not found: {db_path}")
 
@@ -564,8 +791,10 @@ def prepare_cards(
             "SELECT * FROM providers WHERE app_type='claude' AND id='claude-official'"
         ).fetchone()
         template = dict(zip(columns, official)) if official else {}
-        next_sort = int(
-            con.execute("SELECT COALESCE(MAX(sort_index), 0) FROM providers WHERE app_type='claude'").fetchone()[0]
+        next_sort = (
+            int(con.execute("SELECT COALESCE(MAX(sort_index), 0) FROM providers WHERE app_type='claude'").fetchone()[0])
+            if "sort_index" in columns
+            else 0
         )
 
         results: List[Dict[str, Any]] = []
@@ -579,9 +808,22 @@ def prepare_cards(
             current = dict(zip(columns, rows[0])) if rows else None
             token = placeholder
             if current:
-                cfg = json.loads(current["settings_config"])
-                if not isinstance(cfg, dict) or not isinstance(cfg.get("env", {}), dict):
-                    raise ValueError(f"Card config and env must be objects: {name}")
+                raw_cfg = current.get("settings_config")
+                cfg: Dict[str, Any] = {}
+                invalid_old_cfg = False
+                if raw_cfg is None or not isinstance(raw_cfg, str) or not raw_cfg.strip():
+                    invalid_old_cfg = True
+                else:
+                    try:
+                        parsed_cfg = json.loads(raw_cfg)
+                        if isinstance(parsed_cfg, dict) and isinstance(parsed_cfg.get("env", {}), dict):
+                            cfg = parsed_cfg
+                        else:
+                            invalid_old_cfg = True
+                    except (ValueError, TypeError, RecursionError):
+                        invalid_old_cfg = True
+                if invalid_old_cfg:
+                    warnings.append(f"Invalid settings_config in existing card claude:{name}; resetting to template defaults")
                 old_env = cfg.get("env", {})
                 for key in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"):
                     old_token = old_env.get(key)
@@ -604,12 +846,12 @@ def prepare_cards(
                     "settings_config": json.dumps({"env": env}, ensure_ascii=False),
                     "website_url": None,
                     "category": "third_party",
-                    "created_at": current["created_at"] if current else int(time.time() * 1000),
+                    "created_at": current.get("created_at") if current else int(time.time() * 1000),
                     "notes": notes,
                     "icon": None,
                     "icon_color": None,
                     "meta": "{}",
-                    "is_current": current["is_current"] if current else 0,
+                    "is_current": current.get("is_current", 0) if current else 0,
                     "in_failover_queue": 0,
                     "cost_multiplier": record.get("cost_multiplier") or "1.0",
                     "limit_daily_usd": None,
@@ -688,6 +930,9 @@ def switch_card(
     dry_run: bool = False,
     require_router_alive: bool = False,
 ) -> Dict[str, Any]:
+    if not dry_run:
+        _validate_nonlink_path(db_path)
+        _validate_nonlink_path(settings_path)
     if not db_path.is_file():
         raise FileNotFoundError(f"Database not found: {db_path}")
     if not settings_path.is_file():
@@ -696,10 +941,16 @@ def switch_card(
     if state_path.exists():
         try:
             raw_state = json.loads(state_path.read_text(encoding="utf-8-sig"))
-        except (OSError, UnicodeError, ValueError) as exc:
+        except (OSError, UnicodeError, ValueError, RecursionError) as exc:
             raise RuntimeError("Claude must be in direct mode (live-state.json is unreadable)") from exc
-        apps = raw_state.get("apps") if isinstance(raw_state, dict) and isinstance(raw_state.get("apps"), dict) else {}
-        state = apps.get("claude") if isinstance(apps.get("claude"), dict) else {}
+        if not isinstance(raw_state, dict):
+            raise RuntimeError("Claude must be in direct mode (live-state.json root must be an object)")
+        apps = raw_state.get("apps")
+        if not isinstance(apps, dict):
+            raise RuntimeError("Claude must be in direct mode (live-state.json apps must be an object)")
+        state = apps.get("claude")
+        if not isinstance(state, dict):
+            raise RuntimeError("Claude must be in direct mode (live-state.json apps.claude must be an object)")
         if state.get("mode") == "proxy" or state.get("attached") or state.get("pending") is not None:
             raise RuntimeError("Claude must be in direct mode with no pending CC Switch operation")
 
@@ -717,12 +968,37 @@ def switch_card(
         if len(targets) != 1 or len(current) > 1:
             raise ValueError(f"Expected exactly one target card ({card_name!r}) and at most one current Claude card")
         target_id, _, raw_target, _ = targets[0]
-        previous = json.loads(current[0][2]) if current else {}
+        previous: Dict[str, Any] = {}
+        if current:
+            prev_name, raw_prev = current[0][1], current[0][2]
+            invalid_prev = False
+            if raw_prev is None or not isinstance(raw_prev, str) or not raw_prev.strip():
+                invalid_prev = True
+            else:
+                try:
+                    parsed_prev = json.loads(raw_prev)
+                    if isinstance(parsed_prev, dict) and isinstance(parsed_prev.get("env", {}), dict):
+                        previous = parsed_prev
+                    else:
+                        invalid_prev = True
+                except (ValueError, TypeError, RecursionError):
+                    invalid_prev = True
+            if invalid_prev:
+                warnings.append(
+                    f"Previous active Claude card {prev_name!r} had invalid settings_config; fallback to empty baseline"
+                )
+        if not isinstance(raw_target, str):
+            raise ValueError("Target card settings_config must be a JSON string")
+        try:
+            target_cfg = json.loads(raw_target)
+            original_cfg = json.loads(settings_path.read_bytes().decode("utf-8-sig"))
+        except RecursionError as exc:
+            raise ValueError("Card or settings JSON exceeds recursion limit") from exc
         original_bytes = settings_path.read_bytes()
         updated = project_claude_settings(
-            json.loads(original_bytes.decode("utf-8-sig")),
+            original_cfg,
             previous,
-            json.loads(raw_target),
+            target_cfg,
         )
         base_url = updated.get("env", {}).get("ANTHROPIC_BASE_URL")
         endpoint = urlsplit(base_url) if isinstance(base_url, str) else None
@@ -756,6 +1032,8 @@ def switch_card(
         timestamp = time.strftime("%Y%m%d-%H%M%S") + f"-{time.time_ns()}"
         db_backup = Path(f"{db_path}.bak-before-live-switch-{timestamp}")
         settings_backup = Path(f"{settings_path}.bak-before-live-switch-{timestamp}")
+        _validate_nonlink_path(settings_path)
+        _validate_nonlink_path(settings_backup)
         backup_sqlite_database(db_path, db_backup)
         shutil.copy2(settings_path, settings_backup)
         if os.name == "posix":
@@ -806,6 +1084,8 @@ def disable_prompts(
     app_types: Optional[List[str]] = None,
     dry_run: bool = False,
 ) -> Dict[str, Any]:
+    if not dry_run:
+        _validate_nonlink_path(db_path)
     if not db_path.is_file():
         return {"db_exists": False, "dry_run": dry_run, "disabled": [], "backup": None, "warnings": []}
 
@@ -887,6 +1167,8 @@ def retire_prompts_and_skills(
     purge: bool = False,
     dry_run: bool = False,
 ) -> Dict[str, Any]:
+    if not dry_run:
+        _validate_nonlink_path(db_path)
     skills_dir = db_path.parent / "skills"
     archive_parent = db_path.parent / "backups"
     if _is_reparse_or_symlink(skills_dir) or _is_reparse_or_symlink(archive_parent):
@@ -936,7 +1218,6 @@ def retire_prompts_and_skills(
             }
 
         timestamp = time.strftime("%Y%m%d-%H%M%S") + f"-{time.time_ns()}"
-        backup_path: Optional[Path] = None
         if db_changes:
             backup_tag = "retire-legacy" if purge else "disable-prompts"
             backup_path = Path(f"{db_path}.bak-before-{backup_tag}-{timestamp}")
@@ -1027,15 +1308,19 @@ def verify_alignment(
 def main(argv: Optional[List[str]] = None) -> int:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    common_opts = argparse.ArgumentParser(add_help=False)
+    common_opts.add_argument("--db", default=argparse.SUPPRESS, help="Path to cc-switch.db")
+    common_opts.add_argument("--settings", default=argparse.SUPPRESS, help="Path to Claude settings.json")
+
     parser = argparse.ArgumentParser(description="CC Switch & Claude Code card/prompt management CLI")
     parser.add_argument("--db", default="~/.cc-switch/cc-switch.db", help="Path to cc-switch.db")
     parser.add_argument("--settings", default="~/.claude/settings.json", help="Path to Claude settings.json")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p_status = sub.add_parser("status", help="Inspect CC Switch DB, Claude settings, and prompt status")
+    p_status = sub.add_parser("status", parents=[common_opts], help="Inspect CC Switch DB, Claude settings, and prompt status")
     p_status.add_argument("--check-router-port", type=int, default=None)
 
-    p_prep = sub.add_parser("prepare-cards", help="Create or update Kimi, DeepSeek, and hybrid router cards")
+    p_prep = sub.add_parser("prepare-cards", parents=[common_opts], help="Create or update Kimi, DeepSeek, and hybrid router cards")
     p_prep.add_argument("--port", type=int, default=default_router_port())
     p_prep.add_argument("--kimi-model", default=None)
     p_prep.add_argument("--deepseek-model", default=None)
@@ -1043,12 +1328,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_prep.add_argument("--compact-window", default=None)
     p_prep.add_argument("--dry-run", action="store_true")
 
-    p_switch = sub.add_parser("switch-card", help="Switch active Claude card and project into settings.json")
+    p_switch = sub.add_parser("switch-card", parents=[common_opts], help="Switch active Claude card and project into settings.json")
     p_switch.add_argument("card", help="Target Claude card name")
     p_switch.add_argument("--dry-run", action="store_true")
     p_switch.add_argument("--require-router-alive", action="store_true")
 
-    p_prompts = sub.add_parser("disable-prompts", help="Disable enabled prompts in cc-switch.db")
+    p_prompts = sub.add_parser("disable-prompts", parents=[common_opts], help="Disable enabled prompts in cc-switch.db")
     p_prompts.add_argument(
         "--app-type",
         action="append",
@@ -1057,11 +1342,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     p_prompts.add_argument("--dry-run", action="store_true")
 
-    p_retire = sub.add_parser("retire-legacy", help="Disable or purge retired prompts and skills in CC Switch")
+    p_retire = sub.add_parser("retire-legacy", parents=[common_opts], help="Disable or purge retired prompts and skills in CC Switch")
     p_retire.add_argument("--purge", action="store_true", help="Backup and delete retired prompt/skill rows and ~/.cc-switch/skills")
     p_retire.add_argument("--dry-run", action="store_true")
 
-    p_verify = sub.add_parser("verify", help="Verify alignment and prompt/skill safety")
+    p_verify = sub.add_parser("verify", parents=[common_opts], help="Verify alignment and prompt/skill safety")
     p_verify.add_argument("--check-router-port", type=int, default=None)
 
     args = parser.parse_args(argv)
@@ -1105,4 +1390,18 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    if hasattr(sys.stderr, "reconfigure"):
+        try:
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            pass
+    try:
+        raise SystemExit(main())
+    except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
+        err_msg = str(exc)
+        if isinstance(exc, sqlite3.OperationalError) and "locked" in err_msg.lower():
+            err_msg = f"{err_msg} — 请先关闭 CC Switch GUI 后重试 (close CC Switch GUI and retry)"
+        sys.stderr.write(
+            json.dumps({"ok": False, "error_type": type(exc).__name__, "error": err_msg}, ensure_ascii=False) + "\n"
+        )
+        raise SystemExit(1)
