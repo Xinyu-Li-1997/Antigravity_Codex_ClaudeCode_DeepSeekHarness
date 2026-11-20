@@ -3025,15 +3025,42 @@ def _audit_redact(value: Any, roots: List[Tuple[Path, str]], secrets: Set[str]) 
             value = re.sub(re.escape(variant), lambda match: label, value, flags=re.IGNORECASE if os.name == "nt" else 0)
     # URL 仅保留服务端点；查询串、片段与 userinfo 均不进入报告。
     def endpoint(match: re.Match) -> str:
+        raw_u = match[0]
+        trail_chars: List[str] = []
+        while raw_u:
+            ch = raw_u[-1]
+            if ch in ".,;:!?}":
+                trail_chars.append(ch)
+                raw_u = raw_u[:-1]
+            elif ch == ")" and raw_u.count(")") > raw_u.count("("):
+                trail_chars.append(ch)
+                raw_u = raw_u[:-1]
+            elif ch == "]" and raw_u.count("]") > raw_u.count("["):
+                trail_chars.append(ch)
+                raw_u = raw_u[:-1]
+            else:
+                break
+        trail = "".join(reversed(trail_chars))
+        if not raw_u:
+            return match[0]
         try:
-            parsed = urlsplit(match[0])
+            parsed = urlsplit(raw_u)
             host = parsed.hostname or ""
+            if not host:
+                return "<redacted-url>" + trail
             if ":" in host:
                 host = "[" + host + "]"
-            return f"{parsed.scheme}://{host}" + (f":{parsed.port}" if parsed.port else "") + parsed.path
+            return f"{parsed.scheme}://{host}" + (f":{parsed.port}" if parsed.port else "") + parsed.path + trail
         except ValueError:
-            return "<redacted-url>"
-    value = re.sub(r"(?:https?|wss?|socks5h?)://[^\s\"<>]+", endpoint, value, flags=re.IGNORECASE)
+            return "<redacted-url>" + trail
+
+    value = re.sub(
+        r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----(?:[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----|[^\r\n]*)",
+        "<redacted-private-key>",
+        value,
+    )
+    value = re.sub(r"(?:https?|wss?|socks5h?|socks4a?)://[^\s\"'\x60<>]+", endpoint, value, flags=re.IGNORECASE)
+    value = re.sub(r"(?i)(\b[a-z][a-z0-9+.-]*://)([^/\s\"'\x60<>@]+@)", r"\1<redacted>@", value)
     octet = r"(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)"
     value = re.sub(
         rf"(?<![0-9A-Za-z_.-])(?:10\.{octet}\.{octet}\.{octet}|100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.{octet}\.{octet}|172\.(?:1[6-9]|2\d|3[01])\.{octet}\.{octet}|192\.168\.{octet}\.{octet}|169\.254\.{octet}\.{octet})(?![0-9A-Za-z_.-])",
@@ -3046,12 +3073,12 @@ def _audit_redact(value: Any, roots: List[Tuple[Path, str]], secrets: Set[str]) 
         value,
     )
     value = re.sub(
-        r"(?i)(?:[A-Z]:[/\\]Users[/\\]|/mnt/[a-z]/Users[/]|(?:\\\\|//)wsl(?:\.localhost|\$)[/\\][^/\\\s]+[/\\]home[/\\]|/(?:home|Users)/)[^/\\\s\"']+",
+        r"(?i)(?:[A-Z]:[/\\]Users[/\\]|/mnt/[a-z]/Users[/]|(?:\\\\|//)wsl(?:\.localhost|\$)[/\\][^/\\\s\"'\x60|()（）\[\]{},;:]+[/\\]home[/\\]|/(?:home|Users)/)[^/\\\s\"'\x60|()（）\[\]{},;:]+",
         "<home>",
         value,
     )
     value = re.sub(
-        r"(?i)\b(?:sk-[A-Za-z0-9_-]{12,}|AIza[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|hf_[A-Za-z0-9]{20,}|glpat-[A-Za-z0-9_-]{16,}|Bearer\s+[^\s\"']+)",
+        r"(?i)\b(?:sk-[A-Za-z0-9_-]{12,}|AIza[A-Za-z0-9_-]{20,}|ya29\.[A-Za-z0-9._-]{20,}|eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9._-]{8,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|(?:AKIA|ASIA)[0-9A-Z]{16}|hf_[A-Za-z0-9]{20,}|glpat-[A-Za-z0-9_-]{16,}|xox[baprs]-[A-Za-z0-9-]{10,}|(?:Bearer|Basic|Token|ApiKey)\s+[A-Za-z0-9._~+/=-]{6,})",
         "<redacted>",
         value,
     )
@@ -3185,12 +3212,16 @@ def audit_upgrade_status(
     def collect_secrets(doc: Any) -> None:
         if isinstance(doc, dict):
             for key, value in doc.items():
-                if re.search(r"(?i)(?:auth|api.?key|secret|password|credential|bearer|(?:^|[_-])token(?:$|[_-])|[a-z0-9]Token$|^token[A-Z])", key):
+                if re.search(
+                    r"(?i)(?:auth|api.?key|secret|password|passwd|passphrase|credential|bearer|(?:set[_-]?)?cookie|(?:^|[_-])token(?:$|[_-])|[a-z0-9]Token$|^token[A-Z])",
+                    key,
+                ):
+                    is_pwd = bool(re.search(r"(?i)pass(?:w(?:or)?d|phrase)", key))
                     if (
                         isinstance(value, str)
                         and len(value.strip()) >= 6
-                        and not value.strip().isdigit()
-                        and value.strip().lower() not in {"via-router", "present", "missing", "placeholder", "n/a", "true", "false"}
+                        and (not value.strip().isdigit() or is_pwd)
+                        and value.strip().lower() not in {"via-router", "present", "missing", "placeholder", "n/a", "true", "false", "none", "null"}
                     ):
                         secrets.add(value)
                 collect_secrets(value)

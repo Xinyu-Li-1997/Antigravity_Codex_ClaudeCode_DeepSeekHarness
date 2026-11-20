@@ -2674,40 +2674,77 @@ def _refresh_agy_listing(info, batch, *, refresh_model_cache, record_quota=True)
     return info
 
 
+def _split_url_trailing_punct(raw_url):
+    trail = []
+    s = raw_url
+    while s:
+        ch = s[-1]
+        if ch in '.,;:!?}':
+            trail.append(ch)
+            s = s[:-1]
+        elif ch == ')' and s.count(')') > s.count('('):
+            trail.append(ch)
+            s = s[:-1]
+        elif ch == ']' and s.count(']') > s.count('['):
+            trail.append(ch)
+            s = s[:-1]
+        else:
+            break
+    return s, ''.join(reversed(trail))
+
+
 def _sanitize_endpoint_url(raw_url):
     text = str(raw_url or '').strip()
     if not text:
         return ''
-    if not text.lower().startswith(('http://', 'https://')):
-        return '<redacted-url>' if ('@' in text or '?' in text) else text
+    core, trail = _split_url_trailing_punct(text)
+    if not core:
+        return text
+    if not core.lower().startswith(('http://', 'https://')):
+        sanitized = '<redacted-url>' if ('@' in core or '?' in core or '#' in core) else core
+        return sanitized + trail
     try:
-        parsed = urlsplit(text)
+        parsed = urlsplit(core)
         host = parsed.hostname or ''
         if not host:
-            return '<redacted-url>'
+            return '<redacted-url>' + trail
         if ':' in host:
             host = '[' + host + ']'
         port_part = f':{parsed.port}' if parsed.port else ''
-        return f'{parsed.scheme}://{host}{port_part}{parsed.path}'
+        return f'{parsed.scheme}://{host}{port_part}{parsed.path}{trail}'
     except ValueError:
-        return '<redacted-url>'
+        return '<redacted-url>' + trail
 
 
 def _redact_runtime_secret(text):
     raw = str(text or '')
     if not raw:
         return ''
-    raw = re.sub(r'(?i)(?:https?|socks5h?|wss?)://[^\s"<>]+', lambda m: _sanitize_endpoint_url(m.group(0)), raw)
+    raw = re.sub(
+        r'-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----(?:[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----|[^\r\n]*)',
+        '<redacted-private-key>',
+        raw,
+    )
+    raw = re.sub(
+        r'(?i)(?:https?|socks5h?|socks4a?|wss?)://[^\s"\'\x60<>]+',
+        lambda m: _sanitize_endpoint_url(m.group(0)),
+        raw,
+    )
+    raw = re.sub(r'(?i)(\b[a-z][a-z0-9+.-]*://)([^/\s"\'\x60<>@]+@)', r'\1<redacted>@', raw)
     raw = re.sub(r'(?i)\b(Bearer|Basic|Token|ApiKey)\s+[A-Za-z0-9._~+/=-]{8,}', r'\1 <redacted>', raw)
     raw = re.sub(
         r'(?i)(?:^|(?<=[\s"\'{,;]))([A-Za-z0-9_-]*(?:DEEPSEEK_API_KEY|ANTHROPIC_AUTH_TOKEN|ANTHROPIC_API_KEY|OPENAI_API_KEY|'
-        r'api[_-]?key|auth[_-]?token|access[_-]?token|secret[_-]?key|authorization))(["\']?\s*[=:]\s*)(?:"[^"\r\n]*"|\'[^\'\r\n]*\'|(?:(?:Bearer|Basic|Token|ApiKey)\s+)?[^\s"\',}]+)',
+        r'api[_-]?key|auth[_-]?token|access[_-]?token|refresh[_-]?token|id[_-]?token|client[_-]?secret|'
+        r'secret[_-]?key|password|passwd|passphrase|authorization))(["\']?\s*[=:]\s*)'
+        r'(?:"[^"\r\n]*"|\'[^\'\r\n]*\'|(?:(?:Bearer|Basic|Token|ApiKey)\s+)?[^\s"\',}]+)',
         r'\1\2<redacted>',
         raw,
     )
     raw = re.sub(
-        r'\b(?:sk-[A-Za-z0-9_-]{12,}|AIza[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|'
-        r'github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|hf_[A-Za-z0-9]{20,}|glpat-[A-Za-z0-9_-]{16,})',
+        r'\b(?:sk-[A-Za-z0-9_-]{12,}|AIza[A-Za-z0-9_-]{20,}|ya29\.[A-Za-z0-9._-]{20,}|'
+        r'eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9._-]{8,}|'
+        r'gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|(?:AKIA|ASIA)[0-9A-Z]{16}|'
+        r'hf_[A-Za-z0-9]{20,}|glpat-[A-Za-z0-9_-]{16,}|xox[baprs]-[A-Za-z0-9-]{10,})',
         '<redacted>',
         raw,
     )
@@ -6148,7 +6185,7 @@ _GROUNDING_GENERIC_ACRONYMS = frozenset({
     'BOM', 'CRLF', 'EOF', 'EOL', 'AST', 'PID', 'TID', 'UID', 'GID', 'WSL', 'POSIX', 'GNU', 'MIT', 'BSD', 'SHA', 'RSA',
     'LLM', 'IDE', 'SDK', 'MCP', 'SSE', 'RPC', 'IPC', 'ABI', 'ENV', 'CWD', 'TMP', 'DIR', 'WIN', 'MAC', 'APP',
     'PRO', 'MAX', 'MIN', 'AVG', 'TTL', 'LRU', 'RPM', 'TPM', 'QPS', 'TUN', 'NAT', 'LAN', 'WAN', 'VPN', 'RFC', 'ISO',
-    'DOI', 'UTC', 'GMT', 'CSC', 'ASCII', 'OAUTH',
+    'DOI', 'UTC', 'GMT', 'CSC', 'ASCII', 'OAUTH', 'JWT', 'PEM',
 })
 
 _GROUNDING_EXTERNAL_CLIS = frozenset({
@@ -7322,25 +7359,29 @@ def cmd_task(args):
     elif scope['scope_violations']:
         status = 'scope_violation'
     if args.kind == 'polish' and status == 'ok' and isinstance(result, dict) and isinstance(result.get('content'), str):
-        orig_doc = _optional_text(requested_target) if requested_target.is_file() else ''
-        anchor_root = _infer_project_anchor_root(requested_target)
-        if requested_target.is_file():
-            rel_label = (
-                requested_target.relative_to(anchor_root).as_posix()
-                if requested_target.is_relative_to(anchor_root) else requested_target.name
-            )
-            exclude_set = {rel_label} if requested_target.is_relative_to(anchor_root) else set()
-        else:
-            rel_label = requested_target.name
-            exclude_set = set()
-        anchor = _build_grounding_anchor(anchor_root, exclude_set, extra_allowed_text=text)
-        drift_hits = _audit_single_doc_text(rel_label, result['content'], anchor, baseline_text=orig_doc)
-        payload['grounding_audit'] = {
-            'ok': not drift_hits,
-            'finding_count': len(drift_hits),
-            'findings': drift_hits,
-        }
+        payload['grounding_audit'] = _compute_polish_grounding_audit(requested_target, result['content'], text)
     return _dispatch_print(args, {'status': status, **payload, 'invocation': invocation, 'result': result, **error, **scope})
+
+
+def _compute_polish_grounding_audit(requested_target, polished_content, extra_text=''):
+    orig_doc = _optional_text(requested_target) if requested_target.is_file() else ''
+    anchor_root = _infer_project_anchor_root(requested_target)
+    if requested_target.is_file():
+        rel_label = (
+            requested_target.relative_to(anchor_root).as_posix()
+            if requested_target.is_relative_to(anchor_root) else requested_target.name
+        )
+        exclude_set = {rel_label} if requested_target.is_relative_to(anchor_root) else set()
+    else:
+        rel_label = requested_target.name
+        exclude_set = set()
+    anchor = _build_grounding_anchor(anchor_root, exclude_set, extra_allowed_text=extra_text)
+    drift_hits = _audit_single_doc_text(rel_label, polished_content, anchor, baseline_text=orig_doc)
+    return {
+        'ok': not drift_hits,
+        'finding_count': len(drift_hits),
+        'findings': drift_hits,
+    }
 
 
 def _atomic_text(path, content):
@@ -7618,9 +7659,12 @@ def _begin_dispatch(args):
 
 _SECRET_FIELD_KEY_RE = re.compile(
     r'(?i)(?:^|[_-])(?:api[_-]?(?:key|token)|auth[_-]?token|access[_-]?token|refresh[_-]?token|'
-    r'bearer[_-]?token|private[_-]?key|client[_-]?secret|secret(?:[_-]?key)?|password|credential|authorization)s?$'
-    r'|(?:api|auth|access|refresh|bearer|private|secret|client)(?:Key|Token|Secret)s?$'
+    r'id[_-]?token|session[_-]?token|oauth[_-]?token|bearer[_-]?token|private[_-]?key|'
+    r'client[_-]?secret|secret(?:[_-]?key)?|password|passwd|passphrase|credential|'
+    r'authorization|(?:set[_-]?)?cookie)s?$'
+    r'|(?:api|auth|access|refresh|id|session|oauth|bearer|private|secret|client)(?:Key|Token|Secret)s?$'
 )
+_CGNAT_NETWORK = ipaddress.IPv4Network((0x64400000, 10))
 
 
 def _redact_secret_leaves(value):
@@ -7697,11 +7741,11 @@ def _redact_public(value, *, _key='', _in_result_payload=False):
                 text = re.sub(re.escape(variant), lambda _: replacement, text, flags=re.I)
     text = re.sub(
         r'(?i)(?:'
-        r'(?:\\{2,}|//)wsl(?:\.localhost|\$)(?:\\+|/)[^\\/\s"\x27\n]+(?:\\+|/)home(?:\\+|/)[^\\/\s"\x27\n]+'
-        r'|[A-Z]:(?:\\+|/)Users(?:\\+|/)[^\\/\s"\x27\n]+'
-        r'|/mnt/[a-z]/Users/[^\\/\s"\x27\n]+'
-        r'|(?<![A-Za-z0-9_.-])/Users/[^\\/\s"\x27\n]+'
-        r'|(?<![A-Za-z0-9_.-])/home/[^\\/\s"\x27\n]+'
+        r'(?:\\{2,}|//)wsl(?:\.localhost|\$)(?:\\+|/)[^\\/\s"\x27\x60\n|()（）\[\]{},;:]+(?:\\+|/)home(?:\\+|/)[^\\/\s"\x27\x60\n|()（）\[\]{},;:]+'
+        r'|[A-Z]:(?:\\+|/)Users(?:\\+|/)[^\\/\s"\x27\x60\n|()（）\[\]{},;:]+'
+        r'|/mnt/[a-z]/Users/[^\\/\s"\x27\x60\n|()（）\[\]{},;:]+'
+        r'|(?<![A-Za-z0-9_.-])/Users/[^\\/\s"\x27\x60\n|()（）\[\]{},;:]+'
+        r'|(?<![A-Za-z0-9_.-])/home/[^\\/\s"\x27\x60\n|()（）\[\]{},;:]+'
         r')',
         '<HOME>',
         text,
@@ -7709,11 +7753,12 @@ def _redact_public(value, *, _key='', _in_result_payload=False):
     def mask_ip(match):
         try:
             address = ipaddress.ip_address(match.group())
-            return '<PRIVATE_IP>' if address.is_private else match.group()
+            is_priv = address.is_private or (address.version == 4 and address in _CGNAT_NETWORK)
+            return '<PRIVATE_IP>' if is_priv else match.group()
         except ValueError:
             return match.group()
     text = re.sub(r'(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])', mask_ip, text)
-    text = re.sub(r'(?i)(?<![\w:])(?:f[cd][0-9a-f]{2}:[0-9a-f:]{2,}|fe80:[0-9a-f:]{2,})(?![\w:])', mask_ip, text)
+    text = re.sub(r'(?i)(?<![\w:])(?:f[cd][0-9a-f]{2}:[0-9a-f:]{2,}|fe[89ab][0-9a-f]:[0-9a-f:]{2,})(?![\w:])', mask_ip, text)
     text = re.sub(r'cae-harness-[A-Za-z0-9_-]+', '<STAGING>', text)
     is_quota_key = bool(_key and _QUOTA_FIELD_KEY_RE.search(_key))
     is_scientific_field = _in_result_payload or (_key in _SCIENTIFIC_CONTENT_KEYS)
@@ -9110,8 +9155,24 @@ def cmd_batch(args):
                         result['status'] = 'scope_violation'
                     elif not scope.get('scope_verified'):
                         result['status'] = 'failed'
+                if (
+                    result['status'] == 'ok'
+                    and stream['kind'] == 'polish'
+                    and isinstance(result.get('result'), dict)
+                    and isinstance(result['result'].get('content'), str)
+                ):
+                    result['grounding_audit'] = _compute_polish_grounding_audit(
+                        target, result['result']['content'], stream.get('subtask', '')
+                    )
                 if result['status'] == 'ok' and not readonly and stream.get('verify_cmd'):
-                    verification = run_process(stream['verify_cmd'], root, timeout_sec=stream['timeout'], shell=True)
+                    verify_env = {
+                        k: v for k, v in os.environ.items()
+                        if k not in _GIT_REPO_ENV_VARS and k not in _CHILD_SCRUB_SESSION_ENV_VARS
+                    }
+                    verify_env['CAE_HARNESS_DEPTH'] = '1'
+                    verification = run_process(
+                        stream['verify_cmd'], root, timeout_sec=stream['timeout'], shell=True, env=verify_env,
+                    )
                     result['verification_executed'] = True
                     result['verify_exit_code'] = verification.returncode
                     result['verify_output_tail'] = ((verification.stdout or '') + '\n' + (verification.stderr or '')).strip()[-2000:]

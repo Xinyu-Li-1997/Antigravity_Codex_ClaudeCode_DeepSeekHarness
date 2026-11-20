@@ -2,6 +2,21 @@
 
 本文件记录四客户端共用规则、会话钩子、后台验证工具与上游维护流程的版本演进。当前插件版本以 `template/user-guard/plugin.json` 为准；常驻使用文档只说明机制和配置键，不重复维护版本号与性能日期。
 
+## [1.17.6] - 2026-11-20
+
+完成全仓运行期与诊断日志脱敏一致性收口、批量模式润色事实锚定与验收环境隔离补齐、跨运行侧状态锁防死锁加固、CC Switch 数据库基线升级及常驻文档书面语润色：
+
+- **运行期与诊断日志全链路脱敏对齐（`cae_harness.py`、`install.py`、`user_words.py`、`router.py`）**：
+  - 修复 Python 3.13 下 `_redact_public` 对 RFC 6598 共享内网段与 `fe80::/10` 链路本地 IPv6 后半段漏脱敏的问题，并在 `<HOME>` 兜底替换中保护 Markdown 表格竖线与括号分隔边界；
+  - 新增 `_split_url_trailing_punct` 保留 Markdown 链接、圆括号与引号包裹带端口 URL 的外侧闭合符，将 `user_words.py` 与 `router.py` 的 URL 凭据擦除扩展至 `ws`、`wss`、`socks4`、`socks5` 及通用协议前缀，统一补齐 PEM 私钥块、JWT、`ya29.`、`ASIA`、`xox*`、`Basic`、`Token`、`ApiKey` 以及 `id_token`、`sessionToken`、`passwd`、`passphrase`、`cookie` 与纯数字密码脱敏。
+- **批量编排逻辑、状态机边界与 CC Switch 基线更新（`cae_harness.py`、`fleet_state.py`、`handoff_gate.py`、`session_context_loader.py`、`ccswitch_admin.py`）**：
+  - 抽取共用 `_compute_polish_grounding_audit` 接入 `cmd_batch` 的 `polish` 流，并为 `cmd_batch` 可写流 `verify_cmd` 子进程补齐剥离 `_GIT_REPO_ENV_VARS` 与父会话环境变量及注入 `CAE_HARNESS_DEPTH=1`；
+  - 在 `fleet_state.py` 的 `propose`、`record-pass1` 与 `clear` 中统一核验 `execution_side` 与仓库配置指纹对齐，避免跨运行侧或已漂移旧记录造成审批死锁；在 `handoff_gate.py` 将 `--cancel-ticket` 与 `--discover-models` 归入写状态子命令，并将 `ccswitch_admin.py` 的 `TESTED_MAX_SCHEMA` 升级至经实库列结构核验的 `27`。
+- **常驻文档书面语清理与回归单测增补（`README.md`、`AGENTS.md`、`rules/AGENTS.md`、`SKILL.md`、`docs/`、`tests/`）**：
+  - 清理 7 份常驻说明与规则文档正文中的连续斜杠串并同步脱敏与批量润色锚定说明，新增覆盖上述全部修复项的离线回归单测。
+
+---
+
 ## [1.17.5] - 2026-11-20
 
 融合 WSL2 Linux 原生 Antigravity 桌面版无进程版本体检，并结合五路跨端全仓交叉审查完成 Shell/Python AST 安全边界加固、回环路由跨域防护、配置体检零字节码写入收口、重复代码去重与常驻指南去模型名润色：

@@ -960,20 +960,26 @@ def _effective_log_limits(anchor_dir: Optional[Path] = None) -> Tuple[int, int]:
     return max_bytes, trim_bytes
 
 
+_LIFECYCLE_PEM_KEY_RE = re.compile(
+    r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----(?:[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----|[^\r\n]*)"
+)
 _LIFECYCLE_SECRET_RE = re.compile(
-    r"(?i)(?:Bearer\s+[A-Za-z0-9._~+/=-]{8,}|Basic\s+[A-Za-z0-9+/=_-]{6,}|"
-    r"sk-[A-Za-z0-9_-]{12,}|AIza[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|"
-    r"github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|hf_[A-Za-z0-9]{20,}|glpat-[A-Za-z0-9_-]{16,})"
+    r"(?i)(?:\b(?:Bearer|Basic|Token|ApiKey)\s+[A-Za-z0-9._~+/=-]{6,}|"
+    r"sk-[A-Za-z0-9_-]{12,}|AIza[A-Za-z0-9_-]{20,}|ya29\.[A-Za-z0-9._-]{20,}|"
+    r"eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9._-]{8,}|"
+    r"gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|(?:AKIA|ASIA)[0-9A-Z]{16}|"
+    r"hf_[A-Za-z0-9]{20,}|glpat-[A-Za-z0-9_-]{16,}|xox[baprs]-[A-Za-z0-9-]{10,})"
 )
 _LIFECYCLE_KV_SECRET_RE = re.compile(
-    r"(?i)(\b(?:[A-Za-z0-9_]+[_-](?:api[_-]?key|auth[_-]?token|access[_-]?token|refresh[_-]?token|"
-    r"secret[_-]?access[_-]?key|secret[_-]?key|secret|token|password|passwd)|"
-    r"api[_-]?key|auth[_-]?token|access[_-]?token|refresh[_-]?token|secret[_-]?access[_-]?key|"
-    r"secret[_-]?key|client[_-]?secret|password|passwd|token)"
+    r"(?i)(\b(?:[A-Za-z0-9_-]+[_-](?:api[_-]?key|auth[_-]?token|access[_-]?token|refresh[_-]?token|"
+    r"id[_-]?token|secret[_-]?access[_-]?key|secret[_-]?key|secret|token|password|passwd|passphrase|authorization)|"
+    r"api[_-]?key|auth[_-]?token|access[_-]?token|refresh[_-]?token|id[_-]?token|secret[_-]?access[_-]?key|"
+    r"secret[_-]?key|client[_-]?secret|password|passwd|passphrase|authorization|token)"
     r"(?:\\*[\"\'])?\s*[=:]\s*(?:\\*[\"\'])?)([^\s\"\'\\,;})]+)"
 )
 _LIFECYCLE_SECRET_KEY_RE = re.compile(
-    r"(?i)(?:auth|api.?key|secret|password|passwd|credential|bearer|(?:^|[_-])token(?:$|[_-])|[a-z0-9]Token$|^token[A-Z])"
+    r"(?i)(?:auth|api.?key|secret|password|passwd|passphrase|credential|bearer|(?:set[_-]?)?cookie|"
+    r"(?:^|[_-])token(?:$|[_-])|[a-z0-9]Token$|^token[A-Z])"
 )
 _LIFECYCLE_SAFE_LITERALS = frozenset({"via-router", "present", "missing", "placeholder", "n/a", "true", "false", "none", "null"})
 
@@ -981,7 +987,7 @@ _LIFECYCLE_SAFE_LITERALS = frozenset({"via-router", "present", "missing", "place
 def _scrub_kv_secret_match(match: re.Match[str]) -> str:
     prefix, raw_val = match.group(1), match.group(2)
     stripped = raw_val.strip()
-    is_pwd_key = bool(re.search(r"(?i)passw(?:or)?d", prefix))
+    is_pwd_key = bool(re.search(r"(?i)pass(?:w(?:or)?d|phrase)", prefix))
     if len(stripped) < 6 or (stripped.isdigit() and not is_pwd_key) or stripped.lower() in _LIFECYCLE_SAFE_LITERALS:
         return match.group(0)
     return f"{prefix}<redacted>"
@@ -989,9 +995,11 @@ def _scrub_kv_secret_match(match: re.Match[str]) -> str:
 
 def _scrub_lifecycle_entry(val: Any) -> Any:
     if isinstance(val, str):
-        val = re.sub(r"(?i)(https?://)([^/\s@]+@)", r"\1<redacted>@", val)
+        val = _LIFECYCLE_PEM_KEY_RE.sub("<redacted-private-key>", val)
+        val = re.sub(r"(?i)(\b[a-z][a-z0-9+.-]*://)([^/\s\"'<>@]+@)", r"\1<redacted>@", val)
         val = re.sub(
-            r"(?i)([?&](?:[A-Za-z0-9_]+[_-])?(?:key|api_key|token|access_token|secret|secret_access_key|password|passwd)=)[^&\s\"'\\]+",
+            r"(?i)([?&](?:[A-Za-z0-9_]+[_-])?(?:key|api_key|token|auth_token|access_token|refresh_token|"
+            r"id_token|client_secret|secret|secret_access_key|password|passwd|passphrase)=)[^&\s\"'\\]+",
             r"\1<redacted>",
             val,
         )
@@ -1000,7 +1008,7 @@ def _scrub_lifecycle_entry(val: Any) -> Any:
     if isinstance(val, dict):
         scrubbed: Dict[Any, Any] = {}
         for k, v in val.items():
-            is_pwd = isinstance(k, str) and bool(re.search(r"(?i)passw(?:or)?d", k))
+            is_pwd = isinstance(k, str) and bool(re.search(r"(?i)pass(?:w(?:or)?d|phrase)", k))
             if (
                 isinstance(k, str) and _LIFECYCLE_SECRET_KEY_RE.search(k)
                 and isinstance(v, str) and len(v.strip()) >= 6

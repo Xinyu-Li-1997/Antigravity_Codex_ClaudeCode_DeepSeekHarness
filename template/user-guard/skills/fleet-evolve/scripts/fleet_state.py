@@ -578,6 +578,7 @@ def main(argv: list[str] | None = None) -> int:
                         return 2
                     if (
                         existing.get("phase") == "AWAITING_MASTER_RELOAD"
+                        and existing.get("execution_side") == _side()
                         and now - _int_field(existing, "updated_at_epoch", 0) <= _int_field(existing, "ttl_seconds", default_ttl, positive=True)
                         and _is_aligned_with_repo(existing, meta)
                     ):
@@ -586,9 +587,11 @@ def main(argv: list[str] | None = None) -> int:
                         return 2
                     if (
                         existing.get("phase") == "AWAITING_USER_APPROVAL"
+                        and existing.get("execution_side") == _side()
                         and existing.get("proposing_session_id")
                         and existing.get("proposing_session_id") != sid
                         and now - _int_field(existing, "updated_at_epoch", 0) <= _int_field(existing, "ttl_seconds", default_ttl, positive=True)
+                        and _is_aligned_with_repo(existing, meta)
                     ):
                         print(json.dumps({"ok": False, "reason": "active_other_session_proposal", "saved": existing}, ensure_ascii=False, indent=2))
                         return 2
@@ -663,6 +666,7 @@ def main(argv: list[str] | None = None) -> int:
                     claimed_by = existing.get("claimed_by_session_id")
                     if (
                         existing.get("phase") == "AWAITING_USER_APPROVAL"
+                        and existing.get("execution_side") == _side()
                         and now - _int_field(existing, "updated_at_epoch", 0) <= _int_field(existing, "ttl_seconds", default_ttl, positive=True)
                         and _is_aligned_with_repo(existing, meta)
                     ):
@@ -670,6 +674,7 @@ def main(argv: list[str] | None = None) -> int:
                         return 2
                     if (
                         existing.get("phase") == "AWAITING_MASTER_RELOAD"
+                        and existing.get("execution_side") == _side()
                         and claimed_by
                         and claimed_by != sid
                         and now - _int_field(existing, "updated_at_epoch", 0) <= _int_field(existing, "ttl_seconds", default_ttl, positive=True)
@@ -726,11 +731,13 @@ def main(argv: list[str] | None = None) -> int:
                     and now - _int_field(saved, "updated_at_epoch", 0)
                     <= _int_field(saved, "ttl_seconds", default_ttl, positive=True)
                 )
-                if saved.get("phase") == "AWAITING_USER_APPROVAL" and within_ttl and _is_aligned_with_repo(saved, meta):
+                same_side = saved.get("execution_side") == _side()
+                if saved.get("phase") == "AWAITING_USER_APPROVAL" and same_side and within_ttl and _is_aligned_with_repo(saved, meta):
                     print(json.dumps({"ok": False, "reason": "active_user_approval", "error": "An active proposal requires user approval; use --force to explicitly override"}, ensure_ascii=False, indent=2))
                     return 1
                 if (
                     saved.get("phase") == "AWAITING_MASTER_RELOAD"
+                    and same_side
                     and within_ttl
                     and _is_aligned_with_repo(saved, meta)
                 ):

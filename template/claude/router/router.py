@@ -575,34 +575,61 @@ def _read_chunked_body(rfile, max_bytes):
     return b"".join(chunks)
 
 
+_LOG_PEM_KEY_RE = re.compile(
+    r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----(?:[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----|[^\r\n]*)"
+)
 _LOG_SECRET_RE = re.compile(
-    r"(?i)(?:Bearer\s+[A-Za-z0-9._~+/=-]{8,}|"
-    r"sk-[A-Za-z0-9_-]{12,}|AIza[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|"
-    r"github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|hf_[A-Za-z0-9]{20,}|glpat-[A-Za-z0-9_-]{16,})"
+    r"(?i)(?:\b(?:Bearer|Basic|Token|ApiKey)\s+[A-Za-z0-9._~+/=-]{6,}|"
+    r"sk-[A-Za-z0-9_-]{12,}|AIza[A-Za-z0-9_-]{20,}|ya29\.[A-Za-z0-9._-]{20,}|"
+    r"eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9._-]{8,}|"
+    r"gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|(?:AKIA|ASIA)[0-9A-Z]{16}|"
+    r"hf_[A-Za-z0-9]{20,}|glpat-[A-Za-z0-9_-]{16,}|xox[baprs]-[A-Za-z0-9-]{10,})"
 )
 _LOG_KV_SECRET_RE = re.compile(
-    r"(?i)((?:DEEPSEEK_API_KEY|ANTHROPIC_AUTH_TOKEN|ANTHROPIC_API_KEY|OPENAI_API_KEY|"
-    r"api[_-]?key|auth[_-]?token|access[_-]?token|secret[_-]?key)[\"']?\s*[=:]\s*[\"']?)[^\s\"',}]+"
+    r"(?i)(\b(?:[A-Za-z0-9_-]+[_-](?:api[_-]?key|auth[_-]?token|access[_-]?token|refresh[_-]?token|"
+    r"id[_-]?token|secret[_-]?access[_-]?key|secret[_-]?key|secret|token|password|passwd|passphrase|authorization)|"
+    r"DEEPSEEK_API_KEY|ANTHROPIC_AUTH_TOKEN|ANTHROPIC_API_KEY|OPENAI_API_KEY|"
+    r"api[_-]?key|auth[_-]?token|access[_-]?token|refresh[_-]?token|id[_-]?token|secret[_-]?access[_-]?key|"
+    r"secret[_-]?key|client[_-]?secret|password|passwd|passphrase|authorization|token)"
+    r"(?:\\*[\"'])?\s*[=:]\s*(?:\\*[\"'])?)([^\s\"'\\,;})]+)"
 )
 _LOG_SECRET_KEY_RE = re.compile(
-    r"(?i)(?:auth|api.?key|secret|password|credential|bearer|(?:^|[_-])token(?:$|[_-])|[a-z0-9]Token$|^token[A-Z])"
+    r"(?i)(?:auth|api.?key|secret|password|passwd|passphrase|credential|bearer|(?:set[_-]?)?cookie|"
+    r"(?:^|[_-])token(?:$|[_-])|[a-z0-9]Token$|^token[A-Z])"
 )
 _LOG_SAFE_LITERALS = frozenset({"via-router", "present", "missing", "placeholder", "n/a", "true", "false", "none", "null"})
 
 
+def _scrub_log_kv_match(match):
+    prefix, raw_val = match.group(1), match.group(2)
+    stripped = raw_val.strip()
+    is_pwd = bool(re.search(r"(?i)pass(?:w(?:or)?d|phrase)", prefix))
+    if len(stripped) < 6 or (stripped.isdigit() and not is_pwd) or stripped.lower() in _LOG_SAFE_LITERALS:
+        return match.group(0)
+    return f"{prefix}<redacted>"
+
+
 def _scrub_log_value(val):
     if isinstance(val, str):
-        val = re.sub(r"(?i)(https?://)([^/\s@]+@)", r"\1<redacted>@", val)
-        val = re.sub(r"(?i)([?&](?:key|api_key|token|access_token|secret)=)[^&\s\"']+", r"\1<redacted>", val)
-        val = _LOG_KV_SECRET_RE.sub(r"\1<redacted>", val)
+        val = _LOG_PEM_KEY_RE.sub("<redacted-private-key>", val)
+        val = re.sub(r"(?i)(\b[a-z][a-z0-9+.-]*://)([^/\s\"'<>@]+@)", r"\1<redacted>@", val)
+        val = re.sub(
+            r"(?i)([?&](?:[A-Za-z0-9_]+[_-])?(?:key|api_key|token|auth_token|access_token|refresh_token|"
+            r"id_token|client_secret|secret|secret_access_key|password|passwd|passphrase)=)[^&\s\"'\\]+",
+            r"\1<redacted>",
+            val,
+        )
+        val = _LOG_KV_SECRET_RE.sub(_scrub_log_kv_match, val)
         return _LOG_SECRET_RE.sub("<redacted>", val)
     if isinstance(val, dict):
         out = {}
         for k, v in val.items():
+            is_pwd = isinstance(k, str) and bool(re.search(r"(?i)pass(?:w(?:or)?d|phrase)", k))
             if (
                 isinstance(k, str) and _LOG_SECRET_KEY_RE.search(k)
                 and isinstance(v, str) and len(v.strip()) >= 6
-                and not v.strip().isdigit() and v.strip().lower() not in _LOG_SAFE_LITERALS
+                and (not v.strip().isdigit() or is_pwd)
+                and v.strip().lower() not in _LOG_SAFE_LITERALS
             ):
                 out[k] = "<redacted>"
             else:
@@ -610,6 +637,8 @@ def _scrub_log_value(val):
         return out
     if isinstance(val, list):
         return [_scrub_log_value(v) for v in val]
+    if isinstance(val, tuple):
+        return tuple(_scrub_log_value(v) for v in val)
     return val
 
 

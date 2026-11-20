@@ -72,14 +72,14 @@ python -B -X utf8 install.py --audit-upgrade     # 4. 检查各端配置是否�
 
 ### 1. 明确指定客户端、模型、推理强度或隔离级别
 
-后台调度支持两类通道：**外部无头子进程**（`cae_harness.py` 启动的全新非交互 CLI 进程，看不到主会话历史）与**客户端内部原生子代理**（Antigravity 的 `invoke_subagent` / `run_workflow` / `swarm`、Codex 的 `spawn_agent`、Claude Code 的 `Agent` / `Task`）。
+后台调度支持两类通道：**外部无头子进程**（`cae_harness.py` 启动的全新非交互 CLI 进程，看不到主会话历史）与**客户端内部原生子代理**（Antigravity 的 `invoke_subagent`、`run_workflow` 或 `swarm`，Codex 的 `spawn_agent`，Claude Code 的 `Agent` 或 `Task`）。
 
 当你在对话中点明客户端、具体模型、推理强度、隔离级别或节省额度要求时，`cae_harness.py` 通过 `--user-prompt` 将其作为最高优先级（P0）约束锁定，并自动补全上下文窗口、只读小文件行号内联与文件快照校验；内部原生子代理则优先读取代理定义中的显式 `model`，未显式指定时按 `inherit` 继承宿主当前会话模型：
 
 | 指定方式 | 对话指令示例 | 锁定的参数 | 自动补全与报错保护 |
 | --- | --- | --- | --- |
 | **指定客户端或模型** | “这步编码用 Codex 高强度做”“用 DSH 独立核对脱敏与公式” | 指定的客户端、模型名称或模型系列 | 自动补全模型声明的最大上下文窗口、无头非交互标志、小文件行号内联、前后哈希快照与脱敏；目标不可用或已停用时直接报错，不静默换用其他端 |
-| **指定推理强度或隔离级别** | “用高强度推导离散格式”“用 `--isolation clean_room` 空上下文检查 README” | 指定的推理强度等级或四级正交隔离（`full` / `no_skills` / `hooks_only` / `clean_room`） | 对显式专业角色即使调低到 `low` 仍保留主力模型，避免退化为轻量模型；后端不支持所选隔离级别时显式报错拒绝 |
+| **指定推理强度或隔离级别** | “用高强度推导离散格式”“用 `--isolation clean_room` 空上下文检查 README” | 指定的推理强度等级或四级正交隔离（`full`、`no_skills`、`hooks_only`、`clean_room`） | 对显式专业角色即使调低到 `low` 仍保留主力模型，避免退化为轻量模型；后端不支持所选隔离级别时显式报错拒绝 |
 | **指定节省额度或配额回退** | “省点额度快速检查一遍格式”“加 `--fallback-on-quota` 遇限额回退” | 低消耗模式或未改文件时的限额回退 | 遇 `quota_exhausted` 立即停止重试；仅在未锁定单一客户端、未绑定已批准的确认票据且工作区无文件改动时按配置回退 |
 | **同时指定多个客户端** | “用 Codex 和 DSH 交叉审查这部分代码” | 识别“等、和、与、及”并列关系，不误锁单端 | 保留多路（多并发子任务）计划中各分支各自指定的客户端、模型与隔离级别组合 |
 
@@ -100,7 +100,7 @@ python -B -X utf8 install.py --audit-upgrade     # 4. 检查各端配置是否�
 
 ### 3. 多路与可写任务的执行前确认和完成后核验
 
-- **执行前精简确认与本地明细链接**：无论是客户端内部多路或可写原生委派（Antigravity 的 `invoke_subagent` / `run_workflow` / `swarm`、Codex 的 `spawn_agent`、Claude Code 的 `Agent` / `Task`，其中 `swarm` 的 `add` 会按 `tasks` 长度或 `n` 精确计入通道并发流数），还是外部无头命令（`batch`、`gate`、`audit`），启动前均由 `cae_harness.py plan` 生成任务背景、目标、预计后果、**精简 4 列总览表**（`compact_summary_card`）及指向本地 `<ticket_id>_card.md` 完整 14 项参数文件的可点击链接（同时附带离线性能更新时间）。对话中默认只展示精简总览卡与明细链接，避免多路 14 项长表污染上下文；用户确认并执行 `plan --approve-ticket` 登记批准票据后，钩子才放行启动。
+- **执行前精简确认与本地明细链接**：无论是客户端内部多路或可写原生委派（Antigravity 的 `invoke_subagent`、`run_workflow` 或 `swarm`，Codex 的 `spawn_agent`，Claude Code 的 `Agent` 或 `Task`，其中 `swarm` 的 `add` 会按 `tasks` 长度或 `n` 精确计入通道并发流数），还是外部无头命令（`batch`、`gate`、`audit`），启动前均由 `cae_harness.py plan` 生成任务背景、目标、预计后果、**精简 4 列总览表**（`compact_summary_card`）及指向本地 `<ticket_id>_card.md` 完整 14 项参数文件的可点击链接（同时附带离线性能更新时间）。对话中默认只展示精简总览卡与明细链接，避免多路 14 项长表污染上下文；用户确认并执行 `plan --approve-ticket` 登记批准票据后，钩子才放行启动。
 - **压缩与跨对话恢复**：等待确认期间若发生自动压缩，待确认票据会从磁盘独立恢复精简 4 列总览卡、可点击 `<ticket_id>_card.md` 链接与选项卡（仅未落盘明细文件时回退 14 项表）；若进入强制交接阶段，【新对话提示词】同样内嵌精简总览卡、明细链接与 `plan --resume-ticket` 恢复命令，新对话先离线复核旧票据再重建当前会话确认计划。
 - **完成后结果核验**：多路或可写任务结束时，回合结束钩子自动检查回复是否写明成败结论、Token 用量（客户端未返回具体数值时须如实说明无法统计）以及回执文件名或原生轨迹说明，漏写时单次阻断提示补全。
 

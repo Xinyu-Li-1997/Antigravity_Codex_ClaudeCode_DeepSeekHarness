@@ -882,7 +882,7 @@ def handle_pre_invocation(payload: Dict[str, Any]) -> Dict[str, Any]:
     return handle_context_check(payload, event_name="PreInvocation")
 
 
-# ⑥ Codex 恢复协议适配
+# ⑥ Codex 与 Claude Code 恢复协议适配
 
 def handle_codex_session_start(
     payload: Dict[str, Any],
@@ -1041,8 +1041,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Antigravity, Codex & Claude Code Compaction Context Loader Hook")
     parser.add_argument("--client", type=str, default="antigravity", choices=("antigravity", "codex", "claude"), help="Host client type")
     parser.add_argument("--event", type=str, default="", help="Hook event name: SessionStart or PreInvocation")
-    parser.add_argument("--state-dir", type=str, default="", help="Optional state directory override (used by Codex hook)")
-    parser.add_argument("--log", type=str, default="", help="Optional JSONL log file path override (used by Codex hook)")
+    parser.add_argument("--state-dir", type=str, default="", help="Optional state directory override (used by Codex and Claude hooks)")
+    parser.add_argument("--log", type=str, default="", help="Optional JSONL log file path override (used by Codex and Claude hooks)")
     args, _ = parser.parse_known_args()
 
     payload: Dict[str, Any] = {}

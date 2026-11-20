@@ -6347,6 +6347,139 @@ else:
             disk_after = json.loads((plan_dir / f'{tid}.json').read_text(encoding='utf-8'))
             self.assertEqual(disk_after['status'], 'CANCELLED')
 
+    def test_desensitization_cgnat_jwt_pem_url_punct_and_batch_polish_verify_env(self):
+        # 1) _redact_public 覆盖 RFC 6598 共享内网段、IPv6 链路本地与 Markdown 分隔符边界
+        cgnat_a = '100.' + '64.12.34'
+        cgnat_b = '100.' + '100.100.100'
+        v6_ll = 'febf' + '::1a2b'
+        ip_sample = harness._redact_public(f'cgnat={cgnat_a} tailscale={cgnat_b} v6={v6_ll} pub=8.8.8.8')
+        self.assertEqual(ip_sample, 'cgnat=<PRIVATE_IP> tailscale=<PRIVATE_IP> v6=<PRIVATE_IP> pub=8.8.8.8')
+        md_in = '| /ho' + 'me/otheralice | (/Us' + 'ers/otherbob) | `C:\\Us' + 'ers\\othercarol` |'
+        md_home = harness._redact_public(md_in)
+        self.assertEqual(md_home, '| <HOME> | (<HOME>) | `<HOME>` |')
+        self.assertIn('<HOME>/proj', harness._redact_public({'/mnt/c/Users/<user>/proj': 'ok'}))
+
+        # 2) _redact_runtime_secret 保留 URL 外侧括号/引号，擦除多协议凭据、JWT、ya29.、ASIA、xox 与 PEM 私钥
+        jwt_tok = 'eyJhbGciOiJIUzI1NiJ9.' + 'eyJzdWIiOiIxMjM0NTY3ODkwIn0.' + 'SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c'
+        pem_hdr = '-----BEGIN ' + 'EC PRIVATE KEY-----'
+        pem_ftr = '-----END ' + 'EC PRIVATE KEY-----'
+        pem_block = f'{pem_hdr}\nMHcCAQEEII1234567890abcdef==\n{pem_ftr}'
+        at_ch = '@'
+        raw_secret_msg = (
+            f"[endpoint](https://u:p{at_ch}example.com:8443/v1/chat?api_key=sec123) "
+            f"('socks4://proxyu:proxyp{at_ch}127.0.0.1:1080') "
+            f"dsn=postgresql://dbu:dbp{at_ch}example.org:5432/prod "
+            f"jwt={jwt_tok} gtok={'ya29.' + 'a0AfH6SMBx1234567890abcdefGHIJ'} "
+            f"aws={'ASIA' + 'IOSFODNN7EXAMPLE'} slack={'xoxb-' + '1234567890-abcdefGHIJ'} {pem_block}"
+        )
+        scrubbed_msg = harness._redact_runtime_secret(raw_secret_msg)
+        self.assertIn('[endpoint](https://example.com:8443/v1/chat)', scrubbed_msg)
+        self.assertIn("('<redacted-url>')", scrubbed_msg)
+        self.assertIn('postgresql://<redacted>@example.org:5432/prod', scrubbed_msg)
+        for leaked in ('u:p', 'sec123', 'proxyu', 'dbu:dbp', jwt_tok, 'ya29.a0Af', 'ASIAIOSFODNN7EXAMPLE', 'xoxb-123456', 'MHcCAQEE'):
+            self.assertNotIn(leaked, scrubbed_msg)
+        self.assertIn('<redacted-private-key>', scrubbed_msg)
+
+        dict_redacted = harness._redact_public({
+            'id_token': jwt_tok,
+            'sessionToken': 'sess_secret_abcdef1234',
+            'passwd': '12345678',
+            'passphrase': 'correct-horse-battery',
+            'Set-Cookie': 'sid=secretcookievalue123; HttpOnly',
+            'token': '--keep-grounding-token',
+            'input_tokens': 42,
+        })
+        for secret_k in ('id_token', 'sessionToken', 'passwd', 'passphrase', 'Set-Cookie'):
+            self.assertEqual(dict_redacted[secret_k], '<redacted>')
+        self.assertEqual(dict_redacted['token'], '--keep-grounding-token')
+        self.assertEqual(dict_redacted['input_tokens'], 42)
+
+        # 3) cmd_batch polish 流生成 grounding_audit，且 gate verify_cmd 使用清洗后的隔离环境变量
+        ws = self.root / 'batch_polish_gate_ws'
+        ws.mkdir()
+        doc_file = ws / 'README.md'
+        doc_file.write_text('# Solver Guide\n\nRun `solver.py --mesh grid.msh`.\n', encoding='utf-8')
+        (ws / 'solver.py').write_text('def main():\n    return "--mesh"\n', encoding='utf-8')
+        env_dump = self.root / 'verify_env_dump.json'
+        verify_py = (
+            f'"{sys.executable}" -c "import json, os, pathlib; '
+            f'pathlib.Path({str(env_dump)!r}).write_text(json.dumps({{'
+            f'\'depth\': os.environ.get(\'CAE_HARNESS_DEPTH\'), '
+            f'\'git_dir\': os.environ.get(\'GIT_DIR\'), '
+            f'\'agy_cid\': os.environ.get(\'AGY_CONVERSATION_ID\')}}), encoding=\'utf-8\')"'
+        )
+        spec_file = self.root / 'batch_polish_gate_spec.json'
+        spec_file.write_text(json.dumps([
+            {
+                'stream_id': 'S1',
+                'target': str(doc_file),
+                'kind': 'polish',
+                'engine': 'codex:gpt-5.4',
+                'subtask': '润色说明文档',
+            },
+            {
+                'stream_id': 'S2',
+                'target': str(ws),
+                'kind': 'gate',
+                'engine': 'codex:gpt-5.4',
+                'write_scope': ['solver.py'],
+                'verify_cmd': verify_py,
+            },
+        ]), encoding='utf-8')
+        codex_home = self.root / 'batch_codex_home'
+        codex_home.mkdir()
+        (codex_home / 'auth.json').write_text(json.dumps({'tokens': {'access_token': 'tok_valid_123456'}}), encoding='utf-8')
+        (codex_home / 'config.toml').write_text('model = "gpt-5.4"\n', encoding='utf-8')
+        (codex_home / 'models_cache.json').write_text(json.dumps({
+            'models': [{'slug': 'gpt-5.4', 'supported_reasoning_levels': [{'effort': 'high'}, {'effort': 'medium'}]}]
+        }), encoding='utf-8')
+        fake_bin = self.root / 'fake_codex_bin'
+        fake_bin.write_text('#!/bin/sh\nexit 0\n', encoding='utf-8')
+        fake_bin.chmod(0o755)
+        plan_dir = self.root / 'batch_plans'
+
+        def fake_invoke(spec, root_arg, prompt, *pos_args, **kwargs):
+            if '润色说明文档' in prompt:
+                return {
+                    'summary': 'polished',
+                    'content': '# Solver Guide\n\nRun `solver.py --mesh grid.msh --invented-batch-flag`.\n',
+                    'evidence': [],
+                    'unverified': [],
+                }
+            return {'summary': 'ok', 'content': 'done', 'evidence': [], 'unverified': []}
+
+        with patch.dict(os.environ, {
+            'CODEX_HOME': str(codex_home),
+            'CAE_CODEX_BINARY': str(fake_bin),
+            'CAE_PLAN_STATE_DIR': str(plan_dir),
+            'GIT_DIR': '/tmp/leaked-git-dir',
+            'AGY_CONVERSATION_ID': 'leaked-parent-conv',
+        }), patch.object(harness, 'invoke_engine', side_effect=fake_invoke):
+            _, plan_out = self.capture(
+                harness.cmd_plan,
+                self.args('plan', '--spec-file', str(spec_file), '--caller', 'claude',
+                          '--session-id', 'sess-bpg', '--plan-dir', str(plan_dir), '--save-ticket', '--full-json'),
+            )
+            tid = plan_out['ticket_id']
+            self.capture(
+                harness.cmd_plan,
+                self.args('plan', '--approve-ticket', tid, '--caller', 'claude',
+                          '--session-id', 'sess-bpg', '--plan-dir', str(plan_dir)),
+            )
+            rc_b, batch_out = self.capture(
+                harness.cmd_batch,
+                self.args('batch', '--spec-file', str(spec_file), '--caller', 'claude',
+                          '--ticket', tid, '--session-id', 'sess-bpg', '--plan-dir', str(plan_dir)),
+            )
+        self.assertEqual(rc_b, 0)
+        by_id = {s['stream_id']: s for s in batch_out['streams']}
+        self.assertIn('grounding_audit', by_id['S1'])
+        self.assertFalse(by_id['S1']['grounding_audit']['ok'])
+        self.assertGreaterEqual(by_id['S1']['grounding_audit']['finding_count'], 1)
+        self.assertTrue(by_id['S2']['verification_executed'])
+        dumped = json.loads(env_dump.read_text(encoding='utf-8'))
+        self.assertEqual(dumped, {'depth': '1', 'git_dir': None, 'agy_cid': None})
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

@@ -61,7 +61,7 @@ description: >
 
 等待用户确认期间若发生自动压缩，恢复钩子按 `hooks/_lib/adaptive_policy.py` 动态缩放恢复预算并用 `collapse_historical_cards` 折叠历史确认单明细表，同时从磁盘未决票据独立加载工作流背景、目标、预计后果、精简 4 列总览表、可点击 `<ticket_id>_card.md` 完整明细链接和选项卡（无明细文件时回退 14 项长表）。常规用户原话与子代理摘要另成一块；主会话按精简总览卡与明细链接恢复确认，缺失内容不能凭摘要猜补。
 
-实际模式进入 `drain` 或 `freeze` 强制交接后，`handoff_gate.py` 放行 `check-grounding --strict`，并在 `Stop` 硬门禁要求把工作流背景/目标/预计后果、精简 4 列总览表、`<ticket_id>_card.md` 明细链接、性能更新时间、选项卡、票据与 `plan --resume-ticket` 命令放入【新对话提示词】（无明细文件时仍要求完整 14 项表）。Codex 和 Claude Code 默认是 `advisory` 提醒，不能把默认配置写成强制停机。
+实际模式进入 `drain` 或 `freeze` 强制交接后，`handoff_gate.py` 放行 `check-grounding --strict`，并在 `Stop` 硬门禁要求把工作流背景、目标、预计后果、精简 4 列总览表、`<ticket_id>_card.md` 明细链接、性能更新时间、选项卡、票据与 `plan --resume-ticket` 命令放入【新对话提示词】（无明细文件时仍要求完整 14 项表）。Codex 和 Claude Code 默认是 `advisory` 提醒，不能把默认配置写成强制停机。
 
 新会话以 `plan --resume-ticket` 读取并复核，恢复不等于批准。该命令不自动转移原票据的 `session_id`；按原流内容和当前会话标识重新生成确认计划，再按用户选择登记批准，具体用法见 cae-harness 技能。
 

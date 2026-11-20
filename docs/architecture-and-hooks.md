@@ -14,12 +14,12 @@
 | --- | --- | --- |
 | [rules/AGENTS.md](../template/user-guard/rules/AGENTS.md) | 通用 + 上游 | `R0–R11` 全局工程规则唯一模板；零时期性模型名与散落阈值，安装时保留完整标准章节与末尾用户自定义尾段 |
 | [fleet_profile.json](../template/user-guard/skills/cae-harness/fleet_profile.json) | 通用 + 上游 | 统一维护顶层键 `roles`（五类动态角色槽位）、`native_agent_profiles`（四端独立内生代理档案）、`runtime_tunables`（运行期定量阈值）、`subscription_matrix`（启停矩阵）与 `capability_ledger`（离线性能更新时间） |
-| [cae_harness.py](../template/user-guard/skills/cae-harness/scripts/cae_harness.py) | 通用 + 上游 | 识别 `workspace_mode` 与调用方客户端；执行 P0 点名锁定、五角色选路、`--isolation` 四级正交隔离、派工前离线可用性与额度复查、`<ticket_id>_card.md` 落盘与精简总览卡、`batch`/`gate`/`audit`/`task` 无头执行、进程树清理及 `check-grounding` 事实锚定 |
+| [cae_harness.py](../template/user-guard/skills/cae-harness/scripts/cae_harness.py) | 通用 + 上游 | 识别 `workspace_mode` 与调用方客户端；执行 P0 点名锁定、五角色选路、`--isolation` 四级正交隔离、派工前离线可用性与额度复查、`<ticket_id>_card.md` 落盘与精简总览卡、`batch`、`gate`、`audit`、`task` 无头执行、进程树清理及 `check-grounding` 事实锚定 |
 | [user_words.py](../template/user-guard/hooks/user_words.py) | 通用 + 上游 | 五个钩子共用的基础模块（底层委托 `hooks/_lib/`）：跨平台文件锁（`msvcrt` / `fcntl`）、重解析点防御原子写入、`runtime_tunables` 与自适应策略读取、三端轨迹原话与实质子代理摘要提取、历史确认单折叠（`collapse_historical_cards`）及未决票据与完成回执记录存取 |
 | `hooks/_lib/`（`fs_safety.py`、`shell_lex.py`、`adaptive_policy.py`） | 通用 + 上游 | 共享底层安全锁与原子写（`fs_safety.py`）、Shell 词法拆解与引号解码（`shell_lex.py`），以及基于 `fleet_profile.json` 按 `(client, model, effort)` 动态派生压缩恢复预算、交接阈值与代理卡默认参数的自适应策略（`adaptive_policy.py`） |
 | [session_context_loader.py](../template/user-guard/hooks/session_context_loader.py) | 通用 + 上游 | 压缩或恢复入口检测：普通回合零字节注入；压缩恢复时分块注入“历轮原话 + 实质子代理摘要”与“磁盘未决确认单精简总览卡及明细链接” |
 | [status_guard.py](../template/user-guard/hooks/status_guard.py) | 通用 + 上游 | 工具执行前门禁：静态拆解文件工具、多层 Shell 包装、重定向与内联 Python AST 拦截项目外写删及外部 `git worktree`；拦截未变化日志重复读取；拦截绕过调度器直接调用无头 CLI，核验有效 `APPROVED` 票据、隔离一致性与内部原生通道容量（含 `swarm add` 按 `tasks` 长度或 `n` 精确计费） |
-| [reply_repeat_guard.py](../template/user-guard/hooks/reply_repeat_guard.py) | 通用 + 上游 | 回合结束门禁：拦截连续无新数值进展的短句等待，并在重负载完工后静态核验成败词、Token 用量说明及流/回执/轨迹词项（含 `continuationActive` 静默销账对账） |
+| [reply_repeat_guard.py](../template/user-guard/hooks/reply_repeat_guard.py) | 通用 + 上游 | 回合结束门禁：拦截连续无新数值进展的短句等待，并在重负载完工后静态核验成败词、Token 用量说明，以及流标识、回执文件名或轨迹词项（含 `continuationActive` 静默销账对账） |
 | [handoff_gate.py](../template/user-guard/hooks/handoff_gate.py) | 通用 + 上游 | 长会话分级交接门禁：累计压缩次数、轨迹体积与读图字节数，在强制收尾（`drain` / `freeze`）阶段限制新派工并核验【新对话提示词】内嵌精简总览卡、`<ticket_id>_card.md` 链接与 `plan --resume-ticket` 命令 |
 | [install.py](../install.py)、`install.ps1`、`install.sh` | 上游专属 | 探测客户端与 Python 3.11+ 解释器，校验非符号链接/重解析点后幂等分发四端配置；提供零写入配置漂移、`cross_side_status` 双端同步体检、DSH `hook_protocol` 能力探测、`subscription_candidates`、`fleet_profile.native_agent_profiles_configured` 与科学计算包三级 ABI 耦合审计（`--audit-upgrade`） |
 | [fleet_state.py](../template/user-guard/skills/fleet-evolve/scripts/fleet_state.py) | 上游专属 | 核验 `upstream_config_repo` 身份；维护提案审批锁（`propose` / `approve`）、主会话重启重入锁（`record-pass1` / `verify-pass2`）及终审 `clear --verified --readback-done [--session-id <sid>]` 事实锚定强制校验 |
@@ -41,7 +41,7 @@
 | 顶层键名 | 核心字段与职责 | 工程约束边界 |
 | --- | --- | --- |
 | `roles` | `orchestrator`、`math`、`code`、`review`、`fast` 候选列表、推荐挡位与短板隔离规则 | 五角色全动态，不与单一客户端永久绑定；用户明确点名按 P0 优先锁定 |
-| `native_agent_profiles` | `antigravity`、`codex`、`claude`、`dsh` 各自的主模型策略、原生子代理机制（如 `invoke_subagent` / `swarm` / `spawn_agent` / `Agent`）、只读代理列表与钩子协议 | 独立记录各客户端内生代理能力，与外部无头调度解耦；`--audit-upgrade` 上报 `fleet_profile.native_agent_profiles_configured` |
+| `native_agent_profiles` | `antigravity`、`codex`、`claude`、`dsh` 各自的主模型策略、原生子代理机制（如 `invoke_subagent`、`swarm`、`spawn_agent`、`Agent`）、只读代理列表与钩子协议 | 独立记录各客户端内生代理能力，与外部无头调度解耦；`--audit-upgrade` 上报 `fleet_profile.native_agent_profiles_configured` |
 | `subscription_matrix` / `capability_ledger` | 各客户端与模型的启停开关、额度类型及离线性能更新时间（`last_online_refresh_at`、`local_bench_verified_at`） | `enabled: false` 全局跳过；日常派工仅离线读取时间戳，不联网查榜单 |
 
 ### 2. 运行期定量阈值（`runtime_tunables` 子分组）
@@ -49,7 +49,7 @@
 | `runtime_tunables` 分组 | 受控机制与核心键名 | 工程约束边界 |
 | --- | --- | --- |
 | `compaction_recovery` | `per_client.{antigravity,codex,claude}` 内联预算、`recent_subagent_window`、`min_substantive_subagent_chars`、`subagent_head_ratio` | 最新一条返回无条件保留，窗口内其余名额优先保留达到实质长度阈值且命中审查/推导角色的结论，并由 `adaptive_policy.py` 按当前模型窗口与推理强度动态缩放预算 |
-| `handoff_thresholds` | 各客户端交接模式（`default_mode`）、压缩次数/轨迹体积/读图阈值与 `drain` 收尾预算 | Antigravity 默认启用分阶段交接限制；Codex 与 Claude Code 默认 `advisory` 提醒，是否强制阻断取决于实际启用模式 |
+| `handoff_thresholds` | 各客户端交接模式（`default_mode`），压缩次数、轨迹体积与读图阈值，以及 `drain` 收尾预算 | Antigravity 默认启用分阶段交接限制；Codex 与 Claude Code 默认 `advisory` 提醒，是否强制阻断取决于实际启用模式 |
 | `loop_guards` | `reply_repeat` 重复等待回复阈值、`status_guard` 大日志采样与 Shell 解包深度、`lifecycle_log` 滚动裁剪与陈旧 `.lock` 清理 | 仅拦截文件未变化时的同区间重复轮询与无新数值进展的重复等待短句 |
 | `headless_dispatch` | `input_budget_safety_ratio`、`inline_readonly_max_kib`、`batch_max_workers_per_backend`、超时、重试轮数与路由默认端口 | 常驻文档引用键名，不在规则或脚本中散落硬编码数值常量 |
 | `dispatch_confirmation` | 轻重任务分界（流数、文件数、Token、超时）、票据有效期 `ticket_ttl_sec` 与滚动配额熔断百分比（`quota_block_percent`） | 内部原生多路/可写子代理与外部无头调用统一受同一套阈值约束 |
@@ -97,7 +97,7 @@
 
 ### 2. 零黑名单文档事实锚定（`check-grounding`）
 
-`audit_doc_grounding` 不依赖人工维护违禁词表，而是自动扫描工作区源码与配置文件（`fleet_profile.json`、`.py`、`.json`、`.toml`、`.yaml`、C++/Fortran/Rust 源码等）及 `NOTICE`——**刻意跳过 `tests/` 目录与 Markdown 子代理契约（`template/user-guard/agents/*.md`、`template/claude/agents/*.md`），对 Codex 子代理 `.toml` 仅提取键名，并将三端代理契约正文作为被审文档而非锚点白名单**——构建标识符集合、命令行选项集合、定量数值及派生换算集合与中文双字技术词干集合，逐行拦截无源码依据的参数名/文件名、陌生全大写缩写、失步数字与虚构领域举例。`task --kind polish` 自动附带 `grounding_audit`，上游 `fleet_state.py clear --verified --readback-done` 在状态锁内强制执行事实锚定校验（模块缺失或结果无效时拒绝归位），且 `fleet_state.py clear` 对未过期活跃提案、活跃 `AWAITING_MASTER_RELOAD` Pass 2 重启锁及损坏状态文件默认拒绝清除（已认领的 Pass 2 会话可显式传 `--session-id <sid>` 归位，其余覆盖需显式加 `--force`）。
+`audit_doc_grounding` 不依赖人工维护违禁词表，而是自动扫描工作区源码与配置文件（`fleet_profile.json`、`.py`、`.json`、`.toml`、`.yaml`、C++/Fortran/Rust 源码等）及 `NOTICE`——**刻意跳过 `tests/` 目录与 Markdown 子代理契约（`template/user-guard/agents/*.md`、`template/claude/agents/*.md`），对 Codex 子代理 `.toml` 仅提取键名，并将三端代理契约正文作为被审文档而非锚点白名单**——构建标识符集合、命令行选项集合、定量数值及派生换算集合与中文双字技术词干集合，逐行拦截无源码依据的参数名与文件名、陌生全大写缩写、失步数字与虚构领域举例。`task` 与 `batch` 的 `polish` 流均自动附带 `grounding_audit`，上游 `fleet_state.py clear --verified --readback-done` 在状态锁内强制执行事实锚定校验（模块缺失或结果无效时拒绝归位），且 `fleet_state.py clear` 对未过期活跃提案、活跃 `AWAITING_MASTER_RELOAD` Pass 2 重启锁及损坏状态文件默认拒绝清除（已认领的 Pass 2 会话可显式传 `--session-id <sid>` 归位，其余覆盖需显式加 `--force`）。
 
 ### 3. 单分片安全输入预算公式（`_execution_budget`）
 
@@ -112,7 +112,7 @@ $$W_{\text{eff}} = \left\lfloor W_{\text{selected}} \times \frac{p_{\text{eff}}}
 ## 五、规则同步细节、安全脱敏、本地路由切卡与清理卸载
 
 1. **全局规则自定义尾段保留与冲突编号重命名**：Antigravity 以独立插件目录 `plugins/user-guard` 安装，不触碰用户自有的 `~/.gemini/GEMINI.md`；Codex、Claude Code 与 DSH 的顶层全局规则文件（`AGENTS.md` / `CLAUDE.md`）以完整标准模板更新，保留标准 `## 工具与运行环境`、`R10.` 与 `R11.`，同时自动识别并保留排在标准 `## 工具与运行环境` 之后的任意二级标题段落（跳过代码围栏，亦兼容以 `## 工具与` 开头且不同于 `## 工具与运行环境` 的自定义环境段落），将其内部冲突的 `R10.`、`R11.` 改标为 `L1.`、`L2.`，且 `--audit-upgrade` 使用同一边界判等不误报漂移。
-2. **运行期与静态全链路脱敏**：`install.py --audit-upgrade` 与 `cae_harness.py`（`--output` 默认脱敏、`--redact` 标准输出与异常出口脱敏）均自动清洗 Windows/WSL/Linux 真实用户名路径、私网 IPv4（含共享内网段）与私网 IPv6、API Key / Bearer / `sk-` / `ghp_` / `AIza` / `AKIA` / `hf_` / `glpat-` 令牌、URL（含 `http`/`https`/`ws`/`wss`/`socks5`）凭据与精确费用字段（`install.py --audit-upgrade` 同时脱敏自定义卡片 ID，而 `ccswitch_admin.py` 面向本机管理员直接查看与切换本地卡片状态）；`router.py` 与 `user_words.py` 写入本地诊断日志前亦自动擦除令牌、密钥键值与 URL 凭据。
+2. **运行期与静态全链路脱敏**：`install.py --audit-upgrade` 与 `cae_harness.py`（`--output` 默认脱敏、`--redact` 标准输出与异常出口脱敏）均自动清洗 Windows、WSL 与 Linux 真实用户名路径，私网 IPv4（含共享内网段）与私网 IPv6，API Key、`Bearer`、`Basic`、`sk-`、`ghp_`、`AIza`、`ya29.`、JWT、`AKIA`、`ASIA`、`hf_`、`glpat-` 与 PEM 私钥等凭据，各类协议 URL（含 `http`、`https`、`ws`、`wss`、`socks4`、`socks5` 等）中的认证信息与查询参数，以及精确费用字段（`install.py --audit-upgrade` 同时脱敏自定义卡片 ID，而 `ccswitch_admin.py` 面向本机管理员直接查看与切换本地卡片状态）；`router.py` 与 `user_words.py` 写入本地诊断日志前亦自动擦除私钥、令牌、密钥键值与 URL 凭据。
 3. **本地分流代理启动与 CC Switch 安全切卡**：Claude Code 默认随钩子同步 `~/.claude/hooks/ccswitch_admin.py`，显式传入 `--with-cc-router` 时另行同步 `~/.claude/router/`。日常查看卡片对齐状态、启动本地 `127.0.0.1` 分流服务或切换激活卡片的命令如下（Windows PowerShell 使用 `python -B -X utf8` 与反斜杠路径，WSL2 与 Linux Bash 改用 `python3 -B -X utf8` 并将 `\` 换为 `/`，两侧均保留双引号内的 `$HOME`）：
    ```powershell
    python -B -X utf8 "$HOME\.claude\hooks\ccswitch_admin.py" status

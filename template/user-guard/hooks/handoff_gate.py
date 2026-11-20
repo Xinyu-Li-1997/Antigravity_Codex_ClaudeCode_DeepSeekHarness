@@ -1,18 +1,19 @@
 """
-handoff_gate.py - 长会话交接策略与 Antigravity / Codex 宿主适配 (user-guard)
+handoff_gate.py - 长会话交接策略与 Antigravity / Codex / Claude Code 宿主适配 (user-guard)
 
-Antigravity 适配保留原有遥测与门禁；Codex 独立入口默认仅观测和提醒，
-仅在显式 enforce 模式及显式压缩次数策略或用户交接指令下进入排空。
-以下检查点、图片和 /goal 规则只用于 Antigravity：
-1. 结合增量会话遥测（压缩检查点数、近期检查点间隔坍塌、transcript 体积、多模态读图数/字节数）、
+阈值与默认模式由 `fleet_profile.json` 与 `hooks/_lib/adaptive_policy.py` 动态派生：
+Antigravity 默认启用分阶段交接限制；Codex 与 Claude Code 独立入口默认采用 `advisory` 观测提醒，
+在显式或模型策略启用 `enforce` 模式、达到压缩次数阈值或收到用户明确交接指令时进入排空收尾。
+以下检查点间隔、多模态读图和 `/goal` 规则仅用于 Antigravity：
+1. 结合增量会话遥测（压缩检查点数、近期检查点间隔坍塌、transcript 体积、多模态读图数与字节数）、
    UI 截断告警与显式 R8 用户暂缓指令，维护四态状态机：
    normal -> advisory -> drain -> freeze（或 R8 暂缓 overridden）。
-2. Stage-1 (advisory)：纯提醒不阻断，在 PreInvocation 提醒主控注意上下文预算与大体积读图消耗。
+2. Stage-1 (advisory)：纯提醒不阻断，提醒主会话注意上下文预算与大体积读图消耗。
 3. Stage-2 (drain -> freeze)：
-   - 严禁新开委派（invoke_subagent / define_subagent / run_workflow / swarm / schedule / browser_* / cae_harness 派工 / git push）；
-   - drain 排空窗口（默认 4 次模型调用 + 8 次写/运行动作）内允许完成正在进行中的原子收口与本地校验；
-   - freeze 冻结期仅放行：read_file / view_file 非图片只读核对、后台任务/子代理查询管理（manage_task / manage_subagents）、已登记跨表面文件工具的交接文档编写与本地 git add/commit；
-   - Stop 门禁验收交接完整性（并在开启 /goal 时强制校验 <!-- GOAL_CANCELLED --> 标记），每回合至多阻断 1 次。
+   - 严禁新开委派（子代理、工作流、并行代理组、定时任务、浏览器子代理、cae_harness 派工与 git push）；
+   - drain 排空窗口内允许按受控预算完成正在进行中的原子收口与本地校验；
+   - freeze 冻结期仅放行：非图片只读核对（含 `check-grounding --strict`）、后台任务与子代理查询管理、已登记跨表面文件工具的交接文档编写及本地 `git add/commit`；
+   - Stop 门禁验收交接完整性（含未决工作流精简总览卡与明细链接，开启 `/goal` 时强制校验 `<!-- GOAL_CANCELLED -->` 标记），每回合至多阻断 1 次。
 """
 
 # ① 常量、阈值与宿主依赖
@@ -749,7 +750,14 @@ def _git_branch_is_readonly(subargs: List[str]) -> bool:
 def _is_readonly_harness_subcommand(sub_tokens: List[str]) -> bool:
     if not sub_tokens or sub_tokens[0] not in ("check-grounding", "assess", "probe", "plan", "--help", "-h", "status"):
         return False
-    mutating_flags = ("--output", "--approve-ticket", "--save-ticket", "--mark-handed-off")
+    mutating_flags = (
+        "--output",
+        "--approve-ticket",
+        "--save-ticket",
+        "--mark-handed-off",
+        "--cancel-ticket",
+        "--discover-models",
+    )
     return not any(tok in mutating_flags or any(tok.startswith(f + "=") for f in mutating_flags) for tok in sub_tokens[1:])
 
 

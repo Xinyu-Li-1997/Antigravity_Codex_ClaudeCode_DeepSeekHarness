@@ -82,7 +82,7 @@ description: >
 
 等待用户确认期间发生自动压缩，钩子按 `hooks/_lib/adaptive_policy.py` 根据模型与推理强度动态调整恢复预算并用 `collapse_historical_cards` 折叠历史明细表，同时从磁盘未决票据独立加载背景、要做什么、预计后果、精简 4 列总览表、可点击 `<ticket_id>_card.md` 完整 14 项明细链接和选项卡（仅无落盘明细文件时回退展开 14 项长表）。恢复时分成两块：常规用户原话及子代理摘要；未决重负载工作流精简总览与明细链接。票据缺失时报告缺口，不凭印象补写，也不把压缩或超时当作批准。
 
-进入 `drain` 或 `freeze` 强制交接时，`handoff_gate.py` 放行 `check-grounding --strict`，并在 `Stop` 硬门禁要求把工作流背景/目标/预计后果、精简 4 列总览表、`<ticket_id>_card.md` 明细链接、性能更新时间、选项卡、票据与 `plan --resume-ticket` 命令写入【新对话提示词】（无落盘明细文件时仍要求完整 14 项参数表）。Codex 与 Claude Code 默认是 `advisory` 提醒，强制行为以实际模式为准。
+进入 `drain` 或 `freeze` 强制交接时，`handoff_gate.py` 放行 `check-grounding --strict`，并在 `Stop` 硬门禁要求把工作流背景、目标、预计后果、精简 4 列总览表、`<ticket_id>_card.md` 明细链接、性能更新时间、选项卡、票据与 `plan --resume-ticket` 命令写入【新对话提示词】（无落盘明细文件时仍要求完整 14 项参数表）。Codex 与 Claude Code 默认是 `advisory` 提醒，强制行为以实际模式为准。
 
 新会话先用 `plan --resume-ticket` 读取并重新核对完整确认内容。该接口保留原票据的 `session_id`，不会因传入新会话标识自动改绑；跨会话接力应据原流内容和当前会话标识重新生成确认票据，再按用户选择登记批准。内容变化、过期或校验失败时重新形成确认单，恢复本身不代表批准。
 

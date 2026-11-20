@@ -1172,7 +1172,7 @@ class TestCCSwitchAdmin(OfflineSandbox):
 
     def test_schema_supported_newer_warns_and_older_rejected(self):
         db = self.database()
-        for version, warns in ((26, False), (27, True)):
+        for version, warns in ((26, False), (admin.TESTED_MAX_SCHEMA, False), (admin.TESTED_MAX_SCHEMA + 1, True)):
             with closing(sqlite3.connect(db)) as con:
                 con.execute(f"PRAGMA user_version={version}")
                 con.commit()
@@ -5313,6 +5313,111 @@ class TestShard3RouterInstallerFixes(OfflineSandbox):
             self.assertFalse(h_sec._validate_local_request_headers())
             h_sec.send_error.assert_called_once()
             self.assertEqual(h_sec.send_error.call_args.args[0], 403)
+
+    def test_lifecycle_router_install_scrubbers_handoff_flags_and_fleet_state_side_guard(self):
+        jwt_tok = "eyJhbGciOiJIUzI1NiJ9." + "eyJzdWIiOiIxMjM0NTY3ODkwIn0." + "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+        pem_hdr = "-----BEGIN " + "PRIVATE KEY-----"
+        pem_ftr = "-----END " + "PRIVATE KEY-----"
+        pem_key = f"{pem_hdr}\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSj\n{pem_ftr}"
+        at_ch = "@"
+        dirty_payload = {
+            "msg": (
+                f"wss://wsuser:wspass{at_ch}example.com/v1?access_token=wstok123 "
+                f"socks5://su:sp{at_ch}127.0.0.1:1080 postgresql://du:dp{at_ch}example.org/app "
+                f"Authorization: Basic dXNlcjpwYXNzMTIz ApiKey secret_key_987654 "
+                f"{jwt_tok} {'ya29.' + 'a0AfH6SMBx1234567890abcdefGHIJ'} {'ASIA' + 'IOSFODNN7EXAMPLE'} {pem_key}"
+            ),
+            "passwd": "12345678",
+            "passphrase": "horse-staple-battery",
+            "x-api-key": "sk-" + "router-secret-abcdef123456",
+            "safe_router": "via-router",
+            "safe_null": "null",
+            "token_count": "123456",
+            "nested_tuple": ("Bearer secret_bearer_token_123", {"cookie": "sid=cookie_secret_12345"}),
+        }
+        for scrubber in (user_words._scrub_lifecycle_entry, router._scrub_log_value):
+            cleaned = scrubber(dirty_payload)
+            for secret_sub in (
+                "wsuser:wspass", "wstok123", "su:sp", "du:dp", "dXNlcjpwYXNzMTIz",
+                "secret_key_987654", jwt_tok, "ya29.a0Af", "ASIAIOSFODNN7EXAMPLE",
+                "MIIEvQIBADAN", "12345678", "horse-staple", "sk-" + "router-secret",
+                "secret_bearer_token_123", "cookie_secret_12345",
+            ):
+                self.assertNotIn(secret_sub, json.dumps(cleaned), msg=f"{scrubber.__name__} leaked {secret_sub}")
+            self.assertEqual(cleaned["passwd"], "<redacted>")
+            self.assertEqual(cleaned["safe_router"], "via-router")
+            self.assertEqual(cleaned["safe_null"], "null")
+            self.assertEqual(cleaned["token_count"], "123456")
+            self.assertIsInstance(cleaned["nested_tuple"], tuple)
+
+        # installer._audit_redact 保留括号与表格分隔符，擦除多协议凭据与 PEM/JWT
+        audit_sample = installer._audit_redact(
+            f"[doc](https://au:ap{at_ch}example.com:8443/p?token=q1) | {'/ho' + 'me/otheru'} | {jwt_tok} {pem_key}",
+            [],
+            {"12345678"},
+        )
+        self.assertIn("[doc](https://example.com:8443/p)", audit_sample)
+        self.assertIn("| <home> |", audit_sample)
+        self.assertNotIn("au:ap", audit_sample)
+        self.assertNotIn(jwt_tok, audit_sample)
+        self.assertIn("<redacted-private-key>", audit_sample)
+
+        # handoff_gate 区分只读 plan 预览与写盘的 --cancel-ticket / --discover-models
+        self.assertEqual(
+            handoff_gate._classify_run_command("python -B -X utf8 tools/cae_harness.py plan --target ."),
+            "readonly_inspect",
+        )
+        self.assertEqual(
+            handoff_gate._classify_run_command("python -B -X utf8 tools/cae_harness.py plan --cancel-ticket t1"),
+            "mutating_other",
+        )
+        self.assertEqual(
+            handoff_gate._classify_run_command("python -B -X utf8 tools/cae_harness.py probe --discover-models"),
+            "mutating_other",
+        )
+
+        # fleet_state: 跨运行侧 (side_mismatch) 或仓库漂移陈旧记录不死锁 propose / record-pass1 / clear
+        repo = self.root / "fs_side_repo"
+        (repo / "template" / "user-guard" / "skills" / "cae-harness").mkdir(parents=True)
+        (repo / "install.py").write_text("# stub\n", encoding="utf-8")
+        (repo / "template" / "user-guard" / "plugin.json").write_text(json.dumps({"version": "1.17.5"}), encoding="utf-8")
+        (repo / "template" / "user-guard" / "skills" / "cae-harness" / "fleet_profile.json").write_text(
+            json.dumps({"runtime_tunables": {"headless_dispatch": {"fleet_state_ttl_sec": 600}}}),
+            encoding="utf-8",
+        )
+        sdir = self.root / "fs_side_state"
+
+        def run_fs(*cli_args):
+            import contextlib
+            buf = io.StringIO()
+            with mock.patch.dict(os.environ, {"CAE_FLEET_STATE_DIR": str(sdir)}), \
+                    contextlib.redirect_stdout(buf):
+                rc = fleet_state.main(["--repo", str(repo), *cli_args])
+            return rc, json.loads(buf.getvalue())
+
+        rc, _ = run_fs("propose", "--session-id", "other_sess", "--summary", "cross-side proposal")
+        self.assertEqual(rc, 0)
+        with mock.patch.dict(os.environ, {"CAE_FLEET_STATE_DIR": str(sdir)}):
+            sf = fleet_state._validated_state_file(repo)
+        # 同侧活跃异会话提案仍被拦截
+        rc_blk, out_blk = run_fs("propose", "--session-id", "curr_sess", "--summary", "blocked")
+        self.assertEqual(rc_blk, 2)
+        self.assertEqual(out_blk["reason"], "active_other_session_proposal")
+        # 若状态来自另一运行侧（如 WSL vs Windows），同会话无需 --force 即可正常覆盖或归位
+        saved_doc = json.loads(sf.read_text(encoding="utf-8"))
+        saved_doc["execution_side"] = "wsl_other_side"
+        user_words.atomic_write_json(sf, saved_doc)
+        self.assertEqual(run_fs("propose", "--session-id", "curr_sess", "--summary", "same-side fresh")[0], 0)
+
+        saved_doc2 = json.loads(sf.read_text(encoding="utf-8"))
+        saved_doc2["execution_side"] = "wsl_other_side"
+        user_words.atomic_write_json(sf, saved_doc2)
+        self.assertEqual(run_fs("record-pass1", "--session-id", "p1_curr", "--target-master", "agy")[0], 0)
+
+        saved_doc3 = json.loads(sf.read_text(encoding="utf-8"))
+        saved_doc3["execution_side"] = "wsl_other_side"
+        user_words.atomic_write_json(sf, saved_doc3)
+        self.assertEqual(run_fs("clear")[0], 0)
 
 
 if __name__ == "__main__":
