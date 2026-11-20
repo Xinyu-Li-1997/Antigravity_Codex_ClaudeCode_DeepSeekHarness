@@ -1,6 +1,10 @@
 # 面向科学计算与工程研发的四客户端配置与验证工具
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.24293507.svg)](https://doi.org/10.5281/zenodo.24293507)
+[![CI](https://github.com/Xinyu-Li-1997/Antigravity_Codex_ClaudeCode_DeepSeekHarness/actions/workflows/ci.yml/badge.svg)](https://github.com/Xinyu-Li-1997/Antigravity_Codex_ClaudeCode_DeepSeekHarness/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Xinyu-Li-1997/Antigravity_Codex_ClaudeCode_DeepSeekHarness)](https://github.com/Xinyu-Li-1997/Antigravity_Codex_ClaudeCode_DeepSeekHarness/releases)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B_stdlib-3776AB.svg)](install.py)
 
 本仓库 `Antigravity_Codex_ClaudeCode_DeepSeekHarness` 为 **Google Antigravity**（`agy`）、**OpenAI Codex**（`codex`）、**Claude Code**（`claude` 或 `cc`）与 **DeepSeek Harness**（`dsh`）提供共用的工程规范、事件钩子、只读审查子代理与命令行调度脚本。全仓仅依赖 Python 3.11+ 标准库，支持 Windows、WSL2 与 Linux；只安装其中任意一个客户端即可独立使用，安装多个客户端时可按任务类型协同完成公式推导、代码实现与交叉审查。
 
@@ -184,7 +188,7 @@ python -B -X utf8 install.py --audit-upgrade     # 4. 检查各端配置是否�
 Antigravity_Codex_ClaudeCode_DeepSeekHarness/
 ├── README.md                              # 仓库说明：快速上手、适用场景、安装选项、日常用法与工作原理
 ├── AGENTS.md / CHANGELOG.md               # 上游配置仓库维护边界说明与版本变更记录
-├── LICENSE / NOTICE                       # Apache License 2.0 许可证与第 4(d) 条原创归属声明
+├── LICENSE, NOTICE, CITATION.cff          # Apache License 2.0 许可证、第 4(d) 条原创归属声明与学术引用元数据
 ├── .github/workflows/ci.yml               # 跨平台离线回归测试与文档一致性检查流水线
 ├── .timestamps/                           # RFC 3161 时间戳凭证与 DOI 发版说明
 ├── install.py / install.ps1 / install.sh  # 跨平台安装脚本、配置漂移检查、双端体检与科学计算包 ABI 风险检查
