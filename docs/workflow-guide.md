@@ -37,13 +37,13 @@ python -B -X utf8 "$HARNESS" assess --caller auto --redact
 
 向后台派发任务时，**用户明确点名**与**动态角色槽位**（`role:*`）为并列入口，通过 `--user-prompt "<用户原话>"` 保留你的原始意图，其余繁琐底层参数由脚本自动补齐：
 
-| 你的指令类型 | 日常自然语言表达示例 | 锁定的维度（P0 优先） | 脚本自动补齐的参数与安全边界 |
-| --- | --- | --- | --- |
-| **点名具体客户端或模型** | “这步编码用 Codex 高挡位做”“请交给 `<目标客户端或模型名>` 做脱敏审查” | 锁定指定的客户端、模型标识或模型系列 | 外部无头调用自动补齐模型声明最大上下文窗口、无头非交互标志、只读行号内联、文件哈希快照与输出脱敏；目标不可用或 `enabled: false` 时直接报错，不静默换端 |
-| **点名推理挡位、隔离级别或省额度意图** | “这轮挂 high 挡跑”“用 `--isolation clean_room` 盲读说明文档”“省点额度快速扫一遍格式” | 锁定指定推理挡位、四级隔离模式或低消耗策略 | 显式非 `fast` 角色即使降到 `low` 挡仍保留该槽位主力模型；后端不支持所选 `--isolation` 级别时直接报错拒绝 |
-| **多端并列协作指令** | “用 Codex 与 DSH 等多工作流全仓校核验证一下” | 识别“等、和、与、及”多端并列语义，不误锁单端 | 完整保留 `--spec-file` 中各分路声明的不同对等客户端、模型与隔离级别组合 |
-| **只说研究目标（模糊交办）** | “推导弯曲网格离散几何守恒律判据”“审查 `src/flux/` 边界相容性” | 按 `--kind` 搭配 `role:orchestrator`、`role:math`、`role:code`、`role:review`、`role:fast`（或 `<client>:@<role>`、`<client>:<role>`、`<client>:default`、`<client>:<model>`） | 按 `fleet_profile.json` 候选顺序选取当前已启用且额度正常的对等端；常规任务默认采用单模型非委派最高强度（跳过会自动派生多层子代理的 `ultra`），`polish` 润色按篇幅自动选 `medium` 或 `high` |
-| **同端多文件摘录与行号初筛** | “把这三篇论文的控制方程和源码对应行号摘出来” | 当前客户端内部原生 `readonly-reader`、`readonly-collaborator`、`readonly-auditor`（读取 `native_agent_profiles`，默认 `inherit`） | 禁写文件、禁跑构建与测试（Antigravity 与 Claude 禁用终端命令；Codex 交互式原生 `readonly-*` 继承父会话沙箱并由开发者指令、`[features]` 权限收窄与 `PreToolUse` 钩子约束，独立沙箱与文件快照由外部无头 `codex exec -s read-only` 提供）；解析 `inherit` 时优先识别 Codex `agents/*.toml` 及 Claude 与 Antigravity 代理前置元数据中的显式 `model`，不替代跨客户端独立审查 |
+| 指令类型与日常表达示例 | 锁定的维度（P0 优先） | 脚本自动补齐的参数与安全边界 |
+| --- | --- | --- |
+| **点名客户端或模型**：“这步编码用 Codex 高挡位做”“请交给 `<目标客户端或模型名>` 做脱敏审查” | 锁定指定的客户端、模型标识或模型系列 | 外部无头调用自动补齐模型声明最大上下文窗口、无头非交互标志、只读行号内联、文件哈希快照与输出脱敏；目标不可用或 `enabled: false` 时直接报错，不静默换端 |
+| **点名挡位、隔离级别或省额度**：“这轮挂 high 挡跑”“用 `--isolation clean_room` 盲读说明文档”“省点额度快速扫一遍格式” | 锁定指定推理挡位、四级隔离模式或低消耗策略 | 显式非 `fast` 角色即使降到 `low` 挡仍保留该槽位主力模型；后端不支持所选 `--isolation` 级别时直接报错拒绝 |
+| **多端并列协作指令**：“用 Codex 与 DSH 等多工作流全仓校核验证一下” | 识别“等、和、与、及”多端并列语义，不误锁单端 | 完整保留 `--spec-file` 中各分路声明的不同对等客户端、模型与隔离级别组合 |
+| **只说研究目标（模糊交办）**：“推导弯曲网格离散几何守恒律判据”“审查 `src/flux/` 边界相容性” | 按 `--kind` 搭配 `role:orchestrator`、`role:math`、`role:code`、`role:review`、`role:fast`（或 `<client>:@<role>`、`<client>:<role>`、`<client>:default`、`<client>:<model>`） | 按 `fleet_profile.json` 候选顺序选取当前已启用且额度正常的对等端；常规任务默认采用单模型非委派最高强度（跳过会自动派生多层子代理的 `ultra`），`polish` 润色按篇幅自动选 `medium` 或 `high` |
+| **同端多文件摘录与行号初筛**：“把这三篇论文的控制方程和源码对应行号摘出来” | 当前客户端内部原生 `readonly-reader`、`readonly-collaborator`、`readonly-auditor`（读取 `native_agent_profiles`，默认 `inherit`） | 禁写文件、禁跑构建与测试（Antigravity 与 Claude 禁用终端命令；Codex 交互式原生 `readonly-*` 继承父会话沙箱并由开发者指令、`[features]` 权限收窄与 `PreToolUse` 钩子约束，独立沙箱与文件快照由外部无头 `codex exec -s read-only` 提供）；解析 `inherit` 时优先识别 Codex `agents/*.toml` 及 Claude 与 Antigravity 代理前置元数据中的显式 `model`，不替代跨客户端独立审查 |
 
 ### 四级正交隔离（`--isolation`）按需选择
 
@@ -192,12 +192,12 @@ python -B -X utf8 "$HARNESS" gate `
 对于高阶通量分裂算子、弯曲网格几何守恒律（GCL）度量恒等式、隐式时间推进解析雅可比矩阵等核心模块，推荐按以下四步推进：
 
 ```mermaid
-flowchart LR
+flowchart TD
     S1["1. 同端只读梳理<br/>原生 readonly-* 子代理<br/>摘录文献公式与源码行号"] --> S2["2. 独立数理推导<br/>cae-harness task --kind math<br/>role:math + 只读哈希快照"]
     S2 --> S3["3. 白名单编码与定量门禁<br/>cae-harness gate --worker role:code<br/>--write-scope + --verify-cmd 闭环"]
     S3 -->|verify_exit_code != 0 且未达 max_rounds<br/>回传真实报错继续修正| S3
     S3 -->|达 max_rounds 仍未过| F["终止并如实汇报失败现场"]
-    S3 -->|gate_passed == true| S4["4. 跨端审查、事实锚定与 R6 终审<br/>audit / check-grounding --strict<br/>主会话亲自核对原文件行号"]
+    S3 -->|gate_passed == true| S4["4. 跨端审查、事实锚定与 R6 终审<br/>audit + check-grounding --strict<br/>主会话亲自核对原文件行号"]
 ```
 
 修订重要技术文档时，可对支持 `clean_room` 的外部后端（如本机已就绪的 Codex、Claude Code 或 DSH）运行 `python -B -X utf8 "$HARNESS" task --kind review --engine codex:@review --isolation clean_room --target "<文档路径>" ...`（或使用兼容别名 `--clean-room`）剥离全局规则、技能与项目说明，从新读者视角找出晦涩行话与阅读断层；主会话整篇重写后，运行 `python -B -X utf8 "$HARNESS" check-grounding --target "<项目根目录>" --strict` 做零黑名单词法事实核验。
@@ -220,11 +220,11 @@ flowchart LR
 
 阶段性汇报与合入审查必须严格区分实际达到的验证层级，未执行的环节如实注明“未验证”（仅列当前目标环境与核心验证链路的缺口，不堆砌无关外围平台充当免责声明）：
 
-| 证据等级 | 判定标准 | 典型科学计算与工程判据 | 对应回执特征 |
-| --- | --- | --- | --- |
-| **L1 源码或配置已写好** | 源码、接口或配置已写入磁盘，尚未编译或未运行定量验证命令 | 静态结构与语法完整，待目标环境编译与单测 | `verification_executed: false` |
-| **L2 编译或离线单测已通过** | 目标编译器零错误通过，单函数/模块输出与解析公式或基准一致 | 解析雅可比与有限差分或复步导数相对误差达标；边界退化与离线契约单测全绿 | `gate_passed: true`（离线单测） |
-| **L3 离散守恒与系统不变量实测通过** | 算子在封闭、周期域或弯曲网格下严格保持物理守恒律与状态不变量 | 均匀自由流保持（GCL），全局质量、动量、总能离散守恒残差处于双精度机器零量级（ $10^{-14} \sim 10^{-12}$ ）；多进程状态锁与快照零越界 | `gate_passed: true`（守恒与不变量实测） |
-| **L4 网格收敛阶与经典基准算例达标** | 在光滑解或制造解（MMS）加密序列（ $h, h/2, h/4, \dots$ ）上达到理论设计阶数 $p$ ，或吻合标准算例 | 经验收敛阶 $\text{EOC} = \frac{\log(E_1 / E_2)}{\log(h_1 / h_2)}$ 稳定接近设计阶数 $p$ ；Sod/Lax 激波管、顶盖驱动方腔等与文献基准吻合 | `gate_passed: true`（收敛阶与基准算例） |
+| 证据等级 | 判定标准与回执特征 | 典型科学计算与工程判据 |
+| --- | --- | --- |
+| **`L1` 源码或配置落盘** | 源码、接口或配置已写入磁盘，尚未编译或未运行定量验证命令（`verification_executed: false`） | 静态结构与语法完整，待目标环境编译与单测 |
+| **`L2` 编译或离线单测** | 目标编译器零错误通过，单函数或单模块输出与解析公式及基准一致（离线单测 `gate_passed: true`） | 解析雅可比与有限差分或复步导数相对误差达标；边界退化与离线契约单测全绿 |
+| **`L3` 守恒与不变量实测** | 算子在封闭、周期域或弯曲网格下严格保持物理守恒律与状态不变量（守恒与不变量实测 `gate_passed: true`） | 均匀自由流保持（GCL），全局质量、动量、总能离散守恒残差处于双精度机器零量级（ $10^{-14} \sim 10^{-12}$ ）；多进程状态锁与快照零越界 |
+| **`L4` 收敛阶与基准达标** | 在光滑解或制造解（MMS）加密序列（ $h, h/2, h/4, \dots$ ）上达到理论设计阶数 $p$ ，或吻合标准算例（收敛阶与基准算例 `gate_passed: true`） | 经验收敛阶 $\text{EOC} = \frac{\log(E_1 / E_2)}{\log(h_1 / h_2)}$ 稳定接近设计阶数 $p$ ；Sod 与 Lax 激波管、顶盖驱动方腔等与文献基准吻合 |
 
 高内存三维网格生成、大型 C++/Fortran 并行编译与长时数值模拟应按 `R10` 置于 WSL2、容器或独立计算节点等隔离环境中运行，防止宿主机桌面内存溢出（OOM）。

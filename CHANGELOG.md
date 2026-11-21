@@ -2,6 +2,15 @@
 
 本文件记录四客户端共用规则、会话钩子、后台验证工具与上游维护流程的版本演进。当前插件版本以 `template/user-guard/plugin.json` 为准；常驻使用文档只说明机制和配置键，不重复维护版本号与性能日期。
 
+## [1.18.6] - 2026-11-22
+
+补齐第三方工具合规边界与纯官方按量接口选型说明，并结合 GitHub 网页端逐页渲染巡检修复 Mermaid 控件遮挡、窄视口表格竖排挤压与预算公式间距：
+
+- **补齐外部工具安全边界、切卡防丢钩子与按量接口选型说明（`README.md`）**：在安装与配置章节明确区分官方 OAuth 登录与模型厂商官方按量 API Key（严禁用外部工具读写或轮换官方 OAuth 登录凭据、轮询非公开配额接口或向反重力同步全局提示词），补充使用 `ccswitch_admin.py switch-card` 切卡保护 `~/.claude/settings.json` 五类钩子的防覆写说明、未启用客户端 `enabled: false` 选路跳过及不污染主窗口的日常协作分工心法，并同步完善英文概览。
+- **修复 GitHub 网页端 Mermaid 右下角遮挡、窄视口表格首列单字竖排挤压、预算公式间距及历史字面链接（`docs/workflow-guide.md`、`docs/architecture-and-hooks.md`、`README.md`、`CHANGELOG.md`）**：将高风险模块四步协同 Mermaid 图由横向 `flowchart LR` 改为纵向 `flowchart TD`，彻底消除网页端右下角悬浮平移缩放控件对末步节点的遮挡；将三张四列表格精炼为三列布局，根除带左侧目录树的分栏视口下首列被挤压为单字竖条的问题；将预算展示公式中的 `\min\big(...\big)` 改为 `\min(W_{\text{eff}}, \space W_{\text{compact}})` 消除括号空隙与下标逗号粘连；并为历史更新日志中的字面链接语法补齐反引号包裹。
+
+---
+
 ## [1.18.5] - 2026-11-22
 
 补充修复架构说明文档在 GitHub 网页端的两处公式解析细节：
@@ -166,7 +175,7 @@
 完成精简 4 列总览卡与可点击 `<ticket_id>_card.md` 明细链接闭环，开展多模型全仓深度只读审计与主会话逐行复核，修复调度器、四阶段生命周期钩子、安装器、状态锁、本地分流代理与 WSL2 脚本中的全部已核实 P0/P1/P2 隐患，并全面重写同步主说明、指南、架构文档与三张 SVG 流程图：
 
 - **精简 4 列总览卡与 `<ticket_id>_card.md` 明细链接统一机制（`cae_harness.py`、`user_words.py`、`session_context_loader.py`、`handoff_gate.py`、`status_guard.py`、`AGENTS.md`、`SKILL.md`）**：
-  - 统一四端共用机制：`_save_plan` 生成带可点击 `[<ticket_id>_card.md](file:///...)` 链接的 `compact_summary_card` 与 `compact_handoff_prompt_block`，对话展示、压缩恢复与强制交接提示词默认仅呈现 4 列总览表与明细链接（校验 `_card.md` 真实落盘且非链接，仅未落盘时回退 14 项长表），彻底消除多路 14 项长表刷屏污染主上下文；
+  - 统一四端共用机制：`_save_plan` 生成带可点击 `` `[<ticket_id>_card.md](file:///...)` `` 链接的 `compact_summary_card` 与 `compact_handoff_prompt_block`，对话展示、压缩恢复与强制交接提示词默认仅呈现 4 列总览表与明细链接（校验 `_card.md` 真实落盘且非链接，仅未落盘时回退 14 项长表），彻底消除多路 14 项长表刷屏污染主上下文；
   - 新增 `find_session_pending_tickets` 覆盖多张未决票据恢复，`handoff_session_pending_tickets` 幂等同步 `HANDED_OFF` 卡片文本，`handoff_gate.py` 按单票据消耗匹配行消除多票据 `S1` 混叠，`status_guard.py` 阻断文案附带可点击明细链接。
 - **调度器 `cae_harness.py` 票据安全与跨端隔离加固**：
   - 修复 `_check_ticket_execution` 可写流 `verify_cmd` 双向严格校验，拦截空字符串或 `None` 绕过；修复 `plan --resume-ticket` 在未传 `--force` 时对已批准票据的 `user_prompt` 保留、核心规格漂移拦截及内存只读刷新；将锁名空间收口为 `ticket_<id>` 消除 `plan_dir` 自锁；

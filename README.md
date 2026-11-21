@@ -10,7 +10,7 @@
 
 ## 快速上手
 
-1. **安装到本机客户端配置目录**：请先自行安装上述至少一个官方客户端并完成登录（OAuth 或 API Key；可选配合 CC Switch 客户端工具管理 Claude Code 的第三方供应商配置卡片）。克隆本仓库后，在仓库根目录执行一次安装命令：
+1. **安装到本机客户端配置目录**：请先自行安装上述至少一个官方客户端并完成登录（官方 OAuth 登录或按量 API Key；可选配合 CC Switch 客户端工具管理 Claude Code 兼容协议的模型供应商卡片）。克隆本仓库后，在仓库根目录执行一次安装命令：
 
    ```powershell
    # Windows 使用 python -B -X utf8；WSL2 与 Linux 改用 python3 -B -X utf8（也可运行 install.ps1 或 install.sh）
@@ -67,10 +67,11 @@ python -B -X utf8 install.py --audit-upgrade     # 4. 检查各端配置是否�
 - **指定同步范围与本地路由**：默认 `--app auto` 只同步本机实际检测到的已安装客户端；`--app all` 会一次性为全部四个客户端目标目录写入配置，也可按需单独指定 `--app antigravity`、`codex`、`claude`、`dsh` 或 `both`（`Antigravity + Codex`）。Claude Code 如需启用本地 `127.0.0.1` 模型分流代理（按请求体模型名将不同子任务透明转发至不同供应商卡片）或清理 CC Switch 内旧提示词与旧技能，可附加 `--with-cc-router`、`--disable-ccswitch-prompts` 或 `--purge-ccswitch-legacy`（修改前自动在线备份 `cc-switch.db`）。
 - **处理配置检查提示与双端同步**：若 `install.py --audit-upgrade` 返回 `summary.all_aligned: false`，按 `summary.recommended_actions` 处理即可——提示 `refresh_codex_model_catalog` 时先完成客户端首次登录以生成本地模型目录缓存；提示 `sync_codex_model_defaults` 或 `sync_claude_model_defaults` 且希望用推荐默认模型与推理强度覆盖现有设置时，附加 `--sync-model-defaults` 重跑 `install.py`；提示 `start_cc_router` 时按需启动本地 `router.py` 进程；提示 `upgrade_dsh_hook_protocol` 时表明官方 DSH CLI 已开放硬钩子接口，可在维护流程中纳入升级。若报告中 `cross_side_status.dual_side_sync_required` 为 `true`（或存在未启动的 WSL2 发行版），须在 Windows 与 WSL2 两侧分别运行体检与同步，不依赖单侧覆盖。
 - **保留用户自有配置**：Antigravity 安装在独立插件目录 `plugins/user-guard`，不改动 `~/.gemini/GEMINI.md`；Codex、Claude Code 与 DSH 更新全局规则文件（`AGENTS.md` 或 `CLAUDE.md`）时，完整写入标准规则至 `## 工具与运行环境`（含 `R10.`、`R11.`），同时保留排在该标准节之后的任意用户自定义二级标题章节（以及以 `## 工具与` 开头且标题不同于 `## 工具与运行环境` 的自定义环境说明），并将自定义尾段中与标准冲突的 `R10.`、`R11.` 重命名为 `L1.`、`L2.`。
+- **外部工具安全边界与按量接口选型**：各客户端请使用自身官方 OAuth 登录或模型厂商官方签发的按量 API Key，切勿使用外部工具读写或轮换官方 OAuth 登录凭据、轮询非公开配额接口或向反重力同步全局提示词（反重力由 `plugins/user-guard` 独立托管，避免双源覆盖与账号风控）。若配合 CC Switch 为 Claude Code 切换兼容协议的按量 API 卡片，请运行 `ccswitch_admin.py switch-card`（或在图形界面切卡后补跑一次 `install.py` 并以 `install.py --audit-upgrade` 复核对齐状态），避免整文件覆写冲掉 `~/.claude/settings.json` 中的五类生命周期钩子。未安装或不启用的客户端在 `fleet_profile.json` 的 `subscription_matrix.agents` 中设为 `enabled: false` 后，后续任务选路会自动跳过（修改后重跑 `install.py` 同步至本机技能目录）；只需纯按量 API 环境且希望保留完整五类硬钩子时，可单独使用 Claude Code 接入模型厂商官方兼容接口（配置主力模型卡片，避免因 `lightweight` 轻量标记被限制为仅承担 `fast` 角色；或启用本地 `router.py` 分流主力模型与轻量模型子代理），也可按需配合 Codex 或 DSH 无头审查协同运行（DSH 交互主窗口当前为 `soft_rules_only` 软规则约束，无头调用具备补丁隔离与文件哈希快照校验）。
 
 ## 三、日常课题使用方式
 
-打开普通科研或工程仓库时，系统自动识别为通用课题模式（`workspace_mode: "general_project"`）。下方双泳道流程图的左侧对应日常课题目录中的调用流程，右侧对应打开本配置仓库时的维护流程：
+打开普通科研或工程仓库时，系统自动识别为通用课题模式（`workspace_mode: "general_project"`）。日常推荐由主窗口把控需求脉络与原文行号复核，同端 `readonly-*` 子代理负责多文件摘录，长耗时编码与大范围扫描交 `cae_harness.py` 无头子进程隔离运行并仅回传结构化回执，避免长输出污染主窗口上下文。下方双泳道流程图的左侧对应日常课题目录中的调用流程，右侧对应打开本配置仓库时的维护流程：
 
 ![日常课题协作与配置仓库维护流程](docs/assets/user-and-evolution-flow.svg)
 
@@ -80,12 +81,12 @@ python -B -X utf8 install.py --audit-upgrade     # 4. 检查各端配置是否�
 
 当你在对话中点明客户端、具体模型、推理强度、隔离级别或节省额度要求时，`cae_harness.py` 通过 `--user-prompt` 将其作为最高优先级（P0）约束锁定，并自动补全上下文窗口、只读小文件行号内联与文件快照校验；内部原生子代理则优先读取代理定义中的显式 `model`，未显式指定时按 `inherit` 继承宿主当前会话模型：
 
-| 指定方式 | 对话指令示例 | 锁定的参数 | 自动补全与报错保护 |
-| --- | --- | --- | --- |
-| **指定客户端或模型** | “这步编码用 Codex 高强度做”“用 DSH 独立核对脱敏与公式” | 指定的客户端、模型名称或模型系列 | 自动补全模型声明的最大上下文窗口、无头非交互标志、小文件行号内联、前后哈希快照与脱敏；目标不可用或已停用时直接报错，不静默换用其他端 |
-| **指定推理强度或隔离级别** | “用高强度推导离散格式”“用 `--isolation clean_room` 空上下文检查 README” | 指定的推理强度等级或四级正交隔离（`full`、`no_skills`、`hooks_only`、`clean_room`） | 对显式专业角色即使调低到 `low` 仍保留主力模型，避免退化为轻量模型；后端不支持所选隔离级别时显式报错拒绝 |
-| **指定节省额度或配额回退** | “省点额度快速检查一遍格式”“加 `--fallback-on-quota` 遇限额回退” | 低消耗模式或未改文件时的限额回退 | 遇 `quota_exhausted` 立即停止重试；仅在未锁定单一客户端、未绑定已批准的确认票据且工作区无文件改动时按配置回退 |
-| **同时指定多个客户端** | “用 Codex 和 DSH 交叉审查这部分代码” | 识别“等、和、与、及”并列关系，不误锁单端 | 保留多路（多并发子任务）计划中各分支各自指定的客户端、模型与隔离级别组合 |
+| 指定方式与对话示例 | 锁定的参数（P0） | 自动补全与报错保护 |
+| --- | --- | --- |
+| **指定客户端或模型**：“这步编码用 Codex 高强度做”“用 DSH 独立核对脱敏与公式” | 指定的客户端、模型名称或模型系列 | 自动补全模型声明的最大上下文窗口、无头非交互标志、小文件行号内联、前后哈希快照与脱敏；目标不可用或已停用时直接报错，不静默换用其他端 |
+| **指定推理强度或隔离级别**：“用高强度推导离散格式”“用 `--isolation clean_room` 空上下文检查 README” | 指定的推理强度等级或四级正交隔离（`full`、`no_skills`、`hooks_only`、`clean_room`） | 对显式专业角色即使调低到 `low` 仍保留主力模型，避免退化为轻量模型；后端不支持所选隔离级别时显式报错拒绝 |
+| **指定节省额度或配额回退**：“省点额度快速检查一遍格式”“加 `--fallback-on-quota` 遇限额回退” | 低消耗模式或未改文件时的限额回退 | 遇 `quota_exhausted` 立即停止重试；仅在未锁定单一客户端、未绑定已批准的确认票据且工作区无文件改动时按配置回退 |
+| **同时指定多个客户端**：“用 Codex 和 DSH 交叉审查这部分代码” | 识别“等、和、与、及”并列关系，不误锁单端 | 保留多路（多并发子任务）计划中各分支各自指定的客户端、模型与隔离级别组合 |
 
 ### 2. 未指定模型时按任务类型自动选路
 
@@ -208,11 +209,11 @@ Antigravity_Codex_ClaudeCode_DeepSeekHarness/
 
 ### 2. English Overview
 
-`Antigravity_Codex_ClaudeCode_DeepSeekHarness` provides shared engineering rules (`R0–R11`), deterministic session lifecycle hooks, read-only review subagents, lexical grounding checks, and cross-client headless verification workflows across **Google Antigravity** (`agy`), **OpenAI Codex** (`codex`), **Claude Code** (`claude` / `cc`), and **DeepSeek Harness** (`dsh`). Built solely on the Python 3.11+ standard library across Windows, WSL2, and Linux, it targets scientific computing, CAE, CFD, FEA, numerical PDE solvers, HPC, and high-reliability software engineering—preserving official client prefix caching and subscription quotas while preventing post-compaction instruction loss, silent model substitution, tolerance relaxation, out-of-workspace writes, and ungrounded documentation drift.
+`Antigravity_Codex_ClaudeCode_DeepSeekHarness` provides shared engineering rules (`R0–R11`), deterministic session lifecycle hooks, read-only review subagents, lexical grounding checks, and cross-client headless verification workflows across **Google Antigravity** (`agy`), **OpenAI Codex** (`codex`), **Claude Code** (`claude` / `cc`), and **DeepSeek Harness** (`dsh`). Built solely on the Python 3.11+ standard library across Windows, WSL2, and Linux, it targets scientific computing, CAE, CFD, FEA, numerical PDE solvers, HPC, and high-reliability software engineering—preserving official client prefix caching and subscription quotas while preventing post-compaction instruction loss, silent model substitution, tolerance relaxation, unauthorized out-of-workspace writes, and ungrounded documentation drift.
 
-Running `install.py` once installs the rules, hooks, and skills into your local client configuration directories (run separately on Windows and WSL2 when both sides are used) so any research or engineering repository (`general_project`) works immediately without copying config files. Explicit user model, client, effort, or `--isolation` (`full`, `no_skills`, `hooks_only`, `clean_room`) choices take top priority alongside five dynamic role slots (`orchestrator`, `math`, `code`, `review`, `fast`) and per-client `native_agent_profiles`. Multi-stream or write-capable tasks write the 4-column overview and full 14-item parameters to `<ticket_id>_card.md`, presenting a 3-sentence brief (`chat_brief`) with a clickable local file link in chat while preserving `compact_summary_card` for compaction recovery and cross-session handoff prompts. Opening this repository itself (`upstream_config_repo`) enables configuration maintenance via `fleet-evolve` (`full`, `hygiene`, `audit`) with explicit user confirmation gates.
+Running `install.py` once installs the rules, hooks, and skills into your local client configuration directories (run separately on Windows and WSL2 when both sides are used) so any research or engineering repository (`general_project`) works immediately without copying config files. Explicit user model, client, effort, or `--isolation` (`full`, `no_skills`, `hooks_only`, `clean_room`) choices take top priority alongside five dynamic role slots (`orchestrator`, `math`, `code`, `review`, `fast`) and per-client `native_agent_profiles`. Multi-stream or headless write-capable tasks write the 4-column overview and full 14-item parameters to `<ticket_id>_card.md`, presenting a 3-sentence brief (`chat_brief`) with a clickable local file link in chat while preserving `compact_summary_card` for compaction recovery and cross-session handoff prompts. Opening this repository itself (`upstream_config_repo`) enables configuration maintenance via `fleet-evolve` (`full`, `hygiene`, `audit`) with explicit user confirmation gates.
 
-Network access, official client installations, and credentials are prepared by the user. This project is currently supported solely by the China Scholarship Council (CSC), CSC No. `202506280162`, Approval No. `留金选[2025]37号`. Licensed under the [Apache License 2.0](LICENSE); redistributions and derivative works must retain the attribution notices in [NOTICE](NOTICE) (`Copyright 2026 Xinyu Li (Xinyu-Li-1997)`) per Section 4.
+Network access, official client installations (any single client or subset works independently; unconfigured clients set to `enabled: false` in `fleet_profile.json` are skipped automatically during routing), and credentials (official OAuth sign-in or vendor-issued pay-as-you-go API keys; never use external switchers to swap official OAuth credentials, and run `ccswitch_admin.py switch-card`—or re-run `install.py` after GUI card switches—when switching Claude Code API cards so `~/.claude/settings.json` lifecycle hooks remain intact) are prepared by the user. This project is currently supported solely by the China Scholarship Council (CSC), CSC No. `202506280162`, Approval No. `留金选[2025]37号`. Licensed under the [Apache License 2.0](LICENSE); redistributions and derivative works must include a copy of the License and retain the attribution notices in [NOTICE](NOTICE) (`Copyright 2026 Xinyu Li (Xinyu-Li-1997)`) per Section 4.
 
 ### 3. 开源许可
 
