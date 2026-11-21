@@ -3595,6 +3595,37 @@ class TestHeavyWorkflowLifecycle(unittest.TestCase):
         handoff_gate._LAST_HANDOFF_PROFILE_TOKEN = None
         handoff_gate._sync_handoff_tunables("antigravity", "", "")
 
+    def test_v1181_single_turn_runaway_and_full_transcript_size_trigger_drain(self):
+        # 1) 单用户回合内连续跨 4 次 CHECKPOINT 且步数跨度 >= 650 触发 turn_runaway 进入 Stage-2 drain
+        tp_runaway = self.root / "runaway_compact" / "transcript.jsonl"
+        tp_runaway.parent.mkdir(parents=True, exist_ok=True)
+        _append_jsonl(tp_runaway, {"step_index": 167, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "批准"})
+        for cp_step in (215, 434, 680, 877):
+            _append_jsonl(tp_runaway, {"step_index": cp_step, "source": "SYSTEM", "type": "CHECKPOINT"})
+        cid_run = "ag-v1181-runaway"
+        out_run = session_context_loader.handle_pre_invocation({"conversationId": cid_run, "transcriptPath": str(tp_runaway)})
+        self.assertIn("Stage-2 drain", out_run["injectSteps"][0]["systemMessage"]["systemMessage"])
+        gate_run = handoff_gate.load_gate_state(self.state, cid_run)
+        self.assertEqual(gate_run["phase"], "drain")
+        self.assertIn("turn_runaway", gate_run["triggers"])
+
+        # 2) 紧凑版 < 3 MiB 但 transcript_full.jsonl >= 6 MiB 且 cp >= 3 触发 full_transcript_bytes
+        tp_full_dir = self.root / "full_heavy"
+        tp_full_dir.mkdir(parents=True, exist_ok=True)
+        tp_compact = tp_full_dir / "transcript.jsonl"
+        tp_full = tp_full_dir / "transcript_full.jsonl"
+        _append_jsonl(tp_compact, {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "推进"})
+        for cp_step in (120, 260, 410):
+            _append_jsonl(tp_compact, {"step_index": cp_step, "source": "SYSTEM", "type": "CHECKPOINT"})
+        with tp_full.open("wb") as fh:
+            fh.seek(6 * 1024 * 1024 + 128)
+            fh.write(b"\n")
+        cid_full = "ag-v1181-full-bytes"
+        session_context_loader.handle_pre_invocation({"conversationId": cid_full, "transcriptPath": str(tp_compact)})
+        gate_full = handoff_gate.load_gate_state(self.state, cid_full)
+        self.assertEqual(gate_full["phase"], "drain")
+        self.assertIn("full_transcript_bytes", gate_full["triggers"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

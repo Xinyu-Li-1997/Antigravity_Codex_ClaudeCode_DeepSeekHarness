@@ -2,6 +2,16 @@
 
 本文件记录四客户端共用规则、会话钩子、后台验证工具与上游维护流程的版本演进。当前插件版本以 `template/user-guard/plugin.json` 为准；常驻使用文档只说明机制和配置键，不重复维护版本号与性能日期。
 
+## [1.18.1] - 2026-11-21
+
+针对 WSL2 科学计算长会话取证暴露的伪终端分页器死锁、单回合跨多次压缩未收尾及钩子源码自省空耗，补齐三项确定性硬护栏：
+
+- **伪终端裸分页 Git 命令拦截与 `systemd-run` 包装拆壳（`status_guard.py`）**：将 `systemd-run` 纳入多层命令包装拆壳，并在 `PreToolUse` 拦截未显式加 `--no-pager` 或 `-P`、未设置 `GIT_PAGER` 或 `PAGER` 且标准输出直接连向伪终端的裸 `git log`、`git show`、`git diff`、`git reflog`、`git shortlog`，根除 `/usr/bin/pager` 在 `TERM=dumb` 伪终端无限等待按键挂死后台任务的问题。
+- **单回合连压失控与完整轨迹体积收口兜底（`handoff_gate.py`、`fleet_profile.json`）**：新增 `drain_turn_cps`、`drain_turn_steps`（单用户回合内连续跨多次 `CHECKPOINT` 且步数超限触发 `turn_runaway`）与 `drain_full_transcript_mib`（`transcript_full.jsonl` 体积超限触发 `full_transcript_bytes`）两项 `Stage-2 drain` 触发器，并将检查点步数间隔配置键统一为 `*_avg_interval_steps`。
+- **通用课题会话钩子源码自省拦截（`status_guard.py`）**：在 `general_project` 模式下拦截主会话无谓读取已安装 `hooks/*.py` 逆向猜测门禁规则，直接返回单行明确收尾提示以节省上下文窗口。
+
+---
+
 ## [1.18.0] - 2026-11-21
 
 基于 Windows 与 WSL2 多课题真实会话轨迹的跨端实证审计，完成无头子代理持久化可续接会话与双层零丢失超时抢救、多文件输入与波次调度、钩子进程系统级资源自毁护栏、局部补测冒充全过拦截、交接未决拍板保护、压缩去噪与常驻规则精炼升级：

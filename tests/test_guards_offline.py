@@ -2257,6 +2257,49 @@ class TestDispatchAndBillingGuards(unittest.TestCase):
             self.assertEqual(parsed.ticket, "ticket-fixture")
             self.assertTrue(parsed.dry_run and parsed.retry_quota)
 
+    def test_v1181_unpaged_git_pty_guard_and_general_project_hook_introspection_block(self):
+        denied_cmds = (
+            "git log -1 --stat",
+            "git diff src/solver.py",
+            "git diff 2>/dev/null",
+            "wsl -d Ubuntu-24.04 -e git show HEAD",
+            "systemd-run --user --same-dir --pipe --wait -p MemoryMax=4G bash -c 'git status -sb\ngit log -1 --stat'",
+        )
+        for cmd in denied_cmds:
+            with self.subTest(denied=cmd):
+                res = self.pre("run_command", {"CommandLine": cmd})
+                self.assertEqual(res["decision"], "deny")
+                self.assertIn("--no-pager", res["reason"])
+        allowed_cmds = (
+            "git --no-pager log -1 --stat",
+            "git -P diff src/solver.py",
+            "git -c core.pager=cat show HEAD",
+            "GIT_PAGER=cat git log -1 --stat",
+            "git log -1 --stat | cat",
+            "git diff > patch.txt",
+            "git diff --quiet",
+            "git diff --exit-code",
+            "sha=$(git log -1 --format=%H) && echo $sha",
+            "git status -sb",
+            "systemd-run --user --pipe --wait -E GIT_PAGER=cat bash -c 'git log -1 --stat'",
+        )
+        for cmd in allowed_cmds:
+            with self.subTest(allowed=cmd):
+                self.assertEqual(self.pre("run_command", {"CommandLine": cmd})["decision"], "allow")
+        fake_hook = self.project / ".gemini/config/plugins/user-guard/hooks/reply_repeat_guard.py"
+        res_hook = self.pre("read_file", {"Path": str(fake_hook)})
+        self.assertEqual(res_hook["decision"], "deny")
+        self.assertIn("无需读取门禁钩子源码", res_hook["reason"])
+        self.assertEqual(self.pre("read_file", {"Path": str(self.project / "sess_user_words.md")})["decision"], "allow")
+        up_res = status_guard.handle_pre_tool_use({
+            "conversationId": "session-fixture",
+            "cwd": str(REPO_ROOT),
+            "workspacePaths": [str(REPO_ROOT)],
+            "transcriptPath": str(self.project / "trace.jsonl"),
+            "toolCall": {"name": "read_file", "args": {"Path": str(fake_hook)}},
+        })
+        self.assertEqual(up_res["decision"], "allow")
+
     def test_wp8_default_timeout_and_target_metrics_match_heavy_limits(self):
         profile = json.loads((HOOKS_DIR.parent / "skills/cae-harness/fleet_profile.json").read_text(encoding="utf-8"))
         tunables = profile["runtime_tunables"]

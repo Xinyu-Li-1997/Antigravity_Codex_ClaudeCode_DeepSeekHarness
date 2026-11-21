@@ -58,7 +58,10 @@ ADVISORY_IMAGE_BYTES = 50 * 1024 * 1024
 DRAIN_CP_THRESHOLD = 5
 DRAIN_THRASH_MIN_CP = 4
 DRAIN_THRASH_AVG_INTERVAL = 75.0
+DRAIN_TURN_CPS = 3
+DRAIN_TURN_STEPS = 650
 DRAIN_TRANSCRIPT_BYTES = 5 * 1024 * 1024
+DRAIN_FULL_TRANSCRIPT_BYTES = 6 * 1024 * 1024
 DRAIN_MEDIA_STEPS = 160
 DRAIN_MEDIA_MIN_CP = 3
 DRAIN_IMAGE_CALLS = 65
@@ -212,7 +215,10 @@ _HANDOFF_BUILTINS: Dict[str, Any] = {
     "DRAIN_CP_THRESHOLD": DRAIN_CP_THRESHOLD,
     "DRAIN_THRASH_MIN_CP": DRAIN_THRASH_MIN_CP,
     "DRAIN_THRASH_AVG_INTERVAL": DRAIN_THRASH_AVG_INTERVAL,
+    "DRAIN_TURN_CPS": DRAIN_TURN_CPS,
+    "DRAIN_TURN_STEPS": DRAIN_TURN_STEPS,
     "DRAIN_TRANSCRIPT_BYTES": DRAIN_TRANSCRIPT_BYTES,
+    "DRAIN_FULL_TRANSCRIPT_BYTES": DRAIN_FULL_TRANSCRIPT_BYTES,
     "DRAIN_MEDIA_STEPS": DRAIN_MEDIA_STEPS,
     "DRAIN_MEDIA_MIN_CP": DRAIN_MEDIA_MIN_CP,
     "DRAIN_IMAGE_CALLS": DRAIN_IMAGE_CALLS,
@@ -296,7 +302,10 @@ def _sync_handoff_tunables(
             agy.get("drain_thrash_avg_interval_steps", agy.get("drain_thrash_avg_interval_sec")),
             _HANDOFF_BUILTINS["DRAIN_THRASH_AVG_INTERVAL"],
         ),
+        "DRAIN_TURN_CPS": user_words._coerce_pos_int(agy.get("drain_turn_cps"), _HANDOFF_BUILTINS["DRAIN_TURN_CPS"]),
+        "DRAIN_TURN_STEPS": user_words._coerce_pos_int(agy.get("drain_turn_steps"), _HANDOFF_BUILTINS["DRAIN_TURN_STEPS"]),
         "DRAIN_TRANSCRIPT_BYTES": user_words._coerce_pos_int(agy.get("drain_transcript_mib"), 5) * 1024 * 1024,
+        "DRAIN_FULL_TRANSCRIPT_BYTES": user_words._coerce_pos_int(agy.get("drain_full_transcript_mib"), 6) * 1024 * 1024,
         "DRAIN_MEDIA_STEPS": user_words._coerce_pos_int(agy.get("drain_media_steps"), _HANDOFF_BUILTINS["DRAIN_MEDIA_STEPS"]),
         "DRAIN_MEDIA_MIN_CP": user_words._coerce_pos_int(agy.get("drain_media_min_cp"), _HANDOFF_BUILTINS["DRAIN_MEDIA_MIN_CP"]),
         "DRAIN_IMAGE_CALLS": user_words._coerce_pos_int(agy.get("drain_image_calls"), _HANDOFF_BUILTINS["DRAIN_IMAGE_CALLS"]),
@@ -1327,6 +1336,7 @@ def _merge_telemetry(
         recent_avg_interval = sum(tail3) / len(tail3)
 
     transcript_bytes = 0
+    full_transcript_bytes = 0
     if transcript_path is not None:
         transcript_path = user_words.resolve_compact_transcript_path(transcript_path)
         if transcript_path.exists():
@@ -1334,6 +1344,14 @@ def _merge_telemetry(
                 transcript_bytes = int(transcript_path.stat().st_size)
             except OSError:
                 transcript_bytes = 0
+        full_tp = transcript_path.with_name("transcript_full.jsonl")
+        if full_tp.exists():
+            try:
+                full_transcript_bytes = int(full_tp.stat().st_size)
+            except OSError:
+                full_transcript_bytes = 0
+        else:
+            full_transcript_bytes = transcript_bytes
 
     recorded_imgs = compaction_state.get("transcriptImageSizes") or {}
     img_map: Dict[str, int] = {}
@@ -1354,12 +1372,18 @@ def _merge_telemetry(
         int(compaction_state.get("latestStepIndex", -1)),
         cp_steps[-1] if cp_steps else -1,
     )
+    u_step = int(compaction_state.get("latestUserStepIndex", -1))
+    turn_cp_count = sum(1 for s in cp_steps if u_step >= 0 and s > u_step)
+    turn_step_span = (latest_step - u_step) if (u_step >= 0 and latest_step > u_step) else 0
 
     return {
         "cpCount": cp_count,
         "latestCp": cp_steps[-1] if cp_steps else -1,
+        "turnCpCount": turn_cp_count,
+        "turnStepSpan": turn_step_span,
         "recentAvgInterval": recent_avg_interval,
         "transcriptBytes": transcript_bytes,
+        "fullTranscriptBytes": full_transcript_bytes,
         "mediaStepCount": media_step_count,
         "uniqueImageCount": len(img_map),
         "imageCallCount": image_call_count,
@@ -1426,8 +1450,12 @@ def _evaluate_triggers(tel: Dict[str, Any], user_text: str) -> Tuple[List[str], 
         stage2_hits.append("cp_count")
     if cp_count >= DRAIN_THRASH_MIN_CP and avg_int is not None and avg_int <= DRAIN_THRASH_AVG_INTERVAL:
         stage2_hits.append("cp_thrashing")
+    if tel.get("turnCpCount", 0) >= DRAIN_TURN_CPS and tel.get("turnStepSpan", 0) >= DRAIN_TURN_STEPS:
+        stage2_hits.append("turn_runaway")
     if tp_bytes >= DRAIN_TRANSCRIPT_BYTES:
         stage2_hits.append("transcript_bytes")
+    if cp_count >= ADVISORY_CP_THRESHOLD and tel.get("fullTranscriptBytes", 0) >= DRAIN_FULL_TRANSCRIPT_BYTES:
+        stage2_hits.append("full_transcript_bytes")
     if img_bytes >= DRAIN_IMAGE_BYTES:
         stage2_hits.append("media_bytes")
     if (media_steps >= DRAIN_MEDIA_STEPS and cp_count >= DRAIN_MEDIA_MIN_CP) or img_calls >= DRAIN_IMAGE_CALLS:

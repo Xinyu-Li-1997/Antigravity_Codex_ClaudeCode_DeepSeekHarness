@@ -3816,12 +3816,13 @@ def _dispatch_commands(command: str, depth: int = 0):
                     break
                 yield from _dispatch_commands(" ".join(tokens[marker + 1:]), depth + 1)
                 tokens = []
-            elif head in ("wsl", "sudo", "timeout", "nohup", "nice"):
+            elif head in ("wsl", "sudo", "timeout", "nohup", "nice", "systemd-run"):
                 takes_value = {
                     "wsl": ("-d", "--distribution", "-u", "--user", "--cd"),
                     "sudo": ("-u", "--user", "-g", "--group", "-h", "--host", "-p", "--prompt", "-C", "--close-from", "-T", "--command-timeout", "-r", "--role", "-t", "--type", "-D", "--chdir", "-R", "--chroot"),
                     "timeout": ("-k", "--kill-after", "-s", "--signal"),
                     "nice": ("-n", "--adjustment"), "nohup": (),
+                    "systemd-run": ("-p", "--property", "--unit", "-u", "--slice", "--working-directory", "-E", "--setenv", "--uid", "--gid", "--service-type", "--description"),
                 }[head]
                 i = 1
                 while i < len(tokens) and tokens[i].startswith("-"):
@@ -3898,14 +3899,196 @@ def _load_harness_metrics_module(script: Path) -> Any:
     return metrics
 
 
+def _find_unpaged_git_command(command: str, depth: int = 0) -> Optional[str]:
+    if depth > MAX_WRAPPER_DEPTH or not command or not re.search(r"\bgit\b", command, re.I):
+        return None
+    if re.search(r"(?:^|[\s;|&(])(?:\$env:)?(?:GIT_PAGER|PAGER)\s*=", command, re.I):
+        return None
+    masked = _shell_lex.strip_quoted_segments(command)
+    chars = list(masked)
+    i, n = 0, len(chars)
+    while i < n:
+        if chars[i] == "$" and i + 1 < n and chars[i + 1] == "(":
+            d, j = 1, i + 2
+            while j < n and d > 0:
+                d += (chars[j] == "(") - (chars[j] == ")")
+                j += 1
+            for k in range(i, j):
+                chars[k] = " "
+            i = j
+            continue
+        i += 1
+    masked_no_sub = "".join(chars)
+    pos = 0
+    stmts: List[Tuple[str, str]] = []
+    for m in re.finditer(r"\r?\n|;|&&|\|\|", masked_no_sub):
+        stmts.append((command[pos:m.start()], masked_no_sub[pos:m.start()]))
+        pos = m.end()
+    stmts.append((command[pos:], masked_no_sub[pos:]))
+    for raw_stmt, mask_stmt in stmts:
+        if not raw_stmt.strip() or not re.search(r"\bgit\b", raw_stmt, re.I):
+            continue
+        pipe_parts = list(re.finditer(r"(?<!\|)\|(?!\|)", mask_stmt))
+        if pipe_parts:
+            last_p = pipe_parts[-1].end()
+            raw_stmt, mask_stmt = raw_stmt[last_p:], mask_stmt[last_p:]
+        if re.search(r"(?<![2])>", mask_stmt):
+            continue
+        clause = raw_stmt.strip().strip("()")
+        if not clause:
+            continue
+        inner = _unwrap_shell_script_with_tail(clause)
+        if inner is not None and inner[0] and inner[0] != _INVALID_ENCODED_SENTINEL:
+            hit = _find_unpaged_git_command(inner[0], depth + 1)
+            if hit:
+                return hit
+            continue
+        tokens = _safe_split_tokens(clause)
+        while tokens:
+            head = Path(tokens[0].replace(chr(92), "/")).name.lower().removesuffix(".exe")
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tokens[0]):
+                if tokens[0].split("=", 1)[0].upper() in ("GIT_PAGER", "PAGER"):
+                    tokens = []
+                    break
+                tokens.pop(0)
+                continue
+            if head in ("&", "call", "if", "then", "else", "elif", "while", "until", "do", "!", "command", "exec"):
+                tokens.pop(0)
+                continue
+            if head in ("wsl", "sudo", "timeout", "nohup", "nice", "systemd-run", "env"):
+                takes_val = {
+                    "wsl": ("-d", "--distribution", "-u", "--user", "--cd"),
+                    "sudo": ("-u", "--user", "-g", "--group", "-h", "--host", "-p", "--prompt", "-C", "--close-from", "-T", "--command-timeout", "-r", "--role", "-t", "--type", "-D", "--chdir", "-R", "--chroot"),
+                    "timeout": ("-k", "--kill-after", "-s", "--signal"),
+                    "nice": ("-n", "--adjustment"), "nohup": (), "env": ("-u", "--unset", "-C", "--chdir"),
+                    "systemd-run": ("-p", "--property", "--unit", "-u", "--slice", "--working-directory", "-E", "--setenv", "--uid", "--gid", "--service-type", "--description"),
+                }[head]
+                idx = 1
+                saw_no_pager_env = False
+                while idx < len(tokens) and (tokens[idx].startswith("-") or (head == "env" and "=" in tokens[idx])):
+                    fl = tokens[idx]
+                    idx += 1
+                    if fl == "--" or (head == "wsl" and fl in ("-e", "--exec")):
+                        break
+                    if head in ("env", "systemd-run") and re.search(r"(?:^|=)(?:GIT_PAGER|PAGER)=", fl, re.I):
+                        saw_no_pager_env = True
+                    if fl in takes_val and idx < len(tokens):
+                        if head == "systemd-run" and fl in ("-E", "--setenv") and re.match(r"^(?:GIT_PAGER|PAGER)=", tokens[idx], re.I):
+                            saw_no_pager_env = True
+                        idx += 1
+                if saw_no_pager_env:
+                    tokens = []
+                    break
+                if head == "timeout" and idx < len(tokens):
+                    idx += 1
+                tokens = tokens[idx:]
+                if tokens:
+                    m_sh = re.search(r"\b(?:(?:ba|z)?sh|pwsh|powershell)(?:\.exe)?\s+(?:-[A-Za-z]*c|-command)\s+", clause, re.I)
+                    if m_sh:
+                        hit = _find_unpaged_git_command(_shell_lex.unquote_shell_word(clause[m_sh.end():].strip()), depth + 1)
+                        if hit:
+                            return hit
+                        tokens = []
+                        break
+                    sub_inner = _unwrap_shell_script_with_tail(" ".join(shlex.quote(t) for t in tokens))
+                    if sub_inner is not None and sub_inner[0] and sub_inner[0] != _INVALID_ENCODED_SENTINEL:
+                        hit = _find_unpaged_git_command(sub_inner[0], depth + 1)
+                        if hit:
+                            return hit
+                        tokens = []
+                        break
+                continue
+            if head in ("bash", "sh", "zsh", "pwsh", "powershell", "cmd"):
+                m_sh = re.search(r"\b(?:(?:ba|z)?sh|pwsh|powershell)(?:\.exe)?\s+(?:-[A-Za-z]*c|-command)\s+", clause, re.I)
+                if m_sh:
+                    hit = _find_unpaged_git_command(_shell_lex.unquote_shell_word(clause[m_sh.end():].strip()), depth + 1)
+                    if hit:
+                        return hit
+                    tokens = []
+                    break
+                sub_inner = _unwrap_shell_script_with_tail(" ".join(shlex.quote(t) for t in tokens))
+                if sub_inner is not None and sub_inner[0] and sub_inner[0] != _INVALID_ENCODED_SENTINEL:
+                    hit = _find_unpaged_git_command(sub_inner[0], depth + 1)
+                    if hit:
+                        return hit
+                elif head == "cmd":
+                    mk = next((k for k, tok in enumerate(tokens[1:], 1) if tok.lower() in ("/c", "/k")), None)
+                    if mk is not None:
+                        hit = _find_unpaged_git_command(" ".join(tokens[mk + 1:]), depth + 1)
+                        if hit:
+                            return hit
+                else:
+                    mk = next((k for k, tok in enumerate(tokens[1:], 1) if tok.lower() == "-command" or re.fullmatch(r"-[a-z]*c", tok.lower())), None)
+                    if mk is not None and mk + 1 < len(tokens):
+                        hit = _find_unpaged_git_command(" ".join(tokens[mk + 1:]), depth + 1)
+                        if hit:
+                            return hit
+                tokens = []
+                break
+            if head == "git":
+                gi = 1
+                safe_pager = False
+                subcmd = ""
+                while gi < len(tokens):
+                    gt = tokens[gi]
+                    gl = gt.lower()
+                    if gt in ("-P", "--no-pager") or gl.startswith(("-c=core.pager=", "--config-env=core.pager")):
+                        safe_pager = True
+                        break
+                    if gl in ("-h", "--help", "-v", "--version"):
+                        safe_pager = True
+                        break
+                    if gt in ("-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--config-env") and gi + 1 < len(tokens):
+                        if gt == "-c" and tokens[gi + 1].lower().startswith(("core.pager=", "pager.")):
+                            safe_pager = True
+                            break
+                        gi += 2
+                        continue
+                    if gt.startswith("-c") and len(gt) > 2 and gt[2:].lower().startswith(("core.pager=", "pager.")):
+                        safe_pager = True
+                        break
+                    if gt.startswith("-"):
+                        gi += 1
+                        continue
+                    subcmd = gl
+                    break
+                if not safe_pager and subcmd in ("log", "show", "diff", "reflog", "shortlog"):
+                    rest = [r.lower() for r in tokens[gi + 1:]]
+                    if not any(r in ("-h", "--help", "-q", "--quiet") for r in rest) and not (subcmd == "diff" and "--exit-code" in rest):
+                        return " ".join(tokens[:min(len(tokens), 6)])
+            break
+    return None
+
+
 def _check_dispatch_locked(payload, tool_name, args, sid, state_dir):
     if _is_headless_subtask() or os.environ.get("USER_GUARD_DISABLE_TICKET_GATE") == "1":
         return None
     tool_name = _native_tool_name(tool_name)
+    if tool_name in ("read_file", "Read", "view_file"):
+        read_target = str(
+            args.get("Path") or args.get("path") or args.get("file_path") or args.get("AbsolutePath") or ""
+        ).replace("\\", "/")
+        if re.search(r"/(?:\.gemini/config/plugins/user-guard|\.codex|\.claude)/hooks/(?:_lib/)?[A-Za-z0-9_]+\.py$", read_target, re.I):
+            base_dir = Path(payload.get("cwd") or Path.cwd())
+            is_upstream = any(
+                (cand / "install.py").is_file() and (cand / "template" / "user-guard" / "plugin.json").is_file()
+                for cand in (base_dir, *base_dir.parents)
+            )
+            if not is_upstream:
+                return (
+                    "【user-guard】通用课题会话无需读取门禁钩子源码自省规则：若后台任务仍在运行，"
+                    "直接简短汇报当前进展（如有未汇报重负载完工账单请一并附上成败、Token 与回执文件名）即可结束回合等待自动唤醒。"
+                )
     command = _extract_native_shell_command(args)
     shell = tool_name in ("run_command", "Bash", "PowerShell", "exec_command", "bash", "shell", "shell_command")
     heavy_tickets = []
     if shell:
+        unpaged_git = _find_unpaged_git_command(command)
+        if unpaged_git:
+            return (
+                f"【user-guard】禁止在伪终端裸跑可能拉起交互式分页器的 Git 命令（{unpaged_git}），"
+                "否则 /usr/bin/pager (less) 会等待按键卡死后台任务；请改用 `git --no-pager ...` 或前置 `GIT_PAGER=cat`。"
+            )
         for tokens in _dispatch_commands(command):
             names = [
                 re.sub(r"\.(?:exe|cmd|bat|ps1)$", "", Path(t.replace(chr(92), "/")).name.lower())
