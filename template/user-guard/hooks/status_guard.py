@@ -4596,11 +4596,11 @@ def _ticket_required_reason(sid, state_dir=None, extra_plan_dirs=()):
         detail_hint = f"（完整 14 项明细链接：{user_words.format_card_detail_link(detail_file)}）" if detail_file else ""
         return (
             f"【user-guard 重负载派工门禁】检测到当前会话已有未过期的待确认（PENDING）批次票据 `{tid}`，尚未获得 APPROVED 授权{detail_hint}。"
-            f'请先向用户展示精简 4 列总览卡（compact_summary_card）与可点击的完整 14 项参数明细链接（勿把多路 14 项长表全文刷屏对话），待用户明确确认后再执行 `python "{harness_script}" plan --session-id {sid} --approve-ticket {tid}` 解锁启动（严禁未经用户确认自行审批或重复建单）；原生调用须在票据中列出原生通道。'
+            f'请先向用户展示 3 句话极简确认条 `chat_brief` 与可点击的完整 14 项参数明细链接（未落盘明细时回退 `compact_summary_card`；勿在日常对话中粘贴 Markdown 表格刷屏，后台被动唤醒期间勿重复贴票），待用户明确确认后再执行 `python "{harness_script}" plan --session-id {sid} --approve-ticket {tid}` 解锁启动（严禁未经用户确认自行审批或重复建单）；原生调用须在票据中列出原生通道。'
         )
     return (
         "【user-guard 重负载派工门禁】当前会话尚无有效且未过期的批次票据（未找到 APPROVED 或待确认 PENDING 票据，或票据通道容量不匹配）。"
-        f'请先调用 `python "{harness_script}" plan --session-id {sid} ...` 生成中文确认单（自动落盘完整 14 项参数明细至 `<ticket_id>_card.md`，对话仅展示精简 4 列总览卡与明细链接）；'
+        f'请先调用 `python "{harness_script}" plan --session-id {sid} ...` 生成中文确认单（自动落盘 4 列总览表与 14 项参数明细至 `<ticket_id>_card.md`，日常对话仅展示 3 句话极简确认条 `chat_brief` 与明细链接）；'
         "获用户确认并执行 `--approve-ticket` 后再启动；原生调用须在票据中列出原生通道。"
     )
 

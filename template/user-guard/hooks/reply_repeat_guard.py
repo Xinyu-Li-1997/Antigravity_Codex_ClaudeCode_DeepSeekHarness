@@ -193,7 +193,8 @@ def _load_repeat_state(
                             or record["consecutiveShortWaitCount"] < 0
                             or not isinstance(record.get("lastNormalizedReply"), str)
                             or not isinstance(record.get("blockedSignatures"), list)
-                            or (record.get("lastStepIndex") is not None and type(record["lastStepIndex"]) is not int)):
+                            or (record.get("lastStepIndex") is not None and type(record["lastStepIndex"]) is not int)
+                            or ("shownPendingTickets" in record and not isinstance(record["shownPendingTickets"], dict))):
                         raise ValueError("回合复读记录格式错误")
                 return data
             raise ValueError("状态格式或会话身份不符")
@@ -841,7 +842,7 @@ def _check_heavy_report_locked(payload, state_dir, sid, turn_key, reply, decisio
     failure = re.search(r"失败|超时|部分(?:完成|成功|通过)|\b(?:fail(?:ed|ures?)|time(?:d)?[ _-]?out|partial(?:ly)?|"
                         r"invalid_output|verification_failed|scope_violation)\b", facts, re.I)
     status = failure or re.search(r"成功|完成|通过|\b(?:succeeded|completed|passed|ok)\b", reply, re.I)
-    tokens = bool(re.search(r"tokens?[^\n。；]*\d|\d[\d, ]*\s*tokens?|tokens?[^\n。；]*(?:未.*(?:暴露|提供|统计)|无法|不.*(?:暴露|提供))|未[^\n。；]*(?:暴露|提供)[^\n。；]*tokens?", reply, re.I))
+    tokens = bool(re.search(r"tokens?[^\n。；]*\d|\d[\d, ]*[`*_]*\s*[`*_]*tokens?|tokens?[^\n。；]*(?:未.*(?:暴露|提供|统计)|无法|不.*(?:暴露|提供))|未[^\n。；]*(?:暴露|提供)[^\n。；]*tokens?", reply, re.I))
     receipt = bool(re.search(r"receipt|回执|轨迹|日志|[\w-]+\.(?:jsonl|json|log)\b", reply, re.I))
     def has_token(token):
         if not token:
@@ -981,19 +982,83 @@ def _check_test_suite_locked(payload, reply, state_file, state, sid, turn_key, d
     return None
 
 
+_PENDING_TICKET_STATUS_RE = re.compile(
+    r"票据(?:[：:]|\s+)\s*`*([0-9a-fA-F_-]{8,64})`*[^\n]*?状态[：:]\s*`*PENDING`*\b",
+    re.I,
+)
+
+
+def _extract_full_pending_ticket_id(reply: str) -> Optional[str]:
+    """仅当回复包含完整多行待批确认块或总览表（且非交接提示词）时提取票据标识；单行简短待办提醒不命中。"""
+    unquoted = "\n".join(user_words.markdown_unquoted_lines(reply))
+    if not unquoted or "【新对话提示词】" in unquoted:
+        return None
+    m = _PENDING_TICKET_STATUS_RE.search(unquoted)
+    if not m:
+        return None
+    has_full_card = bool(
+        re.search(r"^\s*\|\s*流号\s*\|", unquoted, re.M)
+        or "【待确认派工" in unquoted
+        or ("工作流背景" in unquoted and "选项" in unquoted)
+    )
+    return m.group(1).lower() if has_full_card else None
+
+
+def _check_repeated_pending_ticket_locked(
+    reply: str,
+    state_file: Path,
+    state: Dict[str, Any],
+    record: Dict[str, Any],
+    checkpoint_step: int,
+    state_dir: Path,
+    sid: str,
+    turn_key: str,
+    payload: Dict[str, Any],
+    step_idx: Optional[int],
+    decision: str,
+    message_id: str = "",
+) -> Optional[Dict[str, Any]]:
+    tid = _extract_full_pending_ticket_id(reply)
+    if not tid:
+        return None
+    shown = record.setdefault("shownPendingTickets", {})
+    if shown.get(tid) != checkpoint_step:
+        shown[tid] = checkpoint_step
+        return None
+    blocked_sigs = record.setdefault("blockedSignatures", [])
+    if blocked_sigs or _heavy_report_blocked(state_dir, sid, turn_key, payload):
+        return None
+    blocked_sigs.append(f"pending_ticket:{tid}:{checkpoint_step}")
+    record["lastStepIndex"] = step_idx
+    if message_id:
+        record["lastMessageId"] = message_id
+    _save_repeat_state(state_file, state, sid)
+    short_tid = tid[:8]
+    return {
+        "decision": decision,
+        "reason": (
+            f"【user-guard 待批票据防刷屏】票据 `{tid}` 的确认信息在本回合已展示过，且期间未发生新的上下文压缩。"
+            f"后台任务被动唤醒汇报进展时，请删去重复的多行确认块或总览表（若需附带提醒，至多保留单行说明“票据 `{short_tid}` 仍候回复『批准』启动，不影响当前后台任务”）。"
+        ),
+    }
+
+
 def _handle_stop_locked(payload: Dict[str, Any], state_dir: Path, conversation_id: str) -> Dict[str, Any]:
     turn_key, step_idx, latest_reply = extract_current_turn_latest_reply(payload.get("transcriptPath"))
 
     # 若当前会话处于长会话 Stage-2 (drain/freeze)，优先验收交接完整性与 /goal 停止标记（每回合至多阻断 1 次）
     last_input = user_words.clean_user_content(payload.get("lastUserInput"))
     goal_active = user_words.agy_goal_command(last_input)
+    compaction_cp = -1
     compaction_file = state_dir / f"{conversation_id}_compaction.json"
     try:
         compaction_state = json.loads(compaction_file.read_text(encoding="utf-8-sig"))
-        if (isinstance(compaction_state, dict) and compaction_state.get("conversationId") == conversation_id
-                and compaction_state.get("hasExplicitUserInput") is True):
-            # 已按步骤对账的用户输入及后续取消标记优先于 Stop 中的旧首轮输入。
-            goal_active = None
+        if isinstance(compaction_state, dict) and compaction_state.get("conversationId") == conversation_id:
+            if isinstance(compaction_state.get("latestCheckpointStep"), int):
+                compaction_cp = compaction_state["latestCheckpointStep"]
+            if compaction_state.get("hasExplicitUserInput") is True:
+                # 已按步骤对账的用户输入及后续取消标记优先于 Stop 中的旧首轮输入。
+                goal_active = None
     except (OSError, ValueError, RecursionError):
         pass
     handoff_resp = handoff_gate.check_stop_handoff_locked(
@@ -1028,6 +1093,13 @@ def _handle_stop_locked(payload: Dict[str, Any], state_dir: Path, conversation_i
     last_step = turn_rec.get("lastStepIndex")
     if step_idx is not None and isinstance(last_step, int) and step_idx <= last_step:
         return {"decision": "allow"}
+
+    if ticket_block := _check_repeated_pending_ticket_locked(
+        latest_reply, state_file, state, turn_rec, compaction_cp,
+        state_dir, conversation_id, turn_key, payload, step_idx, "continue",
+    ):
+        log_event("Stop:reply_repeat_guard", conversation_id, f"BLOCKED repeated pending ticket card in {turn_key}")
+        return ticket_block
 
     if not is_short_status_reply(latest_reply):
         turn_rec["consecutiveShortWaitCount"] = 0
@@ -1343,6 +1415,14 @@ def handle_claude_stop_repeat_guard(payload: Dict[str, Any], state_dir: Optional
             if ((step is not None and step == record["lastStepIndex"])
                     or (message_id and message_id == record.get("lastMessageId"))):
                 return {}
+            if ticket_block := _check_repeated_pending_ticket_locked(
+                reply, state_file, state, record, -1,
+                state_dir, sid, turn_key, payload, step, "block", message_id=message_id,
+            ):
+                user_words.append_jsonl_log(logs_dir / "lifecycle.log", {
+                    "event": "Stop:repeated_pending_ticket", "client": client, "session_id": sid, "turn_key": turn_key,
+                })
+                return ticket_block
             record.update(lastStepIndex=step, lastMessageId=message_id)
             if is_short_status_reply(reply):
                 normalized = normalize_reply_text(reply)

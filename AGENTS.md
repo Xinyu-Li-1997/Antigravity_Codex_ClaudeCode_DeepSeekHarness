@@ -42,7 +42,7 @@
 | 恢复与调用前 | `session_context_loader.py`（内部联动 `handoff_gate.py`；Antigravity 注册 `SessionStart`、`PreInvocation`；Codex 与 Claude Code 在 `SessionStart` 同时注册两脚本，在 `PostCompact` 注册 `handoff_gate.py`）去噪恢复原话、实质子代理与超时抢救摘要及未决确认单，并评估交接阶段。 |
 | 新指令提交时 | `handoff_gate.py`（Codex 与 Claude Code 注册 `UserPromptSubmit`；Antigravity 在 `PreInvocation` 对账轨迹控制步）更新交接判断或暂缓宽限期。 |
 | 工具执行前 | `status_guard.py`（内部联动 `handoff_gate.py`；三端注册 `PreToolUse`）核查写边界与同会话外部目录批准租约、日志重复轮询、直接调用底层 CLI 拦截、重负载与 `followup` 票据（`--files` 单路只读按实际声明文件计量）及交接限制。 |
-| 回合结束时 | `reply_repeat_guard.py`（内部联动 `handoff_gate.py`，Codex 与 Claude Code 同时注册两脚本；三端挂载 `Stop`）检查重复空等短句、局部补测冒充全过、重负载完工回执（按 `run_id` 精确销账）及防翻案核验、强制交接提示词与待拍板占位符保护。 |
+| 回合结束时 | `reply_repeat_guard.py`（内部联动 `handoff_gate.py`，Codex 与 Claude Code 同时注册两脚本；三端挂载 `Stop`）检查重复空等短句、同回合重复刷屏待批票据、局部补测冒充全过、重负载完工回执（按 `run_id` 精确销账）及防翻案核验、强制交接提示词与待拍板占位符保护。 |
 
 宿主事件类别数与共用脚本模块数分别说明，不作简单一一对应。Antigravity 默认启用长会话分段收口；Codex 与 Claude Code 默认交接模式为 `advisory`，强制阻断仅在实际模式要求时生效。
 
@@ -68,15 +68,15 @@ python -B -X utf8 install.py --dry-run --yes
 
 ## 派工、持久化续接与可用性检查
 
-主会话遇到实质性推导、多文件编码验证或关键代码与文档审查，应主动通过 `cae-harness` 核查可用端。用户点名按 P0 第一优先级锁定指定维度，以 `--user-prompt` 传递原话。`role:*` 是并列入口，不覆盖点名；未指定的窗口、非委派挡位、无头防分页标志、`--files` 多文件输入与 `--negative-scope-file` 负向契约、只读行号内联、快照和脱敏由脚本补齐。外部无头会话默认持久化（`--ephemeral` 显式关闭），支持 `followup` 增量追问，并在超时场景下执行软时限只读收口与硬超时 `timeout_salvage`（保留部分 Token、已读文件、落盘改动与末尾结论）。轻量卡片跑非 `fast` 角色、WSL 纯 Linux 可写路径走 Windows 互操作或本地路由未存活时明确报错，不静默降级。
+主会话遇到实质性推导、多文件编码验证或关键代码与文档审查，应主动通过 `cae-harness` 核查可用端。用户点名按 P0 第一优先级锁定指定维度，以 `--user-prompt` 传递原话。`role:*` 是并列入口，不覆盖点名；未指定的窗口、非委派挡位、无头防分页标志、`--files` 多文件输入与 `--negative-scope-file` 负向契约、只读行号内联、快照和脱敏由脚本补齐。外部无头会话默认持久化（`--ephemeral` 显式关闭），支持 `followup` 增量追问，并在超时场景下执行软时限只读收口与硬超时 `timeout_salvage`（保留部分 Token、已读文件、落盘改动与末尾结论）。轻量卡片跑非 `fast` 角色、WSL 纯 Linux 可写路径走 Windows 互操作、Windows `codex.exe` 只读关闭内联或本地路由未存活时明确报错，不静默降级。
 
 可用性经过两道门：第一道门由 `fleet-evolve` 联网评估并由用户决定 `subscription_matrix` 启停；第二道门由 `plan` 纯离线复查当前配置、路由存活及可读额度状态。日常派工读取 `capability_ledger`，不联网更新性能。
 
-重负载涵盖外部无头调用（支持 `--isolation` 四级正交隔离）及内部 `invoke_subagent`、`run_workflow`、`spawn_agent`、`Agent`、`swarm` 多路或可写委派。`plan` 先写 `<ticket_id>.json` 再写 `<ticket_id>_card.md` 14 项明细，对话与恢复默认仅展示 `compact_summary_card` 精简总览卡与明细链接。获批后以 `plan --approve-ticket` 登记，执行绑定 `--ticket`；`batch` 支持按 `wave` 波次及同目录不重叠 `write_scope` 并发执行外部无头通道。
+重负载涵盖外部无头调用（支持 `--isolation` 四级正交隔离）及内部 `invoke_subagent`、`run_workflow`、`spawn_agent`、`Agent`、`swarm` 多路或可写委派。`plan` 先写 `<ticket_id>.json` 再写 `<ticket_id>_card.md`（含 4 列总览表与 14 项明细），日常对话默认仅展示 3 句话极简确认条 `chat_brief` 与明细链接，后台被动唤醒期间严禁重复贴票。获批后以 `plan --approve-ticket` 登记，执行绑定 `--ticket`；`batch` 支持按 `wave` 波次及同目录不重叠 `write_scope` 并发执行外部无头通道。
 
 ## 中断恢复与完成回执
 
-等待确认期间发生自动压缩时，恢复钩子按 `hooks/_lib/adaptive_policy.py` 动态缩放预算、过滤异步启动噪音并用 `collapse_historical_cards` 折叠历史明细表；同时从 `<ticket_id>.json` 独立加载精简 4 列总览卡、`<ticket_id>_card.md` 链接与选项卡，与常规摘要分两块显示。进入 `drain` 或 `freeze` 强制流程时，`handoff_gate.py` 放行 `check-grounding --strict`，并在 `Stop` 核验交接要素与未决拍板占位符保护。
+等待确认期间发生自动压缩时，恢复钩子按 `hooks/_lib/adaptive_policy.py` 动态缩放预算、过滤异步启动噪音并用 `collapse_historical_cards` 折叠历史明细表；同时从 `<ticket_id>.json` 独立加载精简 4 列总览卡、`<ticket_id>_card.md` 链接与选项卡供模型恢复核对，主会话向用户仅补展 1 次 `chat_brief` 与明细链接。进入 `drain` 或 `freeze` 强制流程时，`handoff_gate.py` 放行 `check-grounding --strict`，并在 `Stop` 核验交接要素与未决拍板占位符保护。
 
 `reply_repeat_guard.py` 在完工 `Stop` 检查成败词（禁止将含失败或超时的账单写成“全部成功”）、局部补测与全量测试区分，以及 Token 用量或无法统计说明。外部任务须覆盖各流标识和账单中的实际回执文件名；单路 `task` 或 `gate` 省略默认流号 `S1` 时须匹配具体模型名，仅在未记录具体模型名时可用任务状态词替代。原生任务须覆盖完成数量、各流标识或各角色名中的一项，并提供日志或轨迹说明。主会话仍须自行逐路核对具体状态、Token 明细与汇总算术。
 

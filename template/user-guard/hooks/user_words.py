@@ -748,7 +748,7 @@ def render_pending_workflow_block(ticket, for_handoff=False) -> str:
         title = (
             "【新对话待选重负载工作流精简总览与明细链接块】"
             if for_handoff
-            else "【未决重负载工作流专项计划（压缩前待确认方案，非回读摘要——请向用户展示精简总览卡与完整 14 项明细链接，勿在对话中展开 14 项长表）】"
+            else "【未决重负载工作流专项计划（压缩前待确认方案，非回读摘要——向用户说明时仅展示 3 句话极简确认条 chat_brief 与完整 14 项明细链接，勿在日常对话中粘贴 Markdown 表格）】"
         )
         lines = [title, "票据：" + tid_text, "状态：" + status_text]
         detail_name = basename_any_os(detail_file)

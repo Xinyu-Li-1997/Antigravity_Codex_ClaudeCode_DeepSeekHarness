@@ -4892,10 +4892,28 @@ def _copy_tree_no_links(src_dir, dst_dir):
                 shutil.copy2(fsrc, dst_dir / rel_root / fname)
 
 
+def _is_appcontainer_or_interop_codex(info):
+    if not isinstance(info, dict):
+        return False
+    if info.get('windows_interop'):
+        return True
+    binary_norm = str(info.get('binary') or '').replace('\\', '/').lower()
+    return '/windowsapps/' in binary_norm or '/openai/codex/bin/' in binary_norm
+
+
 def _check_writable_transport(target, info, readonly):
     if not readonly and info.get('windows_interop') and _wsl_path(target).startswith('\\\\'):
         raise HarnessError(f'WSL 纯 Linux 文件系统路径无法在 Windows {Path(info["binary"]).name} 沙箱内直接写入',
                            'wsl_interop_write_unsupported')
+
+
+def _check_readonly_inline_transport(prefix, info, readonly, inline_readonly, *, is_resume=False):
+    if prefix == 'codex' and readonly and not is_resume and inline_readonly is False and _is_appcontainer_or_interop_codex(info):
+        raise HarnessError(
+            'Windows AppContainer 或 WSL 跨子系统 codex.exe 在 -s read-only 沙箱下会拦截子进程读盘（blocked by policy），'
+            '禁止传入 --no-inline-readonly；请开启默认内联只读，超长输入请分片或改用支持直接读盘的本地引擎',
+            'inline_readonly_required',
+        )
 
 
 def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, timeout_sec=600,
@@ -4943,6 +4961,7 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
         _verify_claude_router_card_key(info, model)
     interop = info.get('windows_interop', False)
     _check_writable_transport(target_dir, info, readonly)
+    _check_readonly_inline_transport(prefix, info, readonly, inline_readonly, is_resume=bool(resume))
     translate = _wsl_path if interop else str
     needs_stage = clean_room or (interop and translate(target_dir).startswith('\\\\'))
     temp_parent = None
@@ -5172,7 +5191,9 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
                 input_text = exec_prompt
             if not receipt['launch_attempted']:
                 receipt.update(argv=list(command), work_dir=str(exec_dir), staged_readonly_workspace=stage_dir is not None,
-                               clean_room=clean_room, isolation=iso_mode, command_transport='windows_interop' if interop else 'native')
+                               clean_room=clean_room, isolation=iso_mode,
+                               inline_readonly=bool(readonly and (inline_readonly is True or (inline_readonly is None and clean_room))),
+                               command_transport='windows_interop' if interop else 'native')
             if interop:
                 extra_env = {}
                 if prefix == 'claude' and effective_claude_home:
@@ -8711,11 +8732,16 @@ def _resolve_plan_streams(args, streams, backends):
                 _require_execution_profile(profile)
                 eff_profile_tier = profile.get('tier') or tier
                 prefix, _ = _engine_parts(engine)
-                _check_writable_transport(target if target.is_dir() else target.parent, backends[prefix], kind not in ('code', 'gate'))
+                eff_readonly = kind not in ('code', 'gate')
+                eff_inline_ro = False if (channel != 'cae_harness_headless' or not eff_readonly) else bool(
+                    stream.get('inline_readonly', getattr(args, 'inline_readonly', True))
+                )
+                _check_writable_transport(target if target.is_dir() else target.parent, backends[prefix], eff_readonly)
+                _check_readonly_inline_transport(prefix, backends[prefix], eff_readonly, eff_inline_ro)
                 raw_iso_stream = stream.get('isolation', getattr(args, 'isolation', ''))
                 raw_cr_stream = bool(stream.get('clean_room', getattr(args, 'clean_room', False)))
                 stream_iso_mode, _ = _effective_isolation(prefix, raw_iso_stream, clean_room=raw_cr_stream)
-                _validate_isolation(prefix, stream_iso_mode, readonly=(kind not in ('code', 'gate')))
+                _validate_isolation(prefix, stream_iso_mode, readonly=eff_readonly)
                 quota = inspect_backend_quota_and_availability(prefix, backends[prefix], profile['model'],
                                                                 redact_usage=getattr(args, 'redact', False),
                                                                 ignore_cooldown=getattr(args, 'retry_quota', False))
@@ -8857,6 +8883,34 @@ def _render_plan(ticket):
         + popup_footer
         + '\n\n票据：' + tid_clean + '；状态：' + status
     )
+    all_readonly = all(s.get('access_mode') == '只读' for s in ticket['streams'])
+    mode_badge = '严格只读' if all_readonly else '含写入范围'
+    stream_tags = '、'.join(
+        f"{_clean_text(s['stream_id']).strip()} {_clean_text(s['client']).strip()}:{_clean_text(s['model_display']).strip()} ({_clean_text(s['tier']).strip()})"
+        for s in ticket['streams']
+    )
+    unavailable_notes = [
+        f"{_clean_text(s['stream_id']).strip()}:{_clean_text(s.get('unavailable_reason') or '不可用').strip()}"
+        for s in ticket['streams']
+        if not s.get('currently_available')
+    ]
+    quota_brief = ('不可用：' + '，'.join(unavailable_notes)) if unavailable_notes else '额度均可用'
+    goal_one_line = re.sub(r'\s+', ' ', _clean_text(ticket['workflow_goal'])).strip()
+    if len(goal_one_line) > 140:
+        goal_one_line = goal_one_line[:137] + '...'
+    if status == 'PENDING':
+        action_line = f'**请确认**：回复 **「批准」** 启动；如需调整模型或挡位请直接说明，暂缓请回复「交接」（票据 `{tid_clean}`，状态：`{status}`）。'
+    elif status == 'HANDED_OFF':
+        action_line = f'**待接续确认**：已交接票据 `{tid_clean}`（状态：`{status}`），回复 **「批准」** 启动，或说明微调要求。'
+    elif status == 'APPROVED':
+        action_line = f'当前状态：已批准（`{status}`），绑定票据 `{tid_clean}` 执行。'
+    else:
+        action_line = f'票据：`{tid_clean}`；状态：`{status}`。'
+    ticket['chat_brief'] = (
+        f'**【待确认派工 · {mode_badge}】** {goal_one_line}（共 {len(ticket["streams"])} 路：{stream_tags}；{quota_brief}）。\n'
+        f'- 完整总览与 14 项明细：{detail_link}\n'
+        f'- {action_line}'
+    ) if (persisted and detail_link) else ticket['compact_summary_card']
     resume_ref = ('\n恢复命令：plan --resume-ticket ' + tid_clean) if persisted else ''
     ticket['handoff_prompt_block'] = ('【新对话提示词】\n请接力以下完整工作流，先读取并复核票据，不要推测缺失内容。\n'
                                       + markdown + resume_ref)
@@ -8868,7 +8922,7 @@ def _render_plan(ticket):
 
 
 def _compact_plan_stdout_view(ticket):
-    """生成精简 stdout 视图：置顶 compact_summary_card，省略已落盘的 14 项长表与 execution_profile。"""
+    """生成精简 stdout 视图：置顶 chat_brief 与 compact_summary_card，省略已落盘的 14 项长表与 execution_profile。"""
     detail_file = str(ticket.get('card_detail_file') or '')
     full_ticket_file = str(Path(detail_file).with_name(f"{ticket['ticket_id']}.json")) if detail_file else ''
     compact_streams = [
@@ -8882,6 +8936,7 @@ def _compact_plan_stdout_view(ticket):
         'stdout_view': 'compact',
         'card_detail_file': detail_file,
         'full_ticket_file': full_ticket_file,
+        'chat_brief': ticket.get('chat_brief', ''),
         'compact_summary_card': ticket.get('compact_summary_card', ''),
     }
     if ticket.get('status') not in ('APPROVED', 'CANCELLED', 'SUPERSEDED'):

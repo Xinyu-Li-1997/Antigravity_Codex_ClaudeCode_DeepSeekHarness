@@ -2,6 +2,21 @@
 
 本文件记录四客户端共用规则、会话钩子、后台验证工具与上游维护流程的版本演进。当前插件版本以 `template/user-guard/plugin.json` 为准；常驻使用文档只说明机制和配置键，不重复维护版本号与性能日期。
 
+## [1.18.3] - 2026-11-21
+
+基于 WSL2 重型科学计算课题会话（`V14 总控`）真实轨迹复盘，消除待批票据跨后台唤醒重复刷屏、Windows `codex.exe` 只读关闭内联盲读跳票与完工账单反引号误拦，并将日常对话确认展示精简为 3 句话极简确认条加本地明细文件链接：
+
+- **日常对话 3 句话极简确认条 `chat_brief` 与后台唤醒防重复贴票（`cae_harness.py`、`reply_repeat_guard.py`、`status_guard.py`、`user_words.py`）**：
+  - `cae_harness.py plan` 在保留 `<ticket_id>_card.md`（内含 4 列总览表与 14 项完整参数明细）、`compact_summary_card` 与 `compact_handoff_prompt_block` 供明细文件、压缩恢复及跨会话强制交接使用的同时，新增面向日常对话的 3 句话极简确认条 `chat_brief`（一句话目标与读写边界及各路模型挡位、可点击 `<ticket_id>_card.md` 链接、加粗确认动作提示），彻底取消日常聊天框贴表占窗；
+  - `reply_repeat_guard.py` 在 `Stop` 阶段新增 `_check_repeated_pending_ticket_locked`：同一用户回合且未发生新 `CHECKPOINT` 压缩期间，若后台任务被动唤醒后再次输出同一 `PENDING` 票据的多行确认块或总览表，单次拦截并提示仅保留单行简短待办说明（跨压缩恢复、新用户提问或强制交接【新对话提示词】不受限）。
+- **Windows AppContainer 及 WSL 跨子系统 `codex.exe` 只读内联前置硬校验与完工账单反引号兼容（`cae_harness.py`、`reply_repeat_guard.py`）**：
+  - 新增 `_check_readonly_inline_transport`：当后端为 Windows AppContainer 或 WSL 跨子系统 `codex.exe` 且处于 `-s read-only` 只读模式（非 `followup` 续接）时，在 `plan` 出票前与 `invoke_engine` 启动前直接拒绝 `--no-inline-readonly`（状态码 `inline_readonly_required`，自动选路时自动排除该后端回退其他可用端），根治子进程读盘被沙箱 `blocked by policy` 拦截导致白跑作废重开新票的问题，并在回执记录 `inline_readonly` 实际生效布尔值；
+  - 修复 `reply_repeat_guard.py` 完工账单核验正则未兼容数字与 `tokens` 之间带反引号或星号（如 `` `201,795` tokens ``）导致的误拦截重打。
+- **规则、技能与全仓文档同步及离线回归用例增补（`AGENTS.md`、`rules/AGENTS.md`、`SKILL.md`、`README.md`、`docs/`、`tests/`）**：
+  - 同步更新 `R3.1.1`、`R3.1.5` 与 `R9.3` 对 `chat_brief` 展示边界及后台唤醒禁重贴票的规定，新增覆盖上述四项机制的离线回归测试。
+
+---
+
 ## [1.18.2] - 2026-11-21
 
 结合 GitHub Windows CI 失败诊断、本机生命周期门禁实证统计与四路 Codex 高强度交叉审查（经主会话逐行原文复核），完成跨平台路径修复、门禁降噪与会话目录续租、并发状态锁加固及常驻文档润色：

@@ -13,7 +13,7 @@ description: >
 
 遇到实质性数理推导、多文件编码验证或关键代码与文档审查，应先核实本机可用端，多端就绪时优先跨客户端协作。同端 `readonly-*` 代理仅用于原文摘录、多文件读取和行号初筛，不替代跨客户端独立审查。交接清单或审稿意见涉及新增算例、加密网格或扩大参数范围时，须先与现行测试矩阵及已取消方向做集合差分，新增项单列获批后再执行。
 
-用户点名与角色槽位并列。用户以精确标识符或口语指定客户端、模型简称、推理挡位或省额度意图时，按 P0 第一优先级锁定对应维度，通过 `--user-prompt` 传入原话，角色推荐不得覆盖点名。选路支持 `role:orchestrator`、`role:math`、`role:code`、`role:review`、`role:fast` 及 `<client>:@<role>`、`<client>:default`、`<client>:<model>`。点名对象不可用、轻量卡片承担非 `fast` 角色、WSL 纯 Linux 可写路径走 Windows 互操作或所需本地路由未存活时，明确报错，不静默降级。
+用户点名与角色槽位并列。用户以精确标识符或口语指定客户端、模型简称、推理挡位或省额度意图时，按 P0 第一优先级锁定对应维度，通过 `--user-prompt` 传入原话，角色推荐不得覆盖点名。选路支持 `role:orchestrator`、`role:math`、`role:code`、`role:review`、`role:fast` 及 `<client>:@<role>`、`<client>:default`、`<client>:<model>`。点名对象不可用、轻量卡片承担非 `fast` 角色、WSL 纯 Linux 可写路径走 Windows 互操作、Windows `codex.exe` 只读关闭内联（`--no-inline-readonly`）或所需本地路由未存活时，明确报错，不静默降级。
 
 `--kind` 指定工作性质，`--engine` 或 `--worker` 指定角色与选路：
 
@@ -49,7 +49,7 @@ description: >
 
 轻任务按 `runtime_tunables.dispatch_confirmation` 静默执行（单路只读 `task` 显式传入 `--files` 时仅统计所声明文件，上限由 `heavy_max_light_explicit_files` 或默认 4 个文件控制，不误扫整个目标目录）。外部无头调用及内部 `invoke_subagent`、`run_workflow`、`spawn_agent`、`Agent`、`swarm` 等多路或可写委派均须先经 `plan` 确认；`status_guard.py` 对 `swarm` 的 `add` 按 `tasks` 长度或 `n` 计入通道容量。通道含 `cae_harness_headless`、`native_subagent`、`native_workflow`、`native_swarm`；原生通道默认 `inherit`，优先解析代理定义中的显式 `model` 并挂载 `native_agent_profiles`。
 
-`plan` 依次写入 `<ticket_id>.json` 与 `<ticket_id>_card.md` 14 项明细，标准输出默认置顶 `compact_summary_card`；需全量 JSON 时加 `--full-json`，本地交互勿传 `--redact` 以保留可点击链接。对话与压缩恢复默认仅展示精简总览卡及 `<ticket_id>_card.md` 链接，禁止展开多路 14 项长表挤占上下文：
+`plan` 依次写入 `<ticket_id>.json` 与 `<ticket_id>_card.md`（含 4 列总览表与 14 项明细），标准输出默认置顶 `chat_brief` 与 `compact_summary_card`；需全量 JSON 时加 `--full-json`，本地交互勿传 `--redact` 以保留可点击链接。日常对话默认仅展示 3 句话极简确认条 `chat_brief` 及 `<ticket_id>_card.md` 链接，禁止在日常对话粘贴 Markdown 表格或展开 14 项长表，未发生压缩且票据未变时后台被动唤醒严禁重复贴票：
 
 | 序号 | 参数项 | 应显示的内容 |
 | --- | --- | --- |
@@ -72,7 +72,7 @@ description: >
 
 - **批准与微调**：用户批准后运行 `plan --approve-ticket` 登记，同会话更早且通道重叠的待决票据自动标为 `SUPERSEDED`，取消用 `plan --cancel-ticket`。`--override-json` 按 `stream_id` 微调：外部无头通道仅允许 `engine`、`tier`、`timeout`；内部原生通道仅允许 `tier`、`timeout`，禁止微调 `engine`。
 - **持票门禁与波次执行（`wave`）**：执行须绑定 `--ticket`，由 `status_guard.py` 核验票据并拦截裸 CLI 旁路。`batch` 仅执行 `cae_harness_headless` 通道，混合票据的原生流记入 `skipped_native_streams`。各流按整数 `wave` 升序分波次运行：前波次同目标可写流失败时，后续可写流中止为 `upstream_wave_failed`；同波次下，同根目录声明互不重叠 `write_scope` 的任务可安全并发。
-- **压缩恢复与交接**：等待确认期间发生自动压缩时，钩子按 `hooks/_lib/adaptive_policy.py` 缩放预算、过滤异步启动噪音并用 `collapse_historical_cards` 折叠历史明细，同时从 `<ticket_id>.json` 独立加载精简 4 列总览卡、`<ticket_id>_card.md` 链接和选项卡。进入 `drain` 或 `freeze` 强制交接时，`handoff_gate.py` 放行 `check-grounding --strict`，并在 `Stop` 核验【新对话提示词】内的精简总览表、`<ticket_id>_card.md` 链接、`plan --resume-ticket` 命令及待拍板占位符保护。新会话用 `plan --resume-ticket` 复核旧票据，跨会话正式执行须按当前会话标识重建票据。
+- **压缩恢复与交接**：等待确认期间发生自动压缩时，钩子按 `hooks/_lib/adaptive_policy.py` 缩放预算、过滤异步启动噪音并用 `collapse_historical_cards` 折叠历史明细，同时从 `<ticket_id>.json` 独立加载精简 4 列总览卡、`<ticket_id>_card.md` 链接和选项卡供模型恢复核对，向用户仅补展 1 次 `chat_brief` 与明细链接。进入 `drain` 或 `freeze` 强制交接时，`handoff_gate.py` 放行 `check-grounding --strict`，并在 `Stop` 核验【新对话提示词】内的精简总览表、`<ticket_id>_card.md` 链接、`plan --resume-ticket` 命令及待拍板占位符保护。新会话用 `plan --resume-ticket` 复核旧票据，跨会话正式执行须按当前会话标识重建票据。
 - **完工回执核验**：`reply_repeat_guard.py` 在完工 `Stop` 检查成败词（禁止将含失败或超时的账单写成“全部成功”）、局部补测与全量回归区分，以及 Token 用量或无法统计说明。外部任务须覆盖各流标识和账单中的实际回执文件名；单路 `task` 或 `gate` 省略默认流号 `S1` 时须匹配具体模型名，仅在未记录具体模型名时可用任务状态词替代。原生任务须覆盖完成数量、各流标识或各角色名中的一项，并提供日志或轨迹说明。主会话仍须自行逐路核对状态、Token 明细与汇总算术。
 
 ## 命令示例
@@ -110,7 +110,7 @@ python -B -X utf8 "$HARNESS" check-grounding --target "<项目根目录>" --stri
 ]
 ```
 
-生成确认单、展示精简总览卡获批后执行批处理，必要时按回执追问：
+生成确认单、展示 `chat_brief` 极简确认条与明细链接获批后执行批处理，必要时按回执追问：
 
 ```powershell
 python -B -X utf8 "$HARNESS" plan --spec-file "<工作流文件路径>" --tier high --session-id "<当前会话标识>" --workflow-bg "核心文档已重写，需要核对实现" --workflow-goal "分波次检查指定文件" --workflow-impact "只读核查并生成回执，不修改源文件"

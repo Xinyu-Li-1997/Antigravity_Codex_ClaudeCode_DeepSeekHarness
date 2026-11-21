@@ -3626,6 +3626,85 @@ class TestHeavyWorkflowLifecycle(unittest.TestCase):
         self.assertEqual(gate_full["phase"], "drain")
         self.assertIn("full_transcript_bytes", gate_full["triggers"])
 
+    def test_v1183_backtick_tokens_and_repeated_pending_ticket_guard(self):
+        import reply_repeat_guard
+
+        cid = "ag-v1183-ticket-guard"
+        tp = self.root / "v1183_ticket" / "transcript.jsonl"
+        tp.parent.mkdir(parents=True, exist_ok=True)
+        _append_jsonl(tp, {"step_index": 1, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "批准"})
+
+        # 1) Backtick-wrapped token numbers (e.g. `201,795` tokens) satisfy heavy completion report check
+        receipt_path = str(self.root / "codex_readers_batch.json")
+        user_words.atomic_write_json(
+            self.state / "heavy_completions" / f"{cid}.json",
+            [{
+                "run_id": "run-v1183-bt",
+                "subcommand": "batch",
+                "all_succeeded": True,
+                "receipt_file": receipt_path,
+                "streams": [
+                    {"stream_id": "S1", "engine": "codex:gpt-6.2-sol", "model": "gpt-6.2-sol", "succeeded": True, "status": "ok",
+                     "token_usage": {"input_tokens": 199574, "output_tokens": 2221, "total_tokens": 201795}},
+                    {"stream_id": "S2", "engine": "codex:gpt-6.2-astra", "model": "gpt-6.2-astra", "succeeded": True, "status": "ok",
+                     "token_usage": {"input_tokens": 282718, "output_tokens": 3569, "total_tokens": 286287}},
+                ],
+                "token_usage_summary": {"total_tokens": 488082},
+            }],
+        )
+        _append_jsonl(tp, {
+            "step_index": 2, "source": "MODEL", "type": "PLANNER_RESPONSE",
+            "content": (
+                "现汇报外部无头批次 codex_readers_batch.json 执行结果：两路进程均完成。\n"
+                "- S1：小计 `201,795` tokens；\n- S2：小计 `286,287` tokens；总计 `488,082` tokens。"
+            ),
+        })
+        res_bt = reply_repeat_guard.handle_stop_repeat_guard({
+            "conversationId": cid, "terminationReason": "model_stop", "transcriptPath": str(tp),
+        })
+        self.assertEqual(res_bt["decision"], "allow")
+        self.assertEqual(user_words.load_unreported_heavy_completions(cid, self.state), [])
+
+        # 2) Pending ticket multi-line card allowed once per (turn, checkpoint), blocked on background wakeup repeat, 1-line reminder allowed
+        card_text = (
+            "**【待确认派工 · 严格只读】** 并发 3 路复核文档（共 3 路：S1 codex:gpt-6.2-sol (max)；额度均可用）。\n"
+            "- 完整总览与 14 项明细：[680ed899dfc844c8baccfcd107d7dc21_card.md](file:///tmp/680ed899dfc844c8baccfcd107d7dc21_card.md)\n"
+            "- **请确认**：回复 **「批准」** 启动（票据 `680ed899dfc844c8baccfcd107d7dc21`，状态：`PENDING`）。"
+        )
+        _append_jsonl(tp, {"step_index": 3, "source": "MODEL", "type": "PLANNER_RESPONSE", "content": "第 1 阶段完成。\n\n" + card_text})
+        res_first = reply_repeat_guard.handle_stop_repeat_guard({
+            "conversationId": cid, "terminationReason": "model_stop", "transcriptPath": str(tp),
+        })
+        self.assertEqual(res_first["decision"], "allow")
+
+        # Background task finishes via SYSTEM_MESSAGE (same user turn, no compaction) -> repeating full PENDING card is blocked once
+        _append_jsonl(tp, {"step_index": 4, "source": "SYSTEM", "type": "SYSTEM_MESSAGE", "content": "[Message] sender=task-1 finished"})
+        _append_jsonl(tp, {"step_index": 5, "source": "MODEL", "type": "PLANNER_RESPONSE", "content": "第 2A 阶段完成。\n\n" + card_text})
+        res_repeat = reply_repeat_guard.handle_stop_repeat_guard({
+            "conversationId": cid, "terminationReason": "model_stop", "transcriptPath": str(tp),
+        })
+        self.assertEqual(res_repeat["decision"], "continue")
+        self.assertIn("待批票据防刷屏", res_repeat["reason"])
+
+        # Rewritten 1-line brief reminder passes cleanly
+        _append_jsonl(tp, {
+            "step_index": 6, "source": "MODEL", "type": "PLANNER_RESPONSE",
+            "content": "第 2A 阶段完成（票据 `680ed899` 仍候回复「批准」启动，不影响当前后台任务）。",
+        })
+        res_oneline = reply_repeat_guard.handle_stop_repeat_guard({
+            "conversationId": cid, "terminationReason": "model_stop", "transcriptPath": str(tp),
+        })
+        self.assertEqual(res_oneline["decision"], "allow")
+
+        # After a CHECKPOINT compaction, showing chat_brief once again is allowed
+        _append_jsonl(tp, {"step_index": 7, "source": "SYSTEM", "type": "CHECKPOINT"})
+        session_context_loader.handle_pre_invocation({"conversationId": cid, "transcriptPath": str(tp)})
+        _append_jsonl(tp, {"step_index": 8, "source": "MODEL", "type": "PLANNER_RESPONSE", "content": "压缩恢复汇报。\n\n" + card_text})
+        res_after_cp = reply_repeat_guard.handle_stop_repeat_guard({
+            "conversationId": cid, "terminationReason": "model_stop", "transcriptPath": str(tp),
+        })
+        self.assertEqual(res_after_cp["decision"], "allow")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

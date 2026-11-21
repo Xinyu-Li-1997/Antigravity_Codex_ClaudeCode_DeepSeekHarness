@@ -35,7 +35,7 @@ description: >
 
 ## 第二道门：生成确认单前离线复查
 
-`cae_harness.py plan` 在重负载确认前纯离线复查当前程序、凭据、本地路由与可读额度，过滤不可用和超限通道；未暴露的服务端余额保持未知。用户点名按 P0 第一优先级锁定并通过 `--user-prompt` 保存原话。外部无头调用及内部 `invoke_subagent`、`run_workflow`、`spawn_agent`、`Agent`、`swarm`（`swarm add` 按 `tasks` 长度或 `n` 计入票据容量）等多路或可写委派均通过 `plan` 将完整 14 项参数明细写入 `<ticket_id>_card.md` 并生成 `compact_summary_card`，对话仅呈现精简总览卡与明细链接。获批后以 `plan --approve-ticket` 登记，执行绑定 `--ticket`；`batch` 仅执行外部无头通道。
+`cae_harness.py plan` 在重负载确认前纯离线复查当前程序、凭据、本地路由与可读额度，过滤不可用和超限通道；未暴露的服务端余额保持未知。用户点名按 P0 第一优先级锁定并通过 `--user-prompt` 保存原话。外部无头调用及内部 `invoke_subagent`、`run_workflow`、`spawn_agent`、`Agent`、`swarm`（`swarm add` 按 `tasks` 长度或 `n` 计入票据容量）等多路或可写委派均通过 `plan` 将 4 列总览表与完整 14 项参数明细写入 `<ticket_id>_card.md` 并生成 `chat_brief` 与 `compact_summary_card`，日常对话仅呈现 3 句话极简确认条 `chat_brief` 与明细链接，后台被动唤醒期间勿重复贴票。获批后以 `plan --approve-ticket` 登记，执行绑定 `--ticket`；`batch` 仅执行外部无头通道。
 
 ## 确认被打断与完工核验
 

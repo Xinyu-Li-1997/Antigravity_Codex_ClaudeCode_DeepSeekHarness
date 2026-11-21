@@ -6931,6 +6931,49 @@ else:
         self.assertTrue(harness._is_heavy_streams([{'kind': 'review', 'file_count': 5, 'estimated_tokens': 200, 'timeout': 300, 'files': ['f0.py', 'f1.py', 'f2.py', 'f3.py', 'f4.py']}]))
         self.assertTrue(harness._is_heavy_streams([{'kind': 'review', 'file_count': 3, 'estimated_tokens': 200, 'timeout': 300}]))
 
+    def test_v1183_chat_brief_and_winapps_interop_codex_inline_readonly_guard(self):
+        target_file = self.root / 'doc.md'
+        target_file.write_text('# manual\n', encoding='utf-8')
+        plans = self.root / 'v1183-plans'
+        engines = self.four_backends()
+
+        # 1. Persisted plan produces 3-line chat_brief without Markdown tables while preserving card_detail_file & compact_summary_card
+        with patch.object(harness, '_args_backends', return_value=engines):
+            _, view = self.capture(harness.cmd_plan, self.args(
+                'plan', '--caller', 'antigravity', '--engine', 'codex:fixture-code', '--kind', 'review',
+                '--target', str(target_file), '--plan-dir', str(plans), '--session-id', 'v1183-s1', '--save-ticket',
+                '--workflow-bg', '背景', '--workflow-goal', '模拟读者复核交付文档', '--workflow-impact', '严格只读'))
+        brief = view.get('chat_brief', '')
+        self.assertIn('【待确认派工 · 严格只读】', brief)
+        self.assertIn(f"[{view['ticket_id']}_card.md](file://", brief)
+        self.assertIn('回复 **「批准」** 启动', brief)
+        self.assertNotIn('| 流号 |', brief)
+        self.assertEqual(len(brief.strip().splitlines()), 3)
+        self.assertIn('| 流号 | 通道与执行端 | 模型与挡位 | 可用性与额度状态 |', view['compact_summary_card'])
+
+        # 2. WindowsApps / WSL interop codex.exe rejects --no-inline-readonly in plan & invoke_engine, allows resume, and auto-routes away
+        for variant_info in (
+            {**engines['codex'], 'windows_interop': True, 'binary': '/mnt/c/Codex/codex.exe'},
+            {**engines['codex'], 'windows_interop': False, 'binary': r'C:\Program Files\WindowsApps\OpenAI.Codex_26.1117\app\resources\codex.exe'},
+        ):
+            scoped_engines = {**engines, 'codex': variant_info}
+            explicit_args = self.args(
+                'plan', '--kind', 'review', '--target', str(target_file),
+                '--engine', 'codex:fixture-code', '--no-inline-readonly',
+            )
+            with self.assertRaises(harness.HarnessError) as ctx:
+                harness._resolve_plan_streams(explicit_args, [{}], scoped_engines)
+            self.assertEqual(ctx.exception.status, 'inline_readonly_required')
+            with self.assertRaises(harness.HarnessError) as ctx_inv:
+                harness._check_readonly_inline_transport('codex', variant_info, True, False, is_resume=False)
+            self.assertEqual(ctx_inv.exception.status, 'inline_readonly_required')
+            # Followup resume with inline_readonly=False remains allowed
+            harness._check_readonly_inline_transport('codex', variant_info, True, False, is_resume=True)
+            # Auto-route role:review with --no-inline-readonly skips WindowsApps/interop codex and routes to another available backend
+            auto_args = self.args('plan', '--kind', 'review', '--target', str(target_file), '--engine', 'role:review', '--no-inline-readonly')
+            resolved_auto, _ = harness._resolve_plan_streams(auto_args, [{}], scoped_engines)
+            self.assertNotEqual(resolved_auto[0]['client'], 'codex')
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
