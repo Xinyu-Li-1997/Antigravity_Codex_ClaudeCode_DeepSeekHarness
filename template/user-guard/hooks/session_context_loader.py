@@ -25,6 +25,7 @@ HOOKS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(HOOKS_DIR))
 import user_words  # noqa: E402
 from _lib import adaptive_policy as _adaptive_policy  # noqa: E402
+from _lib.process_guard import install_hook_self_guard  # noqa: E402
 
 user_words.ensure_utf8_stdio()
 
@@ -1038,6 +1039,11 @@ def handle_claude_session_start(
 # ⑦ 命令行主入口
 
 def main() -> None:
+    with install_hook_self_guard(HOOKS_DIR):
+        _main_inner()
+
+
+def _main_inner() -> None:
     parser = argparse.ArgumentParser(description="Antigravity, Codex & Claude Code Compaction Context Loader Hook")
     parser.add_argument("--client", type=str, default="antigravity", choices=("antigravity", "codex", "claude"), help="Host client type")
     parser.add_argument("--event", type=str, default="", help="Hook event name: SessionStart or PreInvocation")

@@ -46,8 +46,8 @@
 | 常见问题 | 客户端默认行为的局限 | 本仓库的处理方式 |
 | --- | --- | --- |
 | **长对话压缩丢失前文约束** | 自动摘要易漏掉早期物理符号、法向约定与容差要求；简短状态输出会冲掉审查行号 | 压缩恢复时严格分两块补回：第一块为历轮用户原话与达到有效篇幅的子代理关键结论；第二块为磁盘保存的未决确认单精简总览卡与 `<ticket_id>_card.md` 链接 |
-| **指定模型未生效或后台调用参数不全** | 口头指定的客户端或推理强度易被忽略；手写后台非交互（无头）命令常漏传上下文窗口、隔离模式或文件快照 | 优先锁定用户明确指定的客户端、模型与推理强度，自动补全声明最大窗口、`--isolation` 隔离级别、小文件带行号内联与前后哈希快照；目标不可用直接报错，不静默替换 |
-| **测试未过放宽容差或漏报执行结果** | 倾向将 `rtol=1e-13` 放宽、删改断言，或多路并发任务结束后未说明成败与 Token 消耗 | 全局规则 `R3.6` 禁止擅自放宽容差、守恒残差与收敛阶判据；`cae_harness.py gate` 强制跑通验收命令；回合结束钩子核验成败词、Token 说明与回执标识 |
+| **指定模型未生效、无头超时全丢或后台参数不全** | 口头指定的客户端或推理强度易被忽略；一次性无头调用触及超时即丢失全部推理与账单 | 优先锁定用户明确指定的客户端、模型与推理强度，自动补全声明最大窗口、`--files` 精确多文件输入、`--isolation` 隔离级别与前后哈希快照；默认开启会话持久化与双层超时抢救（软时限续接收口 + 硬超时 `timeout_salvage` 保留部分 Token、已读文件与落盘改动），支持 `followup` 按回执追问 |
+| **测试未过放宽容差、局部补测冒充全过或漏报结果** | 倾向将 `rtol=1e-13` 放宽、仅补测失败子集就宣称全套通过，或把含失败的并发账单写成全部成功 | 全局规则 `R3.6` 禁止擅自放宽容差与收敛阶判据；`cae_harness.py gate` 强制跑通验收命令；回合结束钩子拦截局部补测冒充全量通过及未全胜账单翻案，并核验成败词、Token 说明与回执标识 |
 | **只读审查误改源码、越界写目录或空转轮询** | 审查时顺手改代码、修改项目外目录或反复读取未更新的日志 | `readonly-*` 只读子代理禁写文件、禁跑构建测试；后台只读任务前后比对文件哈希快照；工具执行前静态拦截越界写删与重复读日志 |
 | **重写或润色文档时引入源码不存在的参数** | 润色时易混入仓库未实现的命令行选项、陌生缩写或失步数字 | `cae_harness.py check-grounding --strict` 扫描仓库源码与配置（刻意跳过 `tests/` 与 Markdown 代理契约）校验参数和术语依据，配合 `--isolation clean_room`（或兼容别名 `--clean-room`）空上下文盲读检查独立可读性 |
 | **模型更替导致配置失步或升级破坏 ABI** | 在规则和脚本中写死模型名易过期；跨次版本升级系统级 Python 会破坏编译扩展 | 固定代码与 `fleet_profile.json` 动态参数分离维护，并通过 `install.py --audit-upgrade` 检查四端配置漂移、Windows/WSL2 双端同步缺口及科学计算包 ABI 风险 |
@@ -155,7 +155,7 @@ python -B -X utf8 install.py --audit-upgrade     # 4. 检查各端配置是否�
 
 ![会话确认、压缩接力与完成核验流程](docs/assets/lifecycle-and-verification.svg)
 
-`template/user-guard/hooks/` 包含 5 个顶层 Python 钩子模块与 `hooks/_lib/` 公共库目录：其中 `user_words.py` 作为公共基础模块（底层调用 `hooks/_lib/fs_safety.py` 跨平台文件锁与安全原子写、`shell_lex.py` Shell 语句拆解、`adaptive_policy.py` 自适应阈值派生，完成轨迹解析、历史确认单折叠与密钥脱敏），其余 4 个事件钩子按四阶段运行，并与调度器内置的文档一致性检查构成完整闭环：
+`template/user-guard/hooks/` 包含 5 个顶层 Python 钩子模块与 `hooks/_lib/` 公共库目录：其中 `user_words.py` 作为公共基础模块（底层调用 `hooks/_lib/fs_safety.py` 跨平台文件锁与安全原子写、`shell_lex.py` Shell 语句拆解、`adaptive_policy.py` 自适应阈值派生、`process_guard.py` 钩子进程内存与墙钟自毁护栏及防分页环境配置，完成去噪轨迹解析、历史确认单折叠与密钥脱敏），其余 4 个事件钩子按四阶段运行，并与调度器内置的文档一致性检查构成完整闭环：
 
 1. **压缩恢复**（`session_context_loader.py` + `handoff_gate.py`）：未发生压缩且未达交接阈值的普通回合零字节注入，保持服务端前缀缓存命中；发生压缩或恢复时，按当前客户端、模型与推理强度动态计算字符上限，恢复历轮用户原话与关键子代理结论（通过 `collapse_historical_cards` 将历史确认单明细表折叠为单行占位符防止重复占用上下文），同时从磁盘独立恢复未决票据的精简总览卡与 `<ticket_id>_card.md` 链接。
 2. **执行前安全与票据检查**（`status_guard.py` + `handoff_gate.py`）：静态解析文件工具、Shell 包装命令、重定向与内联 Python 语法树，拦截未授权的项目外写删与外部 `git worktree`、拦截重复读取未变化日志、拦截绕过 `cae_harness.py` 直接调用底层无头 CLI，并核验 `APPROVED` 票据、隔离模式一致性与内部原生通道（含 `swarm add` 按 `tasks` 长度或 `n` 计费）容量。
@@ -179,7 +179,7 @@ python -B -X utf8 install.py --audit-upgrade     # 4. 检查各端配置是否�
 | --- | --- |
 | **阶段选型与日常无感/模糊口语矩阵、14 项参数说明、Euler HLLC 示例、中断恢复与四级（L1–L4）验证流程** | [日常工作流实战指南](docs/workflow-guide.md) |
 | **钩子模块分工、`fleet_profile.json` 配置键说明、压缩恢复细节、分片预算公式、本地路由与卸载清理** | [架构设计与钩子说明](docs/architecture-and-hooks.md) |
-| **`cae_harness.py` 子命令（`probe`、`assess`、`plan`、`batch`、`gate`、`audit`、`task`、`check-grounding`）说明** | [cae-harness 技能规程](template/user-guard/skills/cae-harness/SKILL.md) |
+| **`cae_harness.py` 子命令（`probe`、`assess`、`plan`、`batch`、`gate`、`audit`、`task`、`followup`、`check-grounding`）说明** | [cae-harness 技能规程](template/user-guard/skills/cae-harness/SKILL.md) |
 | **上游仓库维护流程（`full`、`hygiene`、`audit`）、`fleet_state.py` 状态锁与 `install.py` 维护说明** | [fleet-evolve 维护规程](template/user-guard/skills/fleet-evolve/SKILL.md) · [仓库维护说明](AGENTS.md) |
 | **插件模板目录说明与版本变更历史** | [插件模板说明](template/user-guard/README.md) · [更新日志](CHANGELOG.md) |
 | **V1.0.0 存档时间戳、Concept DOI 与 Version DOI 说明及后续发版流程** | [时间戳与 DOI 说明](.timestamps/README.md) |

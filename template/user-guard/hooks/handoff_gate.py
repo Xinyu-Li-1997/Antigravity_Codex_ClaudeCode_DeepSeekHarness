@@ -27,6 +27,8 @@ import os
 import re
 import shlex
 import sys
+from contextlib import suppress
+from datetime import datetime
 from pathlib import Path
 from typing import Any, ContextManager, Dict, List, Optional, Tuple
 
@@ -36,6 +38,7 @@ if str(HOOKS_DIR) not in sys.path:
 import user_words  # noqa: E402
 from _lib import adaptive_policy as _adaptive_policy  # noqa: E402
 from _lib import shell_lex as _shell_lex  # noqa: E402
+from _lib.process_guard import install_hook_self_guard  # noqa: E402
 
 user_words.ensure_utf8_stdio()
 
@@ -108,6 +111,8 @@ PROMPT_MARKER_RE = re.compile(
     r"新开对话.*?提示词|复现与接续提示词)",
     re.IGNORECASE,
 )
+PENDING_DECISION_RE = re.compile(r"[\[<【［]\s*(?:请在此填入|待(?:用户)?拍板|待确认)\s*[\]>】］]")
+PENDING_DECISION_NOTICE = "交接文档仍有未填的决策项。请在【新对话提示词】保留待用户拍板状态，除非能引用后续明确的用户裁定。"
 
 DELEGATION_TOOLS = {"invoke_subagent", "define_subagent", "swarm", "schedule", "run_workflow"}
 AGY_TOOL_ALIASES = {
@@ -977,7 +982,7 @@ def _handoff_document_snapshot(path: Path, *, include_text: bool = False) -> Opt
                 != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
                 or (current.st_dev, current.st_ino) != (after.st_dev, after.st_ino)):
             return None
-        snapshot = {"path": resolved, "sha256": hashlib.sha256(data).hexdigest()}
+        snapshot = {"path": resolved, "sha256": hashlib.sha256(data).hexdigest(), "mtime_ns": after.st_mtime_ns}
         if include_text:
             snapshot["text"] = data.decode("utf-8-sig")
         return snapshot
@@ -985,29 +990,40 @@ def _handoff_document_snapshot(path: Path, *, include_text: bool = False) -> Opt
         return None
 
 
-def _record_handoff_baseline(state: Dict[str, Any], path: Path) -> None:
+def _record_handoff_baseline(state: Dict[str, Any], path: Path, transcript: Optional[Path] = None) -> None:
     baselines = state.setdefault("handoffFileBaselines", {})
     key = str(path.absolute())
     if key not in baselines:
-        snapshot = _handoff_document_snapshot(path)
+        snapshot = _handoff_document_snapshot(path, include_text=True)
         if snapshot is not None:
+            snapshot["pending_decision"] = bool(PENDING_DECISION_RE.search(snapshot.pop("text", "")))
+            if snapshot["pending_decision"] and transcript:
+                with suppress(OSError):
+                    snapshot["transcript_cursor"] = [str(transcript), transcript.stat().st_size]
             baselines[key] = snapshot
 
 
-def _has_valid_handoff_file(gate_state: Dict[str, Any], tickets=None) -> bool:
+def _has_valid_handoff_file(
+    gate_state: Dict[str, Any],
+    tickets=None,
+    transcript: Optional[Path] = None,
+    cwd: Any = None,
+    *,
+    check_decisions: bool = True,
+) -> bool:
     for raw_path, baseline in gate_state.get("handoffFileBaselines", {}).items():
         current = _handoff_document_snapshot(Path(raw_path), include_text=True)
         if (isinstance(baseline, dict) and current and current.get("path") == baseline.get("path")
                 and current.get("sha256") != baseline.get("sha256")
                 and _handoff_structure_present(current.get("text") or "")
-                and _workflow_handoff_present(current.get("text") or "", tickets or [])):
+                and _workflow_handoff_present(current.get("text") or "", tickets or [])
+                and (not check_decisions
+                     or not _pending_decision_promoted(gate_state, current.get("text") or "", transcript, cwd))):
             return True
     return False
 
 
-def _workflow_handoff_present(text: str, tickets) -> bool:
-    if not tickets:
-        return True
+def _handoff_prompt_body(text: str, *, subsections: bool = False) -> str:
     # 只核验提示词正文，正文之前提到票据或在其他章节列矩阵不能代替接力。
     lines = text.splitlines()
     start = None
@@ -1018,9 +1034,10 @@ def _workflow_handoff_present(text: str, tickets) -> bool:
         heading = re.sub(r"^(?:[-*+]\s+|\(?[0-9一二三四五六七八九十]+[.)、．]\s*)", "", heading).strip("#*【】[] \t")
         if PROMPT_MARKER_RE.fullmatch(heading):
             start, inline = i, tail[0] if tail else ""
+            level = len(re.match(r"^#*", line)[0]) or 1
             break
     if start is None:
-        return False
+        return ""
     body_lines = [inline]
     fence = ""
     for line in lines[start + 1:]:
@@ -1030,14 +1047,69 @@ def _workflow_handoff_present(text: str, tickets) -> bool:
                 fence = match[1]
             elif match[1][0] == fence[0] and len(match[1]) >= len(fence) and not match[2].strip():
                 fence = ""
-        if (not fence and re.match(r"^\s*#{1,6}\s+", line)
+        if (not fence and (heading := re.match(r"^\s*(#{1,6})\s+", line))
+                and (not subsections or len(heading[1]) <= level)
                 and not re.match(r"^\s*#### 流 .+（14 项完整参数明细）\s*$", line)):
             break
         body_lines.append(line)
+    return "\n".join(body_lines)
+
+
+def _pending_decision_promoted(state, reply, transcript, cwd):
+    prompt = _handoff_prompt_body(reply, subsections=True)
+    sections = re.split(r"(?m)^[ \t#*+-]*(?:已拍板|作者决定|用户已确认)[ \t*]*(?:[:：]|$)", prompt)[1:]
+    decisions = set()
+    for part in sections:
+        body = re.split(r"\n[ \t]*(?:#{1,6}\s|`{3,}|~{3,})", part, maxsplit=1)[0]
+        if not PENDING_DECISION_RE.search(body):
+            for item in re.split(r"[\n；;]+", body):
+                cleaned = re.sub(r"\s+", "", re.sub(r"^\s*(?:[-*+]|\d+[.)、])\s*", "", item)).strip("*`~-：:")
+                if cleaned:
+                    decisions.add(cleaned)
+    if not decisions:
+        return False
+    baselines = {Path(path): baseline for path, baseline in state.get("handoffFileBaselines", {}).items()}
+    for path in _claude_handoff_targets(["HANDOFF.md", "handoff.md"], str(cwd or "")):
+        baselines.setdefault(path, {"path": str(path.resolve())})
+    pending = []
+    for raw_path, baseline in baselines.items():
+        if not isinstance(baseline, dict):
+            continue
+        if baseline.get("pending_decision") or PENDING_DECISION_RE.search(baseline.get("text") or ""):
+            pending.append(baseline)
+        elif ((current := _handoff_document_snapshot(raw_path, include_text=True))
+              and current.get("path") == baseline.get("path") and PENDING_DECISION_RE.search(current.get("text") or "")):
+            pending.append(current)
+    if not pending:
+        return False
+    for offset, entry in _handoff_tail_entries(transcript):
+        for line in user_words.markdown_unquoted_lines(user_words.transcript_user_text(entry, transcript)):
+            choice = re.match(r"^(?:(?:我(?:已|明确)?)?(?:确认|同意|决定|批准|拍板)[，,:： \t]*(?:采用|选用|选择|使用|按)?|(?:请|就)?(?:采用|改用|选用|选择|使用|按))\s*(.+)", line)
+            value = re.sub(r"\s+", "", choice[1]).strip("。！!`*") if choice else ""
+            if not value or line.endswith(("?", "？")):
+                continue
+            supported = {decision for decision in decisions if re.search(re.escape(value) + r"(?![A-Za-z0-9])", decision)}
+            if not supported:
+                continue
+            try:
+                stamp = datetime.fromisoformat(entry.get("timestamp") or entry.get("created_at") or "").timestamp() * 10**9
+            except (ValueError, TypeError, OSError, OverflowError):
+                stamp = 0
+            if all(stamp > item.get("mtime_ns", float("inf")) or ((cursor := item.get("transcript_cursor"))
+                   and cursor[0] == str(transcript) and offset >= cursor[1]) for item in pending):
+                decisions.difference_update(supported)
+                if not decisions:
+                    return False
+    return True
+
+
+def _workflow_handoff_present(text: str, tickets) -> bool:
+    if not tickets:
+        return True
+    body = _handoff_prompt_body(text)
     def normalize(value):
         return re.sub(r"\s+", "", str(value).replace(r"\|", "|"))
 
-    body = "\n".join(body_lines)
     normalized = normalize(body)
     columns = ["流号", "子任务与范围", "通道", "客户端及子代理类型", "模型名字", "挡位", "上下文窗口",
                "是否无头", "是否净室", "访问模式、写入范围与验收命令", "内联与超时", "当前是否可用",
@@ -1048,7 +1120,7 @@ def _workflow_handoff_present(text: str, tickets) -> bool:
         if all(column in vertical for column in columns):
             rows.append([vertical[column] for column in columns])
 
-    for line in body_lines:
+    for line in body.split("\n"):
         if line.strip().startswith("|") and line.strip().endswith("|"):
             cells = re.split(r"(?<!\\)\|", line.strip())[1:-1]
             if len(cells) == 14:
@@ -1189,8 +1261,10 @@ def _reply_has_handoff_prompt(reply_text: str) -> bool:
         for pos in range(idx + 1, len(lines)):
             if not lines[pos].strip():
                 continue
-            if lines[pos].lstrip().startswith("#"):
-                break
+            if subheading := re.match(r"^\s*(#{1,6})\s+", lines[pos]):
+                if len(subheading[1]) <= (len(re.match(r"^#*", line)[0]) or 1):
+                    break
+                continue
             fence = user_words.MARKDOWN_FENCE_RE.match(lines[pos])
             if fence:
                 content = []
@@ -1798,7 +1872,7 @@ def check_pre_tool_use_locked(payload: Dict[str, Any], state_dir: Path,
                     save_gate_state(state_dir, conversation_id, gate_state)
                 return None
             resolved_target = str(_resolve_candidate_path(write_arg, cwd=cwd, workspace_paths=workspace_paths))
-            _record_handoff_baseline(gate_state, Path(resolved_target))
+            _record_handoff_baseline(gate_state, Path(resolved_target), transcript_path)
             save_gate_state(state_dir, conversation_id, gate_state)
             return None
 
@@ -1948,9 +2022,17 @@ def check_stop_handoff_locked(
         return {"decision": "allow"}
 
     missing_parts: List[str] = []
-    has_file = _has_valid_handoff_file(gate_state, tickets)
+    raw_transcript = payload.get("transcriptPath")
+    transcript = user_words.resolve_compact_transcript_path(Path(raw_transcript).expanduser()) if raw_transcript else None
+    cwd = payload.get("cwd")
+    promoted = _pending_decision_promoted(gate_state, latest_reply, transcript, cwd)
+    has_file = _has_valid_handoff_file(gate_state, tickets, transcript, cwd)
     has_prompt_inline = (_handoff_structure_present(latest_reply)
                          and _workflow_handoff_present(latest_reply, tickets))
+    if not promoted and not has_prompt_inline and not has_file and _has_valid_handoff_file(gate_state, tickets, check_decisions=False):
+        promoted = True
+    if promoted:
+        missing_parts.append(PENDING_DECISION_NOTICE)
     if not has_file and not has_prompt_inline:
         missing_parts.append(
             "尚未落盘非空交接文档，且最终回复未同时满足 4 项必需交接章节要素："
@@ -2394,12 +2476,11 @@ def _claude_tool_kind(payload: Dict[str, Any]) -> Tuple[str, List[Path]]:
     return "mutating_other", []
 
 
-def _extract_native_turn_latest_reply(transcript: Path, client: str) -> str:
-    """当 Stop 事件未携带 last_assistant_message 时，从轨迹提取当前回合最新助手文本回复。"""
+def _handoff_tail_entries(transcript):
     max_tail_bytes = 2 * 1024 * 1024
     try:
         if not transcript or not transcript.is_file():
-            return ""
+            return []
         with open(transcript, "rb") as stream:
             stream.seek(0, os.SEEK_END)
             size = stream.tell()
@@ -2407,22 +2488,29 @@ def _extract_native_turn_latest_reply(transcript: Path, client: str) -> str:
             stream.seek(start)
             buf = stream.read(max_tail_bytes)
     except OSError:
-        return ""
+        return []
     if start > 0:
         first_nl = buf.find(b"\n")
         buf = buf[first_nl + 1 :] if first_nl != -1 else b""
-    raw_lines = [line.rstrip(b"\r") for line in buf.split(b"\n")]
+        start += first_nl + 1
+    entries = []
+    for raw in buf.split(b"\n"):
+        try:
+            entry = json.loads(user_words.decode_jsonl_line(raw)) if raw.strip() else None
+        except (ValueError, RecursionError):
+            entry = None
+        if isinstance(entry, dict) and entry.get("isSidechain") is not True and entry.get("isMeta") is not True:
+            entries.append((start, entry))
+        start += len(raw) + 1
+    return entries
+
+
+def _extract_native_turn_latest_reply(transcript: Path, client: str) -> str:
+    """当 Stop 事件未携带 last_assistant_message 时，从轨迹提取当前回合最新助手文本回复。"""
+    entries = _handoff_tail_entries(transcript)
     if client == "claude":
         chunks: List[str] = []
-        for raw in reversed(raw_lines):
-            if not raw.strip():
-                continue
-            try:
-                entry = json.loads(user_words.decode_jsonl_line(raw))
-            except (ValueError, RecursionError):
-                continue
-            if not isinstance(entry, dict) or entry.get("isSidechain") is True or entry.get("isMeta") is True:
-                continue
+        for _, entry in reversed(entries):
             u_text, u_kind = user_words.claude_user_content(entry)
             if u_text and u_kind in ("user_input", "queued_command", "ask_question_answer"):
                 break
@@ -2450,24 +2538,10 @@ def _extract_native_turn_latest_reply(transcript: Path, client: str) -> str:
         return "\n".join(reversed(chunks)).strip()
 
     codex_chunks: List[str] = []
-    for index, raw in enumerate(raw_lines):
-        if not raw.strip():
-            continue
-        try:
-            entry = json.loads(user_words.decode_jsonl_line(raw))
-        except (ValueError, RecursionError):
-            continue
-        if not isinstance(entry, dict):
-            continue
+    for _, entry in entries:
         typ = entry.get("type")
         rec = entry.get("payload") if typ == "response_item" else None
-        is_user = typ == "USER_INPUT" or entry.get("source") == "USER_EXPLICIT"
-        if isinstance(rec, dict) and rec.get("type") == "message" and rec.get("role") == "user":
-            _, word = user_words._extract_codex_record(entry, index)
-            if word:
-                word["source_path"] = str(transcript)
-            is_user = bool(word and user_words._codex_word_from_record(word))
-        if is_user:
+        if typ == "USER_INPUT" or entry.get("source") == "USER_EXPLICIT" or user_words.transcript_user_text(entry, transcript):
             codex_chunks.clear()
             continue
         if isinstance(rec, dict) and rec.get("type") == "message" and rec.get("role") == "assistant":
@@ -2693,7 +2767,7 @@ def _handle_native_handoff(
                 response = _codex_context(event, notice)
             elif kind == "handoff_document":
                 for target in targets:
-                    _record_handoff_baseline(state, target)
+                    _record_handoff_baseline(state, target, transcript)
             if tool_id:
                 previous[tool_id] = response
                 state["toolDecisions"] = dict(list(previous.items())[-512:])
@@ -2701,17 +2775,22 @@ def _handle_native_handoff(
             reply = str(payload.get("last_assistant_message") or "")
             if not reply.strip():
                 reply = _extract_native_turn_latest_reply(transcript, client)
-            if ((_handoff_structure_present(reply) and _workflow_handoff_present(reply, tickets))
-                    or _has_valid_handoff_file(state, tickets)):
+            cwd = payload.get("cwd")
+            inline_ok = _handoff_structure_present(reply) and _workflow_handoff_present(reply, tickets)
+            file_ok = _has_valid_handoff_file(state, tickets, transcript, cwd)
+            promoted = _pending_decision_promoted(state, reply, transcript, cwd) or (
+                not inline_ok and not file_ok and _has_valid_handoff_file(state, tickets, check_decisions=False)
+            )
+            if not promoted and (inline_ok or file_ok):
                 state.update(phase="freeze", handoffRecorded=True)
                 response = {} if client == "claude" else {"continue": False, "stopReason": "已记录交接结构，结束当前回合；目标与后台任务状态须由用户/总控另行核对。"}
             elif payload.get("stop_hook_active") or state["stopCorrectionRequested"]:
-                state["phase"] = "freeze"
+                state.update(phase="freeze", handoffRecorded=False)
                 response = ({"systemMessage": "交接未通过结构检查，不能报告为已完成。"} if client == "claude" else
                             {"continue": False, "stopReason": "交接要素仍不完整，已停止本轮自动补正以防循环；请人工核对未完成事项。",
                              "systemMessage": "交接未通过结构检查，不能报告为已完成。"})
             else:
-                state["stopCorrectionRequested"] = True
+                state.update(stopCorrectionRequested=True, handoffRecorded=False)
                 four_elements = (
                     "请补齐以下 4 个必需交接章节要素后结束（本次仅补正一次）："
                     "① 已验证进展（含“已验证/已完成”）；"
@@ -2719,7 +2798,7 @@ def _handle_native_handoff(
                     "③ 未完成事项与下一步待办（含“未完成/待办/下一步”）；"
                     "④ 独立【新对话提示词】章节（如 `## 新对话提示词`，正文不少于 15 字且可直接复制粘贴）。"
                 )
-                response = {"decision": "block", "reason": notice + four_elements}
+                response = {"decision": "block", "reason": notice + (PENDING_DECISION_NOTICE if promoted else four_elements)}
         save_gate_state(state_dir, sid, state)
         return response
 
@@ -2735,6 +2814,11 @@ def _default_native_state_dir(client: str) -> Path:
 
 
 def main() -> None:
+    with install_hook_self_guard(HOOKS_DIR):
+        _main_inner()
+
+
+def _main_inner() -> None:
     parser = argparse.ArgumentParser(description="Codex & Claude Code 长会话交接事件适配；反重力使用既有模块接口")
     parser.add_argument("--client", choices=("codex", "claude"), required=True)
     parser.add_argument("--mode", choices=("advisory", "enforce", "off"), default=None)

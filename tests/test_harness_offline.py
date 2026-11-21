@@ -89,6 +89,7 @@ class HarnessTests(unittest.TestCase):
             if not _is_stripped_host_env(k)
         }
         clean_env['USER_GUARD_STATE_DIR'] = str(self.root / 'state')
+        clean_env['LOCALAPPDATA'] = str(self.root / 'local-app-data')
         env_patch = patch.dict(os.environ, clean_env, clear=True)
         env_patch.start()
         self.addCleanup(env_patch.stop)
@@ -363,9 +364,10 @@ class HarnessTests(unittest.TestCase):
             def run(command, cwd, input_text, timeout_sec, **kwargs):
                 self.assertEqual(cwd, self.root)
                 self.assertEqual(input_text, '审查输入')
-                self.assertEqual(command[:4], ['claude.exe', '-p', '--output-format', 'json'])
+                self.assertEqual(command[:5], ['claude.exe', '-p', '--output-format', 'stream-json', '--verbose'])
                 self.assertEqual(json.loads(command[command.index('--json-schema') + 1]), harness.TASK_JSON_SCHEMA)
-                self.assertIn('--no-session-persistence', command)
+                self.assertRegex(command[command.index('--session-id') + 1], r'^[a-f0-9-]{36}$')
+                self.assertNotIn('--no-session-persistence', command)
                 self.assertNotIn('--bare', command)
                 self.assertEqual(command[command.index('--effort') + 1], 'max')
                 self.assertEqual(kwargs['env']['CLAUDE_CONFIG_DIR'], engines['claude']['config_home'])
@@ -803,7 +805,7 @@ assert sys.stdin.readline() == ''
              patch.object(harness, 'run_process', return_value=response) as runner:
             code, report = self.capture(harness.cmd_assess, self.args('assess', '--discover-models'))
         self.assertEqual(code, 0)
-        runner.assert_called_once_with(['agy', 'models'], Path.cwd(), timeout_sec=30)
+        runner.assert_called_once_with(['agy', 'models'], Path.cwd(), timeout_sec=30, check=False)
         agy = report['backends']['agy']
         self.assertEqual(agy['verified_status'], 'model_listing_only')
         self.assertEqual(agy['model_catalog']['timestamp_source'], 'cli_query_time_utc')
@@ -956,7 +958,7 @@ assert sys.stdin.readline() == ''
             self.assertNotIn(prompt, command)
             self.assertEqual(json.loads(input_text)['message']['content'], prompt)
             self.assertEqual(command[command.index('--agent') + 1], 'readonly-collaborator')
-            self.assertEqual(command[command.index('--print-timeout') + 1], '600s')
+            self.assertEqual(command[command.index('--print-timeout') + 1], '510s')
             self.assertNotIn('--dangerously-skip-permissions', command)
             self.assertEqual(kwargs['env']['CAE_HARNESS_DEPTH'], '1')
             stream = '\n'.join([
@@ -2289,7 +2291,7 @@ else:
             engines['agy']['config_home'] = str(self.root / ('agy-' + str(index)))
             with self.subTest(stderr=stderr), patch.object(harness, 'run_process', return_value=subprocess.CompletedProcess([], 0, output, stderr)):
                 with self.assertRaises(harness.HarnessError) as caught:
-                    harness.invoke_engine('agy:default', self.root, 'review', engines, harness.TASK_JSON_SCHEMA)
+                    harness.invoke_engine('agy:default', self.root, 'review', engines, harness.TASK_JSON_SCHEMA, timeout_sec=30)
                 self.assertEqual(caught.exception.status, expected)
                 self.assertEqual(harness._load_active_quota_cooldown('agy', engines['agy']) is not None, expected == 'quota_exhausted')
         engines = backends()
@@ -4024,7 +4026,7 @@ else:
     def test_wp1_wall_clock_staging_timeout_prevents_launch_and_flags_not_suspended(self):
         engines = self.four_backends()
         (self.root / 'a.py').write_text('x=1', encoding='utf-8')
-        with patch.object(harness.time, 'monotonic', side_effect=[0, 11]), \
+        with patch.object(harness.time, 'monotonic', side_effect=[0, 11, 11]), \
              patch.object(harness, 'run_process') as never, self.assertRaises(harness.HarnessError) as caught:
             harness.invoke_engine('codex:default', self.root, '读', engines, harness.TASK_JSON_SCHEMA, timeout_sec=10)
         self.assertEqual(caught.exception.status, 'timeout')
@@ -6479,6 +6481,394 @@ else:
         self.assertTrue(by_id['S2']['verification_executed'])
         dumped = json.loads(env_dump.read_text(encoding='utf-8'))
         self.assertEqual(dumped, {'depth': '1', 'git_dir': None, 'agy_cid': None})
+
+    def test_v118_process_streams_survive_timeout_cancellation_and_failure(self):
+        child = ('import os,sys,time\n'
+                 'print(os.environ["PAGER"], os.environ["GCM_INTERACTIVE"], os.environ["HWLOC_COMPONENTS"], flush=True)\n'
+                 'print("diagnostic", file=sys.stderr, flush=True)\n')
+        for status, tail in (('timeout', 'time.sleep(30)'), ('cancelled', 'time.sleep(30)'), ('failed', 'sys.exit(7)')):
+            with self.subTest(status=status):
+                timer = threading.Timer(0.8, harness._CANCELLED.set) if status == 'cancelled' else None
+                if timer:
+                    timer.start()
+                try:
+                    with self.assertRaises(harness.HarnessError) as caught:
+                        harness.run_process([sys.executable, '-B', '-c', child + tail], self.root,
+                                            input_text='x' * (1024 * 1024), timeout_sec=1.5)
+                    self.assertEqual(caught.exception.status, status)
+                    details = caught.exception.details
+                    self.assertEqual(details['partial_stdout'].strip(), 'cat never -gl')
+                    self.assertEqual(details['partial_stderr'].strip(), 'diagnostic')
+                    if status == 'failed':
+                        self.assertEqual(details['returncode'], 7)
+                finally:
+                    if timer:
+                        timer.cancel()
+                        timer.join()
+                    harness._CANCELLED.clear()
+
+    def test_v118_soft_timeout_wrapup_and_complete_schema_before_resume(self):
+        events = '\n'.join((json.dumps({'type': 'thread.started', 'thread_id': 'session-soft'}),
+                            json.dumps({'type': 'turn.completed', 'usage': {'input_tokens': 30, 'output_tokens': 10}})))
+        for valid in (False, True):
+            now = [0]
+            receipt = {}
+
+            def run(argv, cwd, prompt, timeout, **kwargs):
+                output = Path(argv[argv.index('-o') + 1])
+                if 'resume' not in argv:
+                    self.assertEqual(timeout, 90)
+                    self.assertNotIn('--ephemeral', argv)
+                    output.write_text(json.dumps(TASK) if valid else json.dumps(TASK)[:-1], encoding='utf-8')
+                    now[0] = 91
+                    raise harness.HarnessError('deadline', 'timeout', process_started=True, partial_stdout=events)
+                self.assertEqual(argv[argv.index('resume') + 1], 'session-soft')
+                self.assertEqual(argv[argv.index('-s') + 1], 'read-only')
+                self.assertIn('停止工具调用', prompt)
+                self.assertEqual(timeout, 29)
+                output.write_text(json.dumps(TASK), encoding='utf-8')
+                usage = {'type': 'turn.completed', 'usage': {'input_tokens': 7, 'output_tokens': 3}}
+                return subprocess.CompletedProcess(argv, 0, json.dumps(usage), '')
+
+            with self.subTest(valid=valid), patch.object(harness.time, 'monotonic', side_effect=lambda: now[0]), \
+                 patch.object(harness, 'run_process', side_effect=run) as process:
+                result = harness.invoke_engine('codex:default', self.root, '继续推导', backends(), harness.TASK_JSON_SCHEMA,
+                                               readonly=False, timeout_sec=120, receipt=receipt)
+            self.assertEqual(result, TASK)
+            self.assertEqual(receipt['provider_session_id'], 'session-soft')
+            self.assertEqual(process.call_count, 1 if valid else 2)
+            self.assertEqual(receipt.get('soft_timeout_wrapup', False), not valid)
+            self.assertEqual(receipt['token_usage']['total_tokens'], 40 if valid else 50)
+
+    def test_v118_native_session_arguments_and_ephemeral_opt_out(self):
+        providers = (
+            ('agy', '--conversation', {'event': 'init', 'conversation_id': 'agy-s1'},
+             {'event': 'result', 'result': {'structured_output': TASK}}),
+            ('claude', '--resume', {'type': 'system', 'subtype': 'init', 'session_id': 'claude-s1'},
+             {'type': 'result', 'structured_output': TASK}),
+            ('dsh', '--session-id', {'type': 'session', 'sessionId': 'dsh-s1'},
+             {'type': 'final', 'reason': {'kind': 'completed'}, 'text': json.dumps(TASK)}),
+        )
+        for provider, resume_flag, init, final in providers:
+            for ephemeral in (True, False):
+                with self.subTest(provider=provider, ephemeral=ephemeral):
+                    receipt, now = {}, [0]
+
+                    def run(argv, cwd, prompt, timeout, **kwargs):
+                        if resume_flag in argv:
+                            self.assertEqual(argv[argv.index(resume_flag) + 1], provider + '-s1')
+                            if provider == 'claude':
+                                self.assertIn('--tools', argv)
+                            return subprocess.CompletedProcess(argv, 0, json.dumps(final), '')
+                        if provider == 'claude':
+                            self.assertEqual('--no-session-persistence' in argv, ephemeral)
+                            self.assertEqual('--session-id' in argv, not ephemeral)
+                        if provider == 'dsh':
+                            patch = Path(argv[argv.index('--patch') + 1]).read_text(encoding='utf-8')
+                            self.assertIn('compression: none', patch)
+                        now[0] = 90
+                        raise harness.HarnessError('deadline', 'timeout', process_started=True, partial_stdout=json.dumps(init))
+
+                    with patch.object(harness.time, 'monotonic', side_effect=lambda: now[0]), \
+                         patch.object(harness, 'run_process', side_effect=run) as process, \
+                         patch.object(harness, '_prepare_execution'):
+                        invoke = lambda: harness.invoke_engine(provider + ':default', self.root, '复核', self.four_backends(),
+                                                               harness.TASK_JSON_SCHEMA, timeout_sec=120, receipt=receipt,
+                                                               ephemeral=ephemeral)
+                        if ephemeral:
+                            with self.assertRaises(harness.HarnessError) as caught:
+                                invoke()
+                            self.assertEqual(caught.exception.status, 'timeout')
+                            self.assertIsNone(receipt['provider_session_id'])
+                            self.assertFalse(receipt['timeout_salvage']['resumable'])
+                        else:
+                            self.assertEqual(invoke(), TASK)
+                            self.assertEqual(receipt['provider_session_id'], provider + '-s1')
+                        self.assertEqual(process.call_count, 1 if ephemeral else 2)
+
+    def test_v118_hard_timeout_archives_rollout_and_followup_restores_it(self):
+        root = self.root / 'work'
+        root.mkdir()
+        source = root / 'flux.py'
+        source.write_text('x = 1\n', encoding='utf-8')
+        sessions = self.root / 'plans'
+        receipt_file = self.root / 'receipt.json'
+        sid = 'codex-fixture-s1'
+        rollout = Path('sessions') / 'rollout-2026-11-21T09-00-00-' / f'rollout-{sid}.jsonl'
+        failure = harness.HarnessError('deadline', 'timeout', process_started=True, partial_stderr='diagnostic')
+
+        def run(argv, cwd, prompt, timeout, *, env, **kwargs):
+            trace = Path(env['CODEX_HOME']) / rollout
+            if 'resume' in argv:
+                self.assertTrue(trace.is_file())
+                self.assertEqual(argv[argv.index('resume') + 1], sid)
+                self.assertEqual(cwd, root)
+                self.assertEqual(argv[argv.index('-s') + 1], 'workspace-write')
+                self.assertIn('核对局部守恒', prompt)
+                Path(argv[argv.index('-o') + 1]).write_text(json.dumps(TASK), encoding='utf-8')
+                usage = {'type': 'turn.completed', 'usage': {'input_tokens': 12, 'output_tokens': 4}}
+                return subprocess.CompletedProcess(argv, 0, json.dumps(usage), '')
+            trace.parent.mkdir(parents=True)
+            rows = [
+                {'type': 'session_meta', 'payload': {'id': sid}},
+                {'type': 'item.completed', 'item': {'type': 'command_execution', 'command': 'cat flux.py', 'exit_code': 0}},
+                {'type': 'event_msg', 'payload': {'type': 'token_count', 'info': {'total_token_usage': {
+                    'input_tokens': 110, 'cached_input_tokens': 20, 'output_tokens': 33}}}},
+                {'type': 'response_item', 'payload': {'type': 'message', 'role': 'assistant', 'content': [
+                    {'type': 'output_text', 'text': '已有中间结论'}]}},
+            ]
+            trace.write_text('\n'.join(map(json.dumps, rows)), encoding='utf-8')
+            source.write_text('x = 2\n', encoding='utf-8')
+            raise failure
+
+        args = self.args('task', '--target', str(root), '--kind', 'code', '--engine', 'codex:default',
+                         '--task', '修改通量', '--write-scope', 'flux.py', '--isolation', 'no_skills',
+                         '--timeout', '30', '--plan-dir', str(sessions), '--output', str(receipt_file))
+        with patch.object(harness, '_args_backends', side_effect=lambda *a, **k: backends()), \
+             patch.object(harness, 'run_process', side_effect=run):
+            rc, report = self.capture(harness.cmd_task, args)
+            self.assertEqual(rc, 124)
+            self.assertEqual(report['token_usage']['usage_source'], 'cli_partial_on_timeout')
+            self.assertEqual(report['token_usage_summary']['total_tokens'], 143)
+            salvage = report['timeout_salvage']
+            self.assertEqual(salvage, failure.details['timeout_salvage'])
+            self.assertEqual(salvage['changed_files_on_disk'], ['flux.py'])
+            self.assertEqual(salvage['actual_files_read'], ['flux.py'])
+            self.assertEqual(salvage['provider_session_id'], sid)
+            self.assertEqual(salvage['last_messages'], ['已有中间结论'])
+            self.assertTrue(salvage['resumable'])
+            store = sessions / 'headless_sessions' / 'codex' / report['invocation']['session_store_id']
+            self.assertTrue((store / rollout).is_file())
+            rc, followup = self.capture(harness.cmd_followup, self.args(
+                'followup', '--receipt', str(receipt_file), '--task', '核对局部守恒', '--timeout', '30'))
+        self.assertEqual(rc, 0)
+        self.assertEqual(followup['provider_session_id'], sid)
+        self.assertEqual(followup['token_usage_summary']['total_tokens'], 16)
+        self.assertEqual(followup['changed_files'], [])
+
+    def test_v118_followup_selects_stream_and_checks_readonly_snapshot(self):
+        file = self.root / 'model.py'
+        file.write_text('x = 1\n', encoding='utf-8')
+        receipt = self.root / 'batch.json'
+        inv = {'target_dir': str(self.root), 'engine': 'codex:default', 'readonly': True}
+        receipt.write_text(json.dumps({'streams': [
+            {'stream_id': 'first', 'invocation': {**inv, 'provider_session_id': 'first-id'}},
+            {'stream_id': 'second', 'invocation': {**inv, 'provider_session_id': 'second-id'}},
+        ]}), encoding='utf-8')
+        question = self.root / 'question.txt'
+        question.write_text('核对残差定义', encoding='utf-8-sig')
+
+        def run(argv, cwd, prompt, timeout, **kwargs):
+            self.assertEqual(argv[argv.index('resume') + 1], 'second-id')
+            self.assertEqual(argv[argv.index('-s') + 1], 'read-only')
+            self.assertIn('核对残差定义', prompt)
+            file.write_text('x = 2\n', encoding='utf-8')
+            Path(argv[argv.index('-o') + 1]).write_text(json.dumps(TASK), encoding='utf-8')
+            return subprocess.CompletedProcess(argv, 0, '', '')
+
+        with patch.object(harness, '_args_backends', return_value=backends()), patch.object(harness, 'run_process', side_effect=run):
+            rc, report = self.capture(harness.cmd_followup, self.args(
+                'followup', '--receipt', str(receipt), '--stream', 'second', '--task-file', str(question)))
+        self.assertEqual(rc, 1)
+        self.assertEqual(report['status'], 'scope_violation')
+        self.assertEqual(report['scope_violations'], ['model.py'])
+
+    def test_v118_exact_input_envelope_and_citation_audit(self):
+        for relative, content in (('src/flux.py', 'x=1\nx=2\n'), ('notes/setup.md', 'notes\n'), ('reserved.py', 'outside')):
+            file = self.root / relative
+            file.parent.mkdir(exist_ok=True)
+            file.write_text(content, encoding='utf-8')
+        envelope = ('--files', 'src/flux.py', '--files', 'notes/setup.md', '--negative-scope-file', 'reserved.py')
+        args = self.args('plan', '--target', str(self.root), '--engine', 'codex:default', *envelope)
+        streams, _ = harness._resolve_plan_streams(args, [{'env_contract': '只用指定网格'}], backends())
+        self.assertEqual(streams[0]['files'], ['src/flux.py', 'notes/setup.md'])
+        self.assertEqual(streams[0]['file_count'], 2)
+        self.assertEqual(streams[0]['negative_scope_files'], ['reserved.py'])
+        self.assertEqual(streams[0]['env_contract'], '只用指定网格')
+        with self.assertRaises(harness.HarnessError):
+            harness._resolve_plan_streams(args, [{'files': ['../outside.py']}], backends())
+        with self.assertRaises(harness.HarnessError):
+            harness._literal_input_path('/outside.py')
+
+        def run(argv, cwd, prompt, timeout, **kwargs):
+            staged = {p.relative_to(cwd).as_posix() for p in cwd.rglob('*') if p.is_file()}
+            self.assertEqual(staged, {'src/flux.py', 'notes/setup.md'})
+            self.assertIn('禁止修改：reserved.py', prompt)
+            self.assertNotIn('=== FILE:', prompt)
+            evidence = ['src/flux.py#L1-L2', 'notes/setup.md:1-99']
+            Path(argv[argv.index('-o') + 1]).write_text(
+                json.dumps({**TASK, 'content': '正文引用 ghost.py#L3-L4', 'evidence': evidence}), encoding='utf-8')
+            read = {'type': 'item.completed', 'item': {'type': 'command_execution', 'command': 'cat src/flux.py', 'exit_code': 0}}
+            return subprocess.CompletedProcess(argv, 0, json.dumps(read), '')
+
+        with patch.object(harness, '_args_backends', return_value=backends()), patch.object(harness, 'run_process', side_effect=run):
+            rc, report = self.capture(harness.cmd_task, self.args(
+                'task', '--target', str(self.root), '--kind', 'math', '--engine', 'codex:default',
+                '--task', '核对行号', '--clean-room', '--no-inline-readonly', *envelope))
+        self.assertEqual(rc, 0)
+        citation = report['citation_audit']
+        self.assertEqual(citation['actual_files_read'], ['src/flux.py'])
+        self.assertEqual(citation['missing_files'], ['ghost.py'])
+        self.assertEqual(citation['unopened_cited_files'], ['ghost.py', 'notes/setup.md'])
+        self.assertEqual(citation['out_of_range_lines'], [
+            {'file': 'notes/setup.md', 'line_start': 1, 'line_end': 99, 'line_count': 1}])
+
+    def test_v118_batch_wave_barrier_and_disjoint_scopes(self):
+        root = self.root / 'work'
+        root.mkdir()
+        for name in ('a.py', 'b.py'):
+            (root / name).write_text('old\n', encoding='utf-8')
+        fixture = self.root / 'batch.json'
+        base = {'target': str(root), 'engine': 'codex:default', 'kind': 'code'}
+        fixture.write_text(json.dumps([
+            {**base, 'stream_id': 'blocked', 'wave': 2, 'write_scope': ['a.py'], 'subtask': 'Blocked'},
+            {**base, 'stream_id': 'a', 'write_scope': ['a.py'], 'files': ['a.py', 'b.py'],
+             'negative_scope_files': ['reserved.py'], 'env_contract': '使用离线夹具', 'subtask': 'Alpha'},
+            {**base, 'stream_id': 'b', 'write_scope': ['b.py'], 'subtask': 'Beta'},
+            {**base, 'stream_id': 'read', 'kind': 'review', 'wave': 2, 'subtask': 'Observe'},
+        ]), encoding='utf-8')
+        barrier = threading.Barrier(2, timeout=5)
+
+        def run(spec, cwd, prompt, *args, **kwargs):
+            if 'Observe' in prompt:
+                self.assertEqual((root / 'a.py').read_text(encoding='utf-8'), 'new\n')
+                return TASK
+            self.assertNotIn('Blocked', prompt)
+            name = 'a.py' if 'Alpha' in prompt else 'b.py'
+            if name == 'a.py':
+                self.assertEqual(kwargs['stage_files'], ['a.py', 'b.py'])
+                self.assertIn('环境约定：使用离线夹具', prompt)
+                self.assertIn('禁止修改：reserved.py', prompt)
+            barrier.wait()
+            (cwd / name).write_text('new\n', encoding='utf-8')
+            barrier.wait()
+            if name == 'b.py':
+                raise harness.HarnessError('fixture failed')
+            return TASK
+
+        with patch.object(harness, '_args_backends', return_value=backends()), patch.object(harness, 'invoke_engine', side_effect=run) as engine:
+            rc, report = self.capture(harness.cmd_batch, self.args('batch', '--spec-file', str(fixture)))
+        self.assertEqual(rc, 3)
+        self.assertEqual(engine.call_count, 3)
+        self.assertEqual([s['status'] for s in report['streams']], ['upstream_wave_failed', 'ok', 'failed', 'ok'])
+        self.assertEqual(report['streams'][1]['changed_files'], ['a.py'])
+        self.assertEqual(report['streams'][2]['changed_files'], ['b.py'])
+
+    def test_v118_wsl_interop_plan_rejects_writes_before_launch(self):
+        engines = backends()
+        engines['codex'].update(windows_interop=True)
+        for kind in ('code', 'gate', 'review'):
+            args = self.args('plan', '--kind', kind, '--target', str(self.root), '--engine', 'codex:default')
+            with self.subTest(kind=kind), patch.object(harness, '_wsl_path', return_value=r'\\wsl.localhost\Ubuntu\work'):
+                if kind == 'review':
+                    streams, _ = harness._resolve_plan_streams(args, [{}], engines)
+                    self.assertTrue(streams[0]['currently_available'])
+                else:
+                    with self.assertRaises(harness.HarnessError) as caught:
+                        harness._resolve_plan_streams(args, [{}], engines)
+                    self.assertEqual(caught.exception.status, 'wsl_interop_write_unsupported')
+
+    def test_v118_grounding_samples_large_anchors_and_prunes_archives(self):
+        with (self.root / 'results.json').open('wb') as data:
+            data.write(b'{"first_anchor": 1, ')
+            data.seek(1024 ** 2)
+            data.write(b'"unseen_middle": 5, ')
+            data.seek(3 * 1024 ** 2)
+            data.write(b'"last_anchor": 9}')
+        for directory in ('archive', 'archive_2025', 'outdated_old', '.micromamba', 'conda-meta'):
+            site = self.root / directory
+            site.mkdir()
+            (site / 'input.py').write_text('archived_value = 1\n', encoding='utf-8')
+        anchor = harness._build_grounding_anchor(self.root, set())
+        self.assertTrue({'first_anchor', 'last_anchor'} <= anchor['words'])
+        self.assertTrue({'archived_value', 'unseen_middle'}.isdisjoint(anchor['words']))
+        self.assertNotIn('input.py', anchor['repo_names'])
+        selected = harness._build_grounding_anchor(self.root, set(), target=self.root / 'archive_2025' / 'input.py')
+        self.assertIn('archived_value', selected['words'])
+        self.assertIn('archive_2025/input.py', selected['repo_names'])
+        self.assertNotIn('archive/input.py', selected['repo_names'])
+
+    def test_v118_hardening_cleanup_errors_archive_and_unclaimed_peer_writes(self):
+        # 1. cleanup_errors blocks soft-timeout wrapup
+        calls = 0
+
+        def dirty_timeout(argv, cwd, prompt, timeout, **kwargs):
+            nonlocal calls
+            calls += 1
+            raise harness.HarnessError(
+                'timeout', 'timeout',
+                partial_stdout=json.dumps({'type': 'thread.started', 'thread_id': 'codex-fixture-s2'}),
+                partial_stderr='', cleanup_errors=['tree_leftover'],
+            )
+
+        receipt = {}
+        with patch.object(harness, 'run_process', side_effect=dirty_timeout):
+            with self.assertRaises(harness.HarnessError) as caught:
+                harness.invoke_engine('codex:default', self.root, 'check', backends(), harness.TASK_JSON_SCHEMA, True, 180, receipt=receipt)
+        self.assertEqual(calls, 1)
+        self.assertEqual(caught.exception.details.get('cleanup_errors'), ['tree_leftover'])
+
+        # 2. Unclaimed peer-scope violation is restored at wave barrier & WSL /mnt/ casefold
+        work = self.root / 'peer_violation'
+        work.mkdir()
+        for name in ('a.py', 'b.py'):
+            (work / name).write_text('old\n', encoding='utf-8')
+        self.assertTrue(harness._scope_matches('Src/Flux.py', ['src/flux.py'], casefold=True))
+        spec = self.root / 'peer_spec.json'
+        base = {'target': str(work), 'engine': 'codex:default', 'kind': 'code'}
+        spec.write_text(json.dumps([
+            {**base, 'stream_id': 'a', 'write_scope': ['a.py'], 'subtask': 'Sneaky'},
+            {**base, 'stream_id': 'b', 'write_scope': ['b.py'], 'subtask': 'Idle'},
+        ]), encoding='utf-8')
+        sneaky_wrote = threading.Event()
+        idle_entered = threading.Event()
+        orig_snap = harness.snapshot_files
+
+        def synced_snap(root_dir, *args, **kwargs):
+            if threading.current_thread().name.endswith('_1'):
+                sneaky_wrote.wait(5)
+                snap = orig_snap(root_dir, *args, **kwargs)
+                idle_entered.set()
+                return snap
+            return orig_snap(root_dir, *args, **kwargs)
+
+        def run_sneaky(engine_spec, cwd, prompt, *args, **kwargs):
+            if 'Sneaky' in prompt:
+                (cwd / 'a.py').write_text('new\n', encoding='utf-8')
+                (cwd / 'b.py').write_text('tampered\n', encoding='utf-8')
+                sneaky_wrote.set()
+                idle_entered.wait(5)
+            return TASK
+
+        with (
+            patch.object(harness, '_args_backends', return_value=backends()),
+            patch.object(harness, 'snapshot_files', side_effect=synced_snap),
+            patch.object(harness, 'invoke_engine', side_effect=run_sneaky),
+        ):
+            rc, report = self.capture(harness.cmd_batch, self.args('batch', '--spec-file', str(spec)))
+        self.assertEqual(rc, 3)
+        self.assertEqual(report['streams'][0]['status'], 'scope_violation')
+        self.assertIn('b.py', report['streams'][0]['scope_violations'])
+
+        # 3. followup restores <TEMP> and accepts left-S1 alias
+        audit_receipt = self.root / 'audit_receipt.json'
+        temp_proj = Path(tempfile.gettempdir()) / f'followup_proj_{os.getpid()}'
+        temp_proj.mkdir(exist_ok=True)
+        try:
+            audit_receipt.write_text(json.dumps({
+                'completed_units': [{
+                    'side': 'left', 'shard_id': 1, 'readonly': True, 'engine': 'codex:default',
+                    'target_dir': f'<TEMP>/{temp_proj.name}',
+                    'invocation': {'provider_session_id': 'codex-fixture-left1'},
+                }],
+            }), encoding='utf-8')
+            rc_dry, dry_rep = self.capture(harness.cmd_followup, self.args(
+                'followup', '--receipt', str(audit_receipt), '--stream', 'left-S1', '--dry-run', '--task', 'ping'))
+            self.assertEqual(rc_dry, 0)
+            self.assertTrue(dry_rep['dry_run'])
+        finally:
+            if temp_proj.exists():
+                temp_proj.rmdir()
 
 
 if __name__ == '__main__':

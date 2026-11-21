@@ -400,6 +400,10 @@
       }
     },
     "loop_guards": {
+      "hook_safety": {
+        "max_rss_mib": 1024,
+        "wall_timeout_sec": 12
+      },
       "reply_repeat": {
         "max_short_reply_chars": 300,
         "tail_scan_kib": 256,
@@ -422,6 +426,12 @@
       }
     },
     "headless_dispatch": {
+      "persist_sessions_by_default": true,
+      "soft_timeout_ratio": 0.85,
+      "wrapup_min_sec": 30,
+      "wrapup_max_sec": 90,
+      "grounding_max_anchor_file_mib": 2,
+      "grounding_excluded_dirs": [".micromamba", ".toolchain", "conda-meta", "archive", "archived", "outdated"],
       "input_budget_safety_ratio": 0.9,
       "unlisted_window_fallback_tokens": 120000,
       "default_shard_tokens": 120000,

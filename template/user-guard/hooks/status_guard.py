@@ -39,6 +39,7 @@ HOOKS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(HOOKS_DIR))
 import handoff_gate  # noqa: E402
 import user_words  # noqa: E402
+from _lib.process_guard import apply_noninteractive_env, install_hook_self_guard  # noqa: E402
 from _lib import shell_lex as _shell_lex  # noqa: E402
 
 user_words.ensure_utf8_stdio()
@@ -1034,7 +1035,7 @@ def _is_wsl_standard_temp_path(target: str, distribution: str) -> bool:
         result = subprocess.run(
             [str(executable), *selector, "--exec", "/usr/bin/python3", "-B", "-I", "-c", WSL_TEMP_CHECK],
             input=json.dumps([target]).encode("utf-8"), capture_output=True, timeout=2,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), env=apply_noninteractive_env(dict(os.environ)),
         )
         return result.returncode == 0 and json.loads(result.stdout) == [target]
     except (OSError, subprocess.TimeoutExpired, ValueError):
@@ -3551,17 +3552,8 @@ def _native_turn_snapshot(payload: Dict[str, Any], *, all_turns=False) -> Tuple[
                 if not isinstance(entry, dict):
                     continue
                 typ = entry.get("type")
-                explicit = typ == "USER_INPUT" or entry.get("source") == "USER_EXPLICIT"
-                if typ == "user":
-                    text, kind = user_words.claude_user_content(entry)
-                    explicit = bool(text and kind in ("user_input", "queued_command"))
                 rec = entry.get("payload") if typ == "response_item" else None
-                if isinstance(rec, dict) and rec.get("type") == "message" and rec.get("role") == "user":
-                    _, word = user_words._extract_codex_record(entry, index)
-                    if word:
-                        word["source_path"] = str(path)
-                    explicit = bool(word and user_words._codex_word_from_record(word))
-                if explicit:
+                if typ == "USER_INPUT" or entry.get("source") == "USER_EXPLICIT" or user_words.transcript_user_text(entry, path):
                     _settle_open_batch()
                     turn = "turn_" + hashlib.sha256(str(index).encode("ascii") + b":" + line).hexdigest()[:24]
                     if not all_turns:
@@ -3921,14 +3913,15 @@ def _check_dispatch_locked(payload, tool_name, args, sid, state_dir):
             ]
             if "cae_harness.py" in names and (names[0] == "cae_harness.py" or re.fullmatch(r"(?:python(?:[0-9.]+)?|py)", names[0])):
                 tail = tokens[names.index("cae_harness.py") + 1:]
-                code_task = tail[:1] == ["task"] and ("--kind=code" in tail or any(
+                task_like = tail[:1] in (["task"], ["followup"])
+                code_task = task_like and ("--kind=code" in tail or any(
                     tail[i:i+2] == ["--kind", "code"] for i in range(len(tail))))
                 profile = user_words.load_fleet_profile(HOOKS_DIR)
                 config = profile.get("dispatch_confirmation") or profile.get("runtime_tunables", {}).get("dispatch_confirmation", {})
                 try:
                     limit = float(config.get("heavy_max_light_timeout_sec", 600))
                     default_timeout = profile.get("runtime_tunables", {}).get("headless_dispatch", {}).get("default_timeout_sec", 600)
-                    long_task = tail[:1] == ["task"] and float(_dispatch_option(tail, "--timeout") or default_timeout) > limit
+                    long_task = task_like and float(_dispatch_option(tail, "--timeout") or default_timeout) > limit
                 except (TypeError, ValueError, OverflowError):
                     long_task = False
                 large_target = False
@@ -3939,8 +3932,36 @@ def _check_dispatch_locked(payload, tool_name, args, sid, state_dir):
                 plan_dir_arg = _dispatch_option(tail, "--plan-dir")
                 custom_plan_dir = base / Path(plan_dir_arg).expanduser() if plan_dir_arg else None
                 extra_plan_dirs = (custom_plan_dir,) if custom_plan_dir is not None else ()
-                target_arg = _dispatch_option(tail, "--target") or "."
-                if tail[:1] == ["task"] and "--dry-run" not in tail:
+                explicit_target = _dispatch_option(tail, "--target")
+                receipt_arg = _dispatch_option(tail, "--receipt") if tail[:1] == ["followup"] else None
+                skip_target_metrics = False
+                if receipt_arg and "--dry-run" not in tail:
+                    r_text = receipt_arg.replace("<HOME>", str(Path.home())).replace("<TEMP>", tempfile.gettempdir())
+                    r_doc = user_words._read_state_json(base / Path(r_text).expanduser())
+                    stream_opt = _dispatch_option(tail, "--stream")
+                    if not isinstance(r_doc, dict):
+                        code_task = True
+                    else:
+                        r_streams = (r_doc.get("streams") if isinstance(r_doc.get("streams"), list)
+                                     else (list(r_doc.get("completed_units", [])) + list(r_doc.get("errors", [])))
+                                     if ("completed_units" in r_doc or "errors" in r_doc)
+                                     else r_doc.get("history") if isinstance(r_doc.get("history"), list) else [r_doc])
+                        matched_ro = []
+                        for item in r_streams:
+                            if not isinstance(item, dict):
+                                continue
+                            def_id = f'{item["side"]}:{item.get("shard_id")}' if "side" in item else f'S{item.get("round", 1)}'
+                            alt_id = f'{item["side"]}-S{item.get("shard_id")}' if "side" in item else ""
+                            item_sid = str(item.get("stream_id") or def_id)
+                            prev = {**item, **(item.get("invocation") or {})}
+                            if prev.get("provider_session_id") and (not stream_opt or stream_opt in (item_sid, alt_id)):
+                                matched_ro.append(prev.get("readonly", r_doc.get("readonly")))
+                        if len(matched_ro) == 1 and matched_ro[0] is True:
+                            skip_target_metrics = not explicit_target
+                        else:
+                            code_task = True
+                target_arg = explicit_target or "."
+                if task_like and "--dry-run" not in tail and not skip_target_metrics:
                     target = (base / Path(target_arg).expanduser()).resolve()
                     if target.exists():
                         # 复用派工端的过滤与字节估算，目录链接、空文件等判据只维护一处；脚本缺失时拒绝因 FileNotFoundError 漏放。
@@ -3961,7 +3982,9 @@ def _check_dispatch_locked(payload, tool_name, args, sid, state_dir):
                             )
                         else:
                             large_target = True
-                if tail and (tail[0] in ("batch", "audit", "gate") or code_task or long_task or large_target) and "--dry-run" not in tail:
+                ticket_supplied = task_like and any(arg == "--ticket" or arg.startswith("--ticket=") for arg in tail)
+                if (tail and "--dry-run" not in tail and (tail[0] in ("batch", "audit", "gate")
+                        or code_task or long_task or large_target or ticket_supplied)):
                     heavy_tickets.append((_dispatch_option(tail, "--ticket"), extra_plan_dirs))
                 continue
             head, tail = names[0], tokens[1:]
@@ -4760,6 +4783,11 @@ def handle_claude_pre_tool_use(payload: Dict[str, Any], state_dir: Optional[Path
 
 
 def main() -> None:
+    with install_hook_self_guard(HOOKS_DIR):
+        _main_inner()
+
+
+def _main_inner() -> None:
     parser = argparse.ArgumentParser(description="项目目录边界与防空转门禁")
     parser.add_argument("--client", choices=("antigravity", "claude", "codex"), default="antigravity")
     parser.add_argument("--state-dir", default="")

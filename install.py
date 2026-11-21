@@ -74,7 +74,7 @@ LEGACY_PYTHON_FLAGS = ([], ["-B"], ["-I", "-B"], HOOK_PYTHON_FLAGS)
 HANDOFF_MARKER = re.compile(r"\[user-guard codex-handoff v1 mode=(advisory|enforce|off) compact_limit=([0-9]+)\]")
 CLAUDE_HOOK_SCRIPTS = ("user_words.py", "session_context_loader.py", "status_guard.py", "reply_repeat_guard.py", "handoff_gate.py")
 CODEX_HOOK_ENTRIES = ("session_context_loader.py", "status_guard.py", "reply_repeat_guard.py", "handoff_gate.py")
-HOOK_LIB_FILES = ("__init__.py", "fs_safety.py", "shell_lex.py", "adaptive_policy.py")
+HOOK_LIB_FILES = ("__init__.py", "fs_safety.py", "shell_lex.py", "adaptive_policy.py", "process_guard.py")
 CLAUDE_RETIRED_SCRIPTS = ("background_status.py", "read_delegation_guard.py", "receipts_stop.py")
 
 

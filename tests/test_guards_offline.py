@@ -1937,6 +1937,103 @@ class TestGuardsOffline(unittest.TestCase):
         )
 
 
+class TestHookProcessGuard(unittest.TestCase):
+    def test_noninteractive_defaults_and_installer_registration(self):
+        import install
+        from _lib import process_guard
+
+        original = {"PAGER": "", "HWLOC_COMPONENTS": "custom", "EXTRA": "kept"}
+        self.assertEqual(process_guard.apply_noninteractive_env(original), {
+            "GIT_PAGER": "cat", "PAGER": "", "LESS": "-FRX", "GCM_INTERACTIVE": "never",
+            "HWLOC_COMPONENTS": "custom", "EXTRA": "kept",
+        })
+        self.assertEqual(original, {"PAGER": "", "HWLOC_COMPONENTS": "custom", "EXTRA": "kept"})
+        self.assertEqual(process_guard.apply_noninteractive_env({})["HWLOC_COMPONENTS"], "-gl")
+        self.assertIn("process_guard.py", install.HOOK_LIB_FILES)
+
+    def test_import_is_inert_and_each_cli_installs_self_guard(self):
+        import subprocess
+
+        script = """
+import contextlib, io, signal, sys, threading
+from unittest import mock
+sys.path.insert(0, sys.argv[1])
+with mock.patch.object(threading, 'Timer') as timer, mock.patch.object(signal, 'setitimer', create=True) as alarm:
+    import status_guard, handoff_gate, reply_repeat_guard, session_context_loader
+    timer.assert_not_called()
+    alarm.assert_not_called()
+for module in (status_guard, handoff_gate, reply_repeat_guard, session_context_loader):
+    with mock.patch.object(module, 'install_hook_self_guard') as guard, mock.patch.object(sys, 'argv', ['hook', '--help']), contextlib.redirect_stdout(io.StringIO()):
+        try:
+            module.main()
+        except SystemExit as exc:
+            assert exc.code == 0
+        guard.assert_called_once_with(module.HOOKS_DIR)
+"""
+        proc = subprocess.run([sys.executable, "-B", "-X", "utf8", "-c", script, str(HOOKS_DIR)],
+                              capture_output=True, text=True, encoding="utf-8", timeout=10)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_deadline_exits_with_log_on_local_platform(self):
+        import subprocess
+
+        script = """
+import sys, time
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from _lib import process_guard
+process_guard.user_words.get_runtime_tunables = lambda *args: {'hook_safety': {'wall_timeout_sec': 0.05}}
+process_guard.install_hook_self_guard(Path(sys.argv[1]))
+time.sleep(5)
+raise AssertionError('hook exceeded its configured deadline')
+"""
+        proc = subprocess.run([sys.executable, "-B", "-X", "utf8", "-c", script, str(HOOKS_DIR)],
+                              capture_output=True, text=True, encoding="utf-8", timeout=10)
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("hook wall-clock timeout", proc.stderr)
+        self.assertEqual(proc.stdout, "")
+
+    def test_posix_limits_never_reduce_mapped_memory_or_raise_existing_limits(self):
+        from _lib import process_guard
+
+        mock = unittest.mock
+        resource = mock.Mock(RLIMIT_AS=9, RLIM_INFINITY=-1)
+        resource.getrlimit.return_value = (-1, -1)
+        with mock.patch.dict(sys.modules, {"resource": resource}), \
+                mock.patch("builtins.open", mock.mock_open(read_data="256 20 0\n")), \
+                mock.patch.object(process_guard.os, "sysconf", return_value=4096, create=True):
+            cap = 2 * 1024**2
+            process_guard._limit_address_space(cap)
+            resource.setrlimit.assert_called_once_with(resource.RLIMIT_AS, (cap, -1))
+            resource.setrlimit.reset_mock()
+            process_guard._limit_address_space(cap // 2)
+            resource.getrlimit.return_value = (cap - 1, cap - 1)
+            process_guard._limit_address_space(cap)
+            resource.setrlimit.assert_not_called()
+            resource.getrlimit.return_value = (-1, -1)
+            resource.setrlimit.side_effect = OSError("unsupported RLIMIT_AS")
+            process_guard._limit_address_space(cap)
+
+        with mock.patch.object(process_guard.os, "name", "posix"), \
+                mock.patch.object(process_guard, "signal") as signals, \
+                mock.patch.object(process_guard, "_limit_address_space") as limit, \
+                mock.patch.object(user_words, "get_runtime_tunables", return_value={}) as config:
+            process_guard.install_hook_self_guard(HOOKS_DIR)
+            config.assert_called_once_with("loop_guards", HOOKS_DIR)
+            limit.assert_called_once_with(1024 * 1024**2)
+            self.assertEqual(signals.signal.call_args.args[0], signals.SIGALRM)
+            signals.setitimer.assert_called_once_with(signals.ITIMER_REAL, 12)
+            signals.reset_mock()
+            config.return_value = {"hook_safety": {"max_rss_mib": float("inf"), "wall_timeout_sec": 0.5}}
+            process_guard.install_hook_self_guard(HOOKS_DIR)
+            signals.setitimer.assert_called_once_with(signals.ITIMER_REAL, 0.5)
+            signals.reset_mock()
+            with mock.patch.object(process_guard.threading, "current_thread", return_value=object()):
+                process_guard.install_hook_self_guard(HOOKS_DIR)
+            signals.signal.assert_not_called()
+            signals.setitimer.assert_not_called()
+
+
 class TestDispatchAndBillingGuards(unittest.TestCase):
     def setUp(self):
         try:
@@ -2120,6 +2217,46 @@ class TestDispatchAndBillingGuards(unittest.TestCase):
             self.approve(channel="cae_harness_headless")
             self.assertEqual(self.pre("run_command", {"CommandLine": "python cae_harness.py task --timeout 41 --ticket ticket-fixture"})["decision"], "allow")
 
+    def test_followup_enforces_task_boundaries_and_validates_explicit_tickets(self):
+        def decision(flags):
+            return self.pre("run_command", {"CommandLine": "python -B cae_harness.py followup " + flags})["decision"]
+
+        profile = {"runtime_tunables": {"dispatch_confirmation": {"heavy_max_light_timeout_sec": 40}}}
+        with unittest.mock.patch.object(user_words, "load_fleet_profile", return_value=profile):
+            for flags, expected in (("--kind review --timeout 40", "allow"), ("--kind=code --timeout 40", "deny"),
+                                    ("--timeout=41", "deny"), ("--timeout 41 --dry-run", "allow"),
+                                    ("--timeout 40 --ticket missing", "deny"), ("--timeout 40 --ticket=", "deny")):
+                with self.subTest(flags=flags):
+                    self.assertEqual(decision(flags), expected)
+            for case in ({"status": "PENDING"}, {"sid": "other-session"}, {"expires": time.time() - 1}):
+                self.approve(channel="cae_harness_headless", **case)
+                self.assertEqual(decision("--timeout 40 --ticket ticket-fixture"), "deny")
+            self.approve(channel="native_subagent")
+            self.assertEqual(decision("--timeout 40 --ticket ticket-fixture"), "deny")
+            self.approve(channel="cae_harness_headless")
+            self.assertEqual(decision("--timeout 40 --ticket=ticket-fixture"), "allow")
+            self.assertEqual(decision("--timeout 41 --ticket ticket-fixture"), "allow")
+            for index in range(3):
+                (self.project / f"follow{index}.py").write_text("x=1", encoding="utf-8")
+            self.assertEqual(decision("--timeout 40 --target ."), "deny")
+            self.assertEqual(decision("--timeout 40 --target . --ticket ticket-fixture"), "allow")
+            ro_receipt = self.project / "ro_receipt.json"
+            rw_receipt = self.project / "rw_receipt.json"
+            ro_receipt.write_text(json.dumps({"readonly": True, "invocation": {"provider_session_id": "sid-ro"}}), encoding="utf-8")
+            rw_receipt.write_text(json.dumps({"readonly": False, "invocation": {"provider_session_id": "sid-rw"}}), encoding="utf-8")
+            self.assertEqual(decision(f'--receipt "{ro_receipt}" --timeout 40 --task clarify'), "allow")
+            self.approve(channel="cae_harness_headless", status="PENDING")
+            self.assertEqual(decision(f'--receipt "{rw_receipt}" --timeout 40 --task fix'), "deny")
+            self.approve(channel="cae_harness_headless")
+            self.assertEqual(decision(f'--receipt "{rw_receipt}" --timeout 40 --ticket ticket-fixture --task fix'), "allow")
+            harness_mod = status_guard._load_harness_metrics_module(status_guard._resolve_cae_harness_script(HOOKS_DIR))
+            parsed = harness_mod.build_arg_parser().parse_args([
+                "followup", "--receipt", str(rw_receipt), "--ticket", "ticket-fixture",
+                "--session-id", "sess-1", "--user-prompt", "fix", "--dry-run", "--retry-quota", "--task", "fix",
+            ])
+            self.assertEqual(parsed.ticket, "ticket-fixture")
+            self.assertTrue(parsed.dry_run and parsed.retry_quota)
+
     def test_wp8_default_timeout_and_target_metrics_match_heavy_limits(self):
         profile = json.loads((HOOKS_DIR.parent / "skills/cae-harness/fleet_profile.json").read_text(encoding="utf-8"))
         tunables = profile["runtime_tunables"]
@@ -2269,6 +2406,88 @@ class TestDispatchAndBillingGuards(unittest.TestCase):
                     self.assertFalse(json.loads(ledger.read_text(encoding="utf-8"))[0]["reported_to_user"])
                     self.assertNotIn("reason", self.stop(client, sid, "S1 成功，S2 超时；Token 26；回执 receipt.json"))
                     self.assertTrue(json.loads(ledger.read_text(encoding="utf-8"))[0]["reported_to_user"])
+
+    def test_incomplete_bill_cannot_be_reported_as_all_successful(self):
+        for index, (status, claim) in enumerate(zip(
+                ("failed", "timeout", "partial", "invalid_output", "verification_failed", "scope_violation"),
+                ("全部成功", "全部完成", "全数通过", "all succeeded", "all completed", "all passed"))):
+            with self.subTest(status=status):
+                sid = f"failed-bill-{index}"
+                ledger = self.completion(sid)
+                entries = json.loads(ledger.read_text(encoding="utf-8"))
+                entries[0]["streams"][1].update(status=status, token_usage={
+                    "input_tokens": 10, "output_tokens": 3, "total_tokens": 13,
+                    "usage_source": "cli_partial_on_timeout",
+                })
+                user_words.atomic_write_json(ledger, entries)
+                reply = f"S1、S2 {claim}。没有失败。已完成汇总。Token 26。回执 receipt.json"
+                blocked = self.stop("antigravity", sid, reply)
+                self.assertEqual(blocked["decision"], "continue")
+                for detail in ("含未成功的任务", status, '"total_tokens": 13', "cli_partial_on_timeout"):
+                    self.assertIn(detail, blocked["reason"])
+                self.assertEqual(self.stop("antigravity", sid, reply), {"decision": "allow"})
+                self.assertFalse(json.loads(ledger.read_text(encoding="utf-8"))[0]["reported_to_user"])
+                corrected = f"S1 成功，S2 部分完成，状态 {status}，Token 26，回执 receipt.json"
+                self.assertEqual(self.stop("antigravity", sid, corrected, active=True), {"decision": "allow"})
+                self.assertTrue(json.loads(ledger.read_text(encoding="utf-8"))[0]["reported_to_user"])
+
+    def test_partial_test_rerun_cannot_be_reported_as_full_pass_across_clients(self):
+        cases = (
+            ("antigravity", "Ran 20 tests in 1s\n\nFAILED (failures=1)", "Ran 9 tests in 0.2s\n\nOK", "20 项测试全部通过"),
+            ("codex", "=== 2 failed, 18 passed in 1s ===", "\x1b[32m3 passed in 0.2s\x1b[0m", "20 passed"),
+            ("claude", "Test Summary: | Pass  Fail  Total  Time\nSuite | 19  1  20  1.0s",
+             "Test Summary: | Pass  Total  Time\nLocal | 3  3  0.2s", "全套测试全绿"),
+        )
+        for client, failed, passed, claim in cases:
+            with self.subTest(client=client):
+                sid = f"suite-{client}"
+                self.trace.write_text("", encoding="utf-8")
+                if client == "codex":
+                    _append_jsonl(self.trace, {"type": "session_meta", "payload": {"id": sid, "source": "cli"}})
+                if client == "claude":
+                    _append_jsonl(self.trace, {"type": "user", "sessionId": sid,
+                                               "message": {"role": "user", "content": "检查测试结果"}})
+                for output in (failed, passed):
+                    if client == "antigravity":
+                        row = {"type": "GENERIC", "tool_result": {"output": output}}
+                    elif client == "codex":
+                        row = {"type": "response_item", "payload": {"type": "function_call_output", "output": output}}
+                    else:
+                        row = {"type": "user", "sessionId": sid, "message": {"role": "user", "content": [
+                            {"type": "tool_result", "tool_use_id": "shell", "content": [{"type": "text", "text": output}]},
+                        ]}}
+                    _append_jsonl(self.trace, row)
+                first = self.stop(client, sid, claim)
+                self.assertEqual(first["decision"], "continue" if client == "antigravity" else "block")
+                self.assertIn("待复跑的全量回归", first["reason"])
+                self.assertNotIn("reason", self.stop(client, sid, "全量单测全部通过"))
+
+    def test_suite_claim_uses_only_current_tool_results_and_strict_size_thresholds(self):
+        full_fail = "Ran 20 tests in 1s\n\nFAILED (failures=1)"
+        local_pass = "2 passed in 0.1s"
+        cases = (
+            ("19-failed", [full_fail.replace("20", "19"), local_pass], "全量单测全部通过"),
+            ("no-local", [full_fail], "20 项测试全绿"),
+            ("wrong-order", [local_pass, full_fail], "20 passed"),
+            ("exact-half", [full_fail, "10 passed in 0.2s"], "全量单测全部通过"),
+            ("full-rerun", [full_fail, local_pass, "Ran 21 tests in 1s\n\nOK"], "全量单测全部通过"),
+            ("different-count", [full_fail, local_pass], "120 passed"),
+            ("quoted-claim", [full_fail, local_pass], "> 全量单测全部通过\n以上是待核对的旧记载。"),
+            ("prior-turn", [full_fail, None, local_pass], "全量单测全部通过"),
+            ("honest-claim", [full_fail, local_pass], "20 项测试未全部通过，2 项局部补测全部通过"),
+        )
+        for name, outputs, claim in cases:
+            with self.subTest(name=name):
+                self.trace.write_text("", encoding="utf-8")
+                for index, output in enumerate(outputs):
+                    row = ({"type": "USER_INPUT", "content": "开始新回合"} if output is None else
+                           {"type": "TOOL_RESULT", "content": output})
+                    _append_jsonl(self.trace, dict(row, step_index=index))
+                self.assertEqual(self.stop("antigravity", f"suite-{name}", claim), {"decision": "allow"})
+        self.trace.write_text("", encoding="utf-8")
+        _append_jsonl(self.trace, {"type": "PLANNER_RESPONSE", "source": "MODEL", "content": full_fail})
+        _append_jsonl(self.trace, {"type": "TOOL_RESULT", "content": local_pass})
+        self.assertEqual(self.stop("antigravity", "suite-quoted-log", "全量单测全部通过"), {"decision": "allow"})
 
     def test_wp8_native_stream_identifier_word_boundaries(self):
         native = {"native": True, "turn_key": "turn", "receipt_file": str(self.trace),

@@ -14,14 +14,14 @@
 | --- | --- | --- |
 | [rules/AGENTS.md](../template/user-guard/rules/AGENTS.md) | 通用 + 上游 | `R0–R11` 全局工程规则唯一模板；零时期性模型名与散落阈值，安装时保留完整标准章节与末尾用户自定义尾段 |
 | [fleet_profile.json](../template/user-guard/skills/cae-harness/fleet_profile.json) | 通用 + 上游 | 统一维护顶层键 `roles`（五类动态角色槽位）、`native_agent_profiles`（四端独立内生代理档案）、`runtime_tunables`（运行期定量阈值）、`subscription_matrix`（启停矩阵）与 `capability_ledger`（离线性能更新时间） |
-| [cae_harness.py](../template/user-guard/skills/cae-harness/scripts/cae_harness.py) | 通用 + 上游 | 识别 `workspace_mode` 与调用方客户端；执行 P0 点名锁定、五角色选路、`--isolation` 四级正交隔离、派工前离线可用性与额度复查、`<ticket_id>_card.md` 落盘与精简总览卡、`batch`、`gate`、`audit`、`task` 无头执行、进程树清理及 `check-grounding` 事实锚定 |
-| [user_words.py](../template/user-guard/hooks/user_words.py) | 通用 + 上游 | 五个钩子共用的基础模块（底层委托 `hooks/_lib/`）：跨平台文件锁（`msvcrt` / `fcntl`）、重解析点防御原子写入、`runtime_tunables` 与自适应策略读取、三端轨迹原话与实质子代理摘要提取、历史确认单折叠（`collapse_historical_cards`）及未决票据与完成回执记录存取 |
-| `hooks/_lib/`（`fs_safety.py`、`shell_lex.py`、`adaptive_policy.py`） | 通用 + 上游 | 共享底层安全锁与原子写（`fs_safety.py`）、Shell 词法拆解与引号解码（`shell_lex.py`），以及基于 `fleet_profile.json` 按 `(client, model, effort)` 动态派生压缩恢复预算、交接阈值与代理卡默认参数的自适应策略（`adaptive_policy.py`） |
-| [session_context_loader.py](../template/user-guard/hooks/session_context_loader.py) | 通用 + 上游 | 压缩或恢复入口检测：普通回合零字节注入；压缩恢复时分块注入“历轮原话 + 实质子代理摘要”与“磁盘未决确认单精简总览卡及明细链接” |
-| [status_guard.py](../template/user-guard/hooks/status_guard.py) | 通用 + 上游 | 工具执行前门禁：静态拆解文件工具、多层 Shell 包装、重定向与内联 Python AST 拦截项目外写删及外部 `git worktree`；拦截未变化日志重复读取；拦截绕过调度器直接调用无头 CLI，核验有效 `APPROVED` 票据、隔离一致性与内部原生通道容量（含 `swarm add` 按 `tasks` 长度或 `n` 精确计费） |
-| [reply_repeat_guard.py](../template/user-guard/hooks/reply_repeat_guard.py) | 通用 + 上游 | 回合结束门禁：拦截连续无新数值进展的短句等待，并在重负载完工后静态核验成败词、Token 用量说明，以及流标识、回执文件名或轨迹词项（含 `continuationActive` 静默销账对账） |
-| [handoff_gate.py](../template/user-guard/hooks/handoff_gate.py) | 通用 + 上游 | 长会话分级交接门禁：累计压缩次数、轨迹体积与读图字节数，在强制收尾（`drain` / `freeze`）阶段限制新派工并核验【新对话提示词】内嵌精简总览卡、`<ticket_id>_card.md` 链接与 `plan --resume-ticket` 命令 |
-| [install.py](../install.py)、`install.ps1`、`install.sh` | 上游专属 | 探测客户端与 Python 3.11+ 解释器，校验非符号链接/重解析点后幂等分发四端配置；提供零写入配置漂移、`cross_side_status` 双端同步体检、DSH `hook_protocol` 能力探测、`subscription_candidates`、`fleet_profile.native_agent_profiles_configured` 与科学计算包三级 ABI 耦合审计（`--audit-upgrade`） |
+| [cae_harness.py](../template/user-guard/skills/cae-harness/scripts/cae_harness.py) | 通用 + 上游 | 识别 `workspace_mode` 与调用方客户端；执行 P0 点名锁定、五角色选路、`--isolation` 四级正交隔离、默认持久化可续接无头会话与 `followup` 追问、实时管道读取与双层超时抢救（`soft_timeout_wrapup` 与 `timeout_salvage`）、`--files` 精确多文件与 `wave` 波次编排、`citation_audit` 引用行号核验、`<ticket_id>_card.md` 落盘与精简总览卡及 `check-grounding` 事实锚定 |
+| [user_words.py](../template/user-guard/hooks/user_words.py) | 通用 + 上游 | 四个阶段门禁脚本共用的基础模块（底层委托 `hooks/_lib/`）：跨平台文件锁（`msvcrt` / `fcntl`）、重解析点防御原子写入、`runtime_tunables` 与自适应策略读取、过滤异步启动提示与短权限拒绝噪音的三端轨迹原话及实质子代理摘要提取（保留 `timeout_salvage` 摘要）、历史确认单折叠（`collapse_historical_cards`）及未决票据与完成回执记录存取 |
+| `hooks/_lib/`（`fs_safety.py`、`shell_lex.py`、`adaptive_policy.py`、`process_guard.py`） | 通用 + 上游 | 共享底层安全锁与原子写（`fs_safety.py`）、Shell 词法拆解与引号解码（`shell_lex.py`）、按 `(client, model, effort)` 动态派生压缩与交接阈值的自适应策略（`adaptive_policy.py`），以及钩子命令行入口内存与墙钟自毁护栏和防分页环境变量配置（`process_guard.py`） |
+| [session_context_loader.py](../template/user-guard/hooks/session_context_loader.py) | 通用 + 上游 | 压缩或恢复入口检测：普通回合零字节注入；压缩恢复时分块注入“历轮原话 + 去噪实质子代理及超时抢救摘要”与“磁盘未决确认单精简总览卡及明细链接” |
+| [status_guard.py](../template/user-guard/hooks/status_guard.py) | 通用 + 上游 | 工具执行前门禁：静态拆解文件工具、多层 Shell 包装、重定向与内联 Python AST 拦截项目外写删及外部 `git worktree`；拦截未变化日志重复读取；拦截绕过调度器直接调用无头 CLI，核验有效 `APPROVED` 票据（含 `followup`）、隔离一致性与内部原生通道容量（含 `swarm add` 按 `tasks` 长度或 `n` 精确计费） |
+| [reply_repeat_guard.py](../template/user-guard/hooks/reply_repeat_guard.py) | 通用 + 上游 | 回合结束门禁：拦截连续无新数值进展的短句等待，拦截将局部补测冒充全量测试通过的表述，并在重负载完工后核验成败词（禁止将含失败或超时的账单写成全部成功）、Token 用量说明（兼容 `cli_partial_on_timeout`）及流标识、回执文件名或轨迹词项 |
+| [handoff_gate.py](../template/user-guard/hooks/handoff_gate.py) | 通用 + 上游 | 长会话分级交接门禁：累计压缩次数、轨迹体积与读图字节数，在强制收尾（`drain` / `freeze`）阶段限制新派工，核验【新对话提示词】内嵌精简总览卡、`<ticket_id>_card.md` 链接与 `plan --resume-ticket` 命令，并拦截把落盘交接稿中的待拍板占位符擅自填为已拍板 |
+| [install.py](../install.py)、`install.ps1`、`install.sh` | 上游专属 | 探测客户端与 Python 3.11+ 解释器，校验非符号链接与非重解析点后幂等分发四端配置；提供零写入配置漂移、`cross_side_status` 双端同步体检、DSH `hook_protocol` 能力探测、`subscription_candidates`、`fleet_profile.native_agent_profiles_configured` 与科学计算包三级 ABI 耦合审计（`--audit-upgrade`） |
 | [fleet_state.py](../template/user-guard/skills/fleet-evolve/scripts/fleet_state.py) | 上游专属 | 核验 `upstream_config_repo` 身份；维护提案审批锁（`propose` / `approve`）、主会话重启重入锁（`record-pass1` / `verify-pass2`）及终审 `clear --verified --readback-done [--session-id <sid>]` 事实锚定强制校验 |
 | [router.py](../template/claude/router/router.py)、[ccswitch_admin.py](../template/claude/router/ccswitch_admin.py) | 通用 + 上游 | 严格回环绑定的 `/v1/messages` 前缀透明分流（校验请求目标路径与上游 URL、保留显式非高挡 `effort`、支持 `chunked` 请求体并在上游 `401`/`403` 时失效密钥缓存）与 CC Switch SQLite 在线热备份安全切卡 |
 
@@ -32,7 +32,7 @@
 ## 二、两阶段可用性检查与 `fleet_profile.json` 动态配置结构
 
 1. **维护期联网核查与用户启停确认**（独立 `fleet-evolve` 维护流程）：结合官方资料与本机探测展示各客户端与模型的可用性及额度类型，由用户确认决定启停，写入 `subscription_matrix.agents` 与 `subscription_matrix.models`（`enabled: false` 全局跳过），并在 `capability_ledger` 记录离线性能更新时间（`last_online_refresh_at` 与 `local_bench_verified_at`）。
-2. **派工前纯离线可用性复查**（日常 `cae_harness.py plan`）：在生成确认单前纯离线读取本机程序、凭据配置、所需本地路由健康、本地会话记录中的滚动窗口已用百分比与重置时刻、CC Switch 卡片套餐/余额类型与日月限额，以及运行环境配额冷却文件，过滤不可用或超限通道。未暴露的服务端实时余额保持未知。
+2. **派工前纯离线可用性复查**（日常 `cae_harness.py plan`）：在生成确认单前纯离线读取本机程序、凭据配置、所需本地路由健康、本地会话记录中的滚动窗口已用百分比与重置时刻、CC Switch 卡片套餐或余额类型与日月限额，以及运行环境配额冷却文件，过滤不可用或超限通道。未暴露的服务端实时余额保持未知。
 
 `fleet_profile.json` 将顶层能力档案与运行期阈值清晰分层（支持 `CAE_FLEET_PROFILE` 测试隔离覆盖，并通过基线比对保留单元测试运行时常量覆盖优先级）：
 
@@ -42,17 +42,17 @@
 | --- | --- | --- |
 | `roles` | `orchestrator`、`math`、`code`、`review`、`fast` 候选列表、推荐挡位与短板隔离规则 | 五角色全动态，不与单一客户端永久绑定；用户明确点名按 P0 优先锁定 |
 | `native_agent_profiles` | `antigravity`、`codex`、`claude`、`dsh` 各自的主模型策略、原生子代理机制（如 `invoke_subagent`、`swarm`、`spawn_agent`、`Agent`）、只读代理列表与钩子协议 | 独立记录各客户端内生代理能力，与外部无头调度解耦；`--audit-upgrade` 上报 `fleet_profile.native_agent_profiles_configured` |
-| `subscription_matrix` / `capability_ledger` | 各客户端与模型的启停开关、额度类型及离线性能更新时间（`last_online_refresh_at`、`local_bench_verified_at`） | `enabled: false` 全局跳过；日常派工仅离线读取时间戳，不联网查榜单 |
+| `subscription_matrix` 与 `capability_ledger` | 各客户端与模型的启停开关、额度类型及离线性能更新时间（`last_online_refresh_at`、`local_bench_verified_at`） | `enabled: false` 全局跳过；日常派工仅离线读取时间戳，不联网查榜单 |
 
 ### 2. 运行期定量阈值（`runtime_tunables` 子分组）
 
 | `runtime_tunables` 分组 | 受控机制与核心键名 | 工程约束边界 |
 | --- | --- | --- |
-| `compaction_recovery` | `per_client.{antigravity,codex,claude}` 内联预算、`recent_subagent_window`、`min_substantive_subagent_chars`、`subagent_head_ratio` | 最新一条返回无条件保留，窗口内其余名额优先保留达到实质长度阈值且命中审查/推导角色的结论，并由 `adaptive_policy.py` 按当前模型窗口与推理强度动态缩放预算 |
+| `compaction_recovery` | `per_client.{antigravity,codex,claude}` 内联预算、`recent_subagent_window`、`min_substantive_subagent_chars`、`subagent_head_ratio` | 最新一条返回无条件保留，窗口内其余名额优先保留达到实质长度阈值且命中审查或推导角色的结论，并由 `adaptive_policy.py` 按当前模型窗口与推理强度动态缩放预算 |
 | `handoff_thresholds` | 各客户端交接模式（`default_mode`），压缩次数、轨迹体积与读图阈值，以及 `drain` 收尾预算 | Antigravity 默认启用分阶段交接限制；Codex 与 Claude Code 默认 `advisory` 提醒，是否强制阻断取决于实际启用模式 |
-| `loop_guards` | `reply_repeat` 重复等待回复阈值、`status_guard` 大日志采样与 Shell 解包深度、`lifecycle_log` 滚动裁剪与陈旧 `.lock` 清理 | 仅拦截文件未变化时的同区间重复轮询与无新数值进展的重复等待短句 |
-| `headless_dispatch` | `input_budget_safety_ratio`、`inline_readonly_max_kib`、`batch_max_workers_per_backend`、超时、重试轮数与路由默认端口 | 常驻文档引用键名，不在规则或脚本中散落硬编码数值常量 |
-| `dispatch_confirmation` | 轻重任务分界（流数、文件数、Token、超时）、票据有效期 `ticket_ttl_sec` 与滚动配额熔断百分比（`quota_block_percent`） | 内部原生多路/可写子代理与外部无头调用统一受同一套阈值约束 |
+| `loop_guards` | `hook_safety`（`max_rss_mib`、`wall_timeout_sec` 钩子进程自毁上限）、`reply_repeat` 重复等待回复阈值、`status_guard` 大日志采样与 Shell 解包深度、`lifecycle_log` 滚动裁剪与陈旧 `.lock` 清理 | 保护宿主免受失控钩子消耗内存，同时拦截无变化重复轮询与无新进展等待短句 |
+| `headless_dispatch` | `persist_sessions_by_default`、`soft_timeout_ratio`、`wrapup_min_sec`、`wrapup_max_sec`、`grounding_max_anchor_file_mib`、`grounding_excluded_dirs`、`input_budget_safety_ratio`、`inline_readonly_max_kib`、`batch_max_workers_per_backend`、超时、重试轮数与路由默认端口 | 默认持久化无头会话，触及 `soft_timeout_ratio` 软时限时先按 `wrapup_min_sec..wrapup_max_sec` 预算发起只读续接收尾（`soft_timeout_wrapup`），硬截止耗尽仍从实时管道与日志回收 `timeout_salvage` 及部分 Token |
+| `dispatch_confirmation` | 轻重任务分界（流数、文件数、Token、超时）、票据有效期 `ticket_ttl_sec` 与滚动配额熔断百分比（`quota_block_percent`） | 内部原生多路或可写子代理与外部无头调用统一受同一套阈值约束 |
 
 ---
 
@@ -64,11 +64,11 @@
 
 `plan` 支持单流参数与 `--spec-file` 多流列表，统一覆盖 `cae_harness_headless`、`native_subagent`、`native_workflow`、`native_swarm` 四类通道，并支持 `--isolation` 四级正交隔离（`full`、`no_skills`、`hooks_only`、`clean_room`，`--clean-room` 为兼容别名）。`_save_plan` 先原子写入 `<ticket_id>.json`，再将含背景、要做什么、预计后果、4 列总览表及分路 3 列纵向 14 项完整参数明细（涵盖流号、范围、通道、子代理与实际模型解析、挡位、窗口、无头与隔离状态、读写及验收边界、内联与超时、可用性、额度状态及回执位置；逐项定义见 [日常实战指南](workflow-guide.md) 与 [cae-harness 技能说明](../template/user-guard/skills/cae-harness/SKILL.md)）的 Markdown 写入 `<ticket_id>_card.md`，同时生成带可点击 `[<ticket_id>_card.md](file:///...)` 链接的 `compact_summary_card` 与 `compact_handoff_prompt_block`——对话与恢复默认仅展示精简 4 列总览卡与可点击明细链接，不展开多路 14 项长表。
 
-用户批准并运行 `plan --approve-ticket`（登记前脚本再次离线复查可用性与选路漂移）后，`status_guard.py` 在 `PreToolUse` 阶段完成四项派工检查：① 拦截绕过 `cae_harness.py` 直接调用客户端无头 CLI 的命令（含环境变量前缀、`cmd /c`、`powershell -EncodedCommand` 及最短唯一前缀缩写、`bash -lc`、`wsl`、`sudo`、`timeout` 等常见包装拆壳）；② 对外部重负载核验当前会话有效且未过期的 `APPROVED` 票据（含显式 `--plan-dir`、`--isolation` 一致性、`--write-scope` 子集及可写流 `--verify-cmd` 双向严格一致性校验）；③ 对客户端内部多路或可写原生子代理按回合调用快照核验票据中的原生通道容量（`_native_call_stream_weight` 对 `swarm add` 按 `tasks` 列表长度或正整数 `n` 精确计入流数）；④ `task` 省略 `--target` 时按当前工作目录估算规模阈值。
+用户批准并运行 `plan --approve-ticket`（登记前脚本再次离线复查可用性与选路漂移）后，`status_guard.py` 在 `PreToolUse` 阶段完成四项派工检查：① 拦截绕过 `cae_harness.py` 直接调用客户端无头 CLI 的命令（含环境变量前缀、`cmd /c`、`powershell -EncodedCommand` 及最短唯一前缀缩写、`bash -lc`、`wsl`、`sudo`、`timeout` 等常见包装拆壳）；② 对外部重负载核验当前会话有效且未过期的 `APPROVED` 票据（含显式 `--plan-dir`、`--isolation` 一致性、`--write-scope` 子集及可写流 `--verify-cmd` 双向严格一致性校验；对 `followup` 读取 `--receipt` 原会话读写属性，可写续接强制要求已批票据，短只读续接不重扫全仓体积）；③ 对客户端内部多路或可写原生子代理按回合调用快照核验票据中的原生通道容量（`_native_call_stream_weight` 对 `swarm add` 按 `tasks` 列表长度或正整数 `n` 精确计入流数）；④ `task` 省略 `--target` 时按当前工作目录估算规模阈值。
 
 ### 2. 共有门禁机制与四客户端事件协议映射
 
-本仓库以**共有生命周期机制**为核心，五个钩子脚本模块与宿主事件并非简单一一对应（其中 `user_words.py` 为底层共享库），各客户端按自身协议接入同一套状态与检查逻辑：
+本仓库以**共有生命周期机制**为核心，四个阶段门禁脚本加共用基础库 `user_words.py` 与宿主事件并非简单一一对应，各客户端按自身协议接入同一套状态与检查逻辑：
 
 | 共有防护阶段 | 承担职责的共用脚本模块 | 核心确定性行为 |
 | --- | --- | --- |
@@ -92,7 +92,7 @@
 
 ### 1. 压缩恢复与跨会话票据接力不变量
 
-- **实质子代理筛选与防二次截断**：在最近 `recent_subagent_window` 条已完成子代理记录中无条件保留最新一条，其余名额按实质字数阈值、审查/推导角色关键词与时间序择优；状态归档写入与内联注入各自基于完整 `raw_body` 独立执行一次首尾截取（避免双重省略号），截断切中代码块时由 `_close_unbalanced_fence` 自动闭合围栏且不超预算。
+- **实质子代理筛选与防二次截断**：在最近 `recent_subagent_window` 条已完成子代理记录中无条件保留最新一条，其余名额按实质字数阈值、审查或推导角色关键词与时间序择优；状态归档写入与内联注入各自基于完整 `raw_body` 独立执行一次首尾截取（避免双重省略号），截断切中代码块时由 `_close_unbalanced_fence` 自动闭合围栏且不超预算。
 - **未决工作流独立分区与历史折叠（零幻觉）**：`collapse_historical_cards` 在压缩恢复时将历史 14 项明细表折叠为 `[已折叠历史确认单/账单明细]`；`render_pending_workflow_block` 独立于常规原话字符预算之外直接读取磁盘票据 `<ticket_id>.json`——当 `<ticket_id>_card.md` 已实际落盘且为常规非链接文件时，优先输出精简 4 列总览卡、可点击 `[<ticket_id>_card.md](file:///...)` 链接与三选项（明确要求勿在对话中展开 14 项长表），仅在未落盘明细文件时回退 14 项全字段表（缺项标明 `未记录`），并结合 `adaptive_policy.py` 按当前模型与推理强度动态缩放压缩与交接阈值。`plan --resume-ticket` 在新会话离线重算可用性但保留原票据 `session_id` 不自动改绑，跨会话执行须重新生成绑定新会话的确认票据。
 
 ### 2. 零黑名单文档事实锚定（`check-grounding`）

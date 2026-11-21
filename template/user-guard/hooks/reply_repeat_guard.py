@@ -27,6 +27,7 @@ HOOKS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(HOOKS_DIR))
 import handoff_gate  # noqa: E402
 import user_words  # noqa: E402
+from _lib.process_guard import install_hook_self_guard  # noqa: E402
 
 user_words.ensure_utf8_stdio()
 
@@ -779,7 +780,7 @@ def _native_completion_bill(payload, state=None):
                         if type(row["token_usage"].get(key)) is int)
                for key in token_keys if any(type(row["token_usage"].get(key)) is int for row in rows)}
     return {"streams": rows, "receipt_file": str(path.resolve()), "token_usage_summary": summary,
-            "native": True, "turn_key": native_turn}
+            "native": True, "turn_key": native_turn, "all_succeeded": all(row["status"] != "失败" for row in rows)}
 
 
 def _render_heavy_bill(entries):
@@ -789,7 +790,10 @@ def _render_heavy_bill(entries):
         if not isinstance(usage, dict):
             usage = {}
         numbers = {k: v for k, v in usage.items() if k.endswith("tokens") and type(v) is int}
-        return json.dumps(numbers, ensure_ascii=False, sort_keys=True) if numbers else "该通道未单独暴露 Token 整数，无法统计"
+        if not numbers:
+            return "该通道未单独暴露 Token 整数，无法统计"
+        source = "（超时前部分用量，cli_partial_on_timeout）" if usage.get("usage_source") == "cli_partial_on_timeout" else ""
+        return json.dumps(numbers, ensure_ascii=False, sort_keys=True) + source
     for entry in entries:
         for row in entry.get("streams", []):
             outcome = row.get("status") or ("成功" if row.get("succeeded") else "失败")
@@ -833,7 +837,10 @@ def _check_heavy_report_locked(payload, state_dir, sid, turn_key, reply, decisio
         entries.append(native)
     if not entries:
         return None
-    status = bool(re.search(r"成功|完成|失败|超时|succeeded|completed|failed|timeout|\bok\b", reply, re.I))
+    facts = re.sub(r"(?:无|零|没有)(?:任何)?(?:失败|超时)|\b(?:no|0) (?:fail(?:ed|ures?)|timeouts?)\b", "", reply, flags=re.I)
+    failure = re.search(r"失败|超时|部分(?:完成|成功|通过)|\b(?:fail(?:ed|ures?)|time(?:d)?[ _-]?out|partial(?:ly)?|"
+                        r"invalid_output|verification_failed|scope_violation)\b", facts, re.I)
+    status = failure or re.search(r"成功|完成|通过|\b(?:succeeded|completed|passed|ok)\b", reply, re.I)
     tokens = bool(re.search(r"tokens?[^\n。；]*\d|\d[\d, ]*\s*tokens?|tokens?[^\n。；]*(?:未.*(?:暴露|提供|统计)|无法|不.*(?:暴露|提供))|未[^\n。；]*(?:暴露|提供)[^\n。；]*tokens?", reply, re.I))
     receipt = bool(re.search(r"receipt|回执|轨迹|日志|[\w-]+\.(?:jsonl|json|log)\b", reply, re.I))
     def has_token(token):
@@ -871,7 +878,10 @@ def _check_heavy_report_locked(payload, state_dir, sid, turn_key, reply, decisio
             if entry.get("receipt_file"):
                 filename = str(entry["receipt_file"]).replace(chr(92), "/").rsplit("/", 1)[-1]
                 bound &= has_token(filename)
-    if status and tokens and receipt and bound:
+    contradicted = (any(entry.get("all_succeeded") is False for entry in entries)
+                    and re.search(r"(?:全部|全数)(?:成功|完成|通过)|\ball\s+(?:succeeded|completed|passed)\b", reply, re.I)
+                    and not failure)
+    if status and tokens and receipt and bound and not contradicted:
         user_words.mark_heavy_completions_reported(sid, state_dir)
         state["native_reported"] = native_key
         if native:
@@ -903,7 +913,71 @@ def _check_heavy_report_locked(payload, state_dir, sid, turn_key, reply, decisio
             return None
     state["blocked"] = True
     user_words.atomic_write_json(state_file, state)
-    return {"decision": decision, "reason": "【user-guard 重负载完工核验】请在本轮回复补齐各路成败、Token 明细与汇总、回执或子代理日志位置。磁盘账单如下：\n" + _render_heavy_bill(entries)}
+    correction = "磁盘账单含未成功的任务，请如实说明失败、超时或部分完成情况。" if contradicted else ""
+    return {"decision": decision, "reason": "【user-guard 重负载完工核验】" + correction + "请在本轮回复补齐各路成败、Token 明细与汇总、回执或子代理日志位置。磁盘账单如下：\n" + _render_heavy_bill(entries)}
+
+
+_SUITE_RESULTS = re.compile(
+    r"^[ \t]*Ran[ \t]+(?P<unittest>\d+)[ \t]+tests?\b[^\n]*\n(?:[ \t\r]*\n)*[ \t]*(?P<outcome>OK|FAILED)\b"
+    r"|^[ \t=]*(?P<pytest>\d+ (?:failed|passed|errors?)(?:, \d+ (?:failed|passed|skipped|deselected|errors?|xfailed|xpassed|warnings?))*)"
+    r"(?: in [^\n]+)?[ \t=\r]*$"
+    r"|^[ \t]*(?:Test Summary:[ \t]*\|[ \t]*)?(?P<julia_columns>Pass(?:[ \t]+Fail)?|Fail)[ \t]+Total[^\n]*\n"
+    r"(?:[^\n|]*\|)?[ \t]*(?P<julia_pass>\d+)[ \t]+(?:\d+[ \t]+)?(?P<julia_total>\d+)(?=[ \t\r]|$)", re.M)
+
+
+def _turn_suite_results(path):
+    steps, _ = _read_tail_steps_with_offset(path)
+    start = next((i + 1 for i in range(len(steps) - 1, -1, -1)
+                  if _is_explicit_user_step(steps[i]) or user_words.transcript_user_text(steps[i], path)), 0)
+    for entry in steps[start:]:
+        if entry.get("isSidechain") is True or entry.get("isMeta") is True:
+            continue
+        if entry.get("type") in ("GENERIC", "TOOL_RESULT", "TOOL_RESPONSE"):
+            result = entry.get("tool_result")
+            outputs = [entry.get("content") or (result.get("output") if isinstance(result, dict) else entry.get("output"))]
+        else:
+            outputs = [obj.get("output", obj.get("content"))
+                       for obj in user_words._HarnessArchiveCollector._objects(entry, parse_text=False)
+                       if obj.get("type") in ("function_call_output", "custom_tool_call_output", "local_shell_call_output", "tool_result")]
+        for raw in outputs:
+            if isinstance(raw, dict):
+                raw = raw.get("stdout") or raw.get("output")
+            output = re.sub(r"\x1b\[[0-9;]*m", "", user_words._codex_output_to_text(raw))
+            for result in _SUITE_RESULTS.finditer(output):
+                if result["unittest"]:
+                    yield int(result["unittest"]), result["outcome"] == "OK"
+                elif result["pytest"]:
+                    counts = {status: int(n) for n, status in re.findall(r"(\d+) (\w+)", result["pytest"])}
+                    failed = sum(counts.get(key, 0) for key in ("failed", "error", "errors"))
+                    yield counts.get("passed", 0) + failed, not failed
+                else:
+                    yield int(result["julia_total"]), "Pass" in result["julia_columns"] and result["julia_pass"] == result["julia_total"]
+
+
+def _check_test_suite_locked(payload, reply, state_file, state, sid, turn_key, decision):
+    record = state["turns"][turn_key]
+    green = r"(?:全绿|全部通过|全过|\bpassed\b)"
+    reply = "\n".join(user_words.markdown_unquoted_lines(reply))
+    if record["blockedSignatures"] or not re.search(green, reply, re.I):
+        return None
+    raw_path = payload.get("transcriptPath") or payload.get("transcript_path")
+    if not raw_path:
+        return None
+    passes_since_failure = {}
+    for size, passed in _turn_suite_results(user_words.resolve_compact_transcript_path(Path(raw_path).expanduser())):
+        if passed:
+            passes_since_failure = {total: max(largest, size) for total, largest in passes_since_failure.items() if size < total}
+        elif size >= 20:
+            passes_since_failure[size] = 0
+    for total, largest in passes_since_failure.items():
+        subject = rf"(?:全套测试|全量(?:单测|测试|回归测试)|(?<![\d.]){total}(?!\d)\s*(?:项|个|条)?\s*(?:测试(?:用例)?|用例|tests?|cases?)?)"
+        if 0 < 2 * largest < total and re.search(subject + rf"\s*[:：]?\s*(?:均已|已|均|都)?\s*{green}|\bpassed\s+{total}\s+tests?\b", reply, re.I):
+            if _heavy_report_blocked(state_file.parent, sid, turn_key, payload):
+                return None
+            record["blockedSignatures"].append("test-suite")
+            _save_repeat_state(state_file, state, sid)
+            return {"decision": decision, "reason": f"【user-guard 测试结果核验】{total} 项测试的运行有失败。请按 R3.6 分别报告已通过的局部补测和待复跑的全量回归。"}
+    return None
 
 
 def _handle_stop_locked(payload: Dict[str, Any], state_dir: Path, conversation_id: str) -> Dict[str, Any]:
@@ -945,6 +1019,9 @@ def _handle_stop_locked(payload: Dict[str, Any], state_dir: Path, conversation_i
             "blockedSignatures": [],
         },
     )
+
+    if correction := _check_test_suite_locked(payload, latest_reply, state_file, state, conversation_id, turn_key, "continue"):
+        return correction
 
     # 同一 step_index 幂等保护（防止重复投递误累加）
     last_step = turn_rec.get("lastStepIndex")
@@ -1157,7 +1234,7 @@ def _codex_turn_reply(payload):
             flushed_reply = ""
             saw_tool_after_assistant = False
             with path.open("rb") as source:
-                for index, line in enumerate(source):
+                for line in source:
                     row_offset = offset
                     offset += len(line)
                     try:
@@ -1168,13 +1245,7 @@ def _codex_turn_reply(payload):
                         continue
                     typ = entry.get("type")
                     rec = entry.get("payload") if typ == "response_item" else None
-                    is_user_boundary = typ == "USER_INPUT" or entry.get("source") == "USER_EXPLICIT"
-                    if isinstance(rec, dict) and rec.get("type") == "message" and rec.get("role") == "user":
-                        _, word = user_words._extract_codex_record(entry, index)
-                        if word:
-                            word["source_path"] = str(path)
-                        is_user_boundary = bool(word and user_words._codex_word_from_record(word))
-                    if is_user_boundary:
+                    if _is_explicit_user_step(entry) or user_words.transcript_user_text(entry, path):
                         flushed_step = None
                         flushed_reply = ""
                         saw_tool_after_assistant = False
@@ -1266,6 +1337,8 @@ def handle_claude_stop_repeat_guard(payload: Dict[str, Any], state_dir: Optional
                 "consecutiveShortWaitCount": 0, "lastNormalizedReply": "", "lastStepIndex": None,
                 "blockedSignatures": [],
             })
+            if correction := _check_test_suite_locked(payload, reply, state_file, state, sid, turn_key, "block"):
+                return correction
             if ((step is not None and step == record["lastStepIndex"])
                     or (message_id and message_id == record.get("lastMessageId"))):
                 return {}
@@ -1299,6 +1372,11 @@ def handle_claude_stop_repeat_guard(payload: Dict[str, Any], state_dir: Optional
 # ⑥ 命令行主入口
 
 def main() -> None:
+    with install_hook_self_guard(HOOKS_DIR):
+        _main_inner()
+
+
+def _main_inner() -> None:
     parser = argparse.ArgumentParser(description="Stop 短状态等待回复门禁")
     parser.add_argument("--client", choices=("antigravity", "claude", "codex"), default="antigravity")
     parser.add_argument("--state-dir", default="")

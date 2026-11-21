@@ -9,8 +9,8 @@
 | [plugin.json](plugin.json)、[hooks.json](hooks.json)、[assets/logo.svg](assets/logo.svg) | 插件清单、Antigravity 原生插件事件绑定与图标 |
 | [rules/AGENTS.md](rules/AGENTS.md) | 四端共用的全局工程规则唯一模板；安装时保留完整标准章节与末尾用户自定义尾段 |
 | [agents/](agents/) | `readonly-reader`、`readonly-auditor`、`readonly-collaborator`；默认 `inherit` 跟随主会话（优先识别显式 `model`），禁止修改文件或运行构建测试 |
-| [hooks/](hooks/) | 五个共用钩子模块与共享基础库 `hooks/_lib/`（`fs_safety.py`、`shell_lex.py`、`adaptive_policy.py`）：原话与实质返回提取、按模型与推理强度自适应压缩恢复、工具前写边界与票据检查（含 `swarm` 流数计费）、重复空等与完工回执核验、长会话交接 |
-| [skills/cae-harness/](skills/cae-harness/) | 日常派工、双门可用性复查、`--isolation` 四级正交隔离、`<ticket_id>_card.md` 14 项明细落盘与精简总览卡、无头验证及 `check-grounding` 事实锚定 |
+| [hooks/](hooks/) | 五个共用钩子模块与共享基础库 `hooks/_lib/`（`fs_safety.py`、`shell_lex.py`、`adaptive_policy.py`、`process_guard.py`）：进程内存与墙钟自毁保护、去噪原话与实质返回提取、按模型与推理强度自适应压缩恢复、工具前写边界与票据检查（含 `swarm` 流数计费与 `followup` 核验）、局部补测与完工回执防翻案核验、长会话交接与待拍板保护 |
+| [skills/cae-harness/](skills/cae-harness/) | 日常派工、双门可用性复查、默认持久化可续接无头会话与 `followup` 追问、双层零丢失超时抢救、`--files` 多文件与 `wave` 波次编排、`--isolation` 四级正交隔离、`<ticket_id>_card.md` 14 项明细落盘与精简总览卡及 `check-grounding` 事实锚定 |
 | [skills/cae-harness/fleet_profile.json](skills/cae-harness/fleet_profile.json) | 五角色（`roles`）、四端内生代理档案（`native_agent_profiles`）、运行期定量参数（`runtime_tunables`）、订阅启停矩阵（`subscription_matrix`）与离线性能更新时间（`capability_ledger`）的唯一动态配置来源 |
 | [skills/fleet-evolve/](skills/fleet-evolve/) | 上游配置仓专属的四维工具链评估、审批提案、双端同步与重启重入验收 |
 

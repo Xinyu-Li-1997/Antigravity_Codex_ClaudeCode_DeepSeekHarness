@@ -1181,6 +1181,18 @@ def summarize_subagent_return(
     return f"{cleaned[:head_len].rstrip()}{marker}{cleaned[-tail_len:].lstrip()}"
 
 
+def _archive_noise(text: str) -> bool:
+    text = TOOL_TIMING_HEADER_RE.sub("", text).strip().lower()
+    if not text or (len(text) < 600 and re.match(
+        r'^(?:\{\s*"(?:error|output|content|message)"\s*:\s*")?(?:tool call denied|encountered error in tool execution|\[swarm\])', text
+    )):
+        return True
+    started = re.search(r'(?m)^[ \t]*process_started\b|"process_started"\s*(?:[:,}]|$)|tool is running as a background task', text)
+    return bool(started and not re.search(
+        r'\bprocess_(?:finished|exited)\b|"(?:summary|content|error|timeout_salvage)"\s*:|'
+        r'"(?:exit_code|returncode)"\s*:\s*-?\d|"status"\s*:\s*"(?:ok|failed|timeout|partial)"', text))
+
+
 class _HarnessArchiveCollector:
     """把关联命令的完成输出与异步回执转换成原生归档条目。"""
 
@@ -1232,21 +1244,26 @@ class _HarnessArchiveCollector:
         return None
 
     def _complete(self, meta, raw, index, timestamp):
-        text = raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False)
+        text = _codex_output_to_text(raw) or json.dumps(raw, ensure_ascii=False)
         objects = list(self._objects(raw))
-        if not text.strip() or re.search(
-                r"Script running|Process running|running with (?:cell|session|id)|running in (?:the )?background|background task.*started", text, re.I):
-            return
-        if any(obj.get("session_id") and obj.get("exit_code") is None for obj in objects):
+        if not any(isinstance(obj.get("timeout_salvage"), dict) for obj in objects) and (
+                _archive_noise(text) or any(obj.get("session_id") and obj.get("exit_code") is None
+                                            and not obj.get("receipt_file") for obj in objects)
+                or re.search(r"Script running|Process running|running with (?:cell|session|id)|running in (?:the )?background|background task.*started", text, re.I)):
             return
         receipt = next((obj.get("receipt_file") for obj in objects if obj.get("receipt_file")), "")
         file_data = self._file(receipt or meta.get("output"), meta.get("cwd", ""))
         if file_data:
             receipt, text = str(file_data[0]), file_data[1]
-            objects = list(self._objects(text))
+            objects.extend(self._objects(text))
         models = list(dict.fromkeys(str(obj["model"]) for obj in objects if obj.get("model")))
         summaries = []
         for obj in objects:
+            salvage = obj.get("timeout_salvage")
+            if isinstance(salvage, dict) and (details := {
+                    key: salvage[key] for key in ("provider_session_id", "changed_files_on_disk", "last_messages")
+                    if key in salvage}):
+                summaries.insert(0, "超时抢救：" + json.dumps(details, ensure_ascii=False))
             for key in ("summary", "content", "evidence", "unverified", "error"):
                 val = obj.get(key)
                 if isinstance(val, str) and val.strip():
@@ -1256,7 +1273,9 @@ class _HarnessArchiveCollector:
         if not summaries:
             outputs = [obj.get("output") or obj.get("stdout") for obj in objects]
             summaries = [val for val in outputs if isinstance(val, str) and val.strip()] or [text]
-        body = "\n".join(dict.fromkeys(summaries))
+        body = "\n".join(dict.fromkeys(val for val in summaries if val.startswith("超时抢救：") or not _archive_noise(val)))
+        if not body:
+            return
         if models:
             body = "模型：" + "、".join(models) + "\n" + body
         if receipt:
@@ -1296,7 +1315,7 @@ class _HarnessArchiveCollector:
             if call_id and task_id in self.tasks:
                 self.calls[call_id] = self.tasks[task_id]
                 continue
-            match = re.search(r"cae_harness\.py[\"']?\s+(task|gate|audit|batch)\b", text)
+            match = re.search(r"cae_harness\.py[\"']?\s+(task|followup|gate|audit|batch)\b", text)
             if not match:
                 continue
             command = str(parsed.get("command") or parsed.get("cmd") or parsed.get("CommandLine") or text)
@@ -1567,7 +1586,7 @@ def _extract_agy_subagent_return_body(raw_content: str) -> Tuple[str, str]:
     content_start = msg_match.end()
     close_idx = text.rfind("</SYSTEM_MESSAGE>", content_start)
     body = (text[content_start:close_idx] if close_idx != -1 else text[content_start:]).strip()
-    if not body or body.startswith("Task id "):
+    if body.startswith("Task id ") or _archive_noise(body):
         return "", ""
     return sender, body
 
@@ -2181,6 +2200,19 @@ def _codex_word_from_record(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     }
 
 
+def transcript_user_text(entry: Dict[str, Any], path: Path) -> str:
+    if entry.get("type") == "USER_INPUT" or entry.get("source") == "USER_EXPLICIT":
+        return clean_user_content(entry.get("content"))
+    if entry.get("type") in ("user", "attachment"):
+        text, kind = claude_user_content(entry)
+        return text if kind in ("user_input", "queued_command") else ""
+    _, record = _extract_codex_record(entry, 0)
+    if not record:
+        return ""
+    record["source_path"] = str(path)
+    return (_codex_word_from_record(record) or {}).get("content", "")
+
+
 def _merge_codex_record_origins(existing: Dict[str, Any], incoming: Dict[str, Any]) -> Tuple[bool, bool]:
     """返回是否纠正了归属、是否遇到新的明确来源冲突。"""
     previous = existing["origins"]
@@ -2304,14 +2336,14 @@ def _extract_codex_completed_subagent_items(
                 if isinstance(state_item, dict):
                     for key in ("completed", "final_output", "output", "result", "message", "content"):
                         cand = _codex_output_to_text(state_item.get(key))
-                        if cand:
+                        if not _archive_noise(cand):
                             body = cand
                             break
                 elif isinstance(state_item, str):
                     cand = state_item.strip()
                     if cand and cand.lower() not in pending_states:
                         body = cand
-                if body:
+                if not _archive_noise(body):
                     meta = _register_agent(sub_aid)
                     emitted.append((sub_aid, _format_codex_subagent_label(meta, sub_aid), meta.get("log_path") or "", body))
             return emitted
@@ -2328,7 +2360,7 @@ def _extract_codex_completed_subagent_items(
                     sub_aid = str(elem.get("agent_id") or elem.get("id") or top_aid).strip()
                     for key in ("completed", "final_output", "output", "result", "content", "message"):
                         cand = _codex_output_to_text(elem.get(key))
-                        if cand:
+                        if not _archive_noise(cand):
                             meta = _register_agent(
                                 sub_aid,
                                 nickname=str(elem.get("nickname") or ""),
@@ -2344,7 +2376,7 @@ def _extract_codex_completed_subagent_items(
 
         for key in ("completed", "final_output", "output", "result", "response", "content", "message"):
             cand = _codex_output_to_text(parsed.get(key))
-            if cand:
+            if not _archive_noise(cand):
                 target_ids = call_meta.get("target_ids") or []
                 aid = top_aid or (target_ids[0] if len(target_ids) == 1 else "")
                 meta = _register_agent(aid, nickname=top_nick, agent_type=top_type)
@@ -2352,7 +2384,7 @@ def _extract_codex_completed_subagent_items(
                 return emitted
         return []
 
-    if out_text:
+    if not _archive_noise(out_text):
         lowered = out_text.lower()
         if lowered.startswith(("error:", "timed out", "agent spawned", "spawned agent")):
             return []
@@ -3034,7 +3066,7 @@ def _extract_claude_subagent_returns_from_user(
                 body_text = _extract_claude_text_blocks(tool_res.get(key))
                 if body_text:
                     break
-        if not body_text:
+        if _archive_noise(body_text):
             continue
         agent_id = ""
         explicit_log = ""

@@ -2453,6 +2453,60 @@ class TestHeavyWorkflowLifecycle(unittest.TestCase):
         self.assertIn("后台只读审查已结束", archive["subagent_returns"][0]["content"])
         self.assertEqual(user_words.clean_user_content(rows[-1]["content"], "SYSTEM_MESSAGE"), "")
 
+    def test_harness_archive_excludes_launch_noise_and_keeps_timeout_salvage(self):
+        transcript = self.root / ".system_generated/logs/transcript.jsonl"
+        log = self.root / ".system_generated/tasks/task-salvage.log"
+        user_words.atomic_write_text(log, '{"event":"preflight"}\n{"event":"process_started","pid":12}\n')
+        _append_jsonl(transcript, {"type": "PLANNER_RESPONSE", "tool_calls": [
+            {"id": "launch", "name": "run_command", "args": {"CommandLine": "python cae_harness.py followup"}},
+        ]})
+        _append_jsonl(transcript, {"type": "GENERIC", "tool_call_id": "launch",
+                                   "content": "Tool is running as a background task. Task: task-salvage"})
+        _append_jsonl(transcript, {"type": "SYSTEM_MESSAGE", "content": "[swarm] task-salvage 已启动"})
+        self.assertEqual(user_words.extract_agy_archive(str(transcript))["subagent_returns"], [])
+
+        receipt = self.root / "timeout-receipt.json"
+        user_words.atomic_write_json(receipt, {
+            "status": "partial", "session_id": "fixture-session",
+            "timeout_salvage": {"provider_session_id": "timeout-parent", "last_messages": ["写入修正说明"],
+                                "changed_files_on_disk": ["notes.md"]},
+            "streams": [{"stream_id": "S1", "status": "timeout", "timeout_salvage": {
+                "provider_session_id": "timeout-stream", "last_messages": ["完成接口边界核对"],
+                "changed_files_on_disk": ["solver.py"],
+            }}],
+        })
+        for content in (json.dumps({"receipt_file": str(receipt), "status": "partial"}),
+                        {"error": "tool call denied by pre-tool hook"},
+                        "Created At: now\nEncountered error in tool execution", "[swarm] 看板更新\n子任务已入队",
+                        [{"type": "text", "text": "Tool is running as a background task"}]):
+            _append_jsonl(transcript, {"type": "GENERIC", "tool_call_id": "launch", "content": content})
+        archive = user_words.extract_agy_archive(str(transcript))
+        self.assertEqual(len(archive["subagent_returns"]), 1)
+        returned = archive["subagent_returns"][0]
+        self.assertEqual(returned["receipt_file"], str(receipt))
+        markdown = user_words.format_user_words_markdown(self.sid, archive["words"], subagent_returns=[returned])
+        for value in ("timeout-parent", "写入修正说明", "notes.md", "timeout-stream", "完成接口边界核对", "solver.py"):
+            self.assertIn(value, markdown)
+        self.assertNotIn("看板更新", markdown)
+
+    def test_native_returns_filter_async_deny_and_board_notifications(self):
+        noises = ("Tool is running as a background task", '{"event":"process_started","pid":12}',
+                  "tool call denied by pre-tool hook", "Encountered error in tool execution",
+                  "[swarm] 子任务已入队\n[swarm] 看板已更新")
+        completion = "process_started\nprocess_finished\n子代理核对已完成，结果保存在当前工作区。"
+        for body in (*noises, completion):
+            with self.subTest(body=body):
+                useful = body == completion
+                agy = user_words._extract_agy_subagent_return_body(f"[Message] sender=fixture-agent content={body}")
+                self.assertEqual(agy[1], completion if useful else "")
+                codex = user_words._extract_codex_completed_subagent_items(
+                    {"tool": "wait_agent"}, {"status": {"fixture-agent": {"completed": body}}}, {}, [], set())
+                self.assertEqual([entry[-1] for entry in codex], [completion] if useful else [])
+                claude = user_words._extract_claude_subagent_returns_from_user({"type": "user", "message": {"content": [
+                    {"type": "tool_result", "tool_use_id": "call-fixture", "content": body},
+                ]}}, 1, {"call-fixture": {"sub_type": "fixture-agent"}}, self.root / "claude-trace.jsonl")
+                self.assertEqual([entry["raw_body"] for entry in claude], [completion] if useful else [])
+
     def test_codex_async_poll_completion_is_correlated(self):
         payload = self.native_payload("codex")
         transcript = Path(payload["transcript_path"])
@@ -2599,6 +2653,88 @@ class TestHeavyWorkflowLifecycle(unittest.TestCase):
                     corrected = handler(dict(payload, hook_event_name="Stop", last_assistant_message=reply + "\n" + block), directory, "enforce")
                     self.assertNotEqual(corrected.get("decision"), "block")
                     self.assertTrue(json.loads(state_path.read_text(encoding="utf-8"))["handoffRecorded"])
+
+    def test_stop_preserves_decision_placeholders_from_baseline_and_current_document(self):
+        prefix = ("已验证：接口已核对。Git 工作区待提交。未完成：独立审查。\n"
+                  "## 新对话提示词\n请读取会话记录，并根据已验证的接口证据完成交接。\n")
+        confirmed = "采用方案甲。"
+        for client, section, placeholder in (("antigravity", "已拍板", "[请在此填入]"),
+                                              ("codex", "作者决定", "<待拍板>"),
+                                              ("claude", "用户已确认", "[待确认]")):
+            with self.subTest(client=client):
+                project = self.root / f"project-{client}"
+                project.mkdir()
+                doc = project / "HANDOFF.md"
+                doc.write_text(prefix + f"### {section}\n- {placeholder}\n", encoding="utf-8")
+                state_dir = self.state / client
+                promoted = prefix + f"### {section}\n- {confirmed}\n"
+                retained = prefix + f"### 待用户拍板\n- {placeholder}\n"
+                if client == "antigravity":
+                    transcript = project / "transcript.jsonl"
+                    _append_jsonl(transcript, {"type": "USER_INPUT", "content": "我确认采用方案甲。"})
+                    state = handoff_gate.default_gate_state(self.sid)
+                    state["phase"] = "freeze"
+                    handoff_gate._record_handoff_baseline(state, doc, transcript)
+                    handoff_gate.save_gate_state(state_dir, self.sid, state)
+                    doc.write_text(promoted, encoding="utf-8")
+                    payload = {"conversationId": self.sid, "cwd": str(project), "transcriptPath": str(transcript)}
+
+                    def stop(reply):
+                        return handoff_gate.check_stop_handoff_locked(payload, state_dir, "turn-1", reply)
+
+                else:
+                    payload = dict(self.native_payload(client), cwd=str(project))
+                    handler = handoff_gate.handle_codex_handoff if client == "codex" else handoff_gate.handle_claude_handoff
+                    handler(dict(payload, hook_event_name="UserPromptSubmit", prompt="请整理交接并停机"), state_dir, "enforce")
+
+                    def stop(reply):
+                        return handler(dict(payload, hook_event_name="Stop", last_assistant_message=reply), state_dir, "enforce")
+
+                self.assertNotIn("reason", stop(retained), "保留决策占位符时允许交接")
+                blocked = stop(promoted)
+                self.assertEqual(blocked["decision"], "continue" if client == "antigravity" else "block")
+                self.assertIn("保留待用户拍板状态", blocked["reason"])
+                self.assertNotIn("reason", stop(promoted), "同一回合只补正一次")
+
+    def test_only_later_human_decision_supports_filling_handoff_placeholder(self):
+        payload = self.native_payload("codex")
+        transcript = Path(payload["transcript_path"])
+        state_dir = self.state / "handoff-decisions"
+        handoff_gate.handle_codex_handoff(dict(payload, hook_event_name="UserPromptSubmit", prompt="请整理交接并停机"),
+                                         state_dir, "enforce")
+        prefix = ("已验证：接口已核对。Git 工作区待提交。未完成：独立审查。\n【新对话提示词】\n"
+                  "```markdown\n请先对照原文核查本会话的裁定和接口证据。\n## 用户已确认\n- ")
+        reply = prefix + "采用方案甲。\n```"
+        doc = self.root / "HANDOFF.md"
+        doc.write_text(prefix + "[待确认]\n```", encoding="utf-8")
+        handoff_gate.handle_codex_handoff(dict(payload, hook_event_name="PreToolUse", tool_name="apply_patch",
+                                              tool_input="*** Begin Patch\n*** Update File: HANDOFF.md\n@@\n+更新\n*** End Patch"),
+                                         state_dir, "enforce")
+        self.assertTrue(handoff_gate._pending_decision_promoted({}, reply, transcript, str(self.root)))
+        doc.write_text(reply, encoding="utf-8")
+        file_only = handoff_gate.handle_codex_handoff(
+            dict(payload, hook_event_name="Stop", last_assistant_message="交接已写入 HANDOFF.md。"), state_dir, "enforce"
+        )
+        self.assertEqual(file_only["decision"], "block")
+        self.assertIn("保留待用户拍板状态", file_only["reason"])
+        state = json.loads((state_dir / f"{self.sid}_handoff_gate.json").read_text(encoding="utf-8"))
+        state["stopCorrectionRequested"] = False
+        user_words.atomic_write_json(state_dir / f"{self.sid}_handoff_gate.json", state)
+        multi_reply = prefix + "采用方案甲；采用方案丙。\n```"
+        for role, text in (("assistant", "我确认采用方案甲。"), ("user", "我确认采用方案乙。"),
+                           ("user", "> 我确认采用方案甲。"), ("user", "我确认采用方案甲。")):
+            with self.subTest(role=role, text=text):
+                _append_jsonl(transcript, {"type": "response_item", "payload": {"type": "message", "role": role,
+                                           "content": [{"type": "input_text", "text": text}]}})
+                if role == "user" and text == "我确认采用方案甲。":
+                    self.assertTrue(handoff_gate._pending_decision_promoted(state, multi_reply, transcript, str(self.root)))
+                stop = handoff_gate.handle_codex_handoff(dict(payload, hook_event_name="Stop", last_assistant_message=reply),
+                                                        state_dir, "enforce")
+                state = json.loads((state_dir / f"{self.sid}_handoff_gate.json").read_text(encoding="utf-8"))
+                grounded = role == "user" and text == "我确认采用方案甲。"
+                self.assertEqual(state["handoffRecorded"], grounded)
+                if grounded:
+                    self.assertEqual(stop["continue"], False)
 
     def test_workflow_must_be_inside_prompt_or_a_changed_handoff_document(self):
         _, ticket = self.ticket()

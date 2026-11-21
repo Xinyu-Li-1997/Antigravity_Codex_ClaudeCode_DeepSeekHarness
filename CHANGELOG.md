@@ -2,6 +2,24 @@
 
 本文件记录四客户端共用规则、会话钩子、后台验证工具与上游维护流程的版本演进。当前插件版本以 `template/user-guard/plugin.json` 为准；常驻使用文档只说明机制和配置键，不重复维护版本号与性能日期。
 
+## [1.18.0] - 2026-11-21
+
+基于 Windows 与 WSL2 多课题真实会话轨迹的跨端实证审计，完成无头子代理持久化可续接会话与双层零丢失超时抢救、多文件输入与波次调度、钩子进程系统级资源自毁护栏、局部补测冒充全过拦截、交接未决拍板保护、压缩去噪与常驻规则精炼升级：
+
+- **默认持久化可续接无头会话、双层零丢失超时抢救与精确输入输出信封（`cae_harness.py`、`fleet_profile.json`）**：
+  - 将 `run_process` 升级为实时逐行守护管道读取并默认注入防分页与无头 MPI 非交互环境变量（`GIT_PAGER=cat`、`PAGER=cat`、`LESS=-FRX`、`GCM_INTERACTIVE=never`、`HWLOC_COMPONENTS=-gl`），在超时、取消与非零退出时保留已输出的 `partial_stdout` 与 `partial_stderr`；
+  - 默认开启四端无头会话持久化（`persist_sessions_by_default=true`，新增显式 `--ephemeral` 关闭开关），记录 `provider_session_id` 并在隔离临时目录清理前归档会话轨迹至 `<plan_dir>/headless_sessions/`，新增 `cae_harness.py followup` 子命令支持按回执续接原会话执行精准追问并校验快照边界；
+  - 实现双层超时恢复：第一层在长任务触及软时限（`soft_timeout_ratio`）时优先提取已完成结果或利用剩余预算发起只读续接收口（`soft_timeout_wrapup`）；第二层在硬超时下从实时流、会话日志与前后快照差分确定性提取已完成轮次 Token（`cli_partial_on_timeout`）及 `timeout_salvage`（含 `provider_session_id`、`resumable`、`actual_files_read`、`changed_files_on_disk` 与最近回复片段）；
+  - 为 `task`、`plan`、`batch` 新增 `--files` 跨子目录多文件精确暂存、`--negative-scope-file` 负向边界与 `env_contract` 环境约定，前置拦截 Windows 互操作后端写入 WSL 纯 Linux 路径；新增只读回执 `citation_audit` 行号与读取轨迹核验；为 `cmd_batch` 增加 `wave` 波次顺序与同根目录不重叠 `write_scope` 安全并发；为 `_build_grounding_anchor` 增加 `grounding_max_anchor_file_mib` 大文件首尾采样与 `grounding_excluded_dirs` 工具链及归档目录排除，根治超大结果 JSON 引发的 `MemoryError`。
+- **钩子进程资源自毁护栏、压缩恢复去噪与回合结束诚实性硬门禁（`hooks/_lib/process_guard.py`、`status_guard.py`、`session_context_loader.py`、`user_words.py`、`reply_repeat_guard.py`、`handoff_gate.py`、`install.py`）**：
+  - 新增 `hooks/_lib/process_guard.py` 并纳入 `install.py` 分发：四个会话钩子在命令行入口按 `loop_guards.hook_safety` 设置 POSIX `RLIMIT_AS` 内存上限与 `SIGALRM` / Windows 守护计时器墙钟自毁护栏（进程内调用退出自动注销计时器），防止异常钩子进程长期驻留消耗内存；
+  - 在 `user_words.py` 过滤后台异步启动提示、权限拒绝短文本与看板通知噪音，同时在压缩归档中保留 `timeout_salvage` 关键摘要；在 `status_guard.py` 将 `followup` 纳入重负载与票据校验；
+  - 在 `reply_repeat_guard.py` 新增局部补测冒充全套测试通过门禁（识别 `unittest`、`pytest` 与 Julia 套件统计）及未全胜账单写成“全部成功”的防翻案门禁；在 `handoff_gate.py` 新增落盘交接稿待拍板占位符（如 `[请在此填入]`）防越俎代庖篡改门禁。
+- **常驻规则与技能精炼重写及全链路回归单测（`AGENTS.md`、`rules/AGENTS.md`、`SKILL.md`、`README.md`、`docs/`、`tests/`）**：
+  - 在不增加字节体积、不稀释模型注意力的前提下整篇精炼更新常驻规则、双技能、主说明与架构及实战指南，补充覆盖双层超时抢救、`followup`、波次并发、资源护栏、局部补测拦截与交接防伪的离线与端到端回归测试。
+
+---
+
 ## [1.17.6] - 2026-11-20
 
 完成全仓运行期与诊断日志脱敏一致性收口、批量模式润色事实锚定与验收环境隔离补齐、跨运行侧状态锁防死锁加固、CC Switch 数据库基线升级及常驻文档书面语润色：
