@@ -101,9 +101,11 @@
 
 ### 3. 单分片安全输入预算公式（`_execution_budget`）
 
-模型声明的最大上下文窗口（由 `subscription_matrix.models` 或客户端本地模型目录缓存提供）可能高于客户端出厂默认窗口，也不同于自动压缩触发阈值（如 Claude 的 `client_catalog_rules.claude.auto_compact_window`）。设 `runtime_tunables.headless_dispatch.input_budget_safety_ratio` 为安全系数 $\alpha$ ， $W_{\text{selected}}$ 为当前模型声明窗口， $p_{\text{eff}}$ 为本地目录声明的有效窗口百分比（缺省按 `100` 计）， $W_{\text{compact}}$ 为适用的自动压缩窗口上限，`cae_harness.py` 按下式动态计算单分片安全输入预算：
+模型声明的最大上下文窗口（由 `subscription_matrix.models` 或客户端本地模型目录缓存提供）可能高于客户端出厂默认窗口，也不同于自动压缩触发阈值（如 Claude 的 `client_catalog_rules.claude.auto_compact_window`）。设 `runtime_tunables.headless_dispatch.input_budget_safety_ratio` 为安全系数 $\alpha$ ， $W_{\text{selec}\text{ted}}$ 为当前模型声明窗口， $p_{\text{eff}}$ 为本地目录声明的有效窗口百分比（缺省按 `100` 计）， $W_{\text{compact}}$ 为适用的自动压缩窗口上限，`cae_harness.py` 按下式动态计算单分片安全输入预算：
 
-$$W_{\text{eff}} = \left\lfloor W_{\text{selected}} \times \frac{p_{\text{eff}}}{100} \right\rfloor, \quad C_{\text{plan}} = \min\!\big(W_{\text{eff}},\, W_{\text{compact}}\big), \quad B_{\text{input}} = \left\lfloor \alpha \, C_{\text{plan}} \right\rfloor$$
+$$
+W_{\text{eff}} = \left\lfloor W_{\text{selec}\text{ted}} \times \frac{p_{\text{eff}}}{100} \right\rfloor, \quad C_{\text{plan}} = \min\big(W_{\text{eff}}, W_{\text{compact}}\big), \quad B_{\text{input}} = \left\lfloor \alpha C_{\text{plan}} \right\rfloor
+$$
 
 对于客户端命令未输出整数窗口且未在 `subscription_matrix.models` 声明窗口的模型，调度器按 `runtime_tunables.headless_dispatch.unlisted_window_fallback_tokens` 回退采用保守分片预算（支持环境变量覆盖）；具体窗口与预算数值随 `fleet_profile.json` 与本机目录动态重算，不在常驻文档中固化本机派生指纹。
 
