@@ -1073,6 +1073,13 @@ def switch_card(
             original_cfg = json.loads(original_bytes.decode("utf-8-sig"))
         except RecursionError as exc:
             raise ValueError("Card or settings JSON exceeds recursion limit") from exc
+        tx_base_url = (
+            target_cfg.get("env", {}).get("ANTHROPIC_BASE_URL")
+            if isinstance(target_cfg, dict) and isinstance(target_cfg.get("env"), dict)
+            else None
+        )
+        if require_router_alive and tx_base_url != pre_base_url:
+            raise RuntimeError("Target card ANTHROPIC_BASE_URL changed concurrently before lock acquisition; retry switch-card")
         updated = project_claude_settings(
             original_cfg,
             previous,

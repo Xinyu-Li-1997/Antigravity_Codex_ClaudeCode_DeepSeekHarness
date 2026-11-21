@@ -198,7 +198,8 @@ def _default_ttl_seconds(repo_root: Path | None = None) -> int:
                     continue
                 if "schema_version" in raw and (isinstance(raw["schema_version"], bool) or raw["schema_version"] != 1):
                     continue
-                hd = (raw.get("runtime_tunables") or {}).get("headless_dispatch") or {}
+                rt = raw.get("runtime_tunables")
+                hd = rt.get("headless_dispatch") if isinstance(rt, dict) else None
                 val = hd.get("fleet_state_ttl_sec") if isinstance(hd, dict) else None
                 if isinstance(val, int) and not isinstance(val, bool) and val > 0:
                     return val
@@ -559,6 +560,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps({"ok": False, "reason": "invalid_arguments", "error": "session-id and summary must be non-empty and ttl must be positive"}, ensure_ascii=False, indent=2))
                 return 2
             with _state_lock(state_file):
+                meta = _repo_meta(repo_root)
                 now = int(time.time())
                 payload = {
                     "schema_version": 1,
@@ -605,6 +607,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps({"ok": False, "reason": "invalid_arguments", "error": "session-id must be non-empty"}, ensure_ascii=False, indent=2))
                 return 2
             with _state_lock(state_file):
+                meta = _repo_meta(repo_root)
                 now = int(time.time())
                 try:
                     saved = _load_state(state_file, default_ttl)
@@ -646,6 +649,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps({"ok": False, "reason": "invalid_arguments", "error": "session-id and target-master must be non-empty and ttl must be positive"}, ensure_ascii=False, indent=2))
                 return 2
             with _state_lock(state_file):
+                meta = _repo_meta(repo_root)
                 now = int(time.time())
                 payload = {
                     "schema_version": 1,
@@ -692,6 +696,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps({"ok": False, "reason": "invalid_arguments", "error": "session-id must be non-empty"}, ensure_ascii=False, indent=2))
                 return 2
             with _state_lock(state_file):
+                meta = _repo_meta(repo_root)
                 now = int(time.time())
                 try:
                     saved = _load_state(state_file, default_ttl)
@@ -719,6 +724,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0 if ok else 2
 
         with _state_lock(state_file):
+            meta = _repo_meta(repo_root)
             now = int(time.time())
             if not args.force:
                 try:
@@ -767,13 +773,21 @@ def main(argv: list[str] | None = None) -> int:
                     }, ensure_ascii=False, indent=2))
                     return 2
             if args.verified:
+                post_meta = _repo_meta(repo_root)
+                if args.readback_done and post_meta != meta:
+                    print(json.dumps({
+                        "ok": False,
+                        "readback_verified": False,
+                        "reason": "repo_changed_during_grounding",
+                    }, ensure_ascii=False, indent=2))
+                    return 2
                 payload = {
                     "schema_version": 1,
                     "phase": "IDLE",
-                    "last_verified_epoch": now,
+                    "last_verified_epoch": int(time.time()),
                     "readback_verified": bool(args.readback_done),
                     "execution_side": _side(),
-                    **meta,
+                    **post_meta,
                 }
                 _atomic_write_json(state_file, payload)
             else:

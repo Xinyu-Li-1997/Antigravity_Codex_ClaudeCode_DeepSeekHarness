@@ -19,6 +19,7 @@ import argparse
 import ast
 import base64
 import binascii
+import contextlib
 import hashlib
 import itertools
 import importlib.util
@@ -39,6 +40,7 @@ HOOKS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(HOOKS_DIR))
 import handoff_gate  # noqa: E402
 import user_words  # noqa: E402
+from _lib.fs_safety import is_reparse_or_link  # noqa: E402
 from _lib.process_guard import apply_noninteractive_env, install_hook_self_guard  # noqa: E402
 from _lib import shell_lex as _shell_lex  # noqa: E402
 
@@ -940,15 +942,25 @@ def _normalize_win_mount_key(drv: str, rest: str) -> str:
 
 
 def _normalize_cross_env_lexical(
-    raw_str: str, base_dir: Optional[str] = None, *, from_shell: bool = True
+    raw_str: str, base_dir: Optional[str] = None, *, from_shell: bool = True, msys_shell: bool = False
 ) -> str:
-    r"""盘符与 /mnt/<drive> 共用规范键；兼容 Windows 盘符相对路径（如 D:out.txt、C:..\out.txt）。"""
+    r"""盘符、/mnt/<drive> 与显式 MSYS /<drive>/... 共用规范键；兼容 Windows 盘符相对路径。"""
     expanded = user_words.strip_win_extended_prefix(
         _expand_host_vars(raw_str, base_cwd=base_dir, from_shell=from_shell)
     )
     if not expanded:
         return ""
     slashes = expanded.replace("\\", "/")
+
+    if msys_shell and os.name == "nt":
+        if slashes == "/tmp" or slashes.startswith("/tmp/"):
+            tmp_sub = slashes[4:].lstrip("/")
+            tmp_base = tempfile.gettempdir().replace("\\", "/").rstrip("/")
+            slashes = f"{tmp_base}/{tmp_sub}" if tmp_sub else tmp_base
+        else:
+            m_msys = re.match(r"^/([A-Za-z])(?:/(.*))?$", slashes)
+            if m_msys:
+                return _normalize_win_mount_key(m_msys.group(1).lower(), m_msys.group(2) or "")
 
     m_rel_drive = re.match(r"^([A-Za-z]):([^/].*)$", slashes)
     if m_rel_drive:
@@ -1076,9 +1088,9 @@ def _outer_shell_operators(command: str) -> bool:
 
 
 def _host_path_string(
-    raw_str: str, base_dir: Optional[str] = None, *, from_shell: bool = True
+    raw_str: str, base_dir: Optional[str] = None, *, from_shell: bool = True, msys_shell: bool = False
 ) -> Optional[str]:
-    """将盘符或 WSL 挂载路径还原为当前宿主可解析的路径字符串。"""
+    """将盘符、WSL 挂载路径或显式 MSYS 路径还原为当前宿主可解析的路径字符串。"""
     expanded = user_words.strip_win_extended_prefix(
         _expand_host_vars(raw_str, base_cwd=base_dir, from_shell=from_shell)
     )
@@ -1088,6 +1100,12 @@ def _host_path_string(
         m_mnt = re.match(r"^/mnt/([A-Za-z])(?:/(.*))?$", expanded)
         if m_mnt:
             expanded = f"{m_mnt.group(1).upper()}:/{m_mnt.group(2) or ''}"
+        elif msys_shell and (expanded == "/tmp" or expanded.startswith("/tmp/")):
+            tmp_sub = expanded[4:].lstrip("/")
+            tmp_base = tempfile.gettempdir().replace("\\", "/").rstrip("/")
+            expanded = f"{tmp_base}/{tmp_sub}" if tmp_sub else tmp_base
+        elif msys_shell and (m_msys := re.match(r"^/([A-Za-z])(?:/(.*))?$", expanded)):
+            expanded = f"{m_msys.group(1).upper()}:/{m_msys.group(2) or ''}"
         else:
             return None
     elif re.match(r"^([A-Za-z]):(?![\\/])(.+)$", expanded):
@@ -1114,17 +1132,17 @@ def _host_path_string(
 
 
 def _resolve_nearest_existing(
-    raw_str: str, base_dir: Optional[str], *, from_shell: bool = True
+    raw_str: str, base_dir: Optional[str], *, from_shell: bool = True, msys_shell: bool = False
 ) -> Optional[Path]:
     """解析真实物理位置；相对路径与基准目录必须使用同一种宿主路径格式。"""
-    expanded = _host_path_string(raw_str, base_dir=base_dir, from_shell=from_shell)
+    expanded = _host_path_string(raw_str, base_dir=base_dir, from_shell=from_shell, msys_shell=msys_shell)
     if expanded is None:
         return None
     p = Path(expanded)
     if not p.is_absolute():
         if not base_dir:
             return None
-        base_expanded = _host_path_string(base_dir)
+        base_expanded = _host_path_string(base_dir, msys_shell=msys_shell)
         if base_expanded is None:
             return None
         p = Path(base_expanded) / p
@@ -1176,7 +1194,16 @@ def _collect_boundary_context(
         str(state_dir),
         str(logs_dir),
         str(home_p / ".cache"),
+        str(home_p / ".cargo" / "registry"),
+        str(home_p / ".rustup"),
+        str(home_p / ".npm" / "_cacache"),
     ]
+    if os.name == "nt":
+        local_app = Path(os.environ.get("LOCALAPPDATA") or home_p / "AppData" / "Local")
+        internal_raw.extend([
+            str(local_app / "pip" / "Cache"),
+            str(local_app / "uv" / "cache"),
+        ])
     internal_raw.extend(str(codex_home / name) for name in (
         "memories", "sessions", "cache", "tmp", ".tmp", "sqlite", "attachments", "visualizations",
     ))
@@ -1244,6 +1271,7 @@ def _is_write_target_allowed(
     allow_os_temp: bool = True,
     wsl_distribution: Optional[str] = None,
     from_shell: bool = True,
+    msys_shell: bool = False,
 ) -> bool:
     cleaned = (
         _unquote_shell_word(raw_target.strip()).strip("`;,)")
@@ -1258,7 +1286,8 @@ def _is_write_target_allowed(
     ):
         return False
 
-    lex_key = _normalize_cross_env_lexical(cleaned, base_cwd, from_shell=from_shell)
+    msys_kw = {"msys_shell": True} if msys_shell else {}
+    lex_key = _normalize_cross_env_lexical(cleaned, base_cwd, from_shell=from_shell, **msys_kw)
     if not lex_key:
         return True
     if not any(_is_under_norm_key(lex_key, rk) for rk in allowed_norm_keys):
@@ -1266,11 +1295,13 @@ def _is_write_target_allowed(
                 and _is_wsl_standard_temp_path(cleaned, wsl_distribution))
 
     # 若本地文件系统可解析真实路径，校验是否存在软链接/目录联接逃逸到允许目录外
-    resolved_p = _resolve_nearest_existing(cleaned, base_cwd, from_shell=from_shell)
+    resolved_p = _resolve_nearest_existing(cleaned, base_cwd, from_shell=from_shell, **msys_kw)
     if resolved_p is None:
         # 仅保留当前进程无法物理访问的原生 POSIX 项目路径的跨端词法比较。
         expanded = _expand_host_vars(cleaned, base_cwd=base_cwd, from_shell=from_shell)
         if os.name != "nt" or not expanded.startswith("/") or re.match(r"^/mnt/[A-Za-z](?:/|$)", expanded):
+            return False
+        if msys_shell and (expanded == "/tmp" or expanded.startswith("/tmp/") or re.match(r"^/[A-Za-z](?:/|$)", expanded)):
             return False
     if resolved_p is not None and allowed_resolved_keys:
         res_key = _normalize_cross_env_lexical(str(resolved_p))
@@ -1394,7 +1425,7 @@ _AST_OS_EXEC_SPAWN = {
     "posix_spawn", "posix_spawnp",
 }
 _AST_MODULE_CALLS = {
-    "os": {"chdir", "getcwd", "open", "remove", "unlink", "rmdir", "removedirs", "mkdir", "makedirs", "rename",
+    "os": {"chdir", "getcwd", "open", "O_RDONLY", "remove", "unlink", "rmdir", "removedirs", "mkdir", "makedirs", "rename",
            "replace", "renames", "truncate", "symlink", "link", "chmod", "lchmod", "chown", "lchown", "utime",
            "system", "popen", *_AST_OS_EXEC_SPAWN},
     "sys": {"executable"},
@@ -1413,7 +1444,7 @@ _AST_MODULE_CALLS = {
     "logging": {"FileHandler"},
     "importlib": {"import_module"},
 }
-_AST_READONLY_OPEN_RECEIVERS = frozenset({"Image", "webbrowser"})
+_AST_READONLY_OPEN_RECEIVERS = frozenset({"Image", "webbrowser", "opener", "urlopener", "director"})
 _AST_TEMP_DIR_INDEX = {"mkdtemp": 2, "TemporaryDirectory": 2, "mkstemp": 2, "NamedTemporaryFile": 6}
 _AST_WRITE_CALL_ARGS = {
     **{"os." + name: ((0, ("path",)),) for name in
@@ -1459,6 +1490,24 @@ class _AstDict:
 
 class _AstTempPath(str):
     """仅由已识别的 tempfile 工厂产生，普通字符串无法伪造此类型。"""
+
+
+class _AstSafeSegment(str):
+    """不含路径分隔符、盘符或 '..' 的受控单段名称（如 range 整数或 Path.name）。"""
+
+
+class _AstSubtree(str):
+    """受控目录树内的枚举子项（如 Path(base).glob / rglob / iterdir）。"""
+
+
+def _is_safe_segment_literal(text: str) -> bool:
+    return bool(text) and text not in (".", "..") and not any(c in text for c in ("/", "\\", ":", "\x00", "$", "%")) and ".." not in text
+
+
+def _is_safe_rel_glob(pat: str) -> bool:
+    if not pat or pat.startswith(("/", "\\", "~")) or ":" in pat or "\x00" in pat or "$" in pat or "%" in pat:
+        return False
+    return all(seg != ".." for seg in pat.replace("\\", "/").split("/"))
 
 
 def _copy_ast_bindings(bindings):
@@ -1557,7 +1606,15 @@ def _eval_ast_path_candidates(node, bindings):
             owners = _eval_ast_path_candidates(node.value, bindings)
             if any(isinstance(owner, _AstModule) and owner.name == "sys" for owner in owners):
                 return frozenset((sys.executable,))
+        if node.attr == "O_RDONLY":
+            if isinstance(node.value, ast.Name) and node.value.id == "os" and "os" not in bindings:
+                return frozenset((0,))
+            owners = _eval_ast_path_candidates(node.value, bindings)
+            if any(isinstance(owner, _AstModule) and owner.name == "os" for owner in owners):
+                return frozenset((0,))
         owners = _eval_ast_path_candidates(node.value, bindings)
+        if node.attr in ("name", "stem") and owners and all(isinstance(o, str) for o in owners):
+            return frozenset((_AstSafeSegment("__ast_safe_seg__"),))
         attr_vals = set()
         for owner in owners:
             if isinstance(owner, _AstModule):
@@ -1598,7 +1655,9 @@ def _eval_ast_path_candidates(node, bindings):
                     continue
                 formatted = set()
                 for cand_val in _eval_ast_path_candidates(part.value, bindings):
-                    if isinstance(cand_val, (str, int)) and not isinstance(cand_val, bool):
+                    if isinstance(cand_val, _AstSafeSegment) and _is_safe_segment_literal(fmt_spec or "s"):
+                        formatted.add(_AstSafeSegment("__ast_safe_seg__"))
+                    elif isinstance(cand_val, (str, int)) and not isinstance(cand_val, bool):
                         try:
                             formatted.add(format(cand_val, fmt_spec) if fmt_spec else str(cand_val))
                         except (ValueError, TypeError):
@@ -1608,7 +1667,16 @@ def _eval_ast_path_candidates(node, bindings):
                 parts.append(frozenset(formatted) or dynamic)
             else:
                 parts.append(_eval_ast_path_candidates(part, bindings))
-        return _ast_product(parts, lambda values: "".join(values))
+        joined = _ast_product(parts, lambda values: "".join(values))
+        if any(isinstance(p_item, _AstSafeSegment) for part in parts for p_item in part):
+            upgraded = set()
+            for jv in joined:
+                if isinstance(jv, str) and _is_safe_segment_literal(jv):
+                    upgraded.add(_AstSafeSegment(jv))
+                else:
+                    upgraded.add(jv)
+            return frozenset(upgraded)
+        return joined
     if isinstance(node, ast.IfExp):
         return _eval_ast_path_candidates(node.body, bindings) | _eval_ast_path_candidates(node.orelse, bindings)
     if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Div, ast.Add)):
@@ -1699,6 +1767,14 @@ def _eval_ast_path_candidates(node, bindings):
             return frozenset(("~",))
         if name == "cwd" and isinstance(node.func, ast.Attribute) and not node.args and not node.keywords:
             return frozenset((c or ".") if isinstance(c, str) else _AST_DYNAMIC for c in _ast_values(bindings.get(_AST_CWD, ".")))
+        if name in ("iterdir", "glob", "rglob") and isinstance(node.func, ast.Attribute) and not _ast_has_unpacking(node) and not node.keywords:
+            bases = _eval_ast_path_candidates(node.func.value, bindings)
+            if name == "iterdir" and not node.args:
+                return frozenset(_AstSubtree(b) if isinstance(b, str) and not isinstance(b, _AstSafeSegment) else _AST_DYNAMIC for b in bases)
+            if name in ("glob", "rglob") and len(node.args) == 1:
+                pats = _eval_ast_path_candidates(node.args[0], bindings)
+                if pats and all(isinstance(pt, str) and _is_safe_rel_glob(pt) for pt in pats):
+                    return frozenset(_AstSubtree(b) if isinstance(b, str) and not isinstance(b, _AstSafeSegment) else _AST_DYNAMIC for b in bases)
         if name in ("Path", "PurePath", "WindowsPath", "PosixPath", "expanduser", "abspath", "realpath", "resolve", "join", "joinpath", "str"):
             parts = [_eval_ast_path_candidates(arg, bindings) for arg in node.args]
             is_path_ctor = name in ("Path", "PurePath", "WindowsPath", "PosixPath")
@@ -1804,6 +1880,24 @@ def _merge_ast_value_sets(value_sets, depth: int = 0):
     return frozenset(scalars)
 
 
+def _ast_loop_elem_candidates(iter_node: ast.AST, scope: Dict[Any, Any]) -> frozenset:
+    if (
+        isinstance(iter_node, ast.Call)
+        and isinstance(iter_node.func, ast.Name)
+        and iter_node.func.id == "range"
+        and "range" not in scope
+    ):
+        return frozenset((_AstSafeSegment("__ast_safe_seg__"),))
+    cands = _eval_ast_path_candidates(iter_node, scope)
+    if cands and all(isinstance(v, (_AstSubtree, _AstTempPath, _AstSafeSegment)) for v in cands):
+        return cands
+    if cands and all(isinstance(v, tuple) for v in cands):
+        elems = {item for tup in cands for item in tup}
+        if elems and len(elems) <= _AST_MAX_CANDIDATES:
+            return frozenset(elems)
+    return frozenset((_AST_DYNAMIC,))
+
+
 def _merge_ast_bindings(bindings, alternatives):
     dyn = frozenset((_AST_DYNAMIC,))
     for key in set().union(*(set(state) for state in alternatives)):
@@ -1882,7 +1976,7 @@ def _iter_ast_calls_in_order(node, bindings, active=(), budget=None):
         local = _copy_ast_bindings(bindings)
         for gen in node.generators:
             yield from walk(gen.iter, local)
-            _bind_ast_target(gen.target, frozenset((_AST_DYNAMIC,)), local)
+            _bind_ast_target(gen.target, _ast_loop_elem_candidates(gen.iter, local), local)
             for condition in gen.ifs:
                 yield from walk(condition, local)
         for expr in (node.key, node.value) if isinstance(node, ast.DictComp) else (node.elt,):
@@ -1905,11 +1999,13 @@ def _iter_ast_calls_in_order(node, bindings, active=(), budget=None):
                 if not branch:
                     continue
                 branches.append(branch if isinstance(branch, list) else [branch])
-        alternatives = [_copy_ast_bindings(bindings)]
+        exhaustive_if = isinstance(node, (ast.If, ast.IfExp)) and bool(node.orelse)
+        alternatives = [] if exhaustive_if else [_copy_ast_bindings(bindings)]
+        loop_elems = _ast_loop_elem_candidates(node.iter, bindings) if isinstance(node, (ast.For, ast.AsyncFor)) else None
         for branch in branches:
             local = _copy_ast_bindings(bindings)
-            if isinstance(node, (ast.For, ast.AsyncFor)):
-                _bind_ast_target(node.target, frozenset((_AST_DYNAMIC,)), local)
+            if loop_elems is not None:
+                _bind_ast_target(node.target, loop_elems, local)
             if isinstance(node, ast.Match):
                 case = branch[0]
                 for pattern in ast.walk(case.pattern):
@@ -2029,6 +2125,30 @@ def _iter_ast_calls_in_order(node, bindings, active=(), budget=None):
         yield from walk(child)
 
 
+def _subtree_has_escape_link(base_str: str, cwd: Optional[str], allowed_resolved_keys: List[str]) -> bool:
+    if not allowed_resolved_keys:
+        return False
+    rp = _resolve_nearest_existing(base_str, cwd, from_shell=False)
+    if rp is None or not rp.is_dir():
+        return False
+    inspected = 0
+    for root_s, dirs, files in os.walk(rp, followlinks=False):
+        r_path = Path(root_s)
+        for entry_name in (*dirs, *files):
+            inspected += 1
+            if inspected > 512:
+                return True
+            cand = r_path / entry_name
+            if is_reparse_or_link(cand):
+                try:
+                    target_key = _normalize_cross_env_lexical(str(cand.resolve()), from_shell=False)
+                except (OSError, RuntimeError, ValueError):
+                    return True
+                if not any(_is_under_norm_key(target_key, ark) for ark in allowed_resolved_keys):
+                    return True
+    return False
+
+
 def _ast_bad_target(values, bindings, base_cwd, allowed_norm_keys, allowed_resolved_keys,
                     allow_os_temp, wsl_distribution=None):
     cwds = _ast_values(bindings.get(_AST_CWD, base_cwd))
@@ -2039,16 +2159,82 @@ def _ast_bad_target(values, bindings, base_cwd, allowed_norm_keys, allowed_resol
             continue
         if isinstance(value, _AstTempPath):
             root = tempfile.gettempdir()
-            normalized = [_normalize_cross_env_lexical(root)]
-            rp = _resolve_nearest_existing(root, None)
-            resolved = [_normalize_cross_env_lexical(str(rp))] if rp is not None else normalized
-            if _is_write_target_allowed(value, base_cwd, normalized, resolved):
+            normalized = [_normalize_cross_env_lexical(root, from_shell=False)]
+            rp = _resolve_nearest_existing(root, None, from_shell=False)
+            resolved = [_normalize_cross_env_lexical(str(rp), from_shell=False)] if rp is not None else normalized
+            if _is_write_target_allowed(value, base_cwd, normalized, resolved, from_shell=False):
                 continue
+        if isinstance(value, _AstSubtree):
+            if any(
+                not isinstance(cwd, (str, type(None)))
+                or not _is_write_target_allowed(
+                    value, cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp, wsl_distribution, from_shell=False
+                )
+                or _subtree_has_escape_link(value, cwd, allowed_resolved_keys)
+                for cwd in cwds
+            ):
+                return True
+            continue
         if any(not isinstance(cwd, (str, type(None))) or not _is_write_target_allowed(
-            value, cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp, wsl_distribution
+            value, cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp, wsl_distribution, from_shell=False
         ) for cwd in cwds):
             return True
     return False
+
+
+def _is_ast_readonly_subprocess_call(
+    node: ast.Call,
+    bindings: Dict[Any, Any],
+    cwds: frozenset,
+    allowed_norm_keys: List[str],
+    allowed_resolved_keys: List[str],
+    allow_os_temp: bool,
+    wsl_distribution: Optional[str],
+) -> bool:
+    if _ast_has_unpacking(node) or any(kw.arg in ("shell", "executable") for kw in node.keywords):
+        return False
+    cmd_expr: Optional[ast.AST] = node.args[0] if node.args else None
+    for kw in node.keywords:
+        if kw.arg in ("args", "command", "cmd"):
+            cmd_expr = kw.value
+    if not isinstance(cmd_expr, (ast.List, ast.Tuple)) or len(cmd_expr.elts) < 2:
+        return False
+    if any(isinstance(elt, ast.Starred) for elt in cmd_expr.elts):
+        return False
+    prefix_tokens: List[str] = []
+    dyn_tail_elts: List[ast.AST] = []
+    for idx, elt in enumerate(cmd_expr.elts):
+        vals = _eval_ast_path_candidates(elt, bindings)
+        if not dyn_tail_elts and len(vals) == 1 and all(isinstance(v, str) for v in vals):
+            prefix_tokens.append(next(iter(vals)))
+        else:
+            dyn_tail_elts = cmd_expr.elts[idx:]
+            break
+    is_ro_git, git_cwd, _ = _shell_lex.parse_readonly_git_prefix(prefix_tokens)
+    if not is_ro_git:
+        return False
+    if git_cwd is not None:
+        if any(
+            not isinstance(cwd, (str, type(None)))
+            or not _is_write_target_allowed(
+                git_cwd, cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp, wsl_distribution, from_shell=False
+            )
+            for cwd in cwds
+        ):
+            return False
+    for elt in dyn_tail_elts:
+        vals = _eval_ast_path_candidates(elt, bindings)
+        if _AST_DYNAMIC not in vals and all(isinstance(v, str) for v in vals):
+            if any(v.lower() in ("-o", "--output") or v.lower().startswith(("--output=", "-o/", "--ext-diff")) for v in vals):
+                return False
+            continue
+        # 允许形如 f"HEAD:{rel}" 等明确非选项前缀的动态修订表达式，拒绝可能拼出 -o/--output 的未知前缀
+        if isinstance(elt, ast.JoinedStr) and elt.values and isinstance(elt.values[0], ast.Constant) and isinstance(elt.values[0].value, str):
+            lead = elt.values[0].value
+            if lead and not lead.startswith("-"):
+                continue
+        return False
+    return True
 
 
 def _track_ast_chdir(node, bindings, base_cwd, allowed_norm_keys, allowed_resolved_keys,
@@ -2217,6 +2403,10 @@ def _scan_inline_python_code(
                             if not isinstance(command, str):
                                 if _AST_DEFINITION in bindings:
                                     continue
+                                if qualname.startswith("subprocess.") and _is_ast_readonly_subprocess_call(
+                                    node, bindings, cwds, allowed_norm_keys, allowed_resolved_keys, allow_os_temp, wsl_distribution
+                                ):
+                                    continue
                                 return "Python 子进程命令无法静态确定", "<DYNAMIC_UNRESOLVED>", snippet
                             for cwd in cwds:
                                 if not isinstance(cwd, (str, type(None))):
@@ -2276,6 +2466,9 @@ def _scan_inline_python_code(
                     # 2) Path(p).open(mode)
                     if attr == "open":
                         if isinstance(fn.value, ast.Name) and fn.value.id in _AST_READONLY_OPEN_RECEIVERS and fn.value.id not in bindings:
+                            continue
+                        first_arg_cands = _ast_call_arg_candidates(node, 0, ("url", "fullurl"), bindings, None)
+                        if first_arg_cands and all(isinstance(v, str) and v.lower().startswith(("http://", "https://")) for v in first_arg_cands):
                             continue
                         is_mut, mode_s = _open_mode_is_mutating(node, 0, bindings)
                         if is_mut:
@@ -2931,6 +3124,71 @@ def _extract_git_worktree_add_target(cmd_tokens: List[str], effective_cwd: Optio
     return wt_path, git_cwd, cwd_dynamic
 
 
+def _substitute_shell_local_vars(raw_str: str, local_vars: Dict[str, Optional[str]]) -> str:
+    if not raw_str or "$" not in raw_str or not local_vars:
+        return raw_str
+
+    def _repl(m: re.Match[str]) -> str:
+        name = (m.group(1) or m.group(2) or "").lower()
+        val = local_vars.get(name)
+        return val if isinstance(val, str) and val else m.group(0)
+
+    return re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)(?![A-Za-z0-9_:])", _repl, raw_str)
+
+
+def _try_record_shell_local_var(
+    clause: str,
+    effective_cwd: Optional[str],
+    local_vars: Dict[str, Optional[str]],
+    wsl_distribution: Optional[str],
+) -> bool:
+    """识别纯局部变量赋值子句（Bash VAR=... 或 PowerShell $var = Join-Path / 字面量），返回是否为纯赋值子句。"""
+    s = clause.strip()
+    m_ps = re.match(r"^\$([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)$", s)
+    if m_ps:
+        var_name = m_ps.group(1).lower()
+        rhs = m_ps.group(2).strip()
+        m_jp = re.match(
+            r"^(?:Join-Path\s+(?:-(?:Path|ChildPath)\s+)?|\[(?:System\.)?IO\.Path\]::Combine\s*\(\s*)(.+)$",
+            rhs,
+            re.IGNORECASE,
+        )
+        if m_jp:
+            body = m_jp.group(1).rstrip(")").strip()
+            raw_parts = [p.strip().rstrip(",").strip() for p in (_safe_split_tokens(body) if not rhs.lower().startswith("[") else body.split(",")) if p.strip()]
+            clean_parts = [p for p in raw_parts if not p.lower().startswith(("-path", "-childpath", "-additionalchildpath", "-resolve"))]
+            resolved_parts: List[str] = []
+            ok = bool(clean_parts)
+            for idx_p, part in enumerate(clean_parts):
+                subbed = _substitute_shell_local_vars(_unquote_shell_word(part).rstrip(","), local_vars)
+                exp = _expand_host_vars(subbed, base_cwd=effective_cwd if idx_p == 0 else None)
+                if not exp or _has_unexpanded_dynamic_var(exp, is_cmd_or_win=True):
+                    ok = False
+                    break
+                resolved_parts.append(exp)
+            local_vars[var_name] = _join_ast_path_parts(resolved_parts) if ok else None
+            return True
+        subbed_rhs = _substitute_shell_local_vars(_unquote_shell_word(rhs).rstrip(","), local_vars)
+        exp_rhs = _expand_host_vars(subbed_rhs, base_cwd=effective_cwd)
+        if exp_rhs and not _has_unexpanded_dynamic_var(exp_rhs, is_cmd_or_win=True) and " " not in rhs.strip("\"'"):
+            local_vars[var_name] = exp_rhs
+        else:
+            local_vars[var_name] = None
+        return True
+    m_sh = re.match(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$", s)
+    if m_sh and len(_safe_split_tokens(s)) <= (2 if s.startswith("export ") else 1):
+        var_name = m_sh.group(1).lower()
+        rhs = _unquote_shell_word(m_sh.group(2).strip())
+        subbed_rhs = _substitute_shell_local_vars(rhs, local_vars)
+        exp_rhs = _expand_host_vars(subbed_rhs, base_cwd=effective_cwd)
+        if exp_rhs and not _has_unexpanded_dynamic_var(exp_rhs, is_cmd_or_win=(wsl_distribution is not None)):
+            local_vars[var_name] = exp_rhs
+        else:
+            local_vars[var_name] = None
+        return True
+    return False
+
+
 def _detect_command_external_mutation(
     command_line: str,
     base_cwd: Optional[str],
@@ -2939,6 +3197,7 @@ def _detect_command_external_mutation(
     allow_os_temp: bool = True,
     depth: int = 0,
     wsl_distribution: Optional[str] = None,
+    msys_shell: bool = False,
 ) -> Optional[Tuple[str, str, str]]:
     """
     精准检测命令行是否改动项目目录外的业务路径或全局配置。
@@ -2982,16 +3241,21 @@ def _detect_command_external_mutation(
         unwrapped, outer_tail = unwrapped_pair
         if unwrapped == _INVALID_ENCODED_SENTINEL:
             return "PowerShell 编码命令无法静态解码审查 (-EncodedCommand)", "<ENCODED_COMMAND>", _compact_snippet(command_line)
+        inner_msys = msys_shell or (
+            os.name == "nt"
+            and wsl_distribution is None
+            and bool(re.match(r"^\s*(?:[\"']?[^\s;|&\"']+[\\/])?(?:bash|sh)(?:\.exe)?\b", sanitized, re.I))
+        )
         inner_hit = _detect_command_external_mutation(
             unwrapped, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp,
-            depth + 1, wsl_distribution,
+            depth + 1, wsl_distribution, msys_shell=inner_msys,
         )
         if inner_hit:
             return inner_hit
         if outer_tail:
             tail_hit = _detect_command_external_mutation(
                 "true " + outer_tail, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp,
-                depth + 1, wsl_distribution,
+                depth + 1, wsl_distribution, msys_shell=msys_shell,
             )
             if tail_hit:
                 return tail_hit
@@ -3097,8 +3361,9 @@ def _detect_command_external_mutation(
             ):
                 return f".NET 文件写删操作 ([IO.{cls_name}]::{method_name})", cand, _compact_snippet(m_net.group(0))
 
-    # 4. 按子句跟踪多子句目录切换，逐子句检查输出重定向、内联 Python、嵌套拆壳与写删移动复制命令
+    # 4. 按子句跟踪多子句目录切换与简单局部变量，逐子句检查输出重定向、内联 Python、嵌套拆壳与写删移动复制命令
     clause_cwd = base_cwd
+    local_vars: Dict[str, Optional[str]] = {}
     scanned_py_indices: set[int] = set()
     checked_any_redirect = False
     clauses = _split_shell_clauses(shell_masked)
@@ -3113,6 +3378,9 @@ def _detect_command_external_mutation(
             continue
         # 剥离前导控制流关键字（if/elif/while/until 条件子句中的命令同样会真实执行）
         clause = re.sub(r"^(?:(?:else|then|do|if|elif|while|until)\b\s*)+", "", clause, flags=re.IGNORECASE)
+        if "__INLINE_PY_" not in clause and not _SHELL_REDIRECT_RE.search(clause):
+            if _try_record_shell_local_var(clause, clause_cwd, local_vars, wsl_distribution):
+                continue
         tokens = _safe_split_tokens(clause)
         effective_cwd = clause_cwd
         idx = 0
@@ -3309,11 +3577,12 @@ def _detect_command_external_mutation(
             red_tok = _unquote_shell_word(m_red.group(1).strip())
             if not red_tok or red_tok.lower() in _NULL_SINKS:
                 continue
-            expanded_red = _expand_host_vars(red_tok, base_cwd=effective_cwd)
+            subbed_red = _substitute_shell_local_vars(red_tok, local_vars)
+            expanded_red = _expand_host_vars(subbed_red, base_cwd=effective_cwd)
             if _has_unexpanded_dynamic_var(expanded_red, is_cmd_or_win=(wsl_distribution is not None)):
                 return "Shell 输出重定向写入 [未解析动态变量路径]", red_tok, _compact_snippet(m_red.group(0))
             if not _is_write_target_allowed(
-                expanded_red, effective_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp, wsl_distribution
+                expanded_red, effective_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp, wsl_distribution, msys_shell=msys_shell
             ):
                 return "Shell 输出重定向写入", red_tok, _compact_snippet(m_red.group(0))
 
@@ -3444,8 +3713,9 @@ def _detect_command_external_mutation(
             for cand in targets:
                 if not cand:
                     continue
-                unq_cand = _unquote_shell_word(cand)
-                expanded_cand = _expand_host_vars(unq_cand, base_cwd=effective_cwd)
+                unq_cand = _unquote_shell_word(cand).rstrip(",")
+                subbed_cand = _substitute_shell_local_vars(unq_cand, local_vars)
+                expanded_cand = _expand_host_vars(subbed_cand, base_cwd=effective_cwd)
                 is_win_verb = head_low in ("rd", "del", "erase", "md", "move", "ren", "rename", "copy", "xcopy", "robocopy", "mklink")
                 if _has_unexpanded_dynamic_var(
                     expanded_cand, is_cmd_or_win=(is_win_verb or wsl_distribution is not None)
@@ -3458,7 +3728,7 @@ def _detect_command_external_mutation(
                 ):
                     command_distribution = None
                 if not _is_write_target_allowed(
-                    expanded_cand, effective_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp, command_distribution
+                    expanded_cand, effective_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp, command_distribution, msys_shell=msys_shell
                 ):
                     return action_label, cand, _compact_snippet(clause)
 
@@ -3866,6 +4136,25 @@ def _dispatch_option(tokens, name):
     return result
 
 
+def _dispatch_multi_options(tokens, name) -> List[str]:
+    values: List[str] = []
+    i = 0
+    n = len(tokens)
+    while i < n:
+        tok = tokens[i]
+        if tok.startswith(name + "="):
+            val = tok.split("=", 1)[1].strip("\"'").strip()
+            if val:
+                values.append(val)
+        elif tok == name and i + 1 < n:
+            val = tokens[i + 1].strip("\"'").strip()
+            if val:
+                values.append(val)
+            i += 1
+        i += 1
+    return values
+
+
 _HARNESS_METRICS_CACHE: Dict[str, Tuple[int, Any]] = {}
 
 
@@ -4156,13 +4445,31 @@ def _check_dispatch_locked(payload, tool_name, args, sid, state_dir):
                         except (OSError, ImportError, AttributeError):
                             metrics = None
                         if metrics is not None:
-                            count, tokens_estimate = metrics._target_metrics(
-                                target, _dispatch_option(tail, "--user-prompt") or _dispatch_option(tail, "--task") or ""
+                            explicit_files = _dispatch_multi_options(tail, "--files")
+                            valid_explicit = bool(explicit_files) and all(
+                                not f.startswith(("/", "\\", "~"))
+                                and ":" not in f
+                                and ".." not in f.replace("\\", "/").split("/")
+                                for f in explicit_files
                             )
-                            large_target = (
-                                count > config.get("heavy_max_light_files", 2)
-                                or tokens_estimate > config.get("heavy_max_light_tokens", 24000)
-                            )
+                            metric_root = target.parent if (valid_explicit and target.is_file()) else target
+                            if explicit_files and not valid_explicit:
+                                large_target = True
+                            else:
+                                count, tokens_estimate = metrics._target_metrics(
+                                    metric_root,
+                                    _dispatch_option(tail, "--user-prompt") or _dispatch_option(tail, "--task") or "",
+                                    write_scope=explicit_files if valid_explicit else None,
+                                )
+                                file_limit = (
+                                    metrics._light_file_limit(config, True)
+                                    if valid_explicit and hasattr(metrics, "_light_file_limit")
+                                    else config.get("heavy_max_light_files", 2)
+                                )
+                                large_target = (
+                                    count > file_limit
+                                    or tokens_estimate > config.get("heavy_max_light_tokens", 24000)
+                                )
                         else:
                             large_target = True
                 ticket_supplied = task_like and any(arg == "--ticket" or arg.startswith("--ticket=") for arg in tail)
@@ -4298,6 +4605,162 @@ def _ticket_required_reason(sid, state_dir=None, extra_plan_dirs=()):
     )
 
 
+_BOUNDARY_LEASE_TTL_SEC = 7200.0
+_PROTECTED_EXTERNAL_PREFIXES = (
+    "/etc", "/opt", "/usr", "/bin", "/sbin", "/var", "/lib", "/lib64", "/boot", "/root",
+    "/mnt/c/windows", "/mnt/c/program files", "/mnt/c/program files (x86)", "/mnt/c/programdata",
+)
+
+
+def _boundary_lease_scope_key(action_desc: str, ext_target: str, base_cwd: Optional[str]) -> Optional[str]:
+    """仅对全局同步安装或已存在的非系统外部业务目录内的常规文件编辑生成同会话租约键；新建外部永久目录、删除/移动与系统路径永不自动续租。"""
+    if "执行全局配置同步安装" in action_desc:
+        return "installer_global_sync"
+    if not ext_target or ext_target.startswith("<"):
+        return None
+    non_lease_keywords = (
+        "删除", "移动", "重命名", "Delete File", "Move to", "worktree",
+        "未解析", "动态", "超出", "编码命令", "创建链接", "Shell ", "创建或写入文件/目录",
+    )
+    if any(kw in action_desc for kw in non_lease_keywords):
+        return None
+    expanded = _host_path_string(ext_target, base_dir=base_cwd, from_shell=False)
+    if not expanded or _has_unexpanded_dynamic_var(expanded):
+        return None
+    cand = Path(expanded)
+    if not cand.is_absolute():
+        if not base_cwd:
+            return None
+        base_exp = _host_path_string(base_cwd, from_shell=False)
+        if not base_exp:
+            return None
+        cand = Path(base_exp) / cand
+    parent_dir = cand.parent
+    try:
+        if not parent_dir.is_dir() or is_reparse_or_link(parent_dir):
+            return None
+        resolved_parent = parent_dir.resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
+    norm_parent = _normalize_cross_env_lexical(str(resolved_parent), from_shell=False)
+    if not norm_parent or norm_parent in ("/", "/mnt") or re.fullmatch(r"/mnt/[a-z]", norm_parent):
+        return None
+    # 根目录直属一级文件夹（如 D:\Data 本身）不整体放行，至少精确到具体业务子目录且避开系统与客户端全局配置目录
+    segs = [seg for seg in norm_parent.split("/") if seg]
+    min_segs = 4 if norm_parent.startswith("/mnt/") else 2
+    if len(segs) < min_segs:
+        return None
+    if any(_is_under_norm_key(norm_parent, pref) for pref in _PROTECTED_EXTERNAL_PREFIXES):
+        return None
+    home_norm = _normalize_cross_env_lexical(str(Path.home()), from_shell=False)
+    if home_norm:
+        for cfg_sub in (".gemini/config", ".codex", ".claude", ".dsh", ".ssh", ".gnupg"):
+            if _is_under_norm_key(norm_parent, f"{home_norm.rstrip('/')}/{cfg_sub}"):
+                return None
+    return f"dir:{norm_parent}"
+
+
+def _transcript_has_settled_success_since(tp_path: Path, byte_offset: int) -> Tuple[Optional[bool], int]:
+    """检查自 byte_offset 起轨迹中是否出现已成功落地的工具调用结果：返回 (True=已放行成功, False=被拒绝或报错, None=尚无结果), current_size。"""
+    try:
+        cur_size = tp_path.stat().st_size
+        if cur_size <= byte_offset or byte_offset < 0:
+            return None, cur_size
+        with tp_path.open("rb") as f:
+            f.seek(byte_offset)
+            chunk = f.read(min(cur_size - byte_offset, 512 * 1024))
+    except OSError:
+        return None, 0
+    saw_outcome: Optional[bool] = None
+    for raw_line in chunk.splitlines():
+        if not raw_line.strip():
+            continue
+        try:
+            entry = json.loads(user_words.decode_jsonl_line(raw_line))
+        except (ValueError, RecursionError):
+            continue
+        if not isinstance(entry, dict):
+            continue
+        typ = entry.get("type")
+        if typ in ("TOOL_RESULT", "TOOL_RESPONSE") or (typ == "GENERIC" and isinstance(entry.get("tool_result"), dict)):
+            res_obj = entry.get("tool_result") if isinstance(entry.get("tool_result"), dict) else {}
+            out_txt = str(entry.get("content") or res_obj.get("output") or res_obj.get("error") or "").lower()
+            failed = (
+                entry.get("status") == "ERROR"
+                or bool(res_obj.get("error"))
+                or "denied" in out_txt
+                or "rejected" in out_txt
+                or "cancelled" in out_txt
+            )
+            saw_outcome = not failed
+        elif typ == "response_item" and isinstance(entry.get("payload"), dict):
+            pl = entry["payload"]
+            if pl.get("type") == "function_call_output":
+                out_txt = str(pl.get("output") or "").lower()
+                failed = "denied" in out_txt or "rejected" in out_txt or "permission" in out_txt
+                saw_outcome = not failed
+        elif typ == "user" and isinstance(entry.get("message"), dict):
+            blocks = entry["message"].get("content")
+            if isinstance(blocks, list):
+                for blk in blocks:
+                    if isinstance(blk, dict) and blk.get("type") == "tool_result":
+                        out_txt = str(blk.get("content") or "").lower()
+                        failed = bool(blk.get("is_error")) or "denied" in out_txt or "rejected" in out_txt
+                        saw_outcome = not failed
+    return saw_outcome, cur_size
+
+
+def _reconcile_and_check_boundary_lease_locked(
+    sid: str,
+    state_dir: Path,
+    transcript_path_raw: Any,
+    action_desc: str,
+    ext_target: str,
+    base_cwd: Optional[str],
+) -> bool:
+    """在会话状态锁内对账已获用户放行的项目外目录租约；若命中有效租约返回 True（静默放行），否则登记待确认候选并返回 False。"""
+    if _is_headless_subtask() or not user_words.valid_session_id(sid):
+        return False
+    tp_str = str(transcript_path_raw or "").strip()
+    if not tp_str:
+        return False
+    tp_path = Path(tp_str).expanduser()
+    if not tp_path.is_file() or is_reparse_or_link(tp_path):
+        return False
+    scope_key = _boundary_lease_scope_key(action_desc, ext_target, base_cwd)
+    if not scope_key:
+        return False
+    lease_file = state_dir / f"{sid}_boundary_leases.json"
+    raw_state = user_words._read_state_json(lease_file)
+    state = raw_state if isinstance(raw_state, dict) else {}
+    leases = dict(state.get("leases")) if isinstance(state.get("leases"), dict) else {}
+    now = time.time()
+    leases = {k: float(exp) for k, exp in leases.items() if isinstance(exp, (int, float)) and float(exp) > now}
+    pending = state.get("pending") if isinstance(state.get("pending"), dict) else None
+    changed = False
+    if pending and isinstance(pending.get("scope_key"), str) and isinstance(pending.get("offset"), int):
+        outcome, cur_size = _transcript_has_settled_success_since(tp_path, int(pending["offset"]))
+        if outcome is True:
+            leases[pending["scope_key"]] = now + _BOUNDARY_LEASE_TTL_SEC
+            pending = None
+            changed = True
+        elif outcome is False:
+            pending = None
+            changed = True
+    else:
+        try:
+            cur_size = tp_path.stat().st_size
+        except OSError:
+            return False
+    if scope_key in leases:
+        if changed:
+            user_words.atomic_write_json(lease_file, {"leases": leases, "pending": pending})
+        return True
+    new_pending = {"scope_key": scope_key, "offset": cur_size, "created_at": now}
+    user_words.atomic_write_json(lease_file, {"leases": leases, "pending": new_pending})
+    return False
+
+
 def _is_headless_subtask() -> bool:
     return os.environ.get("CAE_HARNESS_DEPTH", "").strip() not in ("", "0")
 
@@ -4360,6 +4823,7 @@ def handle_pre_tool_use(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     base_cwd: Optional[str] = None
     boundary: Optional[Dict[str, Any]] = None
+    boundary_act_target: Optional[Tuple[str, str]] = None
     # 分支 0: 项目目录外文件改动硬边界门禁 (R4: 跨表面文件修改工具 / run_command / run_workflow)
     if tool_name in (*FILE_MUTATION_TOOLS, "run_command", "run_workflow"):
         proj_keys, allowed_keys, allowed_res_keys, proj_display, base_cwd = _collect_boundary_context(
@@ -4396,6 +4860,7 @@ def handle_pre_tool_use(payload: Dict[str, Any]) -> Dict[str, Any]:
                         act = f"创建或覆写项目外文件 ({display_tool}, {len(content_txt)} 字符)"
                     meta = args.get("ArtifactMetadata") if isinstance(args.get("ArtifactMetadata"), dict) else {}
                     summary_txt = str(meta.get("Summary") or "").splitlines()[0].strip() if meta.get("Summary") else ""
+                    boundary_act_target = (act, write_arg)
                     boundary = _build_boundary_violation_response(
                         display_tool, act, write_arg, proj_display, conversation_id, tool_summary=summary_txt
                     )
@@ -4412,6 +4877,7 @@ def handle_pre_tool_use(payload: Dict[str, Any]) -> Dict[str, Any]:
                 )
                 if wf_hit:
                     act_desc, ext_target, clause_snip = wf_hit
+                    boundary_act_target = (act_desc, ext_target)
                     boundary = _build_boundary_violation_response(
                         display_tool,
                         act_desc,
@@ -4429,6 +4895,7 @@ def handle_pre_tool_use(payload: Dict[str, Any]) -> Dict[str, Any]:
                 )
                 if ext_hit:
                     act_desc, ext_target, clause_snip = ext_hit
+                    boundary_act_target = (act_desc, ext_target)
                     boundary = _build_boundary_violation_response(
                         display_tool,
                         act_desc,
@@ -4447,6 +4914,11 @@ def handle_pre_tool_use(payload: Dict[str, Any]) -> Dict[str, Any]:
             gate_response = handoff_gate.check_pre_tool_use_locked(payload, state_dir, boundary_blocked=boundary is not None)
             if gate_response is not None:
                 return gate_response
+            if boundary is not None and boundary_act_target is not None and boundary.get("decision") == "force_ask":
+                if _reconcile_and_check_boundary_lease_locked(
+                    conversation_id, state_dir, transcript_path_str, boundary_act_target[0], boundary_act_target[1], cwd or base_cwd
+                ):
+                    boundary = None
             if boundary is not None:
                 return boundary
             ticket_reason = _check_dispatch_locked(payload, tool_name, args, conversation_id, state_dir)
@@ -4932,11 +5404,21 @@ def handle_claude_pre_tool_use(payload: Dict[str, Any], state_dir: Optional[Path
             )
             hit = _validate_patch_text(patch_text, "apply_patch")
         elif tool_name in ("Bash", "PowerShell", "exec_command", "bash", "shell", "shell_command"):
-            hit = _detect_command_external_mutation(_extract_native_shell_command(args), base_cwd, allowed, resolved, allow_temp)
+            is_msys = os.name == "nt" and client == "claude" and tool_name in ("Bash", "bash")
+            hit = _detect_command_external_mutation(
+                _extract_native_shell_command(args), base_cwd, allowed, resolved, allow_temp, msys_shell=is_msys
+            )
         elif tool_name.lower() == "write_stdin":
             stdin_text = str(args.get("chars") if args.get("chars") is not None else (args.get("input") or ""))
             if stdin_text.strip():
                 hit = _detect_command_external_mutation(stdin_text, base_cwd, allowed, resolved, allow_temp)
+    if hit and not _is_headless_subtask() and user_words.valid_session_id(sid):
+        with contextlib.suppress(OSError, ValueError):
+            with user_words.session_state_lock(state_dir, sid):
+                if _reconcile_and_check_boundary_lease_locked(
+                    sid, state_dir, payload.get("transcript_path"), hit[0], hit[1], base_cwd or cwd
+                ):
+                    hit = None
     if hit:
         action, target, snippet = hit
         decision = "deny" if _is_headless_subtask() else "ask"

@@ -70,7 +70,7 @@ python -B -X utf8 "$HARNESS" assess --caller auto --redact
 | 你想做的事 | 平时随口怎么说（不用提模型名） | 主控看到后自动替你编排什么 |
 | --- | --- | --- |
 | **早期发散探路与方案排雷** | “并发探探路，对比几种方案并挑挑硬伤” | 并发调高吞吐推理流铺开候选、核算显存与计算复杂度边界；正式定纲写文档前由审慎主控核对历史归档收口 |
-| **关键新命题正反会战** | “这个命题很关键，正反双路深推并找反例挑刺” | 自动通过 `--spec-file` 组 2 流确认单：1 路审慎模型从零正向立论（`role:math`）加 1 路高算力模型对照初稿找反例、卡奇点边界 |
+| **关键新命题正反双路推导** | “这个命题很关键，正反双路深推并找反例挑刺” | 自动通过 `--spec-file` 组 2 流确认单：1 路审慎模型从零正向推导（`role:math`）加 1 路高算力模型对照初稿寻找反例、排查奇点与成立边界 |
 | **限定或排除某几个端** | “不用 Codex，用本机其他端并发做”或“只用反重力双路审查” | 自动过滤未授权或被排除的客户端；若仅剩单一多模型后端则自动拉起 `deep_families` 与 `code_families` 异构双源审查 |
 | **表面快检省额度** | “省点额度快速扫一遍格式与拼写” | 自动切轻量 `role:fast` 槽位与低消耗挡位，不替代核心数理与代码正确性审查 |
 
@@ -176,7 +176,7 @@ python -B -X utf8 "$HARNESS" batch `
 - 周期网格随机扰动初值单步推进后，全局质量、动量、总能离散守恒残差均小于 `1e-14`。
 ````
 
-生成确认票据并获用户批准后，绑定 `--ticket` 启动 `gate` 定量验证闭环（验证未通过时，真实报错在 `--max-rounds` 轮次内自动回传给执行模型迭代修正）：
+为本例单独运行 `plan` 生成可写确认票据（登记上述写入白名单与同一条验收命令）并获用户批准后，绑定新 `--ticket` 启动 `gate` 定量验证闭环（验证未通过时，真实报错在 `--max-rounds` 轮次内自动回传给执行模型迭代修正，测试命令由目标课题环境提供）：
 
 ```powershell
 python -B -X utf8 "$HARNESS" gate `
@@ -195,11 +195,12 @@ python -B -X utf8 "$HARNESS" gate `
 flowchart LR
     S1["1. 同端只读梳理<br/>原生 readonly-* 子代理<br/>摘录文献公式与源码行号"] --> S2["2. 独立数理推导<br/>cae-harness task --kind math<br/>role:math + 只读哈希快照"]
     S2 --> S3["3. 白名单编码与定量门禁<br/>cae-harness gate --worker role:code<br/>--write-scope + --verify-cmd 闭环"]
-    S3 -->|verify_exit_code != 0<br/>回传真实报错继续修正| S3
+    S3 -->|verify_exit_code != 0 且未达 max_rounds<br/>回传真实报错继续修正| S3
+    S3 -->|达 max_rounds 仍未过| F["终止并如实汇报失败现场"]
     S3 -->|gate_passed == true| S4["4. 跨端审查、事实锚定与 R6 终审<br/>audit / check-grounding --strict<br/>主会话亲自核对原文件行号"]
 ```
 
-修订重要技术文档时，可对支持 `clean_room` 的外部后端运行 `python -B -X utf8 "$HARNESS" task --kind review --engine role:review --isolation clean_room --target "<文档路径>" ...`（或使用兼容别名 `--clean-room`）剥离全局规则、技能与项目说明，从新读者视角找出晦涩行话与阅读断层；主会话整篇重写后，运行 `python -B -X utf8 "$HARNESS" check-grounding --target "<项目根目录>" --strict` 做零黑名单词法事实核验。
+修订重要技术文档时，可对支持 `clean_room` 的外部后端（如本机已就绪的 Codex、Claude Code 或 DSH）运行 `python -B -X utf8 "$HARNESS" task --kind review --engine codex:@review --isolation clean_room --target "<文档路径>" ...`（或使用兼容别名 `--clean-room`）剥离全局规则、技能与项目说明，从新读者视角找出晦涩行话与阅读断层；主会话整篇重写后，运行 `python -B -X utf8 "$HARNESS" check-grounding --target "<项目根目录>" --strict` 做零黑名单词法事实核验。
 
 ---
 

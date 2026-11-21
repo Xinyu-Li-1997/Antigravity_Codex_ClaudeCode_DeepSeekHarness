@@ -882,7 +882,8 @@ def _check_heavy_report_locked(payload, state_dir, sid, turn_key, reply, decisio
                     and re.search(r"(?:全部|全数)(?:成功|完成|通过)|\ball\s+(?:succeeded|completed|passed)\b", reply, re.I)
                     and not failure)
     if status and tokens and receipt and bound and not contradicted:
-        user_words.mark_heavy_completions_reported(sid, state_dir)
+        verified_ids = [str(entry["run_id"]) for entry in entries if not entry.get("native") and entry.get("run_id")]
+        user_words.mark_heavy_completions_reported(sid, state_dir, run_ids=verified_ids or None)
         state["native_reported"] = native_key
         if native:
             state["reported_native_ids"] = list(dict.fromkeys(state.get("reported_native_ids", []) + [

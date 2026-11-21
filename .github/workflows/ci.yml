@@ -38,7 +38,9 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          bash -n install.sh template/claude/router/*.sh
+          for script in install.sh template/claude/router/*.sh; do
+            bash -n "$script"
+          done
           bash ./install.sh --probe-apps | python3 -B -X utf8 -c 'import json, sys; p = json.load(sys.stdin); assert all(k in p for k in ("antigravity", "codex", "claude", "dsh", "cc_switch")), p'
 
       - name: Check PowerShell entrypoint on Windows

@@ -1115,7 +1115,7 @@ def _pending_decision_promoted(state, reply, transcript, cwd):
 def _workflow_handoff_present(text: str, tickets) -> bool:
     if not tickets:
         return True
-    body = _handoff_prompt_body(text)
+    body = _handoff_prompt_body(text, subsections=True)
     def normalize(value):
         return re.sub(r"\s+", "", str(value).replace(r"\|", "|"))
 

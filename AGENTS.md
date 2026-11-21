@@ -39,10 +39,10 @@
 
 | 共有防护阶段 | 对应共用脚本与宿主事件映射 |
 | --- | --- |
-| 恢复与调用前 | `session_context_loader.py` + `handoff_gate.py`（Antigravity `SessionStart`、`PreInvocation`；Codex 与 Claude Code `SessionStart`、`PostCompact`）去噪恢复原话、实质子代理与超时抢救摘要及未决确认单，并评估交接阶段。 |
-| 新指令提交时 | `handoff_gate.py`（Codex 与 Claude Code `UserPromptSubmit`；Antigravity 在 `PreInvocation` 对账轨迹控制步）更新交接判断或暂缓宽限期。 |
-| 工具执行前 | `status_guard.py` + `handoff_gate.py`（三端 `PreToolUse`）核查写边界、日志重复轮询、直接调用底层 CLI 拦截、重负载与 `followup` 票据及交接限制。 |
-| 回合结束时 | `reply_repeat_guard.py` + `handoff_gate.py`（三端 `Stop`）检查重复空等短句、局部补测冒充全过、重负载完工回执及防翻案核验、强制交接提示词与待拍板占位符保护。 |
+| 恢复与调用前 | `session_context_loader.py`（内部联动 `handoff_gate.py`；Antigravity 注册 `SessionStart`、`PreInvocation`；Codex 与 Claude Code 在 `SessionStart` 同时注册两脚本，在 `PostCompact` 注册 `handoff_gate.py`）去噪恢复原话、实质子代理与超时抢救摘要及未决确认单，并评估交接阶段。 |
+| 新指令提交时 | `handoff_gate.py`（Codex 与 Claude Code 注册 `UserPromptSubmit`；Antigravity 在 `PreInvocation` 对账轨迹控制步）更新交接判断或暂缓宽限期。 |
+| 工具执行前 | `status_guard.py`（内部联动 `handoff_gate.py`；三端注册 `PreToolUse`）核查写边界与同会话外部目录批准租约、日志重复轮询、直接调用底层 CLI 拦截、重负载与 `followup` 票据（`--files` 单路只读按实际声明文件计量）及交接限制。 |
+| 回合结束时 | `reply_repeat_guard.py`（内部联动 `handoff_gate.py`，Codex 与 Claude Code 同时注册两脚本；三端挂载 `Stop`）检查重复空等短句、局部补测冒充全过、重负载完工回执（按 `run_id` 精确销账）及防翻案核验、强制交接提示词与待拍板占位符保护。 |
 
 宿主事件类别数与共用脚本模块数分别说明，不作简单一一对应。Antigravity 默认启用长会话分段收口；Codex 与 Claude Code 默认交接模式为 `advisory`，强制阻断仅在实际模式要求时生效。
 

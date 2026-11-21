@@ -2,6 +2,24 @@
 
 本文件记录四客户端共用规则、会话钩子、后台验证工具与上游维护流程的版本演进。当前插件版本以 `template/user-guard/plugin.json` 为准；常驻使用文档只说明机制和配置键，不重复维护版本号与性能日期。
 
+## [1.18.2] - 2026-11-21
+
+结合 GitHub Windows CI 失败诊断、本机生命周期门禁实证统计与四路 Codex 高强度交叉审查（经主会话逐行原文复核），完成跨平台路径修复、门禁降噪与会话目录续租、并发状态锁加固及常驻文档润色：
+
+- **Windows 8.3 短路径暂存对比、引文反引号跨句吞噬与续接状态修复（`cae_harness.py`、`ci.yml`、`fleet_state.py`、`ccswitch_admin.py`）**：
+  - 新增 `_is_resolved_within` 统一将候选路径与基准目录同时 `resolve()` 后比对包含关系（兼容循环链接 `RuntimeError`），根治 GitHub Actions Windows Runner `RUNNER~1` 8.3 短路径导致 `_session_trace` 与 `_citation_audit` 漏记已读文件的 CI 失败；将归档目录校验改为逐级 `_is_link` 检查，避免短路径别名误报；
+  - 修复 `_citation_audit` 正则缺少闭合反引号导致同行代码标记与后续中文正文被跨句吞入 `missing_files` 的缺陷；修复 `needs_stage` 持久化暂存漏记 `session_plan_dir` 及 `cmd_followup` 将空 `session_plan_dir` 解析为工作区 `.` 的越界隐患；修正 Antigravity 非软时限分支未扣减前置准备耗时的超时计算；
+  - 修复 `.github/workflows/ci.yml` 中 `bash -n` 仅校验首个位置脚本的语法检查遗漏；在 `fleet_state.py` 锁内刷新仓库元数据并在 `clear --verified --readback-done` 事实锚定后复核指纹无并发漂移；在 `ccswitch_admin.py` 事务内校验目标卡片 `ANTHROPIC_BASE_URL` 与锁前探活端点一致。
+- **项目外变动门禁降噪、同会话批准续租与 `--files` 轻任务精确计量（`status_guard.py`、`hooks/_lib/shell_lex.py`、`handoff_gate.py`、`user_words.py`、`reply_repeat_guard.py`、`adaptive_policy.py`）**：
+  - 在 `shell_lex.py` 抽取共用 `parse_readonly_git_prefix`，消除内联 Python `subprocess` 调用只读 `git` 子命令（含 `f"HEAD:{rel}"` 动态修订）、`os.O_RDONLY`、`http`/`https` URL `.open()`、完备 `if/else` 路径赋值及工作区内 `range`/`glob`/`rglob` 有界循环的 `<DYNAMIC_UNRESOLVED>` 假阳性弹窗；
+  - 支持同一命令内 PowerShell（含 `Join-Path`、`[IO.Path]::Combine` 与尾逗号清理）和 Bash 简单局部变量传播，补齐 Windows 下 Claude Code Git Bash（MSYS `/<drive>/...` 与 `/tmp/...`）路径映射及本地标准包缓存白名单；
+  - 新增基于会话轨迹结算验证的同会话外部目录批准租约（`_reconcile_and_check_boundary_lease_locked`）：对已存在的非系统外部业务目录常规文件编辑及 `install.py` 全局同步，经用户首次批准并核实工具成功落地后本会话内自动续租，而新建外部永久目录、外部删除移动、外部 `git worktree`、系统或客户端全局配置文件直改及无头子任务继续保持严格拦截；
+  - 对齐 `plan`、`PreToolUse` 与 `Stop` 对单路只读 `--files` 的精确文件计量（默认最多 4 个小文件免票静默执行）；修复 `handoff_gate.py` 子标题票据核验截断、`user_words.py` 按 `run_id` 精确销账防并发漏报及 `adaptive_policy.py` 精确模型 ID 优先于去后缀匹配的顺序。
+- **常驻规则与公开文档一致性润色及回归测试增补（`AGENTS.md`、`rules/AGENTS.md`、`SKILL.md`、`README.md`、`docs/`、`tests/`）**：
+  - 同步更新 `R4` 与 `R3.1.5` 说明，修正超时抢救与前缀缓存的绝对化表述及 `clean_room` 后端示例，新增覆盖上述全部跨平台与门禁降噪场景的离线回归测试。
+
+---
+
 ## [1.18.1] - 2026-11-21
 
 针对 WSL2 科学计算长会话取证暴露的伪终端分页器死锁、单回合跨多次压缩未收尾及钩子源码自省空耗，补齐三项确定性硬护栏：

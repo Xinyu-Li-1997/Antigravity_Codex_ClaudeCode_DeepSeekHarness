@@ -4723,6 +4723,13 @@ def _session_logs(prefix, home, sid, isolated):
                   if p.is_file() and not _is_link(p)) if home and (sid or isolated) else []
 
 
+def _is_resolved_within(candidate, base_dir):
+    try:
+        return Path(candidate).resolve().is_relative_to(Path(base_dir).resolve())
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
 def _session_trace(events, root, stage_dir):
     reads, messages, pending, totals = set(), collections.deque(maxlen=3), {}, {}
     for event in events:
@@ -4764,7 +4771,7 @@ def _session_trace(events, root, stage_dir):
                 if isinstance(path, str):
                     current = stage_dir or root
                     rel = _normalize_rel_file(path, current)
-                    if not ntpath.isabs(rel) and '\0' not in rel and (current / rel).resolve().is_relative_to(current):
+                    if not ntpath.isabs(rel) and '\0' not in rel and _is_resolved_within(current / rel, current):
                         reads.add(rel)
             if (kind in ('reasoning', 'agent_reasoning', 'agent_message', 'agent_response', 'assistant',
                          'assistant/message', 'thinking', 'text', 'final', 'result') or node.get('role') == 'assistant' or 'summary' in node):
@@ -4785,14 +4792,25 @@ def _session_trace(events, root, stage_dir):
     return sorted(reads), tail[::-1], totals
 
 
+_CITATION_SPAN_RE = re.compile(
+    r'\x60([^\x60\r\n]+?)(?:#L|:)(\d+)(?:(?:-L?)(\d+))?\x60'
+    r'|\x60([^\x60\r\n]+?)\x60(?:#L|:)(\d+)(?:(?:-L?)(\d+))?'
+    r'|([^\s\x60<>()\[\]"\'：,，;；。、！？【】「」『』（）]+?)(?:#L|:)(\d+)(?:(?:-L?)(\d+))?'
+)
+
+
 def _citation_audit(result, root, reads, inlined, stage_dir=None):
     findings = result.get('findings', [])
     refs = {(f['file'], f['line_start'], f['line_end']) for f in findings}
     for body in (result.get('content', ''), *result.get('evidence', []), *(f['evidence'] for f in findings)):
-        for match in re.finditer(r'(?:\x60([^\x60\r\n]+?)|([^\s\x60<>()：,，;；]+?))(?:#L|:)(\d+)(?:(?:-L?)(\d+))?', body):
-            path, bare, start, end = match.groups()
-            candidate = (path or bare).lstrip('[')
-            if not re.match(r'^\w+://', candidate) and (path or re.search(r'[./\\]|#L', match[0]) or
+        for match in _CITATION_SPAN_RE.finditer(body):
+            g = match.groups()
+            quoted = g[0] or g[3]
+            bare = g[6]
+            start = g[1] or g[4] or g[7]
+            end = g[2] or g[5] or g[8]
+            candidate = (quoted or bare).strip().lstrip('[')
+            if not re.match(r'^\w+://', candidate) and (quoted or re.search(r'[./\\]|#L', match[0]) or
                                                         (root / candidate).is_file()):
                 refs.add((candidate, int(start), int(end or start)))
     audit = dict(actual_files_read=reads, inlined_files=inlined, missing_files=[], out_of_range_lines=[], unopened_cited_files=[])
@@ -4803,7 +4821,7 @@ def _citation_audit(result, root, reads, inlined, stage_dir=None):
         file = base_dir / rel
         if rel not in lengths:
             lengths[rel] = None
-            if not ntpath.isabs(rel) and not rel.startswith('/') and file.resolve().is_relative_to(base_dir) and file.is_file():
+            if not ntpath.isabs(rel) and not rel.startswith('/') and _is_resolved_within(file, base_dir) and file.is_file():
                 with contextlib.suppress(OSError):
                     with file.open(encoding='utf-8-sig', errors='replace') as stream:
                         lengths[rel] = sum(1 for _ in stream)
@@ -4938,13 +4956,14 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
         store_id = _safe_state_id(resume['session_store_id']) if resume and resume.get('session_store_id') else uuid.uuid4().hex
         if needs_stage and persist:
             # 续接时先持会话锁再重建同一路径，满足会话对工作目录的校验并防并发冲突。
-            cleanup.enter_context(_directory_file_lock(resolve_dispatch_plan_dir(plan_dir) / 'headless_sessions', f'stage_{store_id}', '无头会话暂存'))
+            resolved_plan = resolve_dispatch_plan_dir(plan_dir)
+            cleanup.enter_context(_directory_file_lock(resolved_plan / 'headless_sessions', f'stage_{store_id}', '无头会话暂存'))
             temp_path = Path(temp_parent or tempfile.gettempdir()) / f'cae-harness-{store_id}'
             if temp_path.exists() and not _is_link(temp_path):
                 shutil.rmtree(temp_path)
             temp_path.mkdir(mode=0o700)
             cleanup.callback(shutil.rmtree, temp_path)
-            receipt['session_store_id'] = store_id
+            receipt.update(session_store_id=store_id, session_plan_dir=str(resolved_plan))
         else:
             temp_path = Path(cleanup.enter_context(tempfile.TemporaryDirectory(prefix='cae-harness-', dir=temp_parent)))
         schema_file = temp_path / 'schema.json'
@@ -5035,7 +5054,7 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
         archive = None
         if isolated and persist:
             archive = resolve_dispatch_plan_dir(plan_dir) / 'headless_sessions' / prefix / store_id
-            if archive.resolve() != archive:
+            if any(os.path.lexists(p) and _is_link(p) for p in (archive, *archive.parents)):
                 raise HarnessError('会话归档路径不能经过链接')
             cleanup.enter_context(_directory_file_lock(archive.parent, store_id, '无头会话归档'))
             if resume and resume.get('session_store_id'):
@@ -5176,7 +5195,7 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
             if elapsed >= timeout_sec or proc_timeout <= 0:
                 raise HarnessError('前置暂存或处理已耗尽墙钟超时预算', 'timeout')
             if prefix == 'agy' and not soft:
-                proc_timeout = timeout_sec + int(hd.get('agy_timeout_grace_sec', 15))
+                proc_timeout = max(1, timeout_sec - int(elapsed)) + int(hd.get('agy_timeout_grace_sec', 15))
             process_failure = None
             receipt['launch_attempted'] = True
             try:
@@ -5758,7 +5777,7 @@ def _normalize_rel_file(file_str, target_dir):
         root = target_dir.resolve()
         absolute = candidate if candidate.is_absolute() else root / candidate
         return absolute.resolve().relative_to(root).as_posix()
-    except (OSError, ValueError):
+    except (OSError, RuntimeError, ValueError):
         return posixpath.normpath(cleaned)
 
 
@@ -8093,11 +8112,19 @@ def _usage_summary(streams):
             'reported_streams': reported, 'unreported_streams': len(usages) - reported}
 
 
+def _light_file_limit(cfg, has_explicit_files=False):
+    base_limit = int(cfg.get('heavy_max_light_files', 2))
+    if not has_explicit_files:
+        return base_limit
+    raw_explicit = cfg.get('heavy_max_light_explicit_files')
+    return int(raw_explicit) if isinstance(raw_explicit, int) and not isinstance(raw_explicit, bool) and raw_explicit > 0 else max(base_limit, 4)
+
+
 def _is_heavy_streams(streams, switched=False):
     cfg = _confirmation_tunables()
     return bool(switched or len(streams) >= cfg.get('heavy_min_streams', 2) or any(
         stream.get('kind') in ('code', 'gate')
-        or stream.get('file_count', 0) > cfg.get('heavy_max_light_files', 2)
+        or stream.get('file_count', 0) > _light_file_limit(cfg, bool(stream.get('files')))
         or stream.get('estimated_tokens', 0) > cfg.get('heavy_max_light_tokens', 24000)
         or stream.get('timeout', 0) > cfg.get('heavy_max_light_timeout_sec', 600) for stream in streams))
 
@@ -8110,15 +8137,18 @@ def record_heavy_completion_for_stop_hook(args, payload):
     heavy = (command in ('audit', 'gate', 'batch') or getattr(args, 'ticket', '')
              or getattr(args, 'kind', '') == 'code' or (command == 'followup' and payload.get('readonly') is False))
     if not heavy and getattr(args, 'target', None):
+        explicit_files = list(getattr(args, '_stage_files', None) or getattr(args, 'files', None) or [])
         try:
             prompt_sample = _task_text(args)
         except (HarnessError, OSError, AttributeError, TypeError):
             prompt_sample = getattr(args, 'user_prompt', '') or ''
         try:
-            count, tokens = _target_metrics(Path(args.target).expanduser().resolve(), prompt_sample)
+            resolved_target = Path(args.target).expanduser().resolve()
+            metric_root = resolved_target.parent if explicit_files and resolved_target.is_file() else resolved_target
+            count, tokens = _target_metrics(metric_root, prompt_sample, write_scope=explicit_files or None)
         except (HarnessError, OSError):
             count, tokens = 1, estimate_tokens_from_bytes(len((prompt_sample or '').encode('utf-8')))
-        heavy = _is_heavy_streams([{'file_count': count, 'estimated_tokens': tokens, 'timeout': args.timeout}])
+        heavy = _is_heavy_streams([{'file_count': count, 'estimated_tokens': tokens, 'timeout': args.timeout, 'files': explicit_files}])
     if not heavy:
         return
     run_id = uuid.uuid4().hex
@@ -9633,7 +9663,8 @@ def cmd_followup(args):
     ignored = None if readonly else _snapshot_ignore_dirs_for(scopes)
     patterns = read_agentignore_patterns(root)
     before = snapshot_files(root, ignore_dirs=ignored, ignore_patterns=patterns)
-    state = args.plan_dir or str(_unredact_local_path(previous.get('session_plan_dir') or ''))
+    raw_session_plan_dir = str(previous.get('session_plan_dir') or '').strip()
+    state = args.plan_dir or (str(_unredact_local_path(raw_session_plan_dir)) if raw_session_plan_dir else '')
     try:
         payload['result'] = invoke_engine(engine, root, prompt, backends, TASK_JSON_SCHEMA, readonly, args.timeout,
                                           previous.get('agent_type', 'readonly-collaborator'), previous.get('files'),

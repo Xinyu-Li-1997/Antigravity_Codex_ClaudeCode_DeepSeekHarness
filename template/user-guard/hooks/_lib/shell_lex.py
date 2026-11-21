@@ -565,3 +565,79 @@ def extract_cmd_substitutions(clause: str, *, backslash_escape: bool = True) -> 
                     continue
         i += 1
     return subs
+
+
+READONLY_GIT_SUBCOMMANDS = frozenset({
+    "status", "log", "show", "diff", "rev-parse", "ls-files",
+    "cat-file", "grep", "blame", "describe", "shortlog", "reflog",
+})
+
+
+def parse_readonly_git_prefix(tokens: List[str]) -> Tuple[bool, Optional[str], List[str]]:
+    """
+    检查参数序列是否为纯只读 git 子命令前缀：
+    返回 (is_readonly_git, explicit_git_cwd, remaining_subcommand_args)。
+    """
+    if not tokens:
+        return False, None, []
+    head = tokens[0].replace("\\", "/").rsplit("/", 1)[-1].lower()
+    if head.endswith(".exe"):
+        head = head[:-4]
+    if head != "git":
+        return False, None, []
+    idx = 1
+    git_cwd: Optional[str] = None
+    subcmd = ""
+    while idx < len(tokens):
+        tok = tokens[idx]
+        low = tok.lower()
+        if tok in ("-P", "--no-pager", "--no-optional-locks", "--bare"):
+            idx += 1
+            continue
+        if tok == "-C":
+            if idx + 1 >= len(tokens):
+                return False, None, []
+            git_cwd = tokens[idx + 1]
+            idx += 2
+            continue
+        if tok.startswith("-C") and len(tok) > 2:
+            git_cwd = tok[2:]
+            idx += 1
+            continue
+        if tok in ("-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--config-env"):
+            if idx + 1 >= len(tokens):
+                return False, None, []
+            if tok == "-c":
+                cfg_k = tokens[idx + 1].split("=", 1)[0].strip().lower()
+                if cfg_k.startswith(("alias.", "core.fsmonitor", "core.sshcommand", "core.pager", "pager.")) and not cfg_k.startswith(("core.pager", "pager.")):
+                    return False, None, []
+                if any(cfg_k.startswith(p) for p in ("alias.", "core.fsmonitor", "core.sshcommand", "core.hooks", " diff.external", "diff.external")):
+                    return False, None, []
+            else:
+                return False, None, []
+            idx += 2
+            continue
+        if low.startswith(("--git-dir=", "--work-tree=", "-c")):
+            if low.startswith("-c") and len(tok) > 2:
+                cfg_k = tok[2:].split("=", 1)[0].strip().lower()
+                if any(cfg_k.startswith(p) for p in ("alias.", "core.fsmonitor", "core.sshcommand", "core.hooks", "diff.external")):
+                    return False, None, []
+                idx += 1
+                continue
+            return False, None, []
+        if tok.startswith("-"):
+            return False, None, []
+        subcmd = low
+        idx += 1
+        break
+    if subcmd not in READONLY_GIT_SUBCOMMANDS:
+        return False, git_cwd, []
+    rest = tokens[idx:]
+    for arg in rest:
+        al = arg.lower()
+        if al in ("-o", "--output") or al.startswith(("--output=", "-o/")):
+            return False, git_cwd, rest
+        if subcmd == "diff" and al.startswith("--ext-diff"):
+            return False, git_cwd, rest
+    return True, git_cwd, rest
+

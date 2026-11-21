@@ -3764,6 +3764,124 @@ class TestDispatchAndBillingGuards(unittest.TestCase):
         self.assertIsNone(status_guard._detect_command_external_mutation(long_env, str(project), keys, keys, False))
         self.assertLess(time.monotonic() - t0, 0.5)
 
+    def test_v1182_ast_readonly_git_bounded_loops_local_vars_msys_files_and_session_lease(self):
+        project = self.project / "v1182_ws"
+        outside = self.root / "v1182_companion" / "subwork"
+        project.mkdir(parents=True)
+        (project / "sub").mkdir()
+        outside.mkdir(parents=True)
+        (outside / "a.py").write_text("x = 1\n", encoding="utf-8")
+        (outside / "b.py").write_text("x = 2\n", encoding="utf-8")
+        keys = [status_guard._normalize_cross_env_lexical(str(project))]
+
+        # 1) Python AST: 只读 git show f-string、os.O_RDONLY、URL opener、有界循环与完备 if/else 零误报；越界仍拦截
+        for safe_py in (
+            "import subprocess\nsubprocess.check_output(['git', '--no-pager', 'show', f'HEAD:{rel}'])",
+            "import os\nos.open('../outside/readonly.bin', os.O_RDONLY)",
+            "opener.open('http://127.0.0.1:8241/__router/health')",
+            "req.open('https://example.com/status')",
+            "if cond:\n    p = 'sub/a.txt'\nelse:\n    p = 'sub/b.txt'\nopen(p, 'w')",
+            "from pathlib import Path\nfor i in range(4):\n    (Path('sub') / f'{i:03}.txt').write_text('ok')",
+            "from pathlib import Path\nfor p in Path('sub').rglob('*.py'):\n    p.write_bytes(b'ok')",
+        ):
+            self.assertIsNone(status_guard._scan_inline_python_code(safe_py, str(project), keys, keys, True), safe_py)
+        for bad_py in (
+            "import subprocess\nsubprocess.run(['git', 'diff', '--output=../outside.patch', f'HEAD:{rel}'])",
+            "from pathlib import Path\nfor i in range(2):\n    (Path('../v1182_companion') / f'{i:03}.txt').write_text('no')",
+        ):
+            self.assertIsNotNone(status_guard._scan_inline_python_code(bad_py, str(project), keys, keys, True), bad_py)
+
+        # 2) Shell 同命令局部变量（PowerShell Join-Path / 尾逗号 / Bash 变量）放行临时与项目内目录，未赋值变量继续拦截
+        tmp_norm = status_guard._normalize_cross_env_lexical(tempfile.gettempdir())
+        allow_with_tmp = keys + [tmp_norm]
+        for safe_cmd in (
+            "$waveTmp = Join-Path $env:TEMP 'wave_check'; New-Item -ItemType Directory -Path $waveTmp,; Remove-Item -LiteralPath $waveTmp -Recurse -Force",
+            'TS_DIR="$TEMP/ts_v1182"; mkdir -p "$TS_DIR"; rm -rf "$TS_DIR"',
+            "$localOut = 'sub/out_dir'; New-Item -ItemType Directory -Path $localOut",
+        ):
+            self.assertIsNone(
+                status_guard._detect_command_external_mutation(safe_cmd, str(project), allow_with_tmp, allow_with_tmp, True),
+                safe_cmd,
+            )
+        self.assertIsNotNone(
+            status_guard._detect_command_external_mutation("Remove-Item -LiteralPath $unassignedVar -Recurse", str(project), allow_with_tmp, allow_with_tmp, True)
+        )
+
+        # 3) Windows 下 Claude Code Bash (MSYS /tmp 与 /<drive>/...) 路径映射
+        if os.name == "nt":
+            drv = str(project.resolve())[0].lower()
+            rest = str(project.resolve())[2:].replace("\\", "/").lstrip("/")
+            msys_inside = f"/{drv}/{rest}/sub/msys_ok.txt"
+            self.assertIsNone(
+                status_guard._detect_command_external_mutation(
+                    f"echo ok > '{msys_inside}'; rm -rf /tmp/claude_msys_scratch",
+                    str(project), allow_with_tmp, allow_with_tmp, True, msys_shell=True,
+                )
+            )
+
+        # 4) --files 精确多文件单路只读调用按实际传入文件计量（最多 4 个小文件免票），越界或超量仍需票据
+        for idx in range(6):
+            (project / f"m{idx}.py").write_text("v = 1\n", encoding="utf-8")
+        tp = self.root / "v1182_trace.jsonl"
+        _append_jsonl(tp, {"type": "USER_INPUT", "step_index": 1, "content": "检查代码"})
+
+        def call_agy(tool_name, tool_args, sid="v1182-sid"):
+            return status_guard.handle_pre_tool_use({
+                "conversationId": sid, "cwd": str(project), "workspacePaths": [str(project)],
+                "transcriptPath": str(tp), "toolCall": {"name": tool_name, "args": tool_args},
+            })
+
+        self.assertEqual(
+            call_agy("run_command", {"CommandLine": "python cae_harness.py task --kind review --target . --files m0.py --files m1.py --files m2.py"})["decision"],
+            "allow",
+        )
+        self.assertEqual(
+            call_agy("run_command", {"CommandLine": "python cae_harness.py task --kind review --target . --files m0.py --files m1.py --files m2.py --files m3.py --files m4.py"})["decision"],
+            "deny",
+        )
+        self.assertEqual(
+            call_agy("run_command", {"CommandLine": "python cae_harness.py task --kind review --target . --files ../escape.py"})["decision"],
+            "deny",
+        )
+
+        # 5) 同会话外部目录批准租约：首次弹窗 -> 未结算或被拒继续弹窗 -> 轨迹结算成功后同目录后续文件编辑静默放行，但删除与新建外部根仍弹窗
+        r1 = call_agy("edit_file", {"Path": str(outside / "a.py"), "Target": "x = 1", "Replacement": "x = 10"})
+        self.assertEqual(r1["decision"], "force_ask")
+        # 轨迹尚无结算结果时不能伪造租约
+        r2 = call_agy("edit_file", {"Path": str(outside / "b.py"), "Target": "x = 2", "Replacement": "x = 20"})
+        self.assertEqual(r2["decision"], "force_ask")
+        # 用户点击拒绝后仍必须继续弹窗
+        _append_jsonl(tp, {"type": "TOOL_RESULT", "status": "ERROR", "content": "Tool call denied by user"})
+        r3 = call_agy("edit_file", {"Path": str(outside / "b.py"), "Target": "x = 2", "Replacement": "x = 20"})
+        self.assertEqual(r3["decision"], "force_ask")
+        # 用户批准并成功执行后，同会话同目录后续常规编辑静默放行
+        _append_jsonl(tp, {"type": "TOOL_RESULT", "status": "DONE", "content": "Made 1 replacement"})
+        r4 = call_agy("edit_file", {"Path": str(outside / "b.py"), "Target": "x = 2", "Replacement": "x = 20"})
+        self.assertEqual(r4["decision"], "allow")
+        # 删除该外部目录或新建全新外部永久目录依然触发确认
+        self.assertEqual(
+            call_agy("run_command", {"CommandLine": f'Remove-Item -Recurse -Force "{outside}"'})["decision"],
+            "force_ask",
+        )
+        brand_new = self.root / "brand_new_perm_dir" / "f.txt"
+        self.assertEqual(
+            call_agy("write_file", {"Path": str(brand_new), "Content": "new"})["decision"],
+            "force_ask",
+        )
+
+        # 6) mark_heavy_completions_reported 按 run_ids 精确销账，不误销并发新增账单
+        hc_dir = self.state / "heavy_completions"
+        hc_dir.mkdir(parents=True, exist_ok=True)
+        hc_file = hc_dir / "hc-race-sid.json"
+        hc_file.write_text(json.dumps([
+            {"run_id": "run-1", "reported_to_user": False},
+            {"run_id": "run-2", "reported_to_user": False},
+        ]), encoding="utf-8")
+        user_words.mark_heavy_completions_reported("hc-race-sid", self.state, run_ids=["run-1"])
+        saved_hc = json.loads(hc_file.read_text(encoding="utf-8"))
+        self.assertTrue(saved_hc[0]["reported_to_user"])
+        self.assertFalse(saved_hc[1]["reported_to_user"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

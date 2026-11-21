@@ -47,7 +47,7 @@ description: >
 
 第一道门由独立 `fleet-evolve` 联网评估并经用户决定 `subscription_matrix` 启停，`enabled: false` 全局跳过。第二道门由 `plan` 纯离线复查本机程序、凭据、所需本地路由健康及可读额度状态（滚动窗口百分比与重置时间、卡片套餐或余额类型、日月限额及冷却记录），未暴露的服务端余额保持未知。日常派工仅读取 `capability_ledger.last_online_refresh_at` 与 `capability_ledger.local_bench_verified_at`，不联网更新。遇到 `quota_exhausted` 立即停止重试并记录冷却；仅显式开启 `--fallback-on-quota` 且工作区无改动时可按配置回退。
 
-轻任务按 `runtime_tunables.dispatch_confirmation` 静默执行。外部无头调用及内部 `invoke_subagent`、`run_workflow`、`spawn_agent`、`Agent`、`swarm` 等多路或可写委派均须先经 `plan` 确认；`status_guard.py` 对 `swarm` 的 `add` 按 `tasks` 长度或 `n` 计入通道容量。通道含 `cae_harness_headless`、`native_subagent`、`native_workflow`、`native_swarm`；原生通道默认 `inherit`，优先解析代理定义中的显式 `model` 并挂载 `native_agent_profiles`。
+轻任务按 `runtime_tunables.dispatch_confirmation` 静默执行（单路只读 `task` 显式传入 `--files` 时仅统计所声明文件，上限由 `heavy_max_light_explicit_files` 或默认 4 个文件控制，不误扫整个目标目录）。外部无头调用及内部 `invoke_subagent`、`run_workflow`、`spawn_agent`、`Agent`、`swarm` 等多路或可写委派均须先经 `plan` 确认；`status_guard.py` 对 `swarm` 的 `add` 按 `tasks` 长度或 `n` 计入通道容量。通道含 `cae_harness_headless`、`native_subagent`、`native_workflow`、`native_swarm`；原生通道默认 `inherit`，优先解析代理定义中的显式 `model` 并挂载 `native_agent_profiles`。
 
 `plan` 依次写入 `<ticket_id>.json` 与 `<ticket_id>_card.md` 14 项明细，标准输出默认置顶 `compact_summary_card`；需全量 JSON 时加 `--full-json`，本地交互勿传 `--redact` 以保留可点击链接。对话与压缩恢复默认仅展示精简总览卡及 `<ticket_id>_card.md` 链接，禁止展开多路 14 项长表挤占上下文：
 

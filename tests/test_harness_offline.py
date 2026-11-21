@@ -6870,6 +6870,67 @@ else:
             if temp_proj.exists():
                 temp_proj.rmdir()
 
+    def test_v1182_short_alias_stage_citation_backtick_followup_plan_dir_and_explicit_files_light(self):
+        # 1. _session_trace & _citation_audit handle non-canonical/8.3 base_dir spelling and inline backticks in prose
+        real_stage = self.root / 'runneradmin_temp' / 'staged'
+        (real_stage / 'src').mkdir(parents=True)
+        (real_stage / 'src' / 'flux.py').write_text('a = 1\nb = 2\n', encoding='utf-8')
+        orig_resolve = Path.resolve
+
+        def expand_short_runner(p_self, *a, **kw):
+            s = str(p_self)
+            if 'RUNNER~1' in s:
+                return orig_resolve(Path(s.replace('RUNNER~1', 'runneradmin_temp')), *a, **kw)
+            return orig_resolve(p_self, *a, **kw)
+
+        short_stage = self.root / 'RUNNER~1' / 'staged'
+        with patch.object(Path, 'resolve', autospec=True, side_effect=expand_short_runner):
+            reads, _, _ = harness._session_trace(
+                [{'type': 'item.completed', 'item': {'type': 'command_execution', 'command': 'cat src/flux.py', 'exit_code': 0}}],
+                self.root,
+                short_stage,
+            )
+            prose_result = {
+                'content': 'WSL 查询解码见 `cae_harness.py` 第 10 行。参考 [flux.py](src/flux.py:1-2)。',
+                'evidence': ['回执见 `src/flux.py#L1-L2` 与 `src/flux.py`:2。'],
+            }
+            audit = harness._citation_audit(prose_result, real_stage, reads, [], stage_dir=short_stage)
+        self.assertEqual(reads, ['src/flux.py'])
+        self.assertEqual(audit['missing_files'], [])
+        self.assertEqual(audit['out_of_range_lines'], [])
+        self.assertEqual(audit['unopened_cited_files'], [])
+
+        # 2. cmd_followup without session_plan_dir does not default plan_dir to '.' inside workspace
+        proj = self.root / 'followup_clean_ws'
+        proj.mkdir()
+        (proj / 'solver.py').write_text('u = 0\n', encoding='utf-8')
+        rec_file = self.root / 'no_plan_dir_receipt.json'
+        rec_file.write_text(json.dumps({
+            'target': str(proj), 'engine': 'codex:default', 'readonly': True,
+            'invocation': {'provider_session_id': 'sid-clean-1', 'session_store_id': 'abcd1234'},
+        }), encoding='utf-8')
+        seen_plan_dirs = []
+
+        def fake_invoke(engine, root, prompt, backends_map, schema, readonly, timeout, *a, **kw):
+            seen_plan_dirs.append(kw.get('plan_dir'))
+            return TASK
+
+        with patch.object(harness, '_args_backends', return_value=backends()), patch.object(harness, 'invoke_engine', side_effect=fake_invoke):
+            rc_fu, rep_fu = self.capture(harness.cmd_followup, self.args(
+                'followup', '--receipt', str(rec_file), '--task', '核对守恒律'))
+        self.assertEqual(rc_fu, 0)
+        self.assertEqual(seen_plan_dirs, [''])
+        self.assertEqual(rep_fu['scope_violations'], [])
+
+        # 3. Explicit --files up to 4 small files is treated as light single-stream task
+        multi = self.root / 'multi_repo'
+        multi.mkdir()
+        for idx in range(6):
+            (multi / f'f{idx}.py').write_text('x = 1\n', encoding='utf-8')
+        self.assertFalse(harness._is_heavy_streams([{'kind': 'review', 'file_count': 4, 'estimated_tokens': 200, 'timeout': 300, 'files': ['f0.py', 'f1.py', 'f2.py', 'f3.py']}]))
+        self.assertTrue(harness._is_heavy_streams([{'kind': 'review', 'file_count': 5, 'estimated_tokens': 200, 'timeout': 300, 'files': ['f0.py', 'f1.py', 'f2.py', 'f3.py', 'f4.py']}]))
+        self.assertTrue(harness._is_heavy_streams([{'kind': 'review', 'file_count': 3, 'estimated_tokens': 200, 'timeout': 300}]))
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

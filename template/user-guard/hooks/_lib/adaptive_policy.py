@@ -115,22 +115,21 @@ def _candidate_matches_query(
     norm_target: str,
     family_target: str,
     has_1m_suffix: bool,
-    allow_family: bool,
+    stage: str,
 ) -> bool:
     if not cand_low:
         return False
-    if cand_low == low_model:
-        return True
+    if stage == "exact":
+        return cand_low == low_model
     # 禁止无 [1m] 后缀或带小窗口后缀的模型通过剥离后缀误命中 [1m] 专属条目
     if cand_low.endswith("[1m]") and not has_1m_suffix:
         return False
-    cand_stripped = _strip_ctx_suffix(cand_low, strip_1m=has_1m_suffix)
-    if norm_target and cand_stripped == norm_target:
-        return True
-    if allow_family and family_target:
+    if stage == "stripped":
+        cand_stripped = _strip_ctx_suffix(cand_low, strip_1m=has_1m_suffix)
+        return bool(norm_target and cand_stripped == norm_target)
+    if stage == "family" and family_target:
         cand_family = _normalize_model_family_base(cand_low, strip_1m=has_1m_suffix)
-        if cand_family and cand_family == family_target:
-            return True
+        return bool(cand_family and cand_family == family_target)
     return False
 
 
@@ -167,7 +166,7 @@ def _match_subscription_and_builtin(
     sub_1m_id = False
     sub = profile.get("subscription_matrix") if isinstance(profile.get("subscription_matrix"), dict) else {}
     models = sub.get("models") if isinstance(sub.get("models"), dict) else {}
-    for allow_family in (False, True):
+    for stage in ("exact", "stripped", "family"):
         for k, v in models.items():
             if not isinstance(v, dict):
                 continue
@@ -179,8 +178,8 @@ def _match_subscription_and_builtin(
             pl = str(v.get("provider_model") or "").strip().lower()
             if kl.endswith("[1m]") and not has_1m_suffix and (not pl or pl != query_low):
                 continue
-            if _candidate_matches_query(kl, query_low, stripped, family_target, has_1m_suffix, allow_family) or (
-                pl and _candidate_matches_query(pl, query_low, stripped, family_target, has_1m_suffix, allow_family)
+            if _candidate_matches_query(kl, query_low, stripped, family_target, has_1m_suffix, stage) or (
+                pl and _candidate_matches_query(pl, query_low, stripped, family_target, has_1m_suffix, stage)
             ):
                 sub_match = v
                 sub_1m_id = kl.endswith("[1m]") or pl.endswith("[1m]")
@@ -197,7 +196,7 @@ def _match_subscription_and_builtin(
     else:
         candidate_rules = [r for r in rules.values() if isinstance(r, dict)]
 
-    for allow_family in (False, True):
+    for stage in ("exact", "stripped", "family"):
         for c_rule in candidate_rules:
             builtin = c_rule.get("builtin_models")
             if not isinstance(builtin, list):
@@ -210,7 +209,7 @@ def _match_subscription_and_builtin(
                     continue
                 for id_key in ("slug", "model", "name", "display_name"):
                     cand = str(item.get(id_key) or "").strip().lower()
-                    if _candidate_matches_query(cand, query_low, stripped, family_target, has_1m_suffix, allow_family):
+                    if _candidate_matches_query(cand, query_low, stripped, family_target, has_1m_suffix, stage):
                         builtin_match = item
                         builtin_1m_id = cand.endswith("[1m]")
                         break

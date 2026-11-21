@@ -665,7 +665,8 @@ def load_unreported_heavy_completions(session_id, state_dir=None):
     return entries
 
 
-def mark_heavy_completions_reported(session_id, state_dir=None):
+def mark_heavy_completions_reported(session_id, state_dir=None, run_ids=None):
+    allowed_ids = {str(rid) for rid in run_ids if rid} if run_ids is not None else None
     for path in _heavy_completion_paths(session_id, state_dir):
         if not path.is_file():
             continue
@@ -676,6 +677,9 @@ def mark_heavy_completions_reported(session_id, state_dir=None):
             changed = False
             for entry in rows:
                 if isinstance(entry, dict) and entry.get("reported_to_user") is False:
+                    entry_rid = str(entry.get("run_id") or "")
+                    if allowed_ids is not None and entry_rid and entry_rid not in allowed_ids:
+                        continue
                     entry["reported_to_user"] = True
                     changed = True
             if changed:

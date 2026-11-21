@@ -18,7 +18,7 @@
 | [user_words.py](../template/user-guard/hooks/user_words.py) | 通用 + 上游 | 四个阶段门禁脚本共用的基础模块（底层委托 `hooks/_lib/`）：跨平台文件锁（`msvcrt` / `fcntl`）、重解析点防御原子写入、`runtime_tunables` 与自适应策略读取、过滤异步启动提示与短权限拒绝噪音的三端轨迹原话及实质子代理摘要提取（保留 `timeout_salvage` 摘要）、历史确认单折叠（`collapse_historical_cards`）及未决票据与完成回执记录存取 |
 | `hooks/_lib/`（`fs_safety.py`、`shell_lex.py`、`adaptive_policy.py`、`process_guard.py`） | 通用 + 上游 | 共享底层安全锁与原子写（`fs_safety.py`）、Shell 词法拆解与引号解码（`shell_lex.py`）、按 `(client, model, effort)` 动态派生压缩与交接阈值的自适应策略（`adaptive_policy.py`），以及钩子命令行入口内存与墙钟自毁护栏和防分页环境变量配置（`process_guard.py`） |
 | [session_context_loader.py](../template/user-guard/hooks/session_context_loader.py) | 通用 + 上游 | 压缩或恢复入口检测：普通回合零字节注入；压缩恢复时分块注入“历轮原话 + 去噪实质子代理及超时抢救摘要”与“磁盘未决确认单精简总览卡及明细链接” |
-| [status_guard.py](../template/user-guard/hooks/status_guard.py) | 通用 + 上游 | 工具执行前门禁：静态拆解文件工具、多层 Shell 包装、重定向与内联 Python AST 拦截项目外写删及外部 `git worktree`；拦截未变化日志重复读取；拦截绕过调度器直接调用无头 CLI，核验有效 `APPROVED` 票据（含 `followup`）、隔离一致性与内部原生通道容量（含 `swarm add` 按 `tasks` 长度或 `n` 精确计费） |
+| [status_guard.py](../template/user-guard/hooks/status_guard.py) | 通用 + 上游 | 工具执行前门禁：静态拆解文件工具、多层 Shell 包装与局部变量、MSYS 路径、重定向及内联 Python AST（识别只读 `git` 子进程与有界目录遍历）拦截项目外写删及外部 `git worktree`，并对经轨迹结算确认的外部常规编辑目录与全局同步提供同会话续租；拦截未变化日志重复读取；拦截绕过调度器直接调用无头 CLI，核验有效 `APPROVED` 票据（含 `followup` 与 `--files` 精确文件计量）、隔离一致性与内部原生通道容量（含 `swarm add` 按 `tasks` 长度或 `n` 精确计入流数） |
 | [reply_repeat_guard.py](../template/user-guard/hooks/reply_repeat_guard.py) | 通用 + 上游 | 回合结束门禁：拦截连续无新数值进展的短句等待，拦截将局部补测冒充全量测试通过的表述，并在重负载完工后核验成败词（禁止将含失败或超时的账单写成全部成功）、Token 用量说明（兼容 `cli_partial_on_timeout`）及流标识、回执文件名或轨迹词项 |
 | [handoff_gate.py](../template/user-guard/hooks/handoff_gate.py) | 通用 + 上游 | 长会话分级交接门禁：累计压缩次数、轨迹体积与读图字节数，在强制收尾（`drain` / `freeze`）阶段限制新派工，核验【新对话提示词】内嵌精简总览卡、`<ticket_id>_card.md` 链接与 `plan --resume-ticket` 命令，并拦截把落盘交接稿中的待拍板占位符擅自填为已拍板 |
 | [install.py](../install.py)、`install.ps1`、`install.sh` | 上游专属 | 探测客户端与 Python 3.11+ 解释器，校验非符号链接与非重解析点后幂等分发四端配置；提供零写入配置漂移、`cross_side_status` 双端同步体检、DSH `hook_protocol` 能力探测、`subscription_candidates`、`fleet_profile.native_agent_profiles_configured` 与科学计算包三级 ABI 耦合审计（`--audit-upgrade`） |
@@ -74,7 +74,7 @@
 | --- | --- | --- |
 | **会话恢复与调用前** | `session_context_loader.py` + `handoff_gate.py` | 无新压缩时零字节注入；检测到压缩或恢复时分块还原“历轮原话 + 实质子代理摘要”与“磁盘未决票据精简总览卡及可点击 `<ticket_id>_card.md` 链接”，并更新交接阶段 |
 | **新指令提交时** | `handoff_gate.py`（Antigravity 在 `PreInvocation` 同步对账轨迹控制步） | 根据用户最新指令更新交接请求或显式暂缓宽限期（仅短而明确的用户指令生效，引用长文不误触） |
-| **工具执行前** | `status_guard.py` + `handoff_gate.py` | 核验项目外写边界、日志重复轮询、直接调用底层 CLI 拦截、重负载批准票据（含隔离一致性与 `swarm add` 精确流数计费），以及强制交接阶段（`drain`/`freeze`）的动作预算与新派工封锁（放行 `check-grounding --strict` 等只读收尾检查） |
+| **工具执行前** | `status_guard.py` + `handoff_gate.py` | 核验项目外写边界与同会话外部目录批准租约、日志重复轮询、直接调用底层 CLI 拦截、重负载批准票据（含隔离一致性、`--files` 精确文件计量与 `swarm add` 并发流数统计），以及强制交接阶段（`drain`/`freeze`）的动作预算与新派工封锁（放行 `check-grounding --strict` 等只读收尾检查） |
 | **回合结束时** | `reply_repeat_guard.py` + `handoff_gate.py` | 拦截同回合连续无实质进展的等待短句，校验重负载完成回执（成败词、Token 说明、流标识与回执文件名或原生轨迹说明），并在强制交接阶段由 `_matches_compact_card_handoff` 优先核验【新对话提示词】内嵌精简 4 列总览表、`<ticket_id>_card.md` 链接与 `plan --resume-ticket` 命令（无落盘明细文件时回退校验纵向 14 项参数表及历史 14 列行） |
 
 四个对等客户端的具体挂载与适配边界如下：
