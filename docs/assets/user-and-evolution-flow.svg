@@ -59,9 +59,9 @@
 
   <g>
     <rect x="50" y="508" width="624" height="142" rx="12" fill="#ffffff" stroke="#b8cde8"/>
-    <text x="72" y="540" class="heading">3. 轻任务静默执行 · 重负载发精简总览卡与明细链接</text>
+    <text x="72" y="540" class="heading">3. 轻任务静默执行 · 重负载发 3 句话确认条与明细链接</text>
     <text x="72" y="568" class="body">小范围单路检查静默执行；内部原生与外部无头重负载统一先运行 plan。</text>
-    <text x="72" y="594" class="body">14 项明细写入 &lt;ticket_id&gt;_card.md，对话仅展精简 4 列卡与可点击链接。</text>
+    <text x="72" y="594" class="body">4 列总览与 14 项明细写入 &lt;ticket_id&gt;_card.md，日常对话仅展 chat_brief。</text>
     <text x="72" y="620" class="body">压缩时按窗口缩放预算并折叠历史明细；获批后凭 --ticket 放行。</text>
   </g>
 

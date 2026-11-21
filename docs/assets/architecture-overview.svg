@@ -39,8 +39,8 @@
   </g>
   <g><rect x="32" y="640" width="1376" height="166" rx="14" fill="#fff8e9" stroke="#d7b265"/>
     <text x="54" y="674" class="heading">全通道重负载确认：用户明确点名（P0）与动态角色选路并列</text>
-    <text x="54" y="705" class="body">plan 将 14 项明细写入 &lt;ticket_id&gt;_card.md，对话仅发精简 4 列总览卡与可点击链接。</text>
-    <text x="54" y="731" class="body">附离线性能更新时间（last_online_refresh_at / local_bench_verified_at）与三选项。</text>
+    <text x="54" y="705" class="body">plan 将 4 列总览与 14 项明细写入 &lt;ticket_id&gt;_card.md，日常对话仅展 3 句话 chat_brief 与可点击链接。</text>
+    <text x="54" y="731" class="body">明细文件附离线性能更新时间（last_online_refresh_at / local_bench_verified_at）与三选项。</text>
     <text x="54" y="757" class="body">获批后以 --approve-ticket 登记；PreToolUse 核验票据、隔离一致性并拦截裸调 CLI。</text>
     <text x="54" y="783" class="body">点名锁定指定维度；窗口、非委派挡位、--isolation 隔离、行号内联与快照按端补齐。</text>
   </g>

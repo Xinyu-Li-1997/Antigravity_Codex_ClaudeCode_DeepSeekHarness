@@ -23,7 +23,7 @@
   </g>
   <g><rect x="32" y="302" width="850" height="134" rx="14" fill="#fff8e9" stroke="#d7b265"/>
     <text x="54" y="334" class="heading">完整确认：内部原生与外部无头通道统一生成确认单</text>
-    <text x="54" y="363" class="body">完整 14 项明细写入 &lt;ticket_id&gt;_card.md，对话仅发精简 4 列总览卡与可点击链接。</text>
+    <text x="54" y="363" class="body">4 列总览与 14 项明细写入 &lt;ticket_id&gt;_card.md，对话仅发 3 句话 chat_brief 与链接，禁重复刷票。</text>
     <text x="54" y="388" class="body">用户明确批准后运行 plan --approve-ticket；执行阶段绑定 --ticket。</text>
     <text x="54" y="413" class="body">PreToolUse 核验有效票据，同时拦截直接调用无头 CLI 与未经确认的重负载。</text>
   </g>
@@ -45,7 +45,7 @@
     <text x="936" y="177" class="body">adaptive_policy.py 动态缩放恢复预算；</text>
     <text x="936" y="203" class="body">collapse_historical_cards 折叠历史明细；</text>
     <text x="936" y="229" class="body">常规用户原话与关键子代理返回摘要；</text>
-    <text x="936" y="255" class="body">独立读票据输出精简 4 列卡与明细链接；</text>
+    <text x="936" y="255" class="body">独立读票据恢复总览，对话仅补展 chat_brief；</text>
     <text x="936" y="281" class="body">保留背景、目标、后果与三选项（禁刷屏）；</text>
     <text x="936" y="307" class="body">缺项如实报缺口，无明细文件才回退长表；</text>
     <text x="936" y="333" class="body">压缩与恢复均不构成用户批准。</text>
@@ -68,7 +68,7 @@
     <text x="54" y="876" class="heading">共有钩子模块分工与各客户端宿主事件适配</text>
     <text x="54" y="907" class="body">恢复与调用前：session_context_loader.py 与 handoff_gate.py 还原原话、关键返回与未决确认单并评估交接阶段。</text>
     <text x="54" y="933" class="body">工具执行前：status_guard.py 与 handoff_gate.py 检查写边界、重复读日志、直接调 CLI、批准票据与收尾限制。</text>
-    <text x="54" y="959" class="body">回合结束时：reply_repeat_guard.py 与 handoff_gate.py 检查重复等待短句、重负载完成回执与交接提示词。</text>
+    <text x="54" y="959" class="body">回合结束时：reply_repeat_guard.py 与 handoff_gate.py 检查重复等待短句、重复刷票、完成回执与交接提示词。</text>
     <text x="54" y="985" class="body">协议映射：Antigravity 挂 4 类事件；Codex/Claude 挂 5 类事件；DSH 为 soft_rules_only 并由 install.py 探测 hook_protocol。</text>
     <text x="54" y="1011" class="body">共享基础库：user_words.py 与 hooks/_lib/ 承载跨平台锁、自适应阈值、轨迹解析与完成回执记录持久化。</text>
     <text x="54" y="1037" class="body">事实核验：check-grounding --strict 零黑名单拦截无依据标识符、缩写与数字（不替代数学证明与运行验证）。</text>
