@@ -68,11 +68,11 @@ python -B -X utf8 install.py --dry-run --yes
 
 ## 派工、持久化续接与可用性检查
 
-主会话遇到实质性推导、多文件编码验证或关键代码与文档审查，应主动通过 `cae-harness` 核查可用端。用户点名按 P0 第一优先级锁定指定维度，以 `--user-prompt` 传递原话。`role:*` 是并列入口，不覆盖点名；未指定的窗口、非委派挡位、无头防分页标志、`--files` 多文件输入与 `--negative-scope-file` 负向契约、只读行号内联、快照和脱敏由脚本补齐。外部无头会话默认持久化（`--ephemeral` 显式关闭），支持 `followup` 增量追问，并在超时场景下执行软时限只读收口与硬超时 `timeout_salvage`（保留部分 Token、已读文件、落盘改动与末尾结论）。轻量卡片跑非 `fast` 角色、WSL 纯 Linux 可写路径走 Windows 互操作、Windows `codex.exe` 只读关闭内联或本地路由未存活时明确报错，不静默降级。
+主会话遇到实质性推导、多文件编码验证或关键代码与文档审查，应主动通过 `cae-harness` 核查可用端。用户点名按 P0 第一优先级锁定指定维度，以 `--user-prompt` 传递原话（仅泛指后端且未唯一锁定单模型时，保留单流已指定的同后端具体模型）。`role:*` 是并列入口，不覆盖点名；未指定的窗口、非委派挡位、无头防分页标志、`--files` 多文件输入与 `--negative-scope-file` 负向契约、只读行号内联、快照（默认忽略常见语言工具链缓存目录）和脱敏由脚本补齐。外部无头会话默认持久化（`--ephemeral` 显式关闭），支持 `followup` 增量追问，并在超时场景下执行软时限自动降档只读收口与硬超时 `timeout_salvage`（优先保留正式助手回复、部分 Token、已读文件与落盘改动，并如实记录总超时与主回合超时）。轻量卡片跑非 `fast` 角色、WSL 纯 Linux 可写路径走 Windows 互操作、Windows `codex.exe` 只读关闭内联或本地路由未存活时明确报错，不静默降级。
 
 可用性经过两道门：第一道门由 `fleet-evolve` 联网评估并由用户决定 `subscription_matrix` 启停；第二道门由 `plan` 纯离线复查当前配置、路由存活及可读额度状态。日常派工读取 `capability_ledger`，不联网更新性能。
 
-重负载涵盖外部无头调用（支持 `--isolation` 四级正交隔离）及内部 `invoke_subagent`、`run_workflow`、`spawn_agent`、`Agent`、`swarm` 多路或可写委派。`plan` 先写 `<ticket_id>.json` 再写 `<ticket_id>_card.md`（含 4 列总览表与 14 项明细），日常对话默认仅展示 3 句话极简确认条 `chat_brief` 与明细链接，后台被动唤醒期间严禁重复贴票。获批后以 `plan --approve-ticket` 登记，执行绑定 `--ticket`；`batch` 支持按 `wave` 波次及同目录不重叠 `write_scope` 并发执行外部无头通道。
+重负载涵盖外部无头调用（支持 `--isolation` 四级正交隔离）及内部 `invoke_subagent`、`run_workflow`、`spawn_agent`、`Agent`、`swarm` 多路或可写委派。`plan` 先写 `<ticket_id>.json` 再写 `<ticket_id>_card.md`（含 4 列总览表与 14 项明细），日常对话默认仅展示 3 句话极简确认条 `chat_brief` 与明细链接，后台被动唤醒期间严禁重复贴票。获批后以 `plan --approve-ticket` 登记，执行绑定 `--ticket`；`batch` 支持按 `wave` 波次及同目录不重叠 `write_scope` 并发执行外部无头通道，前序波次同工作区可写流失败时默认阻断后续波次全部流（含只读流，仅显式声明 `run_on_upstream_failure: true` 的只读流放行）。
 
 ## 中断恢复与完成回执
 

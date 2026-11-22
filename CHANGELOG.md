@@ -2,6 +2,25 @@
 
 本文件记录四客户端共用规则、会话钩子、后台验证工具与上游维护流程的版本演进。当前插件版本以 `template/user-guard/plugin.json` 为准；常驻使用文档只说明机制和配置键，不重复维护版本号与性能日期。
 
+## [1.18.8] - 2026-11-22
+
+基于真实多波次批处理超时与只读穿透失败样本的逐行根因排查，修复 `cae_harness.py` 五项核心缺陷并补齐 Julia 缓存快照忽略规则：
+
+- **波次失败门控默认阻断后续只读波次（`cae_harness.py`、`SKILL.md`）**：
+  - 将 `cmd_batch` 中同工作区（含父子目录关系）前序波次可写流失败后的阻断范围扩展至后续波次全部流（含只读审查流），避免前序产物未落盘时后续只读波次空转消耗配额；确需独立观察前序部分结果的只读流可通过流字段 `run_on_upstream_failure: true` 显式放行（`_resolve_plan_streams` 同步校验其布尔类型）。
+- **软超时紧急收口自动降档与总超时字段校正（`cae_harness.py`、`SKILL.md`）**：
+  - `invoke_engine` 在触发 `wrapup=True` 短预算只读收口时，为 `codex` 自动降至模型目录声明的最低可用非委派挡位（支持 `low` 时降至 `low`），为 `claude`/`dsh`/`agy` 降至 `low`，并记录 `wrapup_effort`，消除高推理挡位在大上下文下把 30–90 秒收口预算耗尽的问题；
+  - 软超时及二次收口超时异常中将 `timeout_sec` 还原为真实总预算，同时保留 `primary_timeout_sec` 与 `wrapup_timeout_sec` 便于事后排查。
+- **抢救轨迹防挤丢与 PowerShell 读文件解析补强（`cae_harness.py`）**：
+  - `_session_trace` 将正式助手消息（`agent_message`/`assistant`）与短推理小标题（`reasoning`/`thinking`）分队列收集，优先保留正式回复，仅在无正式回复时回退到推理片段；
+  - 补全 Windows PowerShell 读文件提取器 `_extract_shell_read_paths`，覆盖嵌套单引号转义、赋值/子表达式后的 `Get-Content` 与显式 `-LiteralPath`/`-Path` 的 `Select-String`，过滤 PowerShell 变量与管道误匹配。
+- **单流显式模型保护、Windows Codex 沙箱边界提示、零改动显式标记与 `.julia` 快照忽略（`cae_harness.py`、`fleet_profile.json`、`tests/test_harness_offline.py`）**：
+  - 修正 `choose_engine`：当 `--user-prompt` 仅泛指后端而未唯一锁定具体模型时，保留单流 `spec` 中已指定的同后端具体模型，不静默退回 `default`；
+  - Windows AppContainer 与 WSL 互操作 `codex.exe` 在非净室首轮自动附带简短沙箱边界提示；可写 `code` 任务退出码为 0 且磁盘零改动时在回执中显式标注 `no_files_changed: true`；
+  - 将 `.julia` 纳入 `snapshot_ignored_dirs`（显式声明 `.julia/...` 写入范围时自动取消忽略），消除 Julia 临时 depot 与预编译缓存触发的 `scope_violation` 误报，并补齐离线回归单测。
+
+---
+
 ## [1.18.7] - 2026-11-22
 
 基于 `gpt-6.2-astra` 与 `gpt-6.2-sol` 双路独立交叉复核及全历史 Git 对象扫描，完成路线 A 封板前安全加固、常驻规则瘦身与多文档失实校正：

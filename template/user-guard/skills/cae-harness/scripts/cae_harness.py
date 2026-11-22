@@ -1221,8 +1221,13 @@ def choose_engine(backends, caller, explicit='', prompt_text='', user_prompt='',
             slot = (original.split(':', 1)[1] if original.startswith('role:')
                     else _per_backend_role_target(*_engine_parts(original)) if original else '')
             backend = _extract_prompt_backend_hint(user_prompt)
-            if slot and backend and not _extract_prompt_model_hint(user_prompt):
-                hinted = f'{backend}:@{slot}'
+            if backend and not _extract_prompt_model_hint(user_prompt):
+                if slot:
+                    hinted = f'{backend}:@{slot}'
+                elif explicit and not original.startswith('role:'):
+                    orig_prefix, orig_model = _engine_parts(explicit)
+                    if orig_prefix == backend and orig_model and orig_model.lower() != 'default' and not orig_model.startswith('@'):
+                        hinted = f'{orig_prefix}:{orig_model}'
             explicit = hinted
         prompt_text = user_prompt
     if explicit and explicit.strip().lower().startswith('role:'):
@@ -4730,8 +4735,33 @@ def _is_resolved_within(candidate, base_dir):
         return False
 
 
+_SHELL_READ_POS_RE = re.compile(
+    r'''(?:^|[\s'";&|=(])(?:cat|nl\s+-ba|sed\s+-n\s+'[^']+'|Get-Content)\s+(?:-(?:LiteralPath|Path)\s+)?(?:"([^"]+)"|'([^']+)'|([^\s"'|;&)$]+))''',
+    re.I,
+)
+_SHELL_READ_PS_NAMED_RE = re.compile(
+    r'''(?:^|[\s'";&|=(])(?:Get-Content|Select-String)\b[^;|&()\r\n]*?\s-(?:LiteralPath|Path)\s+(?:"([^"]+)"|'([^']+)'|([^\s"'|;&)$]+))''',
+    re.I,
+)
+
+
+def _extract_shell_read_paths(command):
+    if not isinstance(command, str) or not command:
+        return []
+    # 兼容 Windows Codex 经 powershell.exe -Command 单引号嵌套转义生成的 '"'path' 形式。
+    normalized = command.replace("'\"'", "'")
+    paths = []
+    for pattern in (_SHELL_READ_POS_RE, _SHELL_READ_PS_NAMED_RE):
+        for match in pattern.finditer(normalized):
+            cand = next((g for g in match.groups() if g), '')
+            if cand and not cand.startswith(('-', '$')) and '$' not in cand:
+                paths.append(cand)
+    return paths
+
+
 def _session_trace(events, root, stage_dir):
-    reads, messages, pending, totals = set(), collections.deque(maxlen=3), {}, {}
+    reads, pending, totals = set(), {}, {}
+    assistant_msgs, reasoning_msgs = collections.deque(maxlen=4), collections.deque(maxlen=3)
     for event in events:
         node = next((event[k] for k in ('item', 'step_update', 'payload', 'data', 'result')
                      if isinstance(event.get(k), dict)), event)
@@ -4765,25 +4795,34 @@ def _session_trace(events, root, stage_dir):
             if kind in ('command_execution', 'exec_command_end') and node.get('exit_code') == 0:
                 paths = [cmd.get('path') for cmd in (node.get('parsed_cmd') or ()) if isinstance(cmd, dict) and cmd.get('type') == 'read']
                 if not paths and isinstance(node.get('command'), str):
-                    pattern = r'''(?:^|['";&|]\s*)(?:cat|Get-Content|nl\s+-ba|sed\s+-n\s+'[^']+')\s+(?:-LiteralPath\s+)?(?:"([^"]+)"|'([^']+)'|([^\s"'|;&]+))'''
-                    paths = [next(p for p in match if p) for match in re.findall(pattern, node['command'], re.I)]
+                    paths = _extract_shell_read_paths(node['command'])
             for path in paths:
                 if isinstance(path, str):
                     current = stage_dir or root
                     rel = _normalize_rel_file(path, current)
                     if not ntpath.isabs(rel) and '\0' not in rel and _is_resolved_within(current / rel, current):
                         reads.add(rel)
-            if (kind in ('reasoning', 'agent_reasoning', 'agent_message', 'agent_response', 'assistant',
-                         'assistant/message', 'thinking', 'text', 'final', 'result') or node.get('role') == 'assistant' or 'summary' in node):
+            is_reasoning = kind in ('reasoning', 'agent_reasoning', 'thinking')
+            is_assistant = (
+                kind in ('agent_message', 'agent_response', 'assistant', 'assistant/message', 'text', 'final', 'result')
+                or (node.get('role') == 'assistant' and not is_reasoning)
+                or ('summary' in node and not is_reasoning)
+            )
+            if is_reasoning or is_assistant:
                 msg = next((block[k] for k in ('text', 'thinking', 'text_delta', 'message', 'response', 'result', 'content')
                             if isinstance(block.get(k), str) and block[k].strip()), None)
-                if isinstance(msg, str) and msg.strip() and msg[-2500:] not in messages:
-                    messages.append(msg[-2500:])
+                if isinstance(msg, str) and msg.strip():
+                    clipped = msg[-2500:]
+                    target_q = reasoning_msgs if is_reasoning else assistant_msgs
+                    if clipped not in target_q:
+                        target_q.append(clipped)
         if kind == 'token_count' and isinstance(node.get('info'), dict):
             totals = node['info'].get('total_token_usage') or totals
+    # 优先保留正式助手回复，避免被短推理小标题挤出队列；无正式回复时回退到推理片段。
+    selected = list(assistant_msgs)[-3:] if assistant_msgs else list(reasoning_msgs)
     # 从最新片段向前分配字符预算。
     remaining, tail = 2500, []
-    for msg in reversed(messages):
+    for msg in reversed(selected):
         if remaining:
             tail.append(msg[-remaining:])
             remaining -= len(tail[-1])
@@ -5093,17 +5132,36 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
                 receipt['provider_session_id'] = sid
             return paths
 
+        def _wrapup_effort():
+            if prefix == 'codex':
+                rec = _exact_model_record(info.get('models', []), model) if model else {}
+                supported = [str(lv).lower() for lv in (rec.get('supported_efforts') or ()) if lv]
+                delegating = {str(lv).lower() for lv in (rec.get('delegating_efforts') or ()) if lv}
+                non_del = [lv for lv in supported if lv not in delegating]
+                for cand in ('low', 'minimal', 'medium'):
+                    if not non_del or cand in non_del:
+                        return cand
+                return non_del[0]
+            if prefix in ('claude', 'dsh'):
+                return 'low'
+            if prefix == 'agy' and effort:
+                return 'low'
+            return effort
+
         def turn(readonly, exec_prompt, budget, session_id, wrapup=False):
             native_pid_file = None
             win_target = translate(exec_dir)
+            turn_effort = _wrapup_effort() if wrapup else effort
+            if wrapup:
+                receipt['wrapup_effort'] = turn_effort
             if prefix == 'codex':
                 command = [binary, 'exec', '--json', '-s', 'read-only' if readonly else 'workspace-write',
                            '-c', 'approval_policy="never"',
                            '--skip-git-repo-check', '-C', win_target, '--output-schema', translate(schema_file), '-o', translate(output_file)]
                 if model:
                     command.extend(['-m', model])
-                if effort:
-                    command.extend(['-c', f'model_reasoning_effort="{effort}"'])
+                if turn_effort:
+                    command.extend(['-c', f'model_reasoning_effort="{turn_effort}"'])
                 context_window = profile['capacity']['cli_context_window_tokens']
                 if context_window:
                     command.extend(['-c', f'model_context_window={context_window}'])
@@ -5123,8 +5181,8 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
                 command.append('--sandbox')
                 if model:
                     command.extend(['--model', model])
-                if effort and profile.get('effort_option_supported') is not False and not _agy_slug_tier(model)[1]:
-                    command.extend(['--effort', effort])
+                if turn_effort and profile.get('effort_option_supported') is not False and not _agy_slug_tier(model)[1]:
+                    command.extend(['--effort', turn_effort])
                 if readonly:
                     command.extend(['--agent', 'readonly-collaborator' if wrapup else agent])
                     if not clean_room and stage_dir is None:
@@ -5149,8 +5207,8 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
                     command.append('--disable-slash-commands')
                 if model:
                     command.extend(['--model', model])
-                if effort in ('low', 'medium', 'high', 'xhigh', 'max'):
-                    command.extend(['--effort', effort])
+                if turn_effort in ('low', 'medium', 'high', 'xhigh', 'max'):
+                    command.extend(['--effort', turn_effort])
                 if readonly:
                     command.extend(['--permission-mode', 'dontAsk', '--tools', 'Read,Grep,Glob', '--permission-prompts', 'none'])
                 else:
@@ -5173,7 +5231,7 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
                     '- id: deepseek-account\n  disabled: false\n- id: agent-default-model\n'
                     "  name: '@deepseek-ai/dsh-agent-default-model'\n  config:\n"
                     f'    provider: {provider}\n    model: {json.dumps(model or dsh_default_slug)}\n'
-                    f'    reasoningEffort: {effort or "high"}\n', encoding='utf-8')
+                    f'    reasoningEffort: {turn_effort or "high"}\n', encoding='utf-8')
                 command = [binary, '--profile', 'headless', '--patch', translate(patch_file), '--json']
                 if session_id:
                     command.extend(['--session-id', session_id])
@@ -5335,11 +5393,26 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
                     prompt += f'\n[净室单文件映射] 目标文件 {rel.as_posix()} 在当前镜像目录中暂存为 {neutral}。'
             if readonly and (inline_readonly is True or (inline_readonly is None and clean_room)):
                 prompt = _inline_readonly_prompt(prompt, exec_dir, stage_files, exclude_agent_instructions=clean_room, included=inlined)
+            if prefix == 'codex' and _is_appcontainer_or_interop_codex(info) and not clean_room and not resume:
+                if readonly:
+                    prompt += (
+                        '\n[Windows Codex 只读沙箱边界] 本沙箱禁止调用 wsl.exe（将返回 Wsl/E_ACCESSDENIED），'
+                        '且 PowerShell 处于受限语言模式（禁止 .NET 构造器与非常规静态方法，且可能无 rg）；'
+                        '请优先直接基于已内联原文或简单 Get-Content/Select-String 读取。'
+                    )
+                else:
+                    prompt += (
+                        '\n[Windows Codex 沙箱边界] 本沙箱禁止调用 wsl.exe（将返回 Wsl/E_ACCESSDENIED）；'
+                        '若项目门禁涉及 WSL，请在回执 unverified 中如实披露并按授权范围处理，严禁反复重试 wsl.exe。'
+                    )
             try:
                 parsed = turn(readonly, prompt, primary_budget, resume_id)
             except HarnessError as exc:
                 if exc.status != 'timeout' or not soft or exc.details.get('cleanup_errors'):
                     raise
+                if 'timeout_sec' in exc.details:
+                    exc.details.setdefault('primary_timeout_sec', exc.details['timeout_sec'])
+                    exc.details['timeout_sec'] = timeout_sec
                 parsed = completed_output() if outputs else None
                 if parsed is None:
                     with contextlib.suppress(OSError):
@@ -5360,6 +5433,8 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
                                   and not wrapup.details.get('cleanup_errors') and len(outputs) > 1 else None)
                         if parsed is None:
                             exc.details['wrapup_status'] = wrapup.status
+                            if wrapup.status == 'timeout' and 'timeout_sec' in wrapup.details:
+                                exc.details['wrapup_timeout_sec'] = wrapup.details['timeout_sec']
                             if wrapup.details.get('cleanup_errors'):
                                 exc.details['cleanup_errors'] = wrapup.details['cleanup_errors']
                             raise exc from wrapup
@@ -5439,7 +5514,7 @@ def invoke_edit_worker(spec, target_dir, prompt, backends, timeout_sec=600, effo
 
 def _snapshot_ignored_dirs():
     return set(_headless_tunables().get('snapshot_ignored_dirs',
-               ['.git', '.venv', 'venv', 'build', 'dist', 'runs', '__pycache__', 'node_modules', '.cache']))
+               ['.git', '.venv', 'venv', 'build', 'dist', 'runs', '__pycache__', 'node_modules', '.cache', '.julia']))
 
 
 def read_agentignore_patterns(root):
@@ -7699,6 +7774,9 @@ def cmd_task(args):
         status = 'scope_violation'
     if args.kind == 'polish' and status == 'ok' and isinstance(result, dict) and isinstance(result.get('content'), str):
         payload['grounding_audit'] = _compute_polish_grounding_audit(requested_target, result['content'], text)
+    if args.kind == 'code' and status == 'ok' and scope.get('scope_verified') and not scope.get('changed_files'):
+        payload['no_files_changed'] = True
+        payload['no_files_changed_notice'] = '可写编码任务退出码为 0 但磁盘零改动，请核查是否因门禁或前置条件停手。'
     return _dispatch_print(args, {'status': status, **payload, 'invocation': invocation, 'result': result, **error, **scope})
 
 
@@ -8578,10 +8656,12 @@ def _resolve_plan_streams(args, streams, backends):
             raise HarnessError('工作流 timeout 必须为正整数')
         wave = stream.get('wave', 1)
         ephemeral = stream.get('ephemeral', getattr(args, 'ephemeral', False))
-        if type(wave) is not int or type(ephemeral) is not bool:
-            raise HarnessError('工作流 wave 必须为整数，ephemeral 必须为布尔值')
+        run_on_upstream_failure = stream.get('run_on_upstream_failure', False)
+        if type(wave) is not int or type(ephemeral) is not bool or type(run_on_upstream_failure) is not bool:
+            raise HarnessError('工作流 wave 必须为整数，ephemeral 与 run_on_upstream_failure 必须为布尔值')
         files, negative, contract = _input_envelope(args, target, stream)
-        stream.update(files=files, negative_scope_files=negative, env_contract=contract, wave=wave, ephemeral=ephemeral)
+        stream.update(files=files, negative_scope_files=negative, env_contract=contract,
+                      wave=wave, ephemeral=ephemeral, run_on_upstream_failure=run_on_upstream_failure)
         channel = stream.get('channel') or getattr(args, 'channel', 'cae_harness_headless')
         if channel not in _PLAN_CHANNEL_LABELS:
             raise HarnessError('工作流 channel 无效')
@@ -9465,8 +9545,14 @@ def cmd_batch(args):
             target = Path(stream['target']).resolve()
             root = target if target.is_dir() else target.parent
             readonly = stream['kind'] not in ('code', 'gate')
-            if not readonly and root in failed_roots:
-                raise HarnessError('同一工作区前序波次的可写任务失败', 'upstream_wave_failed')
+            allow_on_upstream_fail = bool(readonly and stream.get('run_on_upstream_failure', False))
+            if not allow_on_upstream_fail and any(
+                root == fr or root in fr.parents or fr in root.parents for fr in failed_roots
+            ):
+                raise HarnessError(
+                    '同一工作区前序波次的可写任务失败（若只读流确需独立执行请显式声明 run_on_upstream_failure=true）',
+                    'upstream_wave_failed',
+                )
             _check_writable_transport(root, backends[prefix], readonly)
             if stream['kind'] == 'gate' and not (stream.get('verify_cmd') or '').strip():
                 raise HarnessError('批处理 gate 任务必须声明非空 verify_cmd')
@@ -9573,6 +9659,9 @@ def cmd_batch(args):
                         result['status'] = 'scope_violation'
                     elif not scope.get('scope_verified'):
                         result['status'] = 'failed'
+                    elif result['status'] == 'ok' and stream['kind'] == 'code' and not scope.get('changed_files'):
+                        result['no_files_changed'] = True
+                        result['no_files_changed_notice'] = '可写编码流退出码为 0 但磁盘零改动，请核查是否因门禁或前置条件停手。'
                 if (
                     result['status'] == 'ok'
                     and stream['kind'] == 'polish'
@@ -9641,6 +9730,8 @@ def cmd_batch(args):
                 if unclaimed:
                     results[index]['changed_files'] = sorted(set(results[index].get('changed_files') or ()) | set(unclaimed))
                     results[index]['scope_violations'] = sorted(set(results[index].get('scope_violations') or ()) | set(unclaimed))
+                    results[index].pop('no_files_changed', None)
+                    results[index].pop('no_files_changed_notice', None)
                     results[index].update(status='scope_violation', succeeded=False)
             if not results[index]['succeeded'] and stream['kind'] in ('code', 'gate'):
                 target = Path(stream['target']).resolve()

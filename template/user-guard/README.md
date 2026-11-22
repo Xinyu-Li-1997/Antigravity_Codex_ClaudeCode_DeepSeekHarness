@@ -10,7 +10,7 @@
 | [rules/AGENTS.md](rules/AGENTS.md) | 四端共用的全局工程规则唯一模板；安装时保留完整标准章节与末尾用户自定义尾段 |
 | [agents/](agents/) | `readonly-reader`、`readonly-auditor`、`readonly-collaborator`；默认 `inherit` 跟随主会话（优先识别显式 `model`），禁止修改文件或运行构建测试 |
 | [hooks/](hooks/) | 五个共用钩子模块与共享基础库 `hooks/_lib/`（`fs_safety.py`、`shell_lex.py`、`adaptive_policy.py`、`process_guard.py`）：进程内存与墙钟自毁保护、去噪原话与实质返回提取、按模型与推理强度自适应压缩恢复、工具前写边界（含同会话外部目录批准租约）与票据检查（含 `swarm` 并发流数统计与 `followup` 核验）、同回合待批票据重复刷屏拦截、局部补测与完工回执防翻案核验、长会话交接与待拍板保护 |
-| [skills/cae-harness/](skills/cae-harness/) | 日常派工、双门可用性复查、默认持久化可续接无头会话与 `followup` 追问、双层超时抢救（软时限续接收尾与硬超时管道及日志回收）、`--files` 多文件与 `wave` 波次编排、`--isolation` 四级正交隔离、`<ticket_id>_card.md` 明细落盘与 3 句话极简确认条 `chat_brief` 及 `check-grounding` 事实锚定 |
+| [skills/cae-harness/](skills/cae-harness/) | 日常派工、双门可用性复查、默认持久化可续接无头会话与 `followup` 追问、双层超时抢救（软时限自动降档只读收口与硬超时管道及日志回收）、`--files` 多文件与 `wave` 波次编排（前序可写失败默认阻断后续波次全部流，含只读流）、`--isolation` 四级正交隔离、`<ticket_id>_card.md` 明细落盘与 3 句话极简确认条 `chat_brief` 及 `check-grounding` 事实锚定 |
 | [skills/cae-harness/fleet_profile.json](skills/cae-harness/fleet_profile.json) | 五角色（`roles`）、四端内生代理档案（`native_agent_profiles`）、运行期定量参数（`runtime_tunables`）、订阅启停矩阵（`subscription_matrix`）与离线性能更新时间（`capability_ledger`）的唯一动态配置来源 |
 | [skills/fleet-evolve/](skills/fleet-evolve/) | 上游配置仓专属的四维工具链评估、审批提案、双端同步与重启重入验收 |
 

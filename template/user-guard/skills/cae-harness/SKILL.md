@@ -39,7 +39,7 @@ description: >
 
 外部无头调用自动补齐声明最大窗口、防分页非交互环境变量、前后快照与脱敏；会话持久化按 `persist_sessions_by_default` 默认开启，仅显式传 `--ephemeral` 时关闭：
 - **多文件输入与负向边界**：`task`、`plan`、`batch` 可重复传 `--files <相对路径>`（流字段 `files: [...]`）精确指定目标目录内的多份必读文件，避免只传单文件或整目录拷入；`--negative-scope-file`（流字段 `negative_scope_files: [...]`）与 `env_contract` 显式注入负向排除边界与宿主机环境约定。
-- **双层超时抢救**：底层 `run_process` 实时逐行读取管道。持久化开启且 `timeout >= 120 s` 时，若主运行到达 `soft_timeout_ratio` 软时限仍未产出结果文件但已建立 `provider_session_id`，自动用剩余预算发起一次只读续接收口（`soft_timeout_wrapup`）封装结构化结果；若仍触发硬超时，回执保留已完成轮次的部分 Token（`cli_partial_on_timeout`）与 `timeout_salvage`（含 `provider_session_id`、`resumable`、`actual_files_read`、`changed_files_on_disk` 及最近回复片段）。
+- **双层超时抢救**：底层 `run_process` 实时逐行读取管道。持久化开启且 `timeout >= 120 s` 时，若主运行到达 `soft_timeout_ratio` 软时限仍未产出结果文件但已建立 `provider_session_id`，自动用剩余预算并以低推理挡位（`low`）发起一次只读续接收口（`soft_timeout_wrapup`）封装结构化结果；若仍触发硬超时，回执如实保留总 `timeout_sec`、主回合 `primary_timeout_sec`、已完成轮次的部分 Token（`cli_partial_on_timeout`）与 `timeout_salvage`（含 `provider_session_id`、`resumable`、`actual_files_read`、`changed_files_on_disk` 及优先保留正式回复的最近消息片段）。
 - **按回执续接追问（`followup`）**：回执保存 `provider_session_id`，临时隔离会话归档至 `<plan_dir>/headless_sessions/`。主会话复核存疑或从超时断点续查时，运行 `followup --receipt <回执.json> [--stream <流号>] --task "<追问内容>"` 复用原上下文。
 - **读取轨迹与引用行号核验（`citation_audit`）**：只读回执自动提取 `actual_files_read`，核对正文 `path#Lstart-Lend` 或 `path:start-end` 引用的文件存在性、总行数上限及是否真实打开，供主会话按 R6 复核。
 
@@ -71,7 +71,7 @@ description: >
 ## 批准、波次执行与跨中断恢复
 
 - **批准与微调**：用户批准后运行 `plan --approve-ticket` 登记，同会话更早且通道重叠的待决票据自动标为 `SUPERSEDED`，取消用 `plan --cancel-ticket`。`--override-json` 按 `stream_id` 微调：外部无头通道仅允许 `engine`、`tier`、`timeout`；内部原生通道仅允许 `tier`、`timeout`，禁止微调 `engine`。
-- **持票门禁与波次执行（`wave`）**：执行须绑定 `--ticket`，由 `status_guard.py` 核验票据并拦截裸 CLI 旁路。`batch` 仅执行 `cae_harness_headless` 通道，混合票据的原生流记入 `skipped_native_streams`。各流按整数 `wave` 升序分波次运行：前波次同目标可写流失败时，后续可写流中止为 `upstream_wave_failed`；同波次下，同根目录声明互不重叠 `write_scope` 的任务可安全并发。
+- **持票门禁与波次执行（`wave`）**：执行须绑定 `--ticket`，由 `status_guard.py` 核验票据并拦截裸 CLI 旁路。`batch` 仅执行 `cae_harness_headless` 通道，混合票据的原生流记入 `skipped_native_streams`。各流按整数 `wave` 升序分波次运行：前波次同目标可写流失败时，后续波次默认全部中止为 `upstream_wave_failed`（只读流确需独立执行时须显式声明 `run_on_upstream_failure: true`）；同波次下，同根目录声明互不重叠 `write_scope` 的任务可安全并发。
 - **压缩恢复与交接**：等待确认期间发生自动压缩时，钩子按 `hooks/_lib/adaptive_policy.py` 缩放预算、过滤异步启动噪音并用 `collapse_historical_cards` 折叠历史明细，同时从 `<ticket_id>.json` 独立加载精简 4 列总览卡、`<ticket_id>_card.md` 链接和选项卡供模型恢复核对，向用户仅补展 1 次 `chat_brief` 与明细链接。进入 `drain` 或 `freeze` 强制交接时，`handoff_gate.py` 放行 `check-grounding --strict`，并在 `Stop` 核验【新对话提示词】内的精简总览表、`<ticket_id>_card.md` 链接、`plan --resume-ticket` 命令及待拍板占位符保护。新会话用 `plan --resume-ticket` 复核旧票据，跨会话正式执行须按当前会话标识重建票据。
 - **完工回执核验**：`reply_repeat_guard.py` 在完工 `Stop` 检查成败词（禁止将含失败或超时的账单写成“全部成功”）、局部补测与全量回归区分，以及 Token 用量或无法统计说明。外部任务须覆盖各流标识和账单中的实际回执文件名；单路 `task` 或 `gate` 省略默认流号 `S1` 时须匹配具体模型名，仅在未记录具体模型名时可用任务状态词替代。原生任务须覆盖完成数量、各流标识或各角色名中的一项，并提供日志或轨迹说明。主会话仍须自行逐路核对状态、Token 明细与汇总算术。
 

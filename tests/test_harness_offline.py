@@ -6725,11 +6725,13 @@ else:
             {**base, 'stream_id': 'a', 'write_scope': ['a.py'], 'files': ['a.py', 'b.py'],
              'negative_scope_files': ['reserved.py'], 'env_contract': '使用离线夹具', 'subtask': 'Alpha'},
             {**base, 'stream_id': 'b', 'write_scope': ['b.py'], 'subtask': 'Beta'},
-            {**base, 'stream_id': 'read', 'kind': 'review', 'wave': 2, 'subtask': 'Observe'},
+            {**base, 'stream_id': 'read_blocked', 'kind': 'review', 'wave': 2, 'subtask': 'BlockedObserve'},
+            {**base, 'stream_id': 'read_opt_in', 'kind': 'review', 'wave': 2, 'run_on_upstream_failure': True, 'subtask': 'Observe'},
         ]), encoding='utf-8')
         barrier = threading.Barrier(2, timeout=5)
 
         def run(spec, cwd, prompt, *args, **kwargs):
+            self.assertNotIn('BlockedObserve', prompt)
             if 'Observe' in prompt:
                 self.assertEqual((root / 'a.py').read_text(encoding='utf-8'), 'new\n')
                 return TASK
@@ -6750,7 +6752,8 @@ else:
             rc, report = self.capture(harness.cmd_batch, self.args('batch', '--spec-file', str(fixture)))
         self.assertEqual(rc, 3)
         self.assertEqual(engine.call_count, 3)
-        self.assertEqual([s['status'] for s in report['streams']], ['upstream_wave_failed', 'ok', 'failed', 'ok'])
+        self.assertEqual([s['status'] for s in report['streams']],
+                         ['upstream_wave_failed', 'ok', 'failed', 'upstream_wave_failed', 'ok'])
         self.assertEqual(report['streams'][1]['changed_files'], ['a.py'])
         self.assertEqual(report['streams'][2]['changed_files'], ['b.py'])
 
@@ -6973,6 +6976,163 @@ else:
             auto_args = self.args('plan', '--kind', 'review', '--target', str(target_file), '--engine', 'role:review', '--no-inline-readonly')
             resolved_auto, _ = harness._resolve_plan_streams(auto_args, [{}], scoped_engines)
             self.assertNotEqual(resolved_auto[0]['client'], 'codex')
+
+    def test_v1188_wrapup_downgrade_trace_choose_engine_sandbox_hint_no_op_and_julia_ignore(self):
+        # 1. Soft-timeout wrapup downgrades effort safely to lowest supported level ('low' when supported, else lowest declared)
+        #    and reports true total timeout_sec + primary_timeout_sec + wrapup_timeout_sec on double timeout
+        events = json.dumps({'type': 'thread.started', 'thread_id': 'session-wrap-low'})
+        for supported_levels, expected_wrapup in (
+            (['low', 'medium', 'high', 'max'], 'low'),
+            (['high', 'max'], 'high'),
+        ):
+            now = [0]
+            receipt = {}
+            seen_efforts = []
+            b_case = backends()
+            for item in b_case['codex']['models']:
+                item['supported_efforts'] = list(supported_levels)
+
+            def run_double_timeout(argv, cwd, prompt, timeout, **kwargs):
+                eff_args = [argv[i + 1] for i in range(len(argv) - 1) if argv[i] == '-c' and 'model_reasoning_effort=' in argv[i + 1]]
+                seen_efforts.append(('resume' in argv, eff_args))
+                if 'resume' not in argv:
+                    now[0] = 91
+                    raise harness.HarnessError('子进程超时', 'timeout', timeout_sec=timeout, process_started=True, partial_stdout=events)
+                now[0] = 121
+                raise harness.HarnessError('子进程超时', 'timeout', timeout_sec=timeout, process_started=True, partial_stdout='')
+
+            with self.subTest(supported_levels=supported_levels), \
+                 patch.object(harness.time, 'monotonic', side_effect=lambda: now[0]), \
+                 patch.object(harness, 'run_process', side_effect=run_double_timeout):
+                with self.assertRaises(harness.HarnessError) as caught:
+                    harness.invoke_engine('codex:default', self.root, '推导', b_case, harness.TASK_JSON_SCHEMA,
+                                          readonly=False, timeout_sec=120, effort='max', receipt=receipt)
+            self.assertEqual(seen_efforts[0], (False, ['model_reasoning_effort="max"']))
+            self.assertEqual(seen_efforts[1], (True, [f'model_reasoning_effort="{expected_wrapup}"']))
+            self.assertEqual(receipt.get('wrapup_effort'), expected_wrapup)
+            self.assertEqual(caught.exception.details.get('timeout_sec'), 120)
+            self.assertEqual(caught.exception.details.get('primary_timeout_sec'), 90)
+            self.assertEqual(caught.exception.details.get('wrapup_timeout_sec'), 29)
+            self.assertEqual(caught.exception.details.get('wrapup_status'), 'timeout')
+
+        # Claude & DSH also downgrade to low on wrapup
+        for provider, resume_flag, init, final in (
+            ('claude', '--resume', {'type': 'system', 'subtype': 'init', 'session_id': 'claude-w1'},
+             {'type': 'result', 'structured_output': TASK}),
+            ('dsh', '--session-id', {'type': 'session', 'sessionId': 'dsh-w1'},
+             {'type': 'final', 'reason': {'kind': 'completed'}, 'text': json.dumps(TASK)}),
+        ):
+            rec_p, clk = {}, [0]
+
+            def run_p(argv, cwd, prompt, timeout, **kwargs):
+                if resume_flag in argv:
+                    if provider == 'claude':
+                        self.assertEqual(argv[argv.index('--effort') + 1], 'low')
+                    else:
+                        patch_txt = Path(argv[argv.index('--patch') + 1]).read_text(encoding='utf-8')
+                        self.assertIn('reasoningEffort: low', patch_txt)
+                    return subprocess.CompletedProcess(argv, 0, json.dumps(final), '')
+                clk[0] = 90
+                raise harness.HarnessError('deadline', 'timeout', timeout_sec=timeout, process_started=True, partial_stdout=json.dumps(init))
+
+            with self.subTest(provider=provider), patch.object(harness.time, 'monotonic', side_effect=lambda: clk[0]), \
+                 patch.object(harness, 'run_process', side_effect=run_p), patch.object(harness, '_prepare_execution'):
+                out = harness.invoke_engine(provider + ':default', self.root, '复核', self.four_backends(),
+                                            harness.TASK_JSON_SCHEMA, timeout_sec=120, receipt=rec_p)
+            self.assertEqual(out, TASK)
+            self.assertEqual(rec_p.get('wrapup_effort'), 'low')
+
+        # 2. _session_trace preserves assistant agent_message ahead of reasoning headers & parses PowerShell read commands accurately
+        for rel in ('src/flux.jl', 'notes/spec.md', 'scripts/check_all.jl'):
+            p = self.root / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text('ok\n', encoding='utf-8')
+        trace_events = [
+            {'type': 'item.completed', 'item': {'type': 'command_execution', 'exit_code': 0,
+             'command': '''"powershell.exe" -Command '$lines = Get-Content -LiteralPath \'"\'src/flux.jl\' -Encoding utf8' '''}},
+            {'type': 'item.completed', 'item': {'type': 'command_execution', 'exit_code': 0,
+             'command': '''"powershell.exe" -Command '$a = @(Get-Content -Encoding UTF8 -LiteralPath \'"\'notes/spec.md\')' '''}},
+            {'type': 'item.completed', 'item': {'type': 'command_execution', 'exit_code': 0,
+             'command': '''"powershell.exe" -Command "Select-String -LiteralPath 'scripts/check_all.jl' -Pattern 'foo'; julia -h | Select-String -Pattern 'bar' -Context 0,2"'''}},
+            {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': '已定位核心计数缺陷：CPU 磁盘路径峰值误计。'}},
+            {'type': 'item.completed', 'item': {'type': 'reasoning', 'text': '**Checking A**'}},
+            {'type': 'item.completed', 'item': {'type': 'reasoning', 'text': '**Checking B**'}},
+            {'type': 'item.completed', 'item': {'type': 'reasoning', 'text': '**Checking C**'}},
+        ]
+        reads, msgs, _ = harness._session_trace(trace_events, self.root, None)
+        self.assertEqual(reads, ['notes/spec.md', 'scripts/check_all.jl', 'src/flux.jl'])
+        self.assertEqual(msgs, ['已定位核心计数缺陷：CPU 磁盘路径峰值误计。'])
+        # Fallback to reasoning when no assistant message exists
+        _, only_reason, _ = harness._session_trace(trace_events[-3:], self.root, None)
+        self.assertEqual(only_reason, ['**Checking A**', '**Checking B**', '**Checking C**'])
+
+        # 3. choose_engine keeps explicit same-backend model when user_prompt only names backend generically
+        engines = self.four_backends()
+        engines['codex']['models'] = [
+            {'slug': 'gpt-6.2-sol', 'supported_efforts': ['low', 'high', 'max'], 'context_window': 872000},
+            {'slug': 'gpt-6.2-astra', 'supported_efforts': ['low', 'high', 'max'], 'context_window': 872000},
+        ]
+        self.assertEqual(
+            harness.choose_engine(engines, 'antigravity', 'codex:gpt-6.2-astra',
+                                  user_prompt='优先并发调用 Codex max 旗舰模型（gpt-6.2-astra、gpt-6.2-sol）'),
+            'codex:gpt-6.2-astra',
+        )
+        # Cross-backend P0 hint still overrides
+        self.assertEqual(
+            harness.choose_engine(engines, 'antigravity', 'codex:gpt-6.2-astra', user_prompt='请用 CC 审查'),
+            'claude:default',
+        )
+        # Explicit single model P0 hint still overrides
+        self.assertEqual(
+            harness.choose_engine(engines, 'antigravity', 'codex:gpt-6.2-astra', user_prompt='请用 gpt-6.2-sol 审查'),
+            'codex:gpt-6.2-sol',
+        )
+
+        # 4. WindowsApp codex injects concise sandbox boundary hint (writable & readonly), skipped in clean_room
+        win_engines = {**engines, 'codex': {
+            **engines['codex'],
+            'binary': r'C:\Program Files\WindowsApps\OpenAI.Codex_26.1117\app\resources\codex.exe',
+        }}
+        prompts_seen = []
+
+        def capture_prompt(argv, cwd, prompt, timeout, **kwargs):
+            prompts_seen.append(prompt)
+            Path(argv[argv.index('-o') + 1]).write_text(json.dumps(TASK), encoding='utf-8')
+            return subprocess.CompletedProcess(argv, 0, '', '')
+
+        with patch.object(harness, 'run_process', side_effect=capture_prompt):
+            harness.invoke_engine('codex:gpt-6.2-sol', self.root, '编码任务', win_engines, harness.TASK_JSON_SCHEMA,
+                                  readonly=False, timeout_sec=60)
+            harness.invoke_engine('codex:gpt-6.2-sol', self.root, '审查任务', win_engines, harness.TASK_JSON_SCHEMA,
+                                  readonly=True, timeout_sec=60, stage_files=['src/flux.jl'], inline_readonly=True)
+            harness.invoke_engine('codex:gpt-6.2-sol', self.root, '净室任务', win_engines, harness.TASK_JSON_SCHEMA,
+                                  readonly=True, timeout_sec=60, stage_files=['src/flux.jl'], clean_room=True, inline_readonly=True)
+        self.assertIn('[Windows Codex 沙箱边界]', prompts_seen[0])
+        self.assertIn('[Windows Codex 只读沙箱边界]', prompts_seen[1])
+        self.assertNotIn('[Windows Codex', prompts_seen[2])
+
+        # 5. Writable code task with 0 changed files sets no_files_changed=True, and .julia cache is ignored by snapshot
+        work = self.root / 'julia_work'
+        work.mkdir()
+        (work / 'solver.jl').write_text('x = 1\n', encoding='utf-8')
+
+        def noop_with_julia_cache(*args, **kwargs):
+            cache_file = work / '.julia' / 'demo-pkg-tmp' / 'compiled.ji'
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            cache_file.write_text('cache\n', encoding='utf-8')
+            return TASK
+
+        with patch.object(harness, '_args_backends', return_value=backends()), \
+             patch.object(harness, 'invoke_engine', side_effect=noop_with_julia_cache):
+            rc_t, rep_t = self.capture(harness.cmd_task, self.args(
+                'task', '--target', str(work), '--kind', 'code', '--engine', 'codex:default',
+                '--write-scope', 'solver.jl', '--task', '检查门禁后编码'))
+        self.assertEqual(rc_t, 0)
+        self.assertEqual(rep_t['status'], 'ok')
+        self.assertEqual(rep_t['scope_violations'], [])
+        self.assertTrue(rep_t.get('no_files_changed'))
+        # Explicit .julia write_scope un-ignores .julia so scoped edits remain tracked
+        self.assertNotIn('.julia', harness._snapshot_ignore_dirs_for(['.julia/config.toml']))
 
 
 if __name__ == '__main__':

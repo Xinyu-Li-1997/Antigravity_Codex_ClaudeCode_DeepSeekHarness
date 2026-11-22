@@ -475,7 +475,8 @@
         ".pytest_cache",
         ".mypy_cache",
         ".ruff_cache",
-        "target"
+        "target",
+        ".julia"
       ],
       "batch_max_workers_per_backend": {
         "codex": 2,
