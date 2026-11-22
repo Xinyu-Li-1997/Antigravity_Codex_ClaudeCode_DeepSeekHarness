@@ -5419,6 +5419,103 @@ class TestShard3RouterInstallerFixes(OfflineSandbox):
         user_words.atomic_write_json(sf, saved_doc3)
         self.assertEqual(run_fs("clear")[0], 0)
 
+    def test_v1187_router_remote_https_enforcement_and_error_log_redaction(self):
+        # 1) load_config rejects plaintext remote http upstream when card credentials are injected
+        bad_default = self.root / "bad_remote_http_default.json"
+        user_words.atomic_write_json(bad_default, {
+            "listen": "127.0.0.1",
+            "port": 18291,
+            "default_upstream": "http://api.example.com/v1",
+            "default_key_from_card": "Kimi",
+            "routes": [],
+        })
+        with self.assertRaisesRegex(ValueError, "must use https for non-loopback upstream"):
+            router.load_config(str(bad_default))
+
+        bad_route = self.root / "bad_remote_http_route.json"
+        user_words.atomic_write_json(bad_route, {
+            "listen": "127.0.0.1",
+            "port": 18292,
+            "default_upstream": "https://api.example.com/v1",
+            "default_key_from_card": "Kimi",
+            "routes": [{
+                "prefix": "deepseek",
+                "upstream": "http://api.example.org/anthropic",
+                "key_from_card": "DeepSeek",
+            }],
+        })
+        with self.assertRaisesRegex(ValueError, "must use https for non-loopback upstream"):
+            router.load_config(str(bad_route))
+
+        # Loopback http upstream with card credentials remains allowed (e.g., local test/relay)
+        ok_loopback = self.root / "ok_loopback_http.json"
+        user_words.atomic_write_json(ok_loopback, {
+            "listen": "127.0.0.1",
+            "port": 18293,
+            "default_upstream": "http://127.0.0.1:19999/v1",
+            "default_key_from_card": "Kimi",
+            "routes": [],
+        })
+        loaded_ok = router.load_config(str(ok_loopback))
+        self.assertEqual(loaded_ok["default_upstream"], "http://127.0.0.1:19999/v1")
+
+        # 2) Runtime _forward_locked rejects remote plaintext http before reading card_key
+        log_file = self.root / "router_p0_security.log"
+        cfg_rt = copy.deepcopy(router.DEFAULTS)
+        cfg_rt.update(
+            default_upstream="http://api.example.com/v1",
+            default_key_from_card="Kimi",
+            routes=[],
+            log=str(log_file),
+            follow_windows_proxy=False,
+        )
+        h_http = router.Handler.__new__(router.Handler)
+        h_http.command = "POST"
+        h_http.path = "/v1/messages"
+        h_http.headers = {"Content-Type": "application/json"}
+        h_http.server = SimpleNamespace(cfg=cfg_rt)
+        h_http.send_error = mock.Mock()
+        with mock.patch.object(router, "card_key") as ck_mock:
+            h_http._forward_locked(json.dumps({"model": "sample-model"}).encode("utf-8"))
+        ck_mock.assert_not_called()
+        self.assertEqual(h_http.send_error.call_args.args[0], 502)
+        self.assertIn("https", h_http.send_error.call_args.args[1])
+        rec_http = json.loads(log_file.read_text(encoding="utf-8").splitlines()[-1])
+        self.assertEqual(rec_http["err"], "InsecureUpstreamError")
+
+        # 3) Card key failure and upstream failure never leak raw exception text into logs or 502 responses
+        cfg_https = copy.deepcopy(cfg_rt)
+        cfg_https["default_upstream"] = "https://api.example.com/v1"
+        h_key = router.Handler.__new__(router.Handler)
+        h_key.command = "POST"
+        h_key.path = "/v1/messages"
+        h_key.headers = {"Content-Type": "application/json"}
+        h_key.server = SimpleNamespace(cfg=cfg_https)
+        h_key.send_error = mock.Mock()
+        with mock.patch.object(router, "card_key", side_effect=RuntimeError("LEAK_DIAG_MARKER_991 internal db path")):
+            h_key._forward_locked(json.dumps({"model": "sample-model"}).encode("utf-8"))
+        self.assertEqual(h_key.send_error.call_args.args[0], 502)
+        self.assertNotIn("LEAK_DIAG_MARKER_991", h_key.send_error.call_args.args[1])
+        rec_key = json.loads(log_file.read_text(encoding="utf-8").splitlines()[-1])
+        self.assertEqual(rec_key["err"], "RuntimeError")
+
+        h_up = router.Handler.__new__(router.Handler)
+        h_up.command = "POST"
+        h_up.path = "/v1/messages"
+        h_up.headers = {"Content-Type": "application/json"}
+        h_up.server = SimpleNamespace(cfg=cfg_https)
+        h_up.send_error = mock.Mock()
+        with mock.patch.object(router, "card_key", return_value="tok_p0_fixture"), \
+                mock.patch.object(router.http.client, "HTTPSConnection", side_effect=OSError("LEAK_UPSTREAM_MARKER_992")):
+            h_up._forward_locked(json.dumps({"model": "sample-model"}).encode("utf-8"))
+        self.assertEqual(h_up.send_error.call_args.args[0], 502)
+        self.assertNotIn("LEAK_UPSTREAM_MARKER_992", h_up.send_error.call_args.args[1])
+        rec_up = json.loads(log_file.read_text(encoding="utf-8").splitlines()[-1])
+        self.assertEqual(rec_up["err"], "OSError")
+        full_log = log_file.read_text(encoding="utf-8")
+        self.assertNotIn("LEAK_DIAG_MARKER_991", full_log)
+        self.assertNotIn("LEAK_UPSTREAM_MARKER_992", full_log)
+
 
 if __name__ == "__main__":
     unittest.main()

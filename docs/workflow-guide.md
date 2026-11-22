@@ -95,10 +95,10 @@ python -B -X utf8 "$HARNESS" assess --caller auto --redact
 ```
 
 ```powershell
-# 1. 纯离线生成任务确认单与待批票据（不启动任何子代理）
+# 1. 纯离线生成任务确认单与待批票据（不启动任何子代理；本地交互勿加 --redact 以保留可点击链接，仅对外分享时附加）
 python -B -X utf8 "$HARNESS" plan `
   --spec-file "<工作流配置.json>" --session-id "<当前会话标识>" --plan-dir "<授权票据目录>" `
-  --user-prompt "<用户点名原话>" --output "<授权计划回执路径>" --redact `
+  --user-prompt "<用户点名原话>" --output "<授权计划回执路径>" `
   --workflow-bg "核心通量与边界模块已修改" `
   --workflow-goal "分两路跨客户端只读核查离散格式与参数依据" `
   --workflow-impact "纯只读检查并保存结构化回执，零源码改动"
@@ -106,24 +106,7 @@ python -B -X utf8 "$HARNESS" plan `
 
 注意：两个 `role:review` 并不自动保证落在不同客户端；需要跨模型双源独立审查时，应如上例显式指定不同客户端（支持 `dsh:@review` 或简写 `dsh:review`），或使用 `audit --left ... --right ...` 双盲分片审查。
 
-`plan` 保存票据时先写 `<ticket_id>.json`，再将包含完整背景、要做什么、预计后果、4 列总览表及分路 3 列纵向 **14 项完整参数明细**的确认单写入同目录 `<ticket_id>_card.md`，同时生成日常对话用的 3 句话极简确认条 `chat_brief`、含 4 列总览表的 `compact_summary_card` 与交接片段 `compact_handoff_prompt_block`。**日常对话默认只展示 3 句话极简确认条 `chat_brief` 和可点击明细链接，严禁在聊天框粘贴表格或把多路 14 项长表展开挤占上下文**（未发生压缩且票据未变时，后台任务被动唤醒亦不得重复贴票）；需要逐项核验时直接点击链接查阅 `<ticket_id>_card.md` 中的 4 列总览与 14 项字段：
-
-| 序号 | 参数项 | 展示内容与核验要求 |
-| --- | --- | --- |
-| 1 | 流号 | 每路唯一标识（如 `S1`、`S2`） |
-| 2 | 子任务与范围 | 本路具体职责说明与限定目标文件或目录路径 |
-| 3 | 通道 | 外部无头（`cae_harness_headless`）或客户端内部原生通道（`native_subagent`、`native_workflow`、`native_swarm`） |
-| 4 | 客户端及子代理类型 | 实际执行客户端及子代理角色类型 |
-| 5 | 模型名字 | 具体模型标识及原生 `inherit` 的本地解析结果（优先读取代理定义中显式 `model`，不用角色槽位名冒充） |
-| 6 | 挡位 | 实际采用的推理强度 |
-| 7 | 上下文窗口 | 已解析的模型声明窗口数值，未暴露时如实标明 `未声明` |
-| 8 | 是否无头 | 是否启动独立非交互无头子进程 |
-| 9 | 是否净室与隔离级别 | 是否启用 `clean_room` 盲读；显式指定任一非净室 `--isolation` 级别时均追加标注 `（隔离：<级别>）` |
-| 10 | 访问模式、写入范围与验收命令 | `只读`，或可写任务的 `--write-scope` 白名单及 `--verify-cmd` 验收命令 |
-| 11 | 内联与超时 | 只读文件是否附带行号内联（`--inline-readonly`）及本路超时秒数 |
-| 12 | 当前是否可用 | 派工前离线可用性复查结论及不可用原因 |
-| 13 | 本机配置额度类型与当前状态 | 额度计费来源；未启用 `--redact` 脱敏时显示本地可读百分比、重置时间或限额，启用脱敏或未暴露时标明隐藏或未知说明 |
-| 14 | 回执或子代理日志位置 | 结构化回执文件路径或客户端原生轨迹目录位置 |
+`plan` 保存票据时先写 `<ticket_id>.json`，再将包含完整背景、要做什么、预计后果、4 列总览表及分路 3 列纵向 **14 项完整参数明细**的确认单写入同目录 `<ticket_id>_card.md`，同时生成日常对话用的 3 句话极简确认条 `chat_brief`、含 4 列总览表的 `compact_summary_card` 与交接片段 `compact_handoff_prompt_block`。**日常对话默认只展示 3 句话极简确认条 `chat_brief` 和可点击明细链接，严禁在聊天框粘贴表格或把多路 14 项长表展开挤占上下文**（未发生压缩且票据未变时，后台任务被动唤醒亦不得重复贴票）；14 项字段的逐项定义统一维护在 [cae-harness 技能规程](../template/user-guard/skills/cae-harness/SKILL.md#两道可用性检查与全通道确认单)，需要逐项核验时直接点击 `<ticket_id>_card.md` 链接查阅。
 
 确认单下方展示离线性能更新时间（`capability_ledger.last_online_refresh_at` 与 `capability_ledger.local_bench_verified_at`），并提供三个选项：**① 批准当前计划（推荐）**、**② 微调引擎、挡位或超时后批准**（支持 `--override-json`）、**③ 暂缓并交接**。
 

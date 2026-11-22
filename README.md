@@ -138,25 +138,15 @@ python -B -X utf8 install.py --audit-upgrade     # 4. 检查各端配置是否�
 
 ![固定机制层、动态配置层与全通道派工架构](docs/assets/architecture-overview.svg)
 
-- **主体代码不写死模型名称**：全局规则模板（`R0–R11`）、钩子脚本与 `hooks/_lib/` 公共库、`readonly-*` 只读子代理、`cae_harness.py`、`install.py`、`fleet_state.py`、`ccswitch_admin.py` 及可选本地路由 `router.py` 只引用角色名称与配置键名。
-- **模型、内生代理档案与运行参数集中存放在 [fleet_profile.json](template/user-guard/skills/cae-harness/fleet_profile.json)**：统一管理 `roles` 五类角色候选、`native_agent_profiles` 各端独立内生代理档案、`runtime_tunables` 运行阈值、`subscription_matrix` 启停状态与 `capability_ledger` 离线性能更新时间；`hooks/_lib/adaptive_policy.py` 根据当前客户端、模型上下文窗口与推理强度自动缩放压缩恢复预算、交接阈值及 CC Switch 代理卡默认参数。
+- **主体代码与动态模型解耦**：全局规则模板（`R0–R11`）、钩子脚本与 `hooks/_lib/` 公共库、`readonly-*` 只读子代理、`cae_harness.py`、`install.py`、`fleet_state.py`、`ccswitch_admin.py` 及可选本地路由 `router.py` 均通过角色名称与配置键名调度（仅 Claude 代理卡默认参数推导在未命中配置时保留少量后备兜底字面量）。
+- **模型、内生代理档案与运行参数集中存放在 [fleet_profile.json](template/user-guard/skills/cae-harness/fleet_profile.json)**：统一管理 `roles` 五类角色（`orchestrator`、`math`、`code`、`review`、`fast`）候选、`native_agent_profiles` 各端独立内生代理档案、`runtime_tunables` 运行阈值、`subscription_matrix` 启停状态与 `capability_ledger` 离线性能更新时间；`hooks/_lib/adaptive_policy.py` 根据当前客户端、模型上下文窗口与推理强度自动缩放压缩恢复预算、交接阈值及 CC Switch 代理卡默认参数。当前随附的五类角色推荐与模型窗口配置请直接查阅 [fleet_profile.json](template/user-guard/skills/cae-harness/fleet_profile.json)，实际运行时以本机已安装、已启用且额度正常的客户端配置为准。
 - **维护期与执行前两阶段可用性检查**：维护期通过 `fleet-evolve` 联网核查能力并记录离线性能更新时间，日常任务不再联网查询榜单；每次执行多路任务前，`cae_harness.py plan` 纯离线检查本机可执行程序、凭据配置、本地回环路由状态及本地可读配额记录，过滤不可用或已超限的通道（服务端未公开实时余额时如实标为未知）。
-
-下表为随附 `fleet_profile.json` 的当前五类角色配置示例（属于可动态刷新的示例快照，实际运行时以本机已安装、已启用且额度正常的客户端配置为准）：
-
-| 角色名称 | 随附配置示例客户端与模型系列 | 推荐强度 | 适用任务与边界 |
-| --- | --- | --- | --- |
-| `orchestrator` | Antigravity，`carbon` 系列（低幻觉主控；编码代理与并行实现分流至 `neon`） | `high` | 主对话需求沟通、方案权衡、技术文档重写与任务统筹；配置矩阵声明大窗口，并由 `adaptive_policy.py` 按窗口与强度动态规划预算 |
-| `math` | Codex，`astra` 系列 | `max` | PDE 离散格式推导、守恒与熵稳定证明；显式传入声明最大窗口，跳过 `ultra` 自动委派挡（常规分片亦可按需指定 `high` 兼顾单轮耗时） |
-| `code` | Codex `sol` 系列（跨端备选含 Antigravity `agy:@code` 路由 `neon` `xhigh`；内部 `native_swarm` 编码 worker 推荐 `neon` `high`） | `max` | 核心求解器编码与 `gate --verify-cmd` 测试验证；限制 `--write-scope` 可写文件范围并配合测试验收 |
-| `review` | Codex `sol` 系列（备选含 DSH、Antigravity `carbon`、Claude Code） | `max` | 优先跨客户端交叉审查（同端 `readonly-*` 继承主控模型，仅做摘录与行号初筛）；拒绝用轻量模型替代主力审查 |
-| `fast` | DeepSeek Harness，`deepseek-flash` 系列 | `low` | 用户要求节省额度或做表面格式初筛；不用于核心数学与代码正确性审查 |
 
 ### 2. 共用钩子脚本与四端事件映射
 
 ![会话确认、压缩接力与完成核验流程](docs/assets/lifecycle-and-verification.svg)
 
-`template/user-guard/hooks/` 包含 5 个顶层 Python 钩子模块与 `hooks/_lib/` 公共库目录：其中 `user_words.py` 作为公共基础模块（底层调用 `hooks/_lib/fs_safety.py` 跨平台文件锁与安全原子写、`shell_lex.py` Shell 语句拆解、`adaptive_policy.py` 自适应阈值派生、`process_guard.py` 钩子进程内存与墙钟自毁护栏及防分页环境配置，完成去噪轨迹解析、历史确认单折叠与密钥脱敏），其余 4 个事件钩子按四阶段运行，并与调度器内置的文档一致性检查构成完整闭环：
+`template/user-guard/hooks/` 包含 5 个顶层 Python 钩子模块与 `hooks/_lib/` 公共库目录：其中 `user_words.py` 作为公共基础模块（底层调用 `hooks/_lib/fs_safety.py` 跨平台文件锁与安全原子写、`shell_lex.py` Shell 语句拆解、`adaptive_policy.py` 自适应阈值派生、`process_guard.py` 钩子进程墙钟自毁护栏——POSIX 按条件附加虚拟地址空间上限——及防分页环境配置，完成去噪轨迹解析、历史确认单折叠与密钥脱敏），其余 4 个事件钩子按四阶段运行，并与调度器内置的文档一致性检查构成完整闭环：
 
 1. **压缩恢复**（`session_context_loader.py` + `handoff_gate.py`）：未发生压缩且未达交接阈值的普通回合零字节注入，不改动消息前缀以利复用服务端前缀缓存；发生压缩或恢复时，按当前客户端、模型与推理强度动态计算字符上限，恢复历轮用户原话与关键子代理结论（通过 `collapse_historical_cards` 将历史确认单明细表折叠为单行占位符防止重复占用上下文），同时从磁盘独立加载未决票据总览与 `<ticket_id>_card.md` 链接供模型恢复核对。
 2. **执行前安全与票据检查**（`status_guard.py` + `handoff_gate.py`）：静态解析文件工具、Shell 包装与局部变量、重定向及内联 Python 语法树（识别只读 `git` 子进程与工作区内有界循环），拦截未授权的项目外写删与外部 `git worktree`（支持同会话外部已批目录续租）、拦截重复读取未变化日志、拦截绕过 `cae_harness.py` 直接调用底层无头 CLI，并核验 `APPROVED` 票据（`--files` 单路只读按实际声明文件计量）、隔离模式一致性与内部原生通道（含 `swarm add` 按 `tasks` 长度或 `n` 计入并发流数）容量。
@@ -178,9 +168,9 @@ python -B -X utf8 install.py --audit-upgrade     # 4. 检查各端配置是否�
 
 | 查阅内容 | 对应文档 |
 | --- | --- |
-| **阶段选型与日常无感/模糊口语矩阵、14 项参数说明、Euler HLLC 示例、中断恢复与四级（L1–L4）验证流程** | [日常工作流实战指南](docs/workflow-guide.md) |
+| **阶段选型与日常无感/模糊口语矩阵、确认流命令、Euler HLLC 示例、中断恢复与四级（L1–L4）验证流程** | [日常工作流实战指南](docs/workflow-guide.md) |
 | **钩子模块分工、`fleet_profile.json` 配置键说明、压缩恢复细节、分片预算公式、本地路由与卸载清理** | [架构设计与钩子说明](docs/architecture-and-hooks.md) |
-| **`cae_harness.py` 子命令（`probe`、`assess`、`plan`、`batch`、`gate`、`audit`、`task`、`followup`、`check-grounding`）说明** | [cae-harness 技能规程](template/user-guard/skills/cae-harness/SKILL.md) |
+| **`cae_harness.py` 子命令（`probe`、`assess`、`plan`、`batch`、`gate`、`audit`、`task`、`followup`、`check-grounding`）与 14 项确认参数说明** | [cae-harness 技能规程](template/user-guard/skills/cae-harness/SKILL.md) |
 | **上游仓库维护流程（`full`、`hygiene`、`audit`）、`fleet_state.py` 状态锁与 `install.py` 维护说明** | [fleet-evolve 维护规程](template/user-guard/skills/fleet-evolve/SKILL.md) · [仓库维护说明](AGENTS.md) |
 | **插件模板目录说明与版本变更历史** | [插件模板说明](template/user-guard/README.md) · [更新日志](CHANGELOG.md) |
 | **V1.0.0 存档时间戳、Concept DOI 与 Version DOI 说明及后续发版流程** | [时间戳与 DOI 说明](.timestamps/README.md) |

@@ -7,8 +7,9 @@ Claude Code 每次请求固定发往单一 ANTHROPIC_BASE_URL。将激活卡片�
     CC Switch 卡片读取 API Key 替换请求头，同时剥离 Claude Code 附加的 "[1m]"/"[1M]" 后缀；
   * 其余请求转发至默认上游（如 Kimi），并从 default_key_from_card 指定的卡片读取真实密钥，
     因此指向本地端口的分流卡片本身无需保存真实密钥。
-上游响应（含 SSE 流式块）按字节原样回传。日志仅记录单行耗时、状态码与字节数，绝不写入请求正文、
-响应正文或任何密钥。
+上游响应（含 SSE 流式块）按字节原样回传。日志仅记录单行结构化元数据（时间戳、请求方法、去查询串路径、
+路由前缀、模型名、推理配置、状态码、错误类型名、耗时与字节数），绝不写入请求正文、响应正文、原始异常
+正文或任何密钥。向非回环远端上游注入真实卡片密钥时强制要求 HTTPS。
 
 用法：python3 router.py [--config router.json]
 健康检查：GET http://127.0.0.1:<port>/__router/health
@@ -207,7 +208,7 @@ def _require_pos_number(val, name):
     return val
 
 
-def _validate_upstream_url(val, name):
+def _validate_upstream_url(val, name, *, require_https_for_remote=False):
     if not isinstance(val, str) or not val.strip():
         raise ValueError(f"{name} must be a non-empty http/https URL")
     raw = val.strip()
@@ -220,6 +221,8 @@ def _validate_upstream_url(val, name):
         raise ValueError(f"{name} must not contain embedded credentials")
     if parsed.query or parsed.fragment:
         raise ValueError(f"{name} must not contain query or fragment")
+    if require_https_for_remote and parsed.scheme.lower() != "https" and not _is_loopback_host(parsed.hostname):
+        raise ValueError(f"{name} must use https for non-loopback upstream when injecting card credentials")
     try:
         _ = parsed.port
     except ValueError as exc:
@@ -281,9 +284,17 @@ def load_config(path):
     _require_pos_number(cfg.get("windows_proxy_ttl_s"), "windows_proxy_ttl_s")
     if not isinstance(cfg.get("routes"), list) or any(not isinstance(r, dict) for r in cfg["routes"]):
         raise ValueError("routes must be a list of route objects")
-    _validate_upstream_url(cfg.get("default_upstream"), "default_upstream")
+    _validate_upstream_url(
+        cfg.get("default_upstream"),
+        "default_upstream",
+        require_https_for_remote=bool(cfg.get("default_key_from_card")),
+    )
     for idx, r in enumerate(cfg["routes"]):
-        _validate_upstream_url(r.get("upstream"), f"routes[{idx}].upstream")
+        _validate_upstream_url(
+            r.get("upstream"),
+            f"routes[{idx}].upstream",
+            require_https_for_remote=bool(r.get("key_from_card")),
+        )
     return cfg
 
 
@@ -907,20 +918,25 @@ class Handler(BaseHTTPRequestHandler):
             rec["effort_out"] = oc.get("effort")
             body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         key_card = route.get("key_from_card") if route else cfg.get("default_key_from_card")
+        u = urlsplit(upstream)
+        if key_card and u.scheme.lower() != "https" and not _is_loopback_host(u.hostname or ""):
+            rec.update(status=502, err="InsecureUpstreamError")
+            log_line(cfg, rec)
+            self._safe_send_error(502, "router requires https for non-loopback upstream")
+            return
         if key_card:
             try:
                 key = card_key(cfg, key_card)
             except Exception as e:
-                rec.update(status=502, err=str(e))
+                rec.update(status=502, err=type(e).__name__)
                 log_line(cfg, rec)
-                self._safe_send_error(502, _ascii_reason("router: %s" % e))
+                self._safe_send_error(502, "router card key unavailable")
                 return
             for k in list(headers):
                 if k.lower() in ("x-api-key", "authorization"):
                     del headers[k]
             headers["x-api-key"] = key
             headers["Authorization"] = "Bearer " + key
-        u = urlsplit(upstream)
         origin_path = u.path.rstrip("/") + req_target
         headers["Host"] = u.netloc
         if body or self.command in ("POST", "PUT", "PATCH"):
@@ -994,7 +1010,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.flush()
                 total += len(chunk)
         except Exception as e:
-            rec.update(status=rec.get("status") or 502, err="%s: %s" % (type(e).__name__, e), err_side=side)
+            rec.update(status=rec.get("status") or 502, err=type(e).__name__, err_side=side)
             if not sent:  # 响应头已发出时不能再补写错误页，直接关闭连接避免破坏 SSE 流
                 try:
                     self._safe_send_error(502, "router upstream error")

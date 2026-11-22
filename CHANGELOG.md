@@ -2,6 +2,19 @@
 
 本文件记录四客户端共用规则、会话钩子、后台验证工具与上游维护流程的版本演进。当前插件版本以 `template/user-guard/plugin.json` 为准；常驻使用文档只说明机制和配置键，不重复维护版本号与性能日期。
 
+## [1.18.7] - 2026-11-22
+
+基于 `gpt-6.2-astra` 与 `gpt-6.2-sol` 双路独立交叉复核及全历史 Git 对象扫描，完成路线 A 封板前安全加固、常驻规则瘦身与多文档失实校正：
+
+- **本地路由远端明文 HTTP 阻断与异常日志收敛（`template/claude/router/router.py`、`tests/test_claude_and_router_offline.py`）**：
+  - 在 `_validate_upstream_url`、`load_config` 与 `_forward_locked` 实施双层校验：当上游配置真实卡片密钥注入（`default_key_from_card` / `key_from_card`）时，向非回环远端主机使用明文 `http://` 一律拒绝（本地回环中继与离线回环测试继续放行）；
+  - 将取卡失败与上游异常出口的日志 `err` 字段收敛为异常类型名（`type(e).__name__`），客户端 502 错误响应改为固定 ASCII 文案，消除原始异常文本泄露；同步更新 `router.py` 文件头日志范围说明并补齐离线回归单测。
+- **常驻规则减负与跨文档重复及失实校正（`template/user-guard/rules/AGENTS.md`、`README.md`、`AGENTS.md`、`docs/workflow-guide.md`、`docs/architecture-and-hooks.md`）**：
+  - 按职责唯一归属重写精简 `template/user-guard/rules/AGENTS.md`（移交 14 项字段释义与脚本内部实现细节至技能和架构文档，保留安装器 `## 工具与运行环境`/`R10.`/`R11.` 锚点、数值验收红线与无技能必生效纪律，大幅降低日常对话上下文占用）；
+  - 校正 `process_guard.py` 跨平台自毁上限表述（Windows 仅墙钟计时器，POSIX 按条件附加 `RLIMIT_AS` 虚拟地址空间上限，均在导入与读配置后生效）；校正 `README.md`“主体代码不写死模型名称”表述并移除时期性五角色模型快照表（改指向 `fleet_profile.json`）；移除 `docs/workflow-guide.md` 本地 `plan` 示例中与技能说明冲突的 `--redact` 参数及重复的 14 项字段长表。
+
+---
+
 ## [1.18.6] - 2026-11-22
 
 补齐第三方工具合规边界与纯官方按量接口选型说明，并结合 GitHub 网页端逐页渲染巡检修复 Mermaid 控件遮挡、窄视口表格竖排挤压与预算公式间距：

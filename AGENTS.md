@@ -35,7 +35,7 @@
 | `--app claude` | `~/.claude/CLAUDE.md`、只读子代理、技能和钩子，向 `settings.json` 合并 5 类事件配置；未配置 `effortLevel` 时按动态配置补齐。 |
 | `--app dsh` | `~/.dsh/AGENTS.md` 和 `skills`，复用用户准备的 `DEEPSEEK_API_KEY` 或 `deepseek-account` 凭据，不改 `.credentials.yaml`（当前为软约束 `soft_rules_only`；当官方 CLI 开放硬钩子时由 `install.py` 探测触发元更新）。 |
 
-五个共用钩子脚本模块（`user_words.py` 基础库、`session_context_loader.py`、`status_guard.py`、`reply_repeat_guard.py`、`handoff_gate.py`）及共享基础库 `hooks/_lib/`（`fs_safety.py`、`shell_lex.py`、`adaptive_policy.py`、`process_guard.py`）承载统一的四阶段会话防护，命令行入口均受 `hook_safety` 内存与墙钟自毁上限保护：
+五个共用钩子脚本模块（`user_words.py` 基础库、`session_context_loader.py`、`status_guard.py`、`reply_repeat_guard.py`、`handoff_gate.py`）及共享基础库 `hooks/_lib/`（`fs_safety.py`、`shell_lex.py`、`adaptive_policy.py`、`process_guard.py`）承载统一的四阶段会话防护，命令行入口在模块导入与配置读取后受 `hook_safety` 墙钟自毁上限保护（POSIX 环境按条件附加虚拟地址空间上限）：
 
 | 共有防护阶段 | 对应共用脚本与宿主事件映射 |
 | --- | --- |
