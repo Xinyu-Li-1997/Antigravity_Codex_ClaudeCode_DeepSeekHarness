@@ -5283,7 +5283,7 @@ class TestShard3RouterInstallerFixes(OfflineSandbox):
         with mock.patch.object(installer, "_is_posix_native_cli_path", return_value=True):
             self.assertEqual(installer._read_desktop_app_version(str(wrapper_sh)), "2.33.0")
 
-        # 4) Antigravity 1M 窗口下 cp_threshold 不再二次乘 w_scale 膨胀，保持 3 / 5
+        # 4) Antigravity 大窗口下 cp_threshold 不再二次乘 w_scale 膨胀，保持 3 / 5
         real_prof = json.loads((REPO_ROOT / "template/user-guard/skills/cae-harness/fleet_profile.json").read_text(encoding="utf-8"))
         pol_mod = installer._load_adaptive_policy_readonly(REPO_ROOT)
         self.assertIsNotNone(pol_mod)

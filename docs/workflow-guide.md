@@ -58,7 +58,7 @@ python -B -X utf8 "$HARNESS" assess --caller auto --redact
 
 ### 课题阶段选型、日常无感分流与模糊口语速查矩阵
 
-日常协作无需手写底层命令或记忆模型代号，具体模型映射统一由 `fleet_profile.json` 动态维护（当前具体模型快照见根仓 [README.md](../README.md) 角色表），日常遵循“**三项常规操作无感自动分流，四类特殊意图靠半句口语触发**”：
+日常协作无需手写底层命令或记忆模型代号，具体模型映射与当前窗口配置统一由 [fleet_profile.json](../template/user-guard/skills/cae-harness/fleet_profile.json) 动态维护，日常遵循“**三项常规操作无感自动分流，四类特殊意图靠半句口语触发**”：
 
 1. **平时无需额外说明的无感行为**（打开课题时仅需按是否存在编译或单测硬验证器选一次主窗口模型：未闭环理论与论文定稿期选 `main_model_family` 低幻觉审慎系列，架构与门禁已定型的工程维护期选 `code_families` 高吞吐编码系列）：
    - **代码实现与验证自动切高速编码模型**：模块编写、脚本修复与门禁闭环外部默认走 `role:code`（跨端主力编码槽位或 `agy:@code` 对应 `code_families` 高挡位），内部 `native_swarm` 编码流自动推荐 `swarm_worker_model_family`；

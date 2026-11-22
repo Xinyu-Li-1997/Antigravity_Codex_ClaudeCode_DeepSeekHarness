@@ -2,6 +2,19 @@
 
 本文件记录四客户端共用规则、会话钩子、后台验证工具与上游维护流程的版本演进。当前插件版本以 `template/user-guard/plugin.json` 为准；常驻使用文档只说明机制和配置键，不重复维护版本号与性能日期。
 
+## [1.18.9] - 2026-11-23
+
+依据 Google Antigravity 官方最新模型文档与四端本地实测目录，校准动态配置中的 Antigravity 客户端活跃上下文窗口口径并修补网页端文档遗留引用：
+
+- **Antigravity 活跃上下文窗口口径校准（`fleet_profile.json`）**：
+  - 将 `subscription_matrix.models` 中 `gemini-4-neon`、`gemini-4-carbon`、`gemini-4-hydrogen` 的 `context_window` 由底层原生 API 口径 `1,000,000` 校准为 Antigravity 各表面（App、IDE、插件及 CLI 有头与无头模式）实际共享且不可通过配置文件手改的活跃窗口上限 `512,000`（较此前约 `256,000` 自动压缩阈值翻倍、每轮压缩频率约降 3.5 倍）；
+  - 联动收敛 `cae_harness.py` 无头单分片安全输入预算至 `460,800` tokens（避免跨过 512K 压缩墙），并将 `hooks/_lib/adaptive_policy.py` 对 Antigravity 的恢复预算缩放倍数由 `1.5×` 校准至 `1.25×`（`handoff_thresholds.antigravity` 检查点次数阈值维持 `3 / 5` 不变）；同步更新评估与决策日期至 `2026-11-23`。
+- **公开文档引用修复与预算口径澄清（`docs/workflow-guide.md`、`docs/architecture-and-hooks.md`、`tests/test_claude_and_router_offline.py`）**：
+  - 修复 `docs/workflow-guide.md` 中仍指向 `README.md` 已移除角色表的陈旧引用，统一指向 `fleet_profile.json`；
+  - 在 `docs/architecture-and-hooks.md` 的单分片安全输入预算说明中补充客户端实际活跃窗口与底层原生 API 窗口口径区分原则，并同步更新对应单测注释。
+
+---
+
 ## [1.18.8] - 2026-11-22
 
 基于真实多波次批处理超时与只读穿透失败样本的逐行根因排查，修复 `cae_harness.py` 五项核心缺陷并补齐 Julia 缓存快照忽略规则：
