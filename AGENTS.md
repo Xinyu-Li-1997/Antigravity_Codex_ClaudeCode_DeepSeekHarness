@@ -68,7 +68,7 @@ python -B -X utf8 install.py --dry-run --yes
 
 ## 派工、持久化续接与可用性检查
 
-主会话遇到实质性推导、多文件编码验证或关键代码与文档审查，应主动通过 `cae-harness` 核查可用端。用户点名按 P0 第一优先级锁定指定维度，以 `--user-prompt` 传递原话（仅泛指后端且未唯一锁定单模型时，保留单流已指定的同后端具体模型）。`role:*` 是并列入口，不覆盖点名；未指定的窗口、非委派挡位、无头防分页标志、`--files` 多文件输入与 `--negative-scope-file` 负向契约、只读行号内联、快照（默认忽略常见语言工具链缓存目录）和脱敏由脚本补齐。外部无头会话默认持久化（`--ephemeral` 显式关闭），支持 `followup` 增量追问，并在超时场景下执行软时限自动降档只读收口与硬超时 `timeout_salvage`（优先保留正式助手回复、部分 Token、已读文件与落盘改动，并如实记录总超时与主回合超时）。轻量卡片跑非 `fast` 角色、WSL 纯 Linux 可写路径走 Windows 互操作、Windows `codex.exe` 只读关闭内联或本地路由未存活时明确报错，不静默降级。
+主会话遇到实质性推导、多文件编码验证或关键代码与文档审查，应主动通过 `cae-harness` 核查可用端。用户点名按 P0 第一优先级锁定指定维度，以 `--user-prompt` 传递原话（仅泛指后端且未唯一锁定单模型时，保留单流已指定的同后端具体模型）。`role:*` 是并列入口，不覆盖点名；未指定的窗口、非委派挡位、无头防分页标志、`--files` 多文件输入与 `--negative-scope-file` 负向契约、只读行号内联（回执记录 `inline_readonly_summary`）、快照（默认忽略常见语言工具链缓存目录）和脱敏由脚本补齐。外部无头会话默认持久化（`--ephemeral` 显式关闭），支持 `followup` 增量追问，并在超时场景下执行软时限自动降档只读收口（`agy` 带后缀模型切换同家族低挡 slug 且外层预留 `--print-timeout` 宽限，POSIX 先 `SIGTERM` 后 `SIGKILL`）与硬超时 `timeout_salvage`（优先保留正式助手回复、部分 Token、已读文件与落盘改动，并如实记录总超时与主回合超时；`agy` 收口零进展卡死记 `wrapup_stalled` 并置 `resumable=false` 拦截无效 `followup`）。轻量卡片跑非 `fast` 角色、显式只读超模型窗口（默认报 `over_context_window` 并返回 `suggested_shards`，仅 `--allow-over-budget` 放行）、WSL 纯 Linux 可写路径走 Windows 互操作、Windows `codex.exe` 只读关闭内联或本地路由未存活时明确报错，不静默降级。
 
 可用性经过两道门：第一道门由 `fleet-evolve` 联网评估并由用户决定 `subscription_matrix` 启停；第二道门由 `plan` 纯离线复查当前配置、路由存活及可读额度状态。日常派工读取 `capability_ledger`，不联网更新性能。
 

@@ -7134,6 +7134,247 @@ else:
         # Explicit .julia write_scope un-ignores .julia so scoped edits remain tracked
         self.assertNotIn('.julia', harness._snapshot_ignore_dirs_for(['.julia/config.toml']))
 
+    def test_v11810_agy_wrapup_downgrade_grace_stalled_guard_and_plan_budget_gates(self):
+        # 1. agy tier-suffixed slug downgrades to sibling '-low' model on soft-timeout wrapup,
+        #    and proc_timeout stays strictly above --print-timeout in both primary & wrapup turns
+        agy_engines = self.four_backends()
+        agy_engines['agy']['models'] = [
+            {'slug': 'gemini-4-carbon-high', 'context_window': 512000, 'priority': 1},
+            {'slug': 'gemini-4-carbon-medium', 'context_window': 512000, 'priority': 2},
+            {'slug': 'gemini-4-carbon-low', 'context_window': 512000, 'priority': 3},
+        ]
+        agy_engines['agy']['model'] = 'gemini-4-carbon-high'
+        now = [0.0]
+        seen_calls = []
+        receipt = {}
+
+        def run_agy_wrapup(argv, cwd, prompt, timeout, **kwargs):
+            seen_calls.append({
+                'argv': list(argv),
+                'print_timeout': argv[argv.index('--print-timeout') + 1],
+                'model': argv[argv.index('--model') + 1],
+                'has_effort': '--effort' in argv,
+                'proc_timeout': timeout,
+                'is_resume': '--conversation' in argv,
+            })
+            if '--conversation' not in argv:
+                now[0] = 510.0
+                init_out = json.dumps({'event': 'init', 'conversation_id': 'agy-wrap-s1', 'init': {'model': 'gemini-4-carbon-high'}})
+                return subprocess.CompletedProcess(
+                    argv, 3, init_out + '\n',
+                    '[agy] print timeout after 510s\nAGY_ERROR: {"reason":"print_timeout"}\n',
+                )
+            final = json.dumps({'event': 'result', 'result': {'structured_output': TASK}})
+            return subprocess.CompletedProcess(argv, 0, final, '')
+
+        with patch.object(harness.time, 'monotonic', side_effect=lambda: now[0]), \
+             patch.object(harness, 'run_process', side_effect=run_agy_wrapup):
+            out = harness.invoke_engine(
+                'agy:gemini-4-carbon-high', self.root, '复核双语文档', agy_engines,
+                harness.TASK_JSON_SCHEMA, readonly=True, timeout_sec=600, receipt=receipt,
+            )
+        self.assertEqual(out, TASK)
+        self.assertEqual(len(seen_calls), 2)
+        self.assertEqual(seen_calls[0]['model'], 'gemini-4-carbon-high')
+        self.assertFalse(seen_calls[0]['has_effort'])
+        self.assertEqual(seen_calls[0]['print_timeout'], '510s')
+        self.assertGreater(seen_calls[0]['proc_timeout'], 510)
+        self.assertEqual(seen_calls[0]['proc_timeout'], 525)
+        self.assertTrue(seen_calls[1]['is_resume'])
+        self.assertEqual(seen_calls[1]['model'], 'gemini-4-carbon-low')
+        self.assertFalse(seen_calls[1]['has_effort'])
+        self.assertEqual(seen_calls[1]['print_timeout'], '90s')
+        self.assertGreater(seen_calls[1]['proc_timeout'], 90)
+        self.assertEqual(receipt.get('wrapup_model'), 'gemini-4-carbon-low')
+        self.assertEqual(receipt.get('wrapup_effort'), 'low')
+        self.assertTrue(receipt.get('soft_timeout_wrapup'))
+
+        # 2. agy wrapup timeout with 0 model progress marks wrapup_stalled=True & resumable=False,
+        #    blocking cmd_followup with session_not_resumable; Codex double timeout remains resumable=True
+        stall_now = [0.0]
+        stall_receipt = {}
+
+        def run_agy_stalled(argv, cwd, prompt, timeout, **kwargs):
+            if '--conversation' not in argv:
+                stall_now[0] = 510.0
+                out1 = '\n'.join((
+                    json.dumps({'event': 'init', 'conversation_id': 'agy-stall-s1'}),
+                    json.dumps({'event': 'agent_response', 'text': '已读取前 7 个文件'}),
+                ))
+                raise harness.HarnessError('子进程超时', 'timeout', timeout_sec=timeout, process_started=True, partial_stdout=out1)
+            stall_now[0] = 600.0
+            out2 = '\n'.join((
+                json.dumps({'event': 'init', 'conversation_id': 'agy-stall-s1'}),
+                json.dumps({'event': 'user_input', 'text': '立即停止工具调用'}),
+                json.dumps({'event': 'system_message', 'text': '[Notice] All your subagents and background tasks have been stopped due to server restart.'}),
+            ))
+            raise harness.HarnessError('子进程超时', 'timeout', timeout_sec=timeout, process_started=True, partial_stdout=out2)
+
+        with patch.object(harness.time, 'monotonic', side_effect=lambda: stall_now[0]), \
+             patch.object(harness, 'run_process', side_effect=run_agy_stalled):
+            with self.assertRaises(harness.HarnessError) as stall_exc:
+                harness.invoke_engine(
+                    'agy:gemini-4-carbon-high', self.root, '复核', agy_engines,
+                    harness.TASK_JSON_SCHEMA, readonly=True, timeout_sec=600, receipt=stall_receipt,
+                )
+        self.assertEqual(stall_exc.exception.status, 'timeout')
+        self.assertTrue(stall_receipt.get('wrapup_stalled'))
+        self.assertTrue(stall_exc.exception.details.get('wrapup_stalled'))
+        self.assertFalse(stall_receipt['timeout_salvage']['resumable'])
+        self.assertEqual(stall_receipt['timeout_salvage']['resume_blocked_reason'], 'agy_wrapup_stalled_without_model_turn')
+
+        stall_receipt_path = self.root / 'agy_stalled_receipt.json'
+        stall_receipt_path.write_text(json.dumps({
+            'status': 'timeout', 'target': str(self.root), 'engine': 'agy:gemini-4-carbon-high',
+            'readonly': True, 'timeout_salvage': stall_receipt['timeout_salvage'],
+            'invocation': stall_receipt,
+        }, ensure_ascii=False), encoding='utf-8')
+        with patch.object(harness, 'run_process', side_effect=AssertionError('should not invoke cli on non-resumable receipt')):
+            with self.assertRaises(harness.HarnessError) as f_exc:
+                harness.cmd_followup(self.args(
+                    'followup', '--receipt', str(stall_receipt_path), '--task', '继续收口', '--timeout', '120',
+                ))
+        self.assertEqual(f_exc.exception.status, 'session_not_resumable')
+        self.assertEqual(f_exc.exception.details.get('resume_blocked_reason'), 'agy_wrapup_stalled_without_model_turn')
+
+        # Codex double timeout with empty wrapup stdout still preserves resumable=True (R5 scope guard)
+        cx_now, cx_rec = [0.0], {}
+        cx_init = json.dumps({'type': 'thread.started', 'thread_id': 'codex-double-t1'})
+
+        def run_cx_double(argv, cwd, prompt, timeout, **kwargs):
+            if 'resume' not in argv:
+                cx_now[0] = 91.0
+                raise harness.HarnessError('timeout', 'timeout', timeout_sec=timeout, process_started=True, partial_stdout=cx_init)
+            cx_now[0] = 121.0
+            raise harness.HarnessError('timeout', 'timeout', timeout_sec=timeout, process_started=True, partial_stdout='')
+
+        with patch.object(harness.time, 'monotonic', side_effect=lambda: cx_now[0]), \
+             patch.object(harness, 'run_process', side_effect=run_cx_double):
+            with self.assertRaises(harness.HarnessError):
+                harness.invoke_engine('codex:default', self.root, '推导', backends(), harness.TASK_JSON_SCHEMA,
+                                      readonly=True, timeout_sec=120, receipt=cx_rec)
+        self.assertFalse(cx_rec.get('wrapup_stalled', False))
+        self.assertTrue(cx_rec['timeout_salvage']['resumable'])
+
+        # 3. plan over-window hard block, suggested_shards, auto_route fallback to larger window,
+        #    --allow-over-budget override, directory non-blocking, and inline_readonly_summary telemetry
+        big_dir = self.root / 'big_docs'
+        big_dir.mkdir()
+        big_files = []
+        for idx in range(4):
+            rel = f'part_{idx + 1}.md'
+            # 4 * 420 KiB = 1.64 MiB (~573K tokens > 512K agy window, < 872K codex window)
+            (big_dir / rel).write_bytes(b'a' * (420 * 1024))
+            big_files.append(rel)
+
+        cap_engines = self.four_backends()
+        cap_engines['agy']['models'] = [
+            {'slug': 'gemini-4-carbon-high', 'context_window': 512000, 'priority': 1},
+            {'slug': 'gemini-4-carbon-low', 'context_window': 512000, 'priority': 2},
+        ]
+        cap_engines['agy']['model'] = 'gemini-4-carbon-high'
+        cap_engines['codex']['models'] = [
+            {'slug': 'gpt-6.2-astra', 'context_window': 872000, 'supported_efforts': ['low', 'high', 'max']},
+        ]
+        cap_engines['codex']['model'] = 'gpt-6.2-astra'
+
+        plan_dir = self.root / 'budget_plans'
+        file_flags = []
+        for rel in big_files:
+            file_flags.extend(['--files', rel])
+
+        # Explicit agy:gemini-4-carbon-high over 512K window -> hard-blocked with over_context_window + suggested_shards
+        with patch.object(harness, '_args_backends', return_value=cap_engines):
+            with self.assertRaises(harness.HarnessError) as ow_exc:
+                harness.cmd_plan(self.args(
+                    'plan', '--target', str(big_dir), '--kind', 'review',
+                    '--engine', 'agy:gemini-4-carbon-high', '--session-id', 'sess-ow',
+                    '--plan-dir', str(plan_dir), *file_flags,
+                ))
+        self.assertEqual(ow_exc.exception.status, 'over_context_window')
+        shards = ow_exc.exception.details.get('suggested_shards') or []
+        self.assertGreaterEqual(len(shards), 4)
+        self.assertEqual([f for sh in shards for f in sh['files']], big_files)
+
+        # --allow-over-budget explicitly overrides hard block, surfaces warnings & shards in card & 3-line chat_brief
+        with patch.object(harness, '_args_backends', return_value=cap_engines):
+            rc_allow, plan_allow = self.capture(harness.cmd_plan, self.args(
+                'plan', '--target', str(big_dir), '--kind', 'review',
+                '--engine', 'agy:gemini-4-carbon-high', '--session-id', 'sess-ow',
+                '--plan-dir', str(plan_dir), '--allow-over-budget', '--save-ticket', *file_flags,
+            ))
+        self.assertEqual(rc_allow, 0)
+        st0 = plan_allow['streams'][0]
+        self.assertTrue(st0['over_context_window'])
+        self.assertTrue(st0['over_input_budget'])
+        self.assertTrue(st0['exceeds_inline_cap'])
+        self.assertEqual(len(st0['suggested_shards']), len(shards))
+        self.assertEqual(len(plan_allow['chat_brief'].splitlines()), 3)
+        self.assertIn('超安全预算或内联上限', plan_allow['chat_brief'])
+        card_text = Path(plan_allow['card_detail_file']).read_text(encoding='utf-8')
+        self.assertIn('容量与内联预警', card_text)
+        self.assertIn('建议分片', card_text)
+
+        # Directory target without explicit --files must NOT hard-block
+        with patch.object(harness, '_args_backends', return_value=cap_engines):
+            rc_dir, plan_dir_out = self.capture(harness.cmd_plan, self.args(
+                'plan', '--target', str(big_dir), '--kind', 'review',
+                '--engine', 'agy:gemini-4-carbon-high', '--session-id', 'sess-ow',
+                '--plan-dir', str(plan_dir),
+            ))
+        self.assertEqual(rc_dir, 0)
+        self.assertFalse(plan_dir_out['streams'][0]['over_context_window'])
+
+        # Auto-route role:review when primary 512K agy cannot fit skips to larger-window codex
+        with patch.object(harness, '_args_backends', return_value=cap_engines):
+            rc_auto, plan_auto = self.capture(harness.cmd_plan, self.args(
+                'plan', '--target', str(big_dir), '--kind', 'review', '--caller', 'antigravity',
+                '--engine', 'role:review', '--session-id', 'sess-ow',
+                '--plan-dir', str(plan_dir), *file_flags,
+            ))
+        self.assertEqual(rc_auto, 0)
+        self.assertNotEqual(plan_auto['streams'][0]['client'], 'agy')
+        self.assertTrue(plan_auto['streams'][0]['exceeds_inline_cap'])
+
+        # inline_readonly_summary records exact inlined vs cap-omitted files on readonly execution
+        inline_rec = {}
+        with patch.object(harness, 'run_process', return_value=subprocess.CompletedProcess(
+            ['agy'], 0, json.dumps({'event': 'result', 'result': {'structured_output': TASK}}), '',
+        )):
+            harness.invoke_engine(
+                'agy:gemini-4-carbon-high', big_dir, '审查', cap_engines, harness.TASK_JSON_SCHEMA,
+                readonly=True, timeout_sec=60, stage_files=big_files, inline_readonly=True, receipt=inline_rec,
+            )
+        in_sum = inline_rec.get('inline_readonly_summary') or {}
+        self.assertEqual(in_sum.get('inlined_count'), 1)
+        self.assertEqual(in_sum.get('omitted_count'), 3)
+        self.assertEqual(in_sum.get('cap_omitted_count'), 3)
+        self.assertEqual(in_sum.get('omitted_files'), big_files[1:])
+
+        # 4. _terminate_tree sends SIGTERM before SIGKILL on POSIX
+        class _FakeProc:
+            def __init__(self, polls):
+                self.pid = 42424
+                self._polls = list(polls)
+            def poll(self):
+                return self._polls.pop(0) if len(self._polls) > 1 else self._polls[0]
+
+        sent_signals = []
+
+        def fake_killpg(pid, sig):
+            sent_signals.append((pid, sig))
+            if sig == 9:
+                raise ProcessLookupError()
+
+        with patch.object(harness.os, 'name', 'posix'), \
+             patch.object(harness.os, 'killpg', side_effect=fake_killpg, create=True), \
+             patch.object(harness.signal, 'SIGTERM', 15, create=True), \
+             patch.object(harness.signal, 'SIGKILL', 9, create=True), \
+             patch.object(harness.time, 'sleep'):
+            errs = harness._terminate_tree(_FakeProc([None, None, 0]))
+        self.assertEqual(errs, [])
+        self.assertEqual(sent_signals, [(42424, 15), (42424, 9)])
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

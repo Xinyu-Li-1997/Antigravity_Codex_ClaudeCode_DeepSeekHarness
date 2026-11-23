@@ -39,8 +39,8 @@ description: >
 
 外部无头调用自动补齐声明最大窗口、防分页非交互环境变量、前后快照与脱敏；会话持久化按 `persist_sessions_by_default` 默认开启，仅显式传 `--ephemeral` 时关闭：
 - **多文件输入与负向边界**：`task`、`plan`、`batch` 可重复传 `--files <相对路径>`（流字段 `files: [...]`）精确指定目标目录内的多份必读文件，避免只传单文件或整目录拷入；`--negative-scope-file`（流字段 `negative_scope_files: [...]`）与 `env_contract` 显式注入负向排除边界与宿主机环境约定。
-- **双层超时抢救**：底层 `run_process` 实时逐行读取管道。持久化开启且 `timeout >= 120 s` 时，若主运行到达 `soft_timeout_ratio` 软时限仍未产出结果文件但已建立 `provider_session_id`，自动用剩余预算并以低推理挡位（`low`）发起一次只读续接收口（`soft_timeout_wrapup`）封装结构化结果；若仍触发硬超时，回执如实保留总 `timeout_sec`、主回合 `primary_timeout_sec`、已完成轮次的部分 Token（`cli_partial_on_timeout`）与 `timeout_salvage`（含 `provider_session_id`、`resumable`、`actual_files_read`、`changed_files_on_disk` 及优先保留正式回复的最近消息片段）。
-- **按回执续接追问（`followup`）**：回执保存 `provider_session_id`，临时隔离会话归档至 `<plan_dir>/headless_sessions/`。主会话复核存疑或从超时断点续查时，运行 `followup --receipt <回执.json> [--stream <流号>] --task "<追问内容>"` 复用原上下文。
+- **双层超时抢救**：底层 `run_process` 实时逐行读取管道，POSIX 终止进程组时先发 `SIGTERM` 等待短暂宽限再升级 `SIGKILL`。持久化开启且 `timeout >= 120 s` 时，若主运行到达 `soft_timeout_ratio` 软时限仍未产出结果文件但已建立 `provider_session_id`，自动用剩余预算并以低推理挡位（`agy` 带挡位后缀模型自动切换目录内同家族低挡 slug 并记录 `wrapup_model`，且外层进程超时为 `agy --print-timeout` 保留优雅宽限）发起一次只读续接收口（`soft_timeout_wrapup`）封装结构化结果；若仍触发硬超时，回执如实保留总 `timeout_sec`、主回合 `primary_timeout_sec`、已完成轮次的部分 Token（`cli_partial_on_timeout`）与 `timeout_salvage`（含 `provider_session_id`、`resumable`、`actual_files_read`、`changed_files_on_disk` 及优先保留正式回复的最近消息片段）。若 `agy` 收口超时且零模型进展，回执记 `wrapup_stalled: true` 并将 `timeout_salvage.resumable` 置为 `false`。只读执行同时写入 `inline_readonly_summary` 记录已内联与超限未内联文件统计。
+- **按回执续接追问（`followup`）**：回执保存 `provider_session_id`，临时隔离会话归档至 `<plan_dir>/headless_sessions/`。主会话复核存疑或从超时断点续查时，运行 `followup --receipt <回执.json> [--stream <流号>] --task "<追问内容>"` 复用原上下文；若原回执已标记 `timeout_salvage.resumable: false`，`followup` 立即以 `session_not_resumable` 阻断并提示按分片新开会话。
 - **读取轨迹与引用行号核验（`citation_audit`）**：只读回执自动提取 `actual_files_read`，核对正文 `path#Lstart-Lend` 或 `path:start-end` 引用的文件存在性、总行数上限及是否真实打开，供主会话按 R6 复核。
 
 ## 两道可用性检查与全通道确认单
@@ -49,7 +49,7 @@ description: >
 
 轻任务按 `runtime_tunables.dispatch_confirmation` 静默执行（单路只读 `task` 显式传入 `--files` 时仅统计所声明文件，上限由 `heavy_max_light_explicit_files` 或默认 4 个文件控制，不误扫整个目标目录）。外部无头调用及内部 `invoke_subagent`、`run_workflow`、`spawn_agent`、`Agent`、`swarm` 等多路或可写委派均须先经 `plan` 确认；`status_guard.py` 对 `swarm` 的 `add` 按 `tasks` 长度或 `n` 计入通道容量。通道含 `cae_harness_headless`、`native_subagent`、`native_workflow`、`native_swarm`；原生通道默认 `inherit`，优先解析代理定义中的显式 `model` 并挂载 `native_agent_profiles`。
 
-`plan` 依次写入 `<ticket_id>.json` 与 `<ticket_id>_card.md`（含 4 列总览表与 14 项明细），标准输出默认置顶 `chat_brief` 与 `compact_summary_card`；需全量 JSON 时加 `--full-json`，本地交互勿传 `--redact` 以保留可点击链接。日常对话默认仅展示 3 句话极简确认条 `chat_brief` 及 `<ticket_id>_card.md` 链接，禁止在日常对话粘贴 Markdown 表格或展开 14 项长表，未发生压缩且票据未变时后台被动唤醒严禁重复贴票：
+`plan` 依次写入 `<ticket_id>.json` 与 `<ticket_id>_card.md`（含 4 列总览表与 14 项明细），标准输出默认置顶 `chat_brief` 与 `compact_summary_card`；需全量 JSON 时加 `--full-json`，本地交互勿传 `--redact` 以保留可点击链接。对显式传入 `--files` 或单文件目标的外部无头只读流，`plan` 额外核验声明窗口与安全预算：估算超出目标模型声明窗口时默认报 `over_context_window` 并返回 `suggested_shards`（自动选路 `role:*` 优先换更大窗口引擎，确需抽查可显式加 `--allow-over-budget` 或流字段 `allow_over_budget: true` 放行），超出安全输入预算或内联上限时在明细与 `chat_brief` 预警。日常对话默认仅展示 3 句话极简确认条 `chat_brief` 及 `<ticket_id>_card.md` 链接，禁止在日常对话粘贴 Markdown 表格或展开 14 项长表，未发生压缩且票据未变时后台被动唤醒严禁重复贴票：
 
 | 序号 | 参数项 | 应显示的内容 |
 | --- | --- | --- |

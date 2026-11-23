@@ -107,7 +107,7 @@ $$
 W_{\text{eff}} = \left\lfloor W_{\text{selec}\text{ted}} \times \frac{p_{\text{eff}}}{100} \right\rfloor, \quad C_{\text{plan}} = \min(W_{\text{eff}}, \space W_{\text{compact}}), \quad B_{\text{input}} = \left\lfloor \alpha C_{\text{plan}} \right\rfloor
 $$
 
-对于客户端命令未输出整数窗口且未在 `subscription_matrix.models` 声明窗口的模型，调度器按 `runtime_tunables.headless_dispatch.unlisted_window_fallback_tokens` 回退采用保守分片预算（支持环境变量覆盖）；具体窗口与预算数值随 `fleet_profile.json` 与本机目录动态重算，不在常驻文档中固化本机派生指纹。
+对于客户端命令未输出整数窗口且未在 `subscription_matrix.models` 声明窗口的模型，调度器按 `runtime_tunables.headless_dispatch.unlisted_window_fallback_tokens` 回退采用保守分片预算（支持环境变量覆盖）；具体窗口与预算数值随 `fleet_profile.json` 与本机目录动态重算，不在常驻文档中固化本机派生指纹。`plan` 针对显式传入 `--files` 或单文件目标的只读流复用同一 $B_{\text{input}}$ 与 $W_{\text{selec}\text{ted}}$ 阈值：外部无头估算超出声明窗口时默认以 `over_context_window` 拦截并返回按分片预算与内联上限切分的 `suggested_shards`（显式 `--allow-over-budget` 可放行），超出安全预算或内联上限时在确认单明细及 `chat_brief` 预警。
 
 ---
 

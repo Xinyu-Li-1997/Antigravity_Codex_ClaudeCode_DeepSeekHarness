@@ -2,6 +2,21 @@
 
 本文件记录四客户端共用规则、会话钩子、后台验证工具与上游维护流程的版本演进。当前插件版本以 `template/user-guard/plugin.json` 为准；常驻使用文档只说明机制和配置键，不重复维护版本号与性能日期。
 
+## [1.18.10] - 2026-11-23
+
+基于真实超长双语文档批次（单流显式传入多份超大文档触发分页、压缩与无头超时）的逐行根因排查，补齐 `plan` 显式只读超窗与内联预算护栏，并修复 `agy` 无头软超时收口与进程回收链路的三处缺陷：
+
+- **`plan` 显式只读超窗硬拦截、分片建议与内联遥测（`cae_harness.py`、`SKILL.md`、`docs/workflow-guide.md`、`docs/architecture-and-hooks.md`）**：
+  - `plan` 对显式传入 `--files` 或单文件目标的只读流自动核算声明窗口占比、安全输入预算（`input_budget_tokens`）与只读内联上限（`inline_readonly_max_kib`）；当外部无头显式只读估算超出所选模型声明窗口时默认硬拦截并返回 `over_context_window` 与确定性贪心切分的 `suggested_shards`（自动选路 `role:*` 优先改切更大窗口引擎，确需仅抽查时可显式传 `--allow-over-budget` 或流字段 `allow_over_budget: true` 放行；目录级未传 `--files` 任务保持非阻断）；
+  - 超出安全输入预算或内联上限时在 `<ticket_id>_card.md` 明细写入容量与内联预警及分片建议，并在 3 句话 `chat_brief` 附简洁预警标记；`_inline_readonly_prompt` 同步输出 `inline_readonly_summary`（已内联与超限未内联文件数及字节数）写入回执。
+- **`agy` 带后缀模型收口降档与 `--print-timeout` 宽限协同（`cae_harness.py`）**：
+  - `invoke_engine` 软超时收口由 `_wrapup_model_and_effort` 识别 `agy` 带挡位后缀模型（如 `*-high` / `*-xhigh`），自动切换至目录内同家族更低挡模型（优先 `*-low`、次选 `*-minimal` / `*-medium`）并记录 `wrapup_model` 与 `wrapup_effort`，消除此前带后缀模型收口零降档的问题；
+  - `soft=True` 默认持久化模式下亦为 `agy` 外层 `proc_timeout` 保留高于 `--print-timeout` 的优雅宽限（不侵占收口最小预留时间），且 POSIX 进程树终止（`_terminate_tree`）先发 `SIGTERM` 等待最多 1.5 秒再升级 `SIGKILL`，让 `agy` 得以先完成内部超时收尾与会话刷盘。
+- **`agy` 零进展卡死收口判定与 `followup` 防护（`cae_harness.py`、`tests/test_harness_offline.py`）**：
+  - 当 `agy` 收口回合再次超时且无任何模型或工具推进事件（0 token，仅有 `init`、`user_input`、`system_message` 等启动提示事件）时，回执标记 `wrapup_stalled: true` 并将 `timeout_salvage.resumable` 置为 `false`（附 `resume_blocked_reason: agy_wrapup_stalled_without_model_turn`）；`cmd_followup` 启动前核验 `timeout_salvage.resumable`，遇不可续接回执直接返回 `session_not_resumable` 避免盲目空转，同时保持 Codex 等可正常续接后端原有行为不变；补齐离线回归单测覆盖上述全部机制。
+
+---
+
 ## [1.18.9] - 2026-11-23
 
 依据 Google Antigravity 官方最新模型文档与四端本地实测目录，校准动态配置中的 Antigravity 客户端活跃上下文窗口口径并修补网页端文档遗留引用：

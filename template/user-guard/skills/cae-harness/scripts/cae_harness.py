@@ -3606,6 +3606,11 @@ def _terminate_tree(proc, native_pid_file=None):
             if cleanup.returncode and proc.poll() is None:
                 errors.append('Local process tree termination returned nonzero')
         else:
+            if proc.poll() is None:
+                os.killpg(proc.pid, signal.SIGTERM)
+                grace_deadline = time.monotonic() + 1.5
+                while proc.poll() is None and time.monotonic() < grace_deadline:
+                    time.sleep(0.05)
             os.killpg(proc.pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
@@ -4548,7 +4553,7 @@ def _dsh_supports_cli_permission_flags(binary, env=None, *, interop=False):
         return supported
 
 
-def _inline_readonly_prompt(prompt, root, rel_files=None, *, exclude_agent_instructions=False, included=None):
+def _inline_readonly_prompt(prompt, root, rel_files=None, *, exclude_agent_instructions=False, included=None, summary=None):
     root = Path(root).resolve()
     norm_rels = [_literal_input_path(rel) for rel in rel_files] if rel_files is not None else None
     explicit_single = norm_rels is not None and len(norm_rels) == 1
@@ -4576,7 +4581,7 @@ def _inline_readonly_prompt(prompt, root, rel_files=None, *, exclude_agent_instr
     cap = (_positive_int(_headless_tunables().get('inline_readonly_max_kib')) or 512) * 1024
     header_full = '\n\n所需目标文件原文已附带精确行号内联在下方，请勿再重复调用文件读取工具遍历工作区。\n'
     header_partial = '\n\n以下已内联文件附带精确行号，对已内联文件请勿再重复调用文件读取工具；未内联清单中的非敏感文本文件可按需单次读取。\n'
-    blocks, omitted = [], []
+    blocks, omitted, cap_omitted_count = [], [], 0
     size = max(len(header_full.encode('utf-8')), len(header_partial.encode('utf-8')))
     for item in records:
         path, rel = Path(item['path']), item['rel_path']
@@ -4593,6 +4598,7 @@ def _inline_readonly_prompt(prompt, root, rel_files=None, *, exclude_agent_instr
                 raise ValueError('linked source')
             if path.stat().st_size > cap:
                 omitted.append(rel)
+                cap_omitted_count += 1
                 continue
             text = path.read_text(encoding='utf-8')
             if '\0' in text:
@@ -4602,6 +4608,7 @@ def _inline_readonly_prompt(prompt, root, rel_files=None, *, exclude_agent_instr
             block_size = len(block.encode('utf-8'))
             if size + block_size > cap:
                 omitted.append(rel)
+                cap_omitted_count += 1
                 continue
             size += block_size
             blocks.append(block)
@@ -4609,6 +4616,15 @@ def _inline_readonly_prompt(prompt, root, rel_files=None, *, exclude_agent_instr
                 included.append(rel)
         except (OSError, ValueError):
             omitted.append(rel)
+    if isinstance(summary, dict):
+        summary.update(
+            inlined_count=len(blocks),
+            omitted_count=len(omitted),
+            cap_omitted_count=cap_omitted_count,
+            inlined_bytes=size if blocks else 0,
+            cap_bytes=cap,
+            omitted_files=list(omitted),
+        )
     header = header_partial if omitted else header_full
     suffix = ('\n未内联清单：' + ', '.join(omitted)) if omitted else ''
     return prompt + (header + ''.join(blocks) if blocks else '') + suffix
@@ -4955,6 +4971,29 @@ def _check_readonly_inline_transport(prefix, info, readonly, inline_readonly, *,
         )
 
 
+_AGY_NON_PROGRESS_EVENTS = frozenset({
+    'init', 'user_input', 'system_message', 'system', 'notice', 'heartbeat', 'ping',
+})
+
+
+def _turn_made_model_progress(prefix, raw_out, events, raw_file_text=''):
+    """判断本回合是否实际进入模型推理或工具阶段（目前仅对 agy 启用严格零进展卡死判定）。"""
+    if prefix != 'agy':
+        return True
+    if (raw_file_text or '').strip():
+        return True
+    usage = extract_cli_token_usage(prefix, raw_out, '')
+    if usage.get('usage_source') != 'unreported_by_cli' and (usage.get('total_tokens') or 0) > 0:
+        return True
+    for ev in events or ():
+        if not isinstance(ev, dict):
+            continue
+        ev_name = str(ev.get('event') or ev.get('type') or '').strip().lower()
+        if ev_name and ev_name not in _AGY_NON_PROGRESS_EVENTS:
+            return True
+    return False
+
+
 def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, timeout_sec=600,
                   agent='readonly-collaborator', stage_files=None, effort=None, retry_quota=False,
                   *, profile=None, batch=None, receipt=None, clean_room=False, isolation='', inline_readonly=None,
@@ -5132,7 +5171,7 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
                 receipt['provider_session_id'] = sid
             return paths
 
-        def _wrapup_effort():
+        def _wrapup_model_and_effort():
             if prefix == 'codex':
                 rec = _exact_model_record(info.get('models', []), model) if model else {}
                 supported = [str(lv).lower() for lv in (rec.get('supported_efforts') or ()) if lv]
@@ -5140,26 +5179,52 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
                 non_del = [lv for lv in supported if lv not in delegating]
                 for cand in ('low', 'minimal', 'medium'):
                     if not non_del or cand in non_del:
-                        return cand
-                return non_del[0]
+                        return model, cand, cand
+                return model, non_del[0], non_del[0]
             if prefix in ('claude', 'dsh'):
-                return 'low'
-            if prefix == 'agy' and effort:
-                return 'low'
-            return effort
+                return model, 'low', 'low'
+            if prefix == 'agy':
+                family, slug_tier = _agy_slug_tier(model)
+                if slug_tier:
+                    if slug_tier in ('low', 'minimal'):
+                        return model, None, slug_tier
+                    cands = ('low', 'minimal') if slug_tier == 'medium' else ('low', 'minimal', 'medium')
+                    catalog_models = info.get('models') or ()
+                    for cand in cands:
+                        target_slug = f'{family}-{cand}'
+                        rec = next(
+                            (m for m in catalog_models
+                             if isinstance(m, dict)
+                             and str(m.get('slug') or '').strip().lower() == target_slug
+                             and _model_category('agy', m) != 'hidden_or_internal'),
+                            None,
+                        )
+                        if rec is not None:
+                            return rec['slug'], None, cand
+                    return model, effort, slug_tier
+                if profile.get('effort_option_supported') is not False:
+                    return model, 'low', 'low'
+                return model, effort, effort
+            return model, effort, effort
 
         def turn(readonly, exec_prompt, budget, session_id, wrapup=False):
             native_pid_file = None
             win_target = translate(exec_dir)
-            turn_effort = _wrapup_effort() if wrapup else effort
+            turn_model, turn_effort, wrapup_effort_label = (
+                _wrapup_model_and_effort() if wrapup else (model, effort, None)
+            )
             if wrapup:
-                receipt['wrapup_effort'] = turn_effort
+                receipt['wrapup_effort'] = wrapup_effort_label
+                if turn_model and turn_model != model:
+                    receipt['wrapup_model'] = turn_model
+            agy_print_sec = None
+            agy_grace_used = 0
             if prefix == 'codex':
                 command = [binary, 'exec', '--json', '-s', 'read-only' if readonly else 'workspace-write',
                            '-c', 'approval_policy="never"',
                            '--skip-git-repo-check', '-C', win_target, '--output-schema', translate(schema_file), '-o', translate(output_file)]
-                if model:
-                    command.extend(['-m', model])
+                if turn_model:
+                    command.extend(['-m', turn_model])
                 if turn_effort:
                     command.extend(['-c', f'model_reasoning_effort="{turn_effort}"'])
                 context_window = profile['capacity']['cli_context_window_tokens']
@@ -5172,16 +5237,28 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
                 command.append('-')
                 input_text = exec_prompt
             elif prefix == 'agy':
+                grace = max(1, int(hd.get('agy_timeout_grace_sec', 15)))
+                elapsed_pre = time.monotonic() - wall_start
+                if not soft:
+                    agy_print_sec = max(1, int(timeout_sec - int(elapsed_pre)))
+                    agy_grace_used = grace
+                elif not wrapup:
+                    agy_print_sec = max(1, int(budget - int(elapsed_pre)))
+                    headroom = max(1, int(timeout_sec - elapsed_pre - agy_print_sec - 20))
+                    agy_grace_used = min(grace, headroom)
+                else:
+                    agy_print_sec = max(1, int(timeout_sec - int(elapsed_pre)))
+                    agy_grace_used = min(grace, 10)
                 command = [binary, '--input-format', 'stream-json', '--output-format', 'stream-json',
-                           '--print-timeout', f'{budget}s', '--json-schema', translate(schema_file)]
+                           '--print-timeout', f'{agy_print_sec}s', '--json-schema', translate(schema_file)]
                 if session_id:
                     command.extend(['--conversation', session_id])
                 if iso_mode != 'full':
                     command.append('--disable-slash-commands')
                 command.append('--sandbox')
-                if model:
-                    command.extend(['--model', model])
-                if turn_effort and profile.get('effort_option_supported') is not False and not _agy_slug_tier(model)[1]:
+                if turn_model:
+                    command.extend(['--model', turn_model])
+                if turn_effort and profile.get('effort_option_supported') is not False and not _agy_slug_tier(turn_model)[1]:
                     command.extend(['--effort', turn_effort])
                 if readonly:
                     command.extend(['--agent', 'readonly-collaborator' if wrapup else agent])
@@ -5270,11 +5347,14 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
             # cannot clear a failure recorded by another unit in this same batch.
             _enforce_preflight_quota(backends, (spec,), batch=batch)
             elapsed = time.monotonic() - wall_start
-            proc_timeout = (timeout_sec if wrapup else budget) - (elapsed if soft else int(elapsed))
-            if elapsed >= timeout_sec or proc_timeout <= 0:
-                raise HarnessError('前置暂存或处理已耗尽墙钟超时预算', 'timeout')
-            if prefix == 'agy' and not soft:
-                proc_timeout = max(1, timeout_sec - int(elapsed)) + int(hd.get('agy_timeout_grace_sec', 15))
+            if prefix == 'agy':
+                if elapsed >= timeout_sec:
+                    raise HarnessError('前置暂存或处理已耗尽墙钟超时预算', 'timeout')
+                proc_timeout = agy_print_sec + agy_grace_used
+            else:
+                proc_timeout = (timeout_sec if wrapup else budget) - (elapsed if soft else int(elapsed))
+                if elapsed >= timeout_sec or proc_timeout <= 0:
+                    raise HarnessError('前置暂存或处理已耗尽墙钟超时预算', 'timeout')
             process_failure = None
             receipt['launch_attempted'] = True
             try:
@@ -5304,7 +5384,8 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
                     redacted_detail = _redact_runtime_secret(detail)
                     if _is_agy_print_timeout_text(detail):
                         raise HarnessError('agy 执行触发 --print-timeout 超时', 'timeout',
-                                           returncode=0, finished_reason='print_timeout', stderr=redacted_detail[-2000:])
+                                           timeout_sec=agy_print_sec, returncode=0,
+                                           finished_reason='print_timeout', stderr=redacted_detail[-2000:])
                     if _is_quota_exhausted(detail):
                         cooldown = _record_quota_exhausted(prefix, info, detail, batch=batch)
                         raise HarnessError('agy 额度不足或已达用量上限，已停止并记录冷却状态',
@@ -5322,8 +5403,8 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
                                        stderr=redacted_stderr, **_quota_user_choices(prefix, cooldown))
                 if prefix == 'agy' and _is_agy_print_timeout_text(detail):
                     raise HarnessError('agy 执行触发 --print-timeout 超时', 'timeout',
-                                       returncode=result.returncode, finished_reason='print_timeout',
-                                       stderr=redacted_stderr)
+                                       timeout_sec=agy_print_sec, returncode=result.returncode,
+                                       finished_reason='print_timeout', stderr=redacted_stderr)
                 # A worker may already have written files. Authentication fallback
                 # is allowed only in model listing before planning and execution.
                 raise HarnessError(f'{prefix} 执行失败，退出码 {result.returncode}', returncode=result.returncode,
@@ -5381,6 +5462,7 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
                     return _extract_json_object(candidate, schema, strict=True)
             return None
 
+        wrapup_stalled = False
         try:
             if needs_stage:
                 stage_dir = _stage_wsl_readonly_workspace(target_dir, temp_path, stage_files, exclude_agent_instructions=clean_room)
@@ -5392,7 +5474,10 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
                     neutral = rel.with_name(f'{_STAGED_NEUTRAL_PREFIX}{rel.name}{_STAGED_NEUTRAL_SUFFIX}').as_posix()
                     prompt += f'\n[净室单文件映射] 目标文件 {rel.as_posix()} 在当前镜像目录中暂存为 {neutral}。'
             if readonly and (inline_readonly is True or (inline_readonly is None and clean_room)):
-                prompt = _inline_readonly_prompt(prompt, exec_dir, stage_files, exclude_agent_instructions=clean_room, included=inlined)
+                inline_summary = {}
+                prompt = _inline_readonly_prompt(prompt, exec_dir, stage_files, exclude_agent_instructions=clean_room,
+                                                 included=inlined, summary=inline_summary)
+                receipt['inline_readonly_summary'] = inline_summary
             if prefix == 'codex' and _is_appcontainer_or_interop_codex(info) and not clean_room and not resume:
                 if readonly:
                     prompt += (
@@ -5437,6 +5522,12 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
                                 exc.details['wrapup_timeout_sec'] = wrapup.details['timeout_sec']
                             if wrapup.details.get('cleanup_errors'):
                                 exc.details['cleanup_errors'] = wrapup.details['cleanup_errors']
+                            if prefix == 'agy' and wrapup.status == 'timeout' and len(outputs) >= 2:
+                                w_out, _, w_events, w_raw = outputs[-1]
+                                if not _turn_made_model_progress('agy', w_out, w_events, w_raw):
+                                    wrapup_stalled = True
+                                    receipt['wrapup_stalled'] = True
+                                    exc.details['wrapup_stalled'] = True
                             raise exc from wrapup
                     receipt['soft_timeout_wrapup'] = True
             if stage_dir is not None:
@@ -5484,8 +5575,17 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
                                        partial_stderr='\n'.join(err for _, err, _, _ in outputs))
             if timed_out:
                 sid = receipt['provider_session_id']
-                salvage = dict(provider_session_id=sid, resumable=bool(sid and (not isolated or (paths and not receipt.get('session_log_error')))),
+                can_resume = bool(sid and (not isolated or (paths and not receipt.get('session_log_error'))))
+                if wrapup_stalled:
+                    can_resume = False
+                salvage = dict(provider_session_id=sid, resumable=can_resume,
                                actual_files_read=reads, changed_files_on_disk=None, last_messages=messages)
+                if wrapup_stalled:
+                    salvage['resume_blocked_reason'] = 'agy_wrapup_stalled_without_model_turn'
+                    salvage['resume_warning'] = (
+                        'agy 收口续接超时且未进入模型推理（0 token 且无模型响应事件），'
+                        '原会话状态疑似异常或已锁死；禁止继续 followup，请按分片缩减输入后新开会话。'
+                    )
                 receipt['timeout_salvage'] = failure.details['timeout_salvage'] = salvage
             if readonly and parsed is not None:
                 receipt['citation_audit'] = _citation_audit(parsed, target_dir, reads, inlined, stage_dir=stage_dir)
@@ -8577,6 +8677,109 @@ def _native_swarm_worker_model(prefix, info, kind, raw_tier='', parent_model='')
     return None, None, None
 
 
+def _plan_explicit_file_records(target, files):
+    if not files:
+        return []
+    root = target.parent if target.is_file() else target
+    records = []
+    for rel in files:
+        path = root / rel
+        try:
+            size = path.lstat().st_size if path.is_file() else 0
+        except OSError:
+            size = 0
+        records.append({'rel_path': rel, 'bytes': size, 'tokens': estimate_tokens_from_bytes(size)})
+    return records
+
+
+def _suggest_plan_shards(file_records, target_tokens, *, input_budget=None, inline_cap_bytes=0):
+    if len(file_records) < 2:
+        return []
+    soft_tokens = max(1, min(target_tokens, input_budget or target_tokens))
+    shards, bucket, b_tokens, b_bytes = [], [], 0, 0
+    for rec in file_records:
+        would_exceed_tokens = bool(bucket) and (b_tokens + rec['tokens'] > soft_tokens)
+        would_exceed_inline = bool(bucket and inline_cap_bytes and (b_bytes + rec['bytes'] > inline_cap_bytes))
+        if would_exceed_tokens or would_exceed_inline:
+            shards.append({
+                'shard_id': len(shards) + 1,
+                'file_count': len(bucket),
+                'files': list(bucket),
+                'estimated_bytes': b_bytes,
+                'estimated_tokens': b_tokens,
+                'exceeds_single_file_budget': bool(input_budget and b_tokens > input_budget),
+            })
+            bucket, b_tokens, b_bytes = [], 0, 0
+        bucket.append(rec['rel_path'])
+        b_tokens += rec['tokens']
+        b_bytes += rec['bytes']
+    if bucket:
+        shards.append({
+            'shard_id': len(shards) + 1,
+            'file_count': len(bucket),
+            'files': list(bucket),
+            'estimated_bytes': b_bytes,
+            'estimated_tokens': b_tokens,
+            'exceeds_single_file_budget': bool(input_budget and b_tokens > input_budget),
+        })
+    return shards
+
+
+def _plan_capacity_assessment(target, files, readonly, channel, inline_readonly, profile, estimated_tokens):
+    hd = _headless_tunables()
+    capacity = profile.get('capacity', {})
+    selected_window = capacity.get('selected_window_tokens')
+    input_budget = capacity.get('input_budget_tokens')
+    inline_cap_bytes = (_positive_int(hd.get('inline_readonly_max_kib')) or 512) * 1024
+    shard_target = _positive_int(hd.get('default_shard_tokens')) or 120_000
+    records = _plan_explicit_file_records(target, files)
+    explicit_scope = bool(records)
+    explicit_bytes = sum(rec['bytes'] for rec in records)
+    ratio = round(estimated_tokens / selected_window, 4) if selected_window else None
+    over_window = bool(explicit_scope and readonly and selected_window and estimated_tokens > selected_window)
+    over_budget = bool(explicit_scope and readonly and input_budget and estimated_tokens > input_budget)
+    exceeds_inline = bool(explicit_scope and readonly and channel == 'cae_harness_headless'
+                          and inline_readonly and explicit_bytes > inline_cap_bytes)
+    shards = (
+        _suggest_plan_shards(
+            records,
+            shard_target,
+            input_budget=input_budget,
+            inline_cap_bytes=inline_cap_bytes if (channel == 'cae_harness_headless' and inline_readonly) else 0,
+        )
+        if (over_window or over_budget or exceeds_inline) and len(records) >= 2
+        else []
+    )
+    warnings = []
+    if over_window:
+        warnings.append(
+            f'显式只读输入估算 {estimated_tokens} tokens 超出声明上下文窗口 {selected_window} tokens'
+            f'（占比 {ratio * 100:.1f}%），建议分片或换更大窗口模型'
+        )
+    elif over_budget:
+        warnings.append(
+            f'显式只读输入估算 {estimated_tokens} tokens 超出安全输入预算 {input_budget} tokens'
+            f'（声明窗口 {selected_window or "未声明"}），建议分片以防中途触发压缩或超时'
+        )
+    if exceeds_inline:
+        warnings.append(
+            f'显式只读文件共 {explicit_bytes / 1024:.1f} KiB，超出内联上限 {inline_cap_bytes // 1024} KiB，'
+            '超限文件将退回工具分页读取并显著拉长耗时'
+        )
+    return {
+        'context_window': selected_window,
+        'input_budget_tokens': input_budget,
+        'budget_utilization_ratio': ratio,
+        'over_input_budget': over_budget,
+        'over_context_window': over_window,
+        'exceeds_inline_cap': exceeds_inline,
+        'explicit_bytes': explicit_bytes,
+        'inline_cap_bytes': inline_cap_bytes,
+        'capacity_warnings': warnings,
+        'suggested_shards': shards,
+    }
+
+
 def _plan_stream_details(args, stream, profile, prefix, channel):
     native = channel != 'cae_harness_headless'
     readonly = stream['kind'] not in ('code', 'gate')
@@ -8657,11 +8860,14 @@ def _resolve_plan_streams(args, streams, backends):
         wave = stream.get('wave', 1)
         ephemeral = stream.get('ephemeral', getattr(args, 'ephemeral', False))
         run_on_upstream_failure = stream.get('run_on_upstream_failure', False)
-        if type(wave) is not int or type(ephemeral) is not bool or type(run_on_upstream_failure) is not bool:
-            raise HarnessError('工作流 wave 必须为整数，ephemeral 与 run_on_upstream_failure 必须为布尔值')
+        allow_over_budget = stream.get('allow_over_budget', getattr(args, 'allow_over_budget', False))
+        if (type(wave) is not int or type(ephemeral) is not bool
+                or type(run_on_upstream_failure) is not bool or type(allow_over_budget) is not bool):
+            raise HarnessError('工作流 wave 必须为整数，ephemeral、run_on_upstream_failure 与 allow_over_budget 必须为布尔值')
         files, negative, contract = _input_envelope(args, target, stream)
         stream.update(files=files, negative_scope_files=negative, env_contract=contract,
-                      wave=wave, ephemeral=ephemeral, run_on_upstream_failure=run_on_upstream_failure)
+                      wave=wave, ephemeral=ephemeral, run_on_upstream_failure=run_on_upstream_failure,
+                      allow_over_budget=allow_over_budget)
         channel = stream.get('channel') or getattr(args, 'channel', 'cae_harness_headless')
         if channel not in _PLAN_CHANNEL_LABELS:
             raise HarnessError('工作流 channel 无效')
@@ -8731,11 +8937,23 @@ def _resolve_plan_streams(args, streams, backends):
             quota = inspect_backend_quota_and_availability(prefix, info, model,
                                                             redact_usage=getattr(args, 'redact', False),
                                                             ignore_cooldown=getattr(args, 'retry_quota', False))
+            cap_assess = _plan_capacity_assessment(
+                target, files, kind not in ('code', 'gate'), channel, False, profile, tokens,
+            )
             log_dir = home / ('sessions' if prefix == 'codex' else 'projects' if prefix == 'claude' else 'antigravity' if prefix == 'agy' else 'sessions')
             chosen = {**stream, 'stream_id': sid, 'target': str(target), 'kind': kind, 'caller': caller,
                       'requested_engine': requested, 'engine': engine, 'tier': tier, 'requested_model': requested_model,
                       'model_display': display, 'timeout': int(stream.get('timeout', args.timeout)),
-                      'execution_profile': profile, 'file_count': count, 'estimated_tokens': tokens, **quota}
+                      'execution_profile': profile, 'file_count': count, 'estimated_tokens': tokens,
+                      'input_budget_tokens': cap_assess['input_budget_tokens'],
+                      'budget_utilization_ratio': cap_assess['budget_utilization_ratio'],
+                      'over_input_budget': cap_assess['over_input_budget'],
+                      'over_context_window': cap_assess['over_context_window'],
+                      'exceeds_inline_cap': cap_assess['exceeds_inline_cap'],
+                      'explicit_bytes': cap_assess['explicit_bytes'],
+                      'capacity_warnings': cap_assess['capacity_warnings'],
+                      **({'suggested_shards': cap_assess['suggested_shards']} if cap_assess['suggested_shards'] else {}),
+                      **quota}
             chosen['receipt_location'] = (stream.get('receipt_location') or getattr(args, 'receipt_location', '')
                                           or str(log_dir) + '（具体子代理日志由原生客户端分配）')
             resolved.append(_plan_stream_details(args, chosen, profile, prefix, channel))
@@ -8784,6 +9002,7 @@ def _resolve_plan_streams(args, streams, backends):
         )
         excluded = set()
         last_error = None
+        last_over_window_exc = None
         chosen = None
         stream_switched = False
         auto_route = (not _extract_prompt_backend_hint(eff_user_engine) and not _extract_prompt_model_hint(eff_user_engine)
@@ -8832,13 +9051,46 @@ def _resolve_plan_streams(args, streams, backends):
                     excluded.add(prefix)
                     stream_switched = True
                     continue
+                cap_assess = _plan_capacity_assessment(
+                    target, files, eff_readonly, channel, eff_inline_ro, profile, tokens,
+                )
+                if cap_assess['over_context_window'] and not allow_over_budget:
+                    shard_note = (f'（已生成 {len(cap_assess["suggested_shards"])} 组建议分片）'
+                                  if cap_assess['suggested_shards'] else '')
+                    raise HarnessError(
+                        f'流 {sid}（{profile.get("spec") or engine}）显式只读文件估算约 {tokens} tokens，'
+                        f'超出模型声明上下文窗口 {cap_assess["context_window"]} tokens{shard_note}；'
+                        '请按 suggested_shards 拆分为多批/多流执行，改用更大窗口引擎，'
+                        '或仅确认抽查时显式传 --allow-over-budget / allow_over_budget: true',
+                        'over_context_window',
+                        stream_id=sid,
+                        engine=profile.get('spec') or engine,
+                        model=profile.get('model'),
+                        estimated_tokens=tokens,
+                        context_window=cap_assess['context_window'],
+                        input_budget_tokens=cap_assess['input_budget_tokens'],
+                        explicit_bytes=cap_assess['explicit_bytes'],
+                        suggested_shards=cap_assess['suggested_shards'],
+                        allow_override_flag='--allow-over-budget',
+                    )
                 chosen = {**stream, 'stream_id': sid, 'target': str(target), 'kind': kind,
                           'requested_engine': requested, 'requested_model': requested_model, 'engine': engine, 'tier': eff_profile_tier,
                           'timeout': int(stream.get('timeout') or args.timeout), 'execution_profile': profile,
-                          'file_count': count, 'estimated_tokens': tokens, **quota}
+                          'file_count': count, 'estimated_tokens': tokens,
+                          'input_budget_tokens': cap_assess['input_budget_tokens'],
+                          'budget_utilization_ratio': cap_assess['budget_utilization_ratio'],
+                          'over_input_budget': cap_assess['over_input_budget'],
+                          'over_context_window': cap_assess['over_context_window'],
+                          'exceeds_inline_cap': cap_assess['exceeds_inline_cap'],
+                          'explicit_bytes': cap_assess['explicit_bytes'],
+                          'capacity_warnings': cap_assess['capacity_warnings'],
+                          **({'suggested_shards': cap_assess['suggested_shards']} if cap_assess['suggested_shards'] else {}),
+                          **quota}
                 break
             except HarnessError as exc:
                 last_error = exc.status
+                if exc.status == 'over_context_window':
+                    last_over_window_exc = exc
                 if not auto_route:
                     raise
                 if engine:
@@ -8849,6 +9101,8 @@ def _resolve_plan_streams(args, streams, backends):
                         continue
                 break
         if chosen is None:
+            if last_over_window_exc is not None:
+                raise last_over_window_exc
             raise HarnessError('二次检查门未找到可用通道', last_error or 'failed', stream_id=sid)
         switched |= stream_switched and (not original.get('execution_profile')
                                         or engine != original.get('engine')
@@ -8911,18 +9165,44 @@ def _render_plan(ticket):
         clean_room_cell = yes_no(stream['clean_room'])
         if not stream['clean_room'] and stream.get('isolation') in ('full', 'no_skills', 'hooks_only'):
             clean_room_cell += f'（隔离：{stream["isolation"]}）'
+        window_cell = str(stream['context_window']) + ' tokens' if stream['context_window'] else '未声明'
+        if stream.get('over_context_window') or stream.get('over_input_budget'):
+            est_tok = stream.get('estimated_tokens')
+            budget_tok = stream.get('input_budget_tokens')
+            shard_cnt = len(stream.get('suggested_shards') or ())
+            tag = '超声明窗口' if stream.get('over_context_window') else '超安全预算'
+            window_cell += f'（估算 {est_tok} / 安全预算 {budget_tok} tokens；⚠ {tag}'
+            if shard_cnt:
+                window_cell += f'，建议拆 {shard_cnt} 片'
+            window_cell += '）'
+        inline_cell = '内联：' + yes_no(stream['inline_readonly']) + '；超时：' + str(stream['timeout']) + ' 秒'
+        if stream.get('exceeds_inline_cap') and stream.get('explicit_bytes'):
+            cap_kib = (_positive_int(_headless_tunables().get('inline_readonly_max_kib')) or 512)
+            inline_cell += f'（⚠ 显式文件 {stream["explicit_bytes"] / 1024:.1f} KiB > {cap_kib} KiB 内联上限，超限文件将分页读取）'
         values = [stream['stream_id'], stream.get('subtask', '') + '；范围：' + stream['target'],
                   _PLAN_CHANNEL_LABELS[stream['channel']] + ' (' + stream['channel'] + ')',
                   stream['client'] + '；' + stream['agent_type'], stream['model_display'], stream['tier'],
-                  str(stream['context_window']) + ' tokens' if stream['context_window'] else '未声明',
+                  window_cell,
                   yes_no(stream['headless']), clean_room_cell, stream['access_mode'],
-                  '内联：' + yes_no(stream['inline_readonly']) + '；超时：' + str(stream['timeout']) + ' 秒',
+                  inline_cell,
                   available, stream['quota_scheme'] + '；' + stream['quota_summary'], stream['receipt_location']]
         rows.append(row([values[0], values[2] + '；' + values[3], values[4] + '；' + values[5],
                          values[11] + '；' + values[12]]))
         details += ['', '#### 流 ' + _clean_text(stream['stream_id']).replace('\n', ' ') + '（14 项完整参数明细）', '',
                     '| 序号 | 参数项 | 当前值 |', '| --- | --- | --- |']
         details.extend(row([index, name, value]) for index, (name, value) in enumerate(zip(columns, values), 1))
+        if stream.get('capacity_warnings'):
+            details += ['', '**容量与内联预警**：']
+            details.extend(f'- {_clean_text(warn)}' for warn in stream['capacity_warnings'])
+        if stream.get('suggested_shards'):
+            details += ['', '**建议分片（按单分片预算与内联上限切分）**：']
+            for sh in stream['suggested_shards']:
+                file_list = ', '.join(_clean_text(f) for f in sh.get('files', []))
+                single_flag = '（单文件超安全预算）' if sh.get('exceeds_single_file_budget') else ''
+                details.append(
+                    f'- 分片 {sh["shard_id"]}（{sh["file_count"]} 文件，约 {sh["estimated_bytes"] / 1024:.1f} KiB / '
+                    f'{sh["estimated_tokens"]} tokens{single_flag}）：{file_list}'
+                )
     overview_markdown = '\n'.join(rows)
     rows.extend(details)
     ledger = ticket.get('capability_ledger', {})
@@ -8975,6 +9255,13 @@ def _render_plan(ticket):
         if not s.get('currently_available')
     ]
     quota_brief = ('不可用：' + '，'.join(unavailable_notes)) if unavailable_notes else '额度均可用'
+    warn_streams = [
+        _clean_text(s['stream_id']).strip()
+        for s in ticket['streams']
+        if s.get('capacity_warnings')
+    ]
+    if warn_streams:
+        quota_brief += '；⚠ ' + '、'.join(warn_streams) + ' 超安全预算或内联上限，见明细'
     goal_one_line = re.sub(r'\s+', ' ', _clean_text(ticket['workflow_goal'])).strip()
     if len(goal_one_line) > 140:
         goal_one_line = goal_one_line[:137] + '...'
@@ -9779,6 +10066,16 @@ def cmd_followup(args):
     if len(candidates) != 1:
         raise HarnessError('回执中未找到唯一可续接会话，请核对 --stream 和 provider_session_id')
     previous = candidates[0]
+    salvage = previous.get('timeout_salvage') if isinstance(previous.get('timeout_salvage'), dict) else None
+    if salvage is None and len(_result_streams(source)) == 1 and isinstance(source.get('timeout_salvage'), dict):
+        salvage = source.get('timeout_salvage')
+    if isinstance(salvage, dict) and salvage.get('resumable') is False:
+        raise HarnessError(
+            salvage.get('resume_warning') or '原会话回执已标记为不可续接（timeout_salvage.resumable=false），请按分片新开会话',
+            'session_not_resumable',
+            provider_session_id=previous.get('provider_session_id'),
+            resume_blocked_reason=salvage.get('resume_blocked_reason') or 'marked_not_resumable',
+        )
     root = _unredact_local_path(previous.get('target_dir') or source.get('target') or '')
     readonly = previous.get('readonly', source.get('readonly'))
     engine = previous.get('engine') or source.get('engine')
@@ -9861,6 +10158,7 @@ def build_arg_parser():
     plan.add_argument('--workflow-goal', default='', help='工作流目标说明')
     plan.add_argument('--workflow-impact', default='', help='预计后果与影响范围说明')
     plan.add_argument('--save-ticket', action='store_true', help='即使未达重负载阈值也强制保存票据文件')
+    plan.add_argument('--allow-over-budget', action='store_true', help='允许显式只读文件估算超过目标模型声明上下文窗口')
     plan.add_argument('--full-json', action='store_true', help='标准输出保留完整票据 JSON（含 14 项长表与 execution_profile）；默认仅输出精简视图')
     actions = plan.add_mutually_exclusive_group()
     actions.add_argument('--approve-ticket', default='', help='按票据 ID 经二次可用性检查后登记为已批准状态')

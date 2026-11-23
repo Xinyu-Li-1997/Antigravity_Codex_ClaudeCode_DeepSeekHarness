@@ -104,7 +104,7 @@ python -B -X utf8 "$HARNESS" plan `
   --workflow-impact "纯只读检查并保存结构化回执，零源码改动"
 ```
 
-注意：两个 `role:review` 并不自动保证落在不同客户端；需要跨模型双源独立审查时，应如上例显式指定不同客户端（支持 `dsh:@review` 或简写 `dsh:review`），或使用 `audit --left ... --right ...` 双盲分片审查。多波次批处理中，前序波次同工作区（含父子目录）的可写流失败时，后续波次默认全部中止为 `upstream_wave_failed`（避免后续只读审查流在产物未落盘时白耗配额；确需独立观察前序部分结果的只读流可在流定义中显式声明 `"run_on_upstream_failure": true`）。此外，可写编码任务退出码为 0 但磁盘零改动时，回执会显式标注 `no_files_changed: true` 便于主会话及时排查是否因前置门禁停手。
+注意：两个 `role:review` 并不自动保证落在不同客户端；需要跨模型双源独立审查时，应如上例显式指定不同客户端（支持 `dsh:@review` 或简写 `dsh:review`），或使用 `audit --left ... --right ...` 双盲分片审查。对显式传入 `--files` 或单文件目标的外部无头只读流，`plan` 会在生成票据前离线核验声明上下文窗口、安全输入预算与只读内联上限：估算超出所选模型声明窗口时默认报 `over_context_window` 并输出按分片预算切分的 `suggested_shards`（自动选路优先改派更大窗口后端，确需抽查时可加 `--allow-over-budget` 放行），超出安全预算或内联上限时在明细与确认条预警；只读回执另附 `inline_readonly_summary` 统计内联与超限文件。若 `agy` 软超时收口遇零进展卡死，回执会置 `timeout_salvage.resumable: false`，后续 `followup` 自动返回 `session_not_resumable` 阻止盲目空转。多波次批处理中，前序波次同工作区（含父子目录）的可写流失败时，后续波次默认全部中止为 `upstream_wave_failed`（避免后续只读审查流在产物未落盘时白耗配额；确需独立观察前序部分结果的只读流可在流定义中显式声明 `"run_on_upstream_failure": true`）。此外，可写编码任务退出码为 0 但磁盘零改动时，回执会显式标注 `no_files_changed: true` 便于主会话及时排查是否因前置门禁停手。
 
 `plan` 保存票据时先写 `<ticket_id>.json`，再将包含完整背景、要做什么、预计后果、4 列总览表及分路 3 列纵向 **14 项完整参数明细**的确认单写入同目录 `<ticket_id>_card.md`，同时生成日常对话用的 3 句话极简确认条 `chat_brief`、含 4 列总览表的 `compact_summary_card` 与交接片段 `compact_handoff_prompt_block`。**日常对话默认只展示 3 句话极简确认条 `chat_brief` 和可点击明细链接，严禁在聊天框粘贴表格或把多路 14 项长表展开挤占上下文**（未发生压缩且票据未变时，后台任务被动唤醒亦不得重复贴票）；14 项字段的逐项定义统一维护在 [cae-harness 技能规程](../template/user-guard/skills/cae-harness/SKILL.md#两道可用性检查与全通道确认单)，需要逐项核验时直接点击 `<ticket_id>_card.md` 链接查阅。
 
