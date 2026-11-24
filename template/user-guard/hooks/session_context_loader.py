@@ -844,6 +844,8 @@ def handle_context_check(payload: Dict[str, Any], event_name: str = "PreInvocati
     1. 日常无新增 CHECKPOINT：按增量字节游标直接返回 {"injectSteps": []}，避免全文件重复扫描与重复注入；
     2. 捕获新增 CHECKPOINT（或显式 compact/resume 信号）：提取全量用户原话落盘并精确注入 1 次。
     """
+    if os.environ.get("CAE_HARNESS_DEPTH", "").strip() not in ("", "0"):
+        return {"injectSteps": []}
     conversation_id = str(payload.get("conversationId") or "unknown_session").strip()
     transcript_path_str = payload.get("transcriptPath")
     explicit_source = str(payload.get("source") or payload.get("eventSource") or "").strip().lower()
@@ -894,6 +896,8 @@ def handle_codex_session_start(
     处理 Codex SessionStart (compact / resume) 事件：
     提取同 ID 主会话 rollout 原话并落盘至 user-words/<session_id>.md，返回 hookSpecificOutput.additionalContext。
     """
+    if os.environ.get("CAE_HARNESS_DEPTH", "").strip() not in ("", "0"):
+        return {}
     codex_home_env = os.environ.get("CODEX_HOME", "").strip()
     default_codex_home = Path(codex_home_env).expanduser() if codex_home_env else (Path.home() / ".codex")
 
@@ -989,6 +993,8 @@ def handle_claude_session_start(
     payload: Dict[str, Any], state_dir_str: str = "", log_path_str: str = "",
 ) -> Dict[str, Any]:
     """Claude SessionStart：恢复原话并按宿主协议注入有界上下文。"""
+    if os.environ.get("CAE_HARNESS_DEPTH", "").strip() not in ("", "0"):
+        return {}
     home = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude").expanduser()
     state_dir = Path(state_dir_str).expanduser() if state_dir_str else home / "hooks" / "state" / "session-context"
     user_words.sweep_stale_lock_files(state_dir.parent if state_dir.name == "session-context" else state_dir, HOOKS_DIR)

@@ -70,7 +70,7 @@
   <g>
     <rect x="50" y="680" width="624" height="146" rx="12" fill="#eefaf4" stroke="#82bfa0"/>
     <text x="72" y="712" class="heading">4. 定量验证、完成回执检查与主会话原文终审</text>
-    <text x="72" y="740" class="body">只读任务比对哈希快照；可写 gate 锁范围并强制跑通 --verify-cmd。</text>
+    <text x="72" y="740" class="body">只读任务比对自适应快照；可写 gate 锁范围并强制跑通 --verify-cmd。</text>
     <text x="72" y="766" class="body">严禁放宽容差与守恒判据；文档盲读支持 --isolation 四级隔离与事实锚定。</text>
     <text x="72" y="792" class="body">Stop 检查成败词、Token 说明与回执标识；主会话亲自核对行号与算术。</text>
   </g>

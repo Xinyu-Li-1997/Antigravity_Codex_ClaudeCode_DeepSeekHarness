@@ -39,7 +39,7 @@ python -B -X utf8 "$HARNESS" assess --caller auto --redact
 
 | 指令类型与日常表达示例 | 锁定的维度（P0 优先） | 脚本自动补齐的参数与安全边界 |
 | --- | --- | --- |
-| **点名客户端或模型**：“这步编码用 Codex 高挡位做”“请交给 `<目标客户端或模型名>` 做脱敏审查” | 锁定指定的客户端、模型标识或模型系列 | 外部无头调用自动补齐模型声明最大上下文窗口、无头非交互标志、只读行号内联、文件哈希快照与输出脱敏；目标不可用或 `enabled: false` 时直接报错，不静默换端 |
+| **点名客户端或模型**：“这步编码用 Codex 高挡位做”“请交给 `<目标客户端或模型名>` 做脱敏审查” | 锁定指定的客户端、模型标识或模型系列 | 外部无头调用自动补齐模型声明最大上下文窗口、无头非交互标志、分后端只读行号内联、自适应文件快照与输出脱敏；目标不可用或 `enabled: false` 时直接报错，不静默换端 |
 | **点名挡位、隔离级别或省额度**：“这轮挂 high 挡跑”“用 `--isolation clean_room` 盲读说明文档”“省点额度快速扫一遍格式” | 锁定指定推理挡位、四级隔离模式或低消耗策略 | 显式非 `fast` 角色即使降到 `low` 挡仍保留该槽位主力模型；后端不支持所选 `--isolation` 级别时直接报错拒绝 |
 | **多端并列协作指令**：“用 Codex 与 DSH 等多工作流全仓校核验证一下” | 识别“等、和、与、及”多端并列语义，不误锁单端 | 完整保留 `--spec-file` 中各分路声明的不同对等客户端、模型与隔离级别组合 |
 | **只说研究目标（模糊交办）**：“推导弯曲网格离散几何守恒律判据”“审查 `src/flux/` 边界相容性” | 按 `--kind` 搭配 `role:orchestrator`、`role:math`、`role:code`、`role:review`、`role:fast`（或 `<client>:@<role>`、`<client>:<role>`、`<client>:default`、`<client>:<model>`） | 按 `fleet_profile.json` 候选顺序选取当前已启用且额度正常的对等端；常规任务默认采用单模型非委派最高强度（跳过会自动派生多层子代理的 `ultra`），`polish` 润色按篇幅自动选 `medium` 或 `high` |
@@ -104,7 +104,7 @@ python -B -X utf8 "$HARNESS" plan `
   --workflow-impact "纯只读检查并保存结构化回执，零源码改动"
 ```
 
-注意：两个 `role:review` 并不自动保证落在不同客户端；需要跨模型双源独立审查时，应如上例显式指定不同客户端（支持 `dsh:@review` 或简写 `dsh:review`），或使用 `audit --left ... --right ...` 双盲分片审查。对显式传入 `--files` 或单文件目标的外部无头只读流，`plan` 会在生成票据前离线核验声明上下文窗口、安全输入预算与只读内联上限：估算超出所选模型声明窗口时默认报 `over_context_window` 并输出按分片预算切分的 `suggested_shards`（自动选路优先改派更大窗口后端，确需抽查时可加 `--allow-over-budget` 放行），超出安全预算或内联上限时在明细与确认条预警；只读回执另附 `inline_readonly_summary` 统计内联与超限文件。若 `agy` 软超时收口遇零进展卡死，回执会置 `timeout_salvage.resumable: false`，后续 `followup` 自动返回 `session_not_resumable` 阻止盲目空转。多波次批处理中，前序波次同工作区（含父子目录）的可写流失败时，后续波次默认全部中止为 `upstream_wave_failed`（避免后续只读审查流在产物未落盘时白耗配额；确需独立观察前序部分结果的只读流可在流定义中显式声明 `"run_on_upstream_failure": true`）。此外，可写编码任务退出码为 0 但磁盘零改动时，回执会显式标注 `no_files_changed: true` 便于主会话及时排查是否因前置门禁停手。
+注意：两个 `role:review` 并不自动保证落在不同客户端；需要跨模型双源独立审查时，应如上例显式指定不同客户端（支持 `dsh:@review` 或简写 `dsh:review`），或使用 `audit --left ... --right ...` 双盲分片审查。对显式传入 `--files` 或单文件目标的外部无头只读流，`plan` 会在生成票据前离线核验声明上下文窗口、安全输入预算与分后端只读内联上限（`agy` 按 `agy_inline_readonly_max_kib`，其余按 `inline_readonly_max_kib`，未内联清单自动截断）：估算超出所选模型声明窗口时默认报 `over_context_window` 并输出按分片预算切分的 `suggested_shards`（自动选路优先改派更大窗口后端，确需抽查时可加 `--allow-over-budget` 放行），超出安全预算或内联上限时在明细与确认条预警；只读回执另附 `inline_readonly_summary` 统计内联与超限文件。若 `agy` 主回合触发 `--print-timeout` 时后台回合仍活跃（`with turn in progress`）或收口遇零进展卡死，回执会置 `timeout_salvage.resumable: false`，后续 `followup` 自动返回 `session_not_resumable` 阻止盲目空转。多波次批处理中，前序波次同工作区（含父子目录）的可写流失败时，后续波次默认全部中止为 `upstream_wave_failed`（避免后续只读审查流在产物未落盘时白耗配额；确需独立观察前序部分结果的只读流可在流定义中显式声明 `"run_on_upstream_failure": true`）。此外，可写编码任务退出码为 0 但磁盘零改动时，回执会显式标注 `no_files_changed: true` 便于主会话及时排查是否因前置门禁停手。
 
 `plan` 保存票据时先写 `<ticket_id>.json`，再将包含完整背景、要做什么、预计后果、4 列总览表及分路 3 列纵向 **14 项完整参数明细**的确认单写入同目录 `<ticket_id>_card.md`，同时生成日常对话用的 3 句话极简确认条 `chat_brief`、含 4 列总览表的 `compact_summary_card` 与交接片段 `compact_handoff_prompt_block`。**日常对话默认只展示 3 句话极简确认条 `chat_brief` 和可点击明细链接，严禁在聊天框粘贴表格或把多路 14 项长表展开挤占上下文**（未发生压缩且票据未变时，后台任务被动唤醒亦不得重复贴票）；14 项字段的逐项定义统一维护在 [cae-harness 技能规程](../template/user-guard/skills/cae-harness/SKILL.md#两道可用性检查与全通道确认单)，需要逐项核验时直接点击 `<ticket_id>_card.md` 链接查阅。
 
@@ -133,7 +133,7 @@ python -B -X utf8 "$HARNESS" batch `
 
 1. **数学物理控制方程与符号约定**：守恒型或原始变量顺序、无量纲参考量（ $L_{\text{ref}}, U_{\text{ref}}, \rho_{\text{ref}}$ ）、单元界面单位外法向 $\mathbf{n}$ 的指向约定、状态方程与边界相容性条件；
 2. **目标工作区路径**：对应 `--target` 根目录；
-3. **必读源码路径与精确行号区间**：直接指明相关算子与测试夹具的起止行号（避免 Windows 沙箱遍历大型目录超时；在累计内联字节上限 `inline_readonly_max_kib` 内，只读目标文件会自动附带精确行号内联）；
+3. **必读源码路径与精确行号区间**：直接指明相关算子与测试夹具的起止行号（避免 Windows 沙箱遍历大型目录超时；在各端只读内联上限 `agy_inline_readonly_max_kib` / `inline_readonly_max_kib` 内，目标文件会自动附带精确行号内联）；
 4. **允许修改的文件白名单与红线**：可写任务配合 `--write-scope` 限定路径，审查与推导任务声明“零文件修改”，严禁放宽容差或删改断言；
 5. **可执行的定量验证命令**：配合 `--verify-cmd` 运行离散守恒残差、数值导数比对或收敛阶单测。
 
@@ -176,7 +176,7 @@ python -B -X utf8 "$HARNESS" gate `
 
 ```mermaid
 flowchart TD
-    S1["1. 同端只读梳理<br/>原生 readonly-* 子代理<br/>摘录文献公式与源码行号"] --> S2["2. 独立数理推导<br/>cae-harness task --kind math<br/>role:math + 只读哈希快照"]
+    S1["1. 同端只读梳理<br/>原生 readonly-* 子代理<br/>摘录文献公式与源码行号"] --> S2["2. 独立数理推导<br/>cae-harness task --kind math<br/>role:math + 只读自适应快照"]
     S2 --> S3["3. 白名单编码与定量门禁<br/>cae-harness gate --worker role:code<br/>--write-scope + --verify-cmd 闭环"]
     S3 -->|verify_exit_code != 0 且未达 max_rounds<br/>回传真实报错继续修正| S3
     S3 -->|达 max_rounds 仍未过| F["终止并如实汇报失败现场"]
@@ -195,7 +195,7 @@ flowchart TD
    python -B -X utf8 "$HARNESS" plan `
      --resume-ticket "<票据标识>" --plan-dir "<授权票据目录>" --user-prompt "<用户点名原话>"
    ```
-3. **持久化续接、双层超时抢救与完工回执核验**：外部无头会话按 `persist_sessions_by_default` 默认保存 `provider_session_id`（显式传 `--ephemeral` 时关闭）。长任务达到软时限时先自动降为低推理挡位（`low` 或模型目录声明的最低可用非委派挡位）发起只读续接收尾（`soft_timeout_wrapup`）；到达硬截止仍超时时，只要实时管道或本地会话日志有已落盘记录，回执即保留真实 `timeout` 状态、总预算 `timeout_sec` 与主回合 `primary_timeout_sec`，并返回已产出的部分用量（`cli_partial_on_timeout`）及 `timeout_salvage`（含已读文件、落盘改动与优先保留正式助手回复的末尾消息）。后续可用 `followup --receipt <回执路径> [--stream <流号>] [--ticket <票据标识>] --task "<追问内容>"` 沿原会话读写范围追问（原会话可写或超出轻任务时限时须绑定已批 `--ticket`）。任务结束后，`reply_repeat_guard.py` 在 `Stop` 拦截将局部补测冒充全套测试通过、将含失败或超时的账单写成“全部成功”的表述，并检查本轮回复是否包含：明确的执行成败词、真实 Token 用量数字（或“该通道未单独暴露整数、无法统计”的明确说明），以及外部任务的各流标识（单路 `task` 或单路 `gate` 省略默认流号 `S1` 时须匹配具体模型名，仅在未记录具体模型名时可用任务状态词替代）与非空回执实际文件名（内部原生任务则覆盖完成数量、全部流标识或互不重复的角色名之一及轨迹或日志说明）。漏报且同回合未触发其他门禁时单次阻断并附上磁盘账单；主会话仍须逐路核对真实状态（`status`、`gate_passed`、`scope_violations`）、`citation_audit` 原文行号与汇总算术。
+3. **持久化续接、双层超时抢救与完工回执核验**：外部无头会话按 `persist_sessions_by_default` 默认保存 `provider_session_id`（显式传 `--ephemeral` 时关闭）。长任务达到软时限时先自动降为低推理挡位（`low` 或模型目录声明的最低可用非委派挡位）向独立 `result_wrapup.json` 发起紧凑输出的只读续接收尾（`soft_timeout_wrapup`，`agy` 后台活跃回合直接跳过死锁收口）；到达硬截止仍超时时，只要实时管道或本地会话日志有已落盘记录，回执即保留真实 `timeout` 状态、总预算 `timeout_sec` 与主回合 `primary_timeout_sec`，并返回已产出的部分用量（`cli_partial_on_timeout`）及 `timeout_salvage`（含已读文件、落盘改动与优先保留正式助手回复的末尾消息）。后续可用 `followup --receipt <回执路径> [--stream <流号>] [--effort <挡位>] [--ticket <票据标识>] --task "<追问内容>"` 沿原会话读写范围追问（续接超时回执未指定挡位时默认按 `followup_default_effort` 降挡防二次超时；原会话可写或超出轻任务时限时须绑定已批 `--ticket`）。任务结束后，`reply_repeat_guard.py` 在 `Stop` 拦截将局部补测冒充全套测试通过、将含失败或超时的账单写成“全部成功”的表述，并检查本轮回复是否包含：明确的执行成败词、真实 Token 用量数字（兼容 Markdown 表格账单 Token 列及“无法统计”等明确说明），以及外部任务的各流标识（单路 `task` 或单路 `gate` 省略默认流号 `S1` 时须匹配具体模型名，仅在未记录具体模型名时可用任务状态词替代）与非空回执实际文件名（内部原生任务则覆盖完成数量、全部流标识或互不重复的角色名之一及轨迹或日志说明）。漏报且同回合未触发其他门禁时单次阻断并附上磁盘账单；主会话仍须逐路核对真实状态（`status`、`gate_passed`、`scope_violations`）、`citation_audit` 原文行号与汇总算术。
 
 ---
 

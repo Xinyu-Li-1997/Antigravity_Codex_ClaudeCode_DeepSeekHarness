@@ -432,7 +432,8 @@
       "persist_sessions_by_default": true,
       "soft_timeout_ratio": 0.85,
       "wrapup_min_sec": 30,
-      "wrapup_max_sec": 90,
+      "wrapup_max_sec": 150,
+      "followup_default_effort": "medium",
       "grounding_max_anchor_file_mib": 2,
       "grounding_excluded_dirs": [".micromamba", ".toolchain", "conda-meta", "archive", "archived", "outdated"],
       "input_budget_safety_ratio": 0.9,
@@ -462,6 +463,7 @@
         "key_cache_ttl_sec": 60
       },
       "inline_readonly_max_kib": 512,
+      "agy_inline_readonly_max_kib": 128,
       "snapshot_ignored_dirs": [
         ".git",
         ".venv",

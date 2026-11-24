@@ -818,6 +818,39 @@ def _heavy_report_blocked(state_dir, sid, turn_key, payload):
     return state.get("turn") == turn_key and state.get("blocked") is True
 
 
+def _has_token_report(reply: str) -> bool:
+    if re.search(
+        r"tokens?[^\n。；]*\d|\d[\d, ]*[`*_]*\s*[`*_]*tokens?"
+        r"|tokens?[^\n。；]*(?:未.*(?:暴露|提供|统计)|无法|不.*(?:暴露|提供))"
+        r"|未[^\n。；]*(?:暴露|提供)[^\n。；]*tokens?",
+        reply,
+        re.I,
+    ):
+        return True
+    # 兼容 Markdown 表格账单：表头含 Token 列、紧随分隔线且对应 Token 列单元格含数字或未上报说明。
+    lines = reply.splitlines()
+    for idx in range(len(lines) - 2):
+        hdr = lines[idx]
+        sep = lines[idx + 1]
+        if (
+            "|" in hdr
+            and re.search(r"tokens?", hdr, re.I)
+            and re.match(r"^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*$", sep)
+        ):
+            hdr_cells = [c.strip() for c in hdr.strip().strip("|").split("|")]
+            token_cols = [c_idx for c_idx, cell in enumerate(hdr_cells) if re.search(r"tokens?", cell, re.I)]
+            if not token_cols:
+                continue
+            for row in lines[idx + 2:]:
+                if "|" not in row:
+                    break
+                row_cells = [c.strip() for c in row.strip().strip("|").split("|")]
+                for c_idx in token_cols:
+                    if c_idx < len(row_cells) and re.search(r"\d|无法统计|未暴露|未提供|未上报|不暴露|不提供", row_cells[c_idx]):
+                        return True
+    return False
+
+
 def _check_heavy_report_locked(payload, state_dir, sid, turn_key, reply, decision, *, reconcile_only: bool = False):
     if (
         os.environ.get("CAE_HARNESS_DEPTH", "").strip() not in ("", "0")
@@ -842,7 +875,7 @@ def _check_heavy_report_locked(payload, state_dir, sid, turn_key, reply, decisio
     failure = re.search(r"失败|超时|部分(?:完成|成功|通过)|\b(?:fail(?:ed|ures?)|time(?:d)?[ _-]?out|partial(?:ly)?|"
                         r"invalid_output|verification_failed|scope_violation)\b", facts, re.I)
     status = failure or re.search(r"成功|完成|通过|\b(?:succeeded|completed|passed|ok)\b", reply, re.I)
-    tokens = bool(re.search(r"tokens?[^\n。；]*\d|\d[\d, ]*[`*_]*\s*[`*_]*tokens?|tokens?[^\n。；]*(?:未.*(?:暴露|提供|统计)|无法|不.*(?:暴露|提供))|未[^\n。；]*(?:暴露|提供)[^\n。；]*tokens?", reply, re.I))
+    tokens = _has_token_report(reply)
     receipt = bool(re.search(r"receipt|回执|轨迹|日志|[\w-]+\.(?:jsonl|json|log)\b", reply, re.I))
     def has_token(token):
         if not token:
@@ -1150,6 +1183,8 @@ def _handle_stop_locked(payload: Dict[str, Any], state_dir: Path, conversation_i
 
 def handle_stop_repeat_guard(payload: Dict[str, Any]) -> Dict[str, Any]:
     """处理 Stop 事件防复读刷屏检测"""
+    if os.environ.get("CAE_HARNESS_DEPTH", "").strip() not in ("", "0"):
+        return {"decision": "allow"}
     _sync_repeat_tunables()
     conversation_id = str(payload.get("conversationId") or "unknown_session").strip()
     termination_reason = str(payload.get("terminationReason") or "").strip().casefold()

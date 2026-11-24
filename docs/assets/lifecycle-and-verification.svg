@@ -30,7 +30,7 @@
   <g><rect x="32" y="460" width="850" height="162" rx="14" fill="#ffffff" stroke="#b5c8e5"/>
     <text x="54" y="492" class="heading">按批准计划执行：读写边界与验证门禁严格受控</text>
     <text x="54" y="521" class="body">batch 仅执行外部无头通道；原生子代理由当前客户端按批准计划调用。</text>
-    <text x="54" y="546" class="body">在累计内联上限内为只读小文件附带精确行号，前后按过滤规则比对文件哈希快照。</text>
+    <text x="54" y="546" class="body">按后端内联上限为只读文件附带精确行号，前后按过滤规则以自适应快照核验改动。</text>
     <text x="54" y="571" class="body">gate 锁定 --write-scope 白名单并强制跑通非空 --verify-cmd。</text>
     <text x="54" y="596" class="body">触发 quota_exhausted 立即停止重试；同后端排队流熔断并保留已跑结果。</text>
   </g>

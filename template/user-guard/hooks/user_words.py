@@ -1987,20 +1987,17 @@ def codex_hook_session(
 ) -> Tuple[str, Optional[Path], Optional[str], bool]:
     """供两个钩子共用，返回会话标识、轨迹、未核实原因与子会话跳过标记。"""
     sid = str(payload.get("session_id") or "").strip()
+    if os.environ.get("CAE_HARNESS_DEPTH", "").strip() not in ("", "0"):
+        return sid, None, None, True
     agent_id = payload.get("agent_id")
     if agent_id is not None and str(agent_id) != sid:
         return sid, None, None, True
     if not valid_session_id(sid):
         return sid, None, "hook input 缺少有效 session_id", False
     raw_path = strip_win_extended_prefix(str(payload.get("transcript_path") or ""))
-    in_harness = os.environ.get("CAE_HARNESS_DEPTH", "").strip() not in ("", "0")
     if not raw_path:
-        if in_harness:
-            return sid, None, None, True
         return sid, None, "未提供 transcript_path，无法核实主会话身份", False
     transcript = Path(raw_path).expanduser()
-    if not transcript.is_file() and in_harness:
-        return sid, None, None, True
     meta, error = read_codex_rollout_meta(transcript)
     if meta and meta["source_kind"] == "subagent":
         return sid, None, None, True
@@ -2823,8 +2820,10 @@ CLAUDE_INJECTED_TAG_RE = re.compile(
 
 
 def claude_hook_session(payload: Dict[str, Any]) -> Tuple[str, Optional[Path], str, bool]:
-    """定位显式主轨迹；子代理支线返回 skip=True，未传路径时仅查 projects 下同 ID 主会话。"""
+    """定位显式主轨迹；子代理支线与无头子任务返回 skip=True，未传路径时仅查 projects 下同 ID 主会话。"""
     sid = str(payload.get("session_id") or "").strip()
+    if os.environ.get("CAE_HARNESS_DEPTH", "").strip() not in ("", "0"):
+        return sid, None, "", True
     if payload.get("agent_id"):
         return sid, None, "", True
     if not valid_session_id(sid):
@@ -2842,8 +2841,6 @@ def claude_hook_session(payload: Dict[str, Any]) -> Tuple[str, Optional[Path], s
         candidates = [path for path in candidates if path.is_file()]
         if candidates:
             return sid, max(candidates, key=lambda path: path.stat().st_mtime_ns), "", False
-    if os.environ.get("CAE_HARNESS_DEPTH", "").strip() not in ("", "0"):
-        return sid, None, "", True
     return sid, None, "未找到 Claude 会话轨迹文件", False
 
 

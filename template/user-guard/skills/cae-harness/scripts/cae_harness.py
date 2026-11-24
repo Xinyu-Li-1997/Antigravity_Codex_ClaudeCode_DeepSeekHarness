@@ -4553,7 +4553,45 @@ def _dsh_supports_cli_permission_flags(binary, env=None, *, interop=False):
         return supported
 
 
-def _inline_readonly_prompt(prompt, root, rel_files=None, *, exclude_agent_instructions=False, included=None, summary=None):
+_INLINE_OMITTED_LIST_MAX_ITEMS = 80
+_INLINE_OMITTED_LIST_MAX_BYTES = 8 * 1024
+_INLINE_OMITTED_RECEIPT_MAX_ITEMS = 200
+_CODEX_MAX_PROMPT_CHARS = 950_000
+
+
+def _inline_readonly_cap_bytes(prefix=''):
+    hd = _headless_tunables()
+    default_kib = _positive_int(hd.get('inline_readonly_max_kib')) or 512
+    if str(prefix or '').strip().lower() == 'agy':
+        agy_kib = _positive_int(hd.get('agy_inline_readonly_max_kib'))
+        if agy_kib is None:
+            agy_kib = min(default_kib, 128)
+        return agy_kib * 1024
+    return default_kib * 1024
+
+
+def _format_omitted_list_suffix(omitted):
+    if not omitted:
+        return ''
+    prefix_text = '\n未内联清单：'
+    shown = []
+    used = len(prefix_text.encode('utf-8'))
+    for rel in omitted:
+        if len(shown) >= _INLINE_OMITTED_LIST_MAX_ITEMS:
+            break
+        sep = ', ' if shown else ''
+        piece = sep + rel
+        piece_bytes = len(piece.encode('utf-8'))
+        if shown and used + piece_bytes > _INLINE_OMITTED_LIST_MAX_BYTES:
+            break
+        shown.append(rel)
+        used += piece_bytes
+    rest = len(omitted) - len(shown)
+    tail = f' ...（其余 {rest} 个文件已省略，请按需定向读取）' if rest > 0 else ''
+    return prefix_text + ', '.join(shown) + tail
+
+
+def _inline_readonly_prompt(prompt, root, rel_files=None, *, exclude_agent_instructions=False, included=None, summary=None, prefix=''):
     root = Path(root).resolve()
     norm_rels = [_literal_input_path(rel) for rel in rel_files] if rel_files is not None else None
     explicit_single = norm_rels is not None and len(norm_rels) == 1
@@ -4578,10 +4616,10 @@ def _inline_readonly_prompt(prompt, root, rel_files=None, *, exclude_agent_instr
             if records and not filtered:
                 raise HarnessError(_CLEAN_ROOM_ONLY_INSTR_ERROR)
             records = filtered
-    cap = (_positive_int(_headless_tunables().get('inline_readonly_max_kib')) or 512) * 1024
+    cap = _inline_readonly_cap_bytes(prefix)
     header_full = '\n\n所需目标文件原文已附带精确行号内联在下方，请勿再重复调用文件读取工具遍历工作区。\n'
     header_partial = '\n\n以下已内联文件附带精确行号，对已内联文件请勿再重复调用文件读取工具；未内联清单中的非敏感文本文件可按需单次读取。\n'
-    blocks, omitted, cap_omitted_count = [], [], 0
+    blocks, block_rels, omitted, cap_omitted_count = [], [], [], 0
     size = max(len(header_full.encode('utf-8')), len(header_partial.encode('utf-8')))
     for item in records:
         path, rel = Path(item['path']), item['rel_path']
@@ -4612,10 +4650,24 @@ def _inline_readonly_prompt(prompt, root, rel_files=None, *, exclude_agent_instr
                 continue
             size += block_size
             blocks.append(block)
-            if included is not None:
-                included.append(rel)
+            block_rels.append(rel)
         except (OSError, ValueError):
             omitted.append(rel)
+    if str(prefix or '').strip().lower() == 'codex':
+        # Codex CLI 单条输入协议硬上限约 1,048,576 字符；预留安全余量防止 input_too_large。
+        while blocks:
+            candidate_suffix = _format_omitted_list_suffix(omitted)
+            candidate_header = header_partial if omitted else header_full
+            total_chars = len(prompt) + len(candidate_header) + sum(len(b) for b in blocks) + len(candidate_suffix)
+            if total_chars <= _CODEX_MAX_PROMPT_CHARS:
+                break
+            dropped_block = blocks.pop()
+            dropped_rel = block_rels.pop()
+            size -= len(dropped_block.encode('utf-8'))
+            omitted.insert(0, dropped_rel)
+            cap_omitted_count += 1
+    if included is not None:
+        included.extend(block_rels)
     if isinstance(summary, dict):
         summary.update(
             inlined_count=len(blocks),
@@ -4623,10 +4675,11 @@ def _inline_readonly_prompt(prompt, root, rel_files=None, *, exclude_agent_instr
             cap_omitted_count=cap_omitted_count,
             inlined_bytes=size if blocks else 0,
             cap_bytes=cap,
-            omitted_files=list(omitted),
+            omitted_files=list(omitted[:_INLINE_OMITTED_RECEIPT_MAX_ITEMS]),
+            omitted_files_truncated=len(omitted) > _INLINE_OMITTED_RECEIPT_MAX_ITEMS,
         )
     header = header_partial if omitted else header_full
-    suffix = ('\n未内联清单：' + ', '.join(omitted)) if omitted else ''
+    suffix = _format_omitted_list_suffix(omitted)
     return prompt + (header + ''.join(blocks) if blocks else '') + suffix
 
 
@@ -4687,6 +4740,14 @@ def extract_cli_token_usage(prefix, raw_stdout, raw_stderr=''):
                     inp += extra_cache
                 elif total is not None and out is None and inp + extra_cache <= total:
                     inp += extra_cache
+        elif prefix == 'agy':
+            if inp is not None and cached:
+                # agy CLI 的 input_tokens 与 total_tokens 均不含 cache_read_tokens；仅在口径未含缓存时补入总输入防重复计数。
+                if total is None or (out is not None and inp + out == total):
+                    orig_inp = inp
+                    inp += cached
+                    if total is not None and out is not None and total == orig_inp + out:
+                        total = inp + out
         if total is None and inp is not None and out is not None:
             total = inp + out
         return {'input_tokens': inp, 'cached_input_tokens': cached, 'output_tokens': out, 'total_tokens': total}
@@ -4736,12 +4797,20 @@ def _provider_id(event):
 
 
 def _session_logs(prefix, home, sid, isolated):
-    subdir = {'codex': 'sessions', 'claude': 'projects', 'agy': 'antigravity-cli/brain', 'dsh': 'sessions'}[prefix]
+    if not (home and (sid or isolated)):
+        return []
+    if prefix == 'dsh':
+        pat = f'**/{sid or "*"}/session*.jsonl*'
+        for sub in ('headless-sessions', 'sessions'):
+            found = sorted(p for p in (home / sub).glob(pat) if p.is_file() and not _is_link(p))
+            if found:
+                return found
+        return []
+    subdir = {'codex': 'sessions', 'claude': 'projects', 'agy': 'antigravity-cli/brain'}[prefix]
     patterns = {'codex': f'**/rollout-*{sid or ""}.jsonl', 'claude': f'**/{sid}.jsonl',
-                'agy': f'{sid}/.system_generated/logs/transcript*.jsonl',
-                'dsh': f'**/{sid or "*"}/session*.jsonl*'}
+                'agy': f'{sid}/.system_generated/logs/transcript*.jsonl'}
     return sorted(p for p in (home / subdir).glob(patterns[prefix])
-                  if p.is_file() and not _is_link(p)) if home and (sid or isolated) else []
+                  if p.is_file() and not _is_link(p))
 
 
 def _is_resolved_within(candidate, base_dir):
@@ -4850,8 +4919,30 @@ def _session_trace(events, root, stage_dir):
 _CITATION_SPAN_RE = re.compile(
     r'\x60([^\x60\r\n]+?)(?:#L|:)(\d+)(?:(?:-L?)(\d+))?\x60'
     r'|\x60([^\x60\r\n]+?)\x60(?:#L|:)(\d+)(?:(?:-L?)(\d+))?'
-    r'|([^\s\x60<>()\[\]"\'：,，;；。、！？【】「」『』（）]+?)(?:#L|:)(\d+)(?:(?:-L?)(\d+))?'
+    r'|([^\s\x60<>()\[\]"\'：,，;；。、！？【】「」『』（）｜–—]+?)(?:#L|:)(\d+)(?:(?:-L?)(\d+))?'
 )
+
+_CITATION_NOISE_CHARS_RE = re.compile(r'[\s｜、，；：！？【】「」『』（）{}\*\?<>"]')
+_CITATION_PURE_EXT_RE = re.compile(r'^(?:\.[A-Za-z0-9_-]+)+$')
+
+
+def _is_plausible_citation_candidate(candidate, root):
+    if not candidate or candidate.startswith('#') or re.match(r'^\w+://', candidate):
+        return False
+    if candidate.isdigit() or _CITATION_NOISE_CHARS_RE.search(candidate):
+        return False
+    if candidate.strip('.,;:/\\-_~') == '':
+        return False
+    with contextlib.suppress(OSError):
+        if (root / candidate).is_file():
+            return True
+    if _CITATION_PURE_EXT_RE.match(candidate) or re.fullmatch(r'[\d/\\._-]+', candidate):
+        return False
+    if '/' in candidate or '\\' in candidate:
+        return True
+    if '.' in candidate and not candidate.startswith('.') and not candidate.endswith('.'):
+        return True
+    return False
 
 
 def _citation_audit(result, root, reads, inlined, stage_dir=None):
@@ -4864,9 +4955,10 @@ def _citation_audit(result, root, reads, inlined, stage_dir=None):
             bare = g[6]
             start = g[1] or g[4] or g[7]
             end = g[2] or g[5] or g[8]
-            candidate = (quoted or bare).strip().lstrip('[')
-            if not re.match(r'^\w+://', candidate) and (quoted or re.search(r'[./\\]|#L', match[0]) or
-                                                        (root / candidate).is_file()):
+            candidate = (quoted or bare).strip().lstrip('[').rstrip('.,;:')
+            if _is_plausible_citation_candidate(candidate, root) and (
+                quoted or re.search(r'[./\\]|#L', match[0]) or (root / candidate).is_file()
+            ):
                 refs.add((candidate, int(start), int(end or start)))
     audit = dict(actual_files_read=reads, inlined_files=inlined, missing_files=[], out_of_range_lines=[], unopened_cited_files=[])
     lengths, opened = {}, set(reads) | set(inlined)
@@ -4976,20 +5068,61 @@ _AGY_NON_PROGRESS_EVENTS = frozenset({
 })
 
 
+def _rmtree_retry(path, *, ignore_errors=False, retries=5, delay=0.1):
+    target = Path(path)
+    if not os.path.lexists(target):
+        return
+    last_exc = None
+    for attempt in range(max(1, retries)):
+        try:
+            shutil.rmtree(target)
+            return
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            last_exc = exc
+            if attempt + 1 < retries:
+                time.sleep(delay * (attempt + 1))
+    if not ignore_errors and last_exc is not None:
+        raise last_exc
+
+
 def _turn_made_model_progress(prefix, raw_out, events, raw_file_text=''):
-    """判断本回合是否实际进入模型推理或工具阶段（目前仅对 agy 启用严格零进展卡死判定）。"""
+    """判断本回合是否实际进入模型推理或工具阶段（对 agy 解包 step_update 与 result，避免被累计 usage 误导）。"""
     if prefix != 'agy':
         return True
     if (raw_file_text or '').strip():
         return True
-    usage = extract_cli_token_usage(prefix, raw_out, '')
-    if usage.get('usage_source') != 'unreported_by_cli' and (usage.get('total_tokens') or 0) > 0:
-        return True
+    saw_structured_agy = False
     for ev in events or ():
         if not isinstance(ev, dict):
             continue
         ev_name = str(ev.get('event') or ev.get('type') or '').strip().lower()
-        if ev_name and ev_name not in _AGY_NON_PROGRESS_EVENTS:
+        if not ev_name:
+            continue
+        if ev_name == 'step_update':
+            saw_structured_agy = True
+            su = ev.get('step_update')
+            if isinstance(su, dict):
+                step_type = str(su.get('step_type') or '').strip().lower()
+                if step_type and step_type not in _AGY_NON_PROGRESS_EVENTS:
+                    return True
+            continue
+        if ev_name == 'result':
+            saw_structured_agy = True
+            res = ev.get('result')
+            if isinstance(res, dict):
+                if str(res.get('response') or '').strip() or res.get('structured_output') is not None:
+                    return True
+                finished_reason = str(res.get('finished_reason') or '').strip().lower()
+                if finished_reason and finished_reason not in ('print_timeout', 'timeout', 'error', 'cancelled', 'canceled'):
+                    return True
+            continue
+        if ev_name not in _AGY_NON_PROGRESS_EVENTS:
+            return True
+    if not saw_structured_agy:
+        usage = extract_cli_token_usage(prefix, raw_out, '')
+        if usage.get('usage_source') != 'unreported_by_cli' and (usage.get('total_tokens') or 0) > 0:
             return True
     return False
 
@@ -5004,7 +5137,7 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
     persist = bool(resume) or (not ephemeral and hd.get('persist_sessions_by_default', True))
     soft = persist and timeout_sec >= 120
     primary_budget = (min(timeout_sec - hd.get('wrapup_min_sec', 30),
-                          max(timeout_sec - hd.get('wrapup_max_sec', 90), int(timeout_sec * hd.get('soft_timeout_ratio', .85))))
+                          max(timeout_sec - hd.get('wrapup_max_sec', 150), int(timeout_sec * hd.get('soft_timeout_ratio', .85))))
                       if soft else timeout_sec)
     batch = batch or _QuotaBatch(retry_quota)
     prefix, _ = _engine_parts(spec)
@@ -5057,12 +5190,13 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
             cleanup.enter_context(_directory_file_lock(resolved_plan / 'headless_sessions', f'stage_{store_id}', '无头会话暂存'))
             temp_path = Path(temp_parent or tempfile.gettempdir()) / f'cae-harness-{store_id}'
             if temp_path.exists() and not _is_link(temp_path):
-                shutil.rmtree(temp_path)
+                _rmtree_retry(temp_path)
             temp_path.mkdir(mode=0o700)
-            cleanup.callback(shutil.rmtree, temp_path)
+            cleanup.callback(_rmtree_retry, temp_path, ignore_errors=True)
             receipt.update(session_store_id=store_id, session_plan_dir=str(resolved_plan))
         else:
-            temp_path = Path(cleanup.enter_context(tempfile.TemporaryDirectory(prefix='cae-harness-', dir=temp_parent)))
+            temp_path = Path(tempfile.mkdtemp(prefix='cae-harness-', dir=temp_parent))
+            cleanup.callback(_rmtree_retry, temp_path, ignore_errors=True)
         schema_file = temp_path / 'schema.json'
         schema_file.write_text(json.dumps(schema, ensure_ascii=False), encoding='utf-8')
         output_file = temp_path / 'result.json'
@@ -5210,6 +5344,7 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
         def turn(readonly, exec_prompt, budget, session_id, wrapup=False):
             native_pid_file = None
             win_target = translate(exec_dir)
+            turn_output_file = (temp_path / 'result_wrapup.json') if wrapup else output_file
             turn_model, turn_effort, wrapup_effort_label = (
                 _wrapup_model_and_effort() if wrapup else (model, effort, None)
             )
@@ -5222,7 +5357,7 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
             if prefix == 'codex':
                 command = [binary, 'exec', '--json', '-s', 'read-only' if readonly else 'workspace-write',
                            '-c', 'approval_policy="never"',
-                           '--skip-git-repo-check', '-C', win_target, '--output-schema', translate(schema_file), '-o', translate(output_file)]
+                           '--skip-git-repo-check', '-C', win_target, '--output-schema', translate(schema_file), '-o', translate(turn_output_file)]
                 if turn_model:
                     command.extend(['-m', turn_model])
                 if turn_effort:
@@ -5302,7 +5437,7 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
                     '- id: approval\n  config:\n    policy: never\n- id: permission\n  config:\n    mode: ' + mode_str + '\n'
                 ) if not supports_perm_flags else ''
                 storage = ('- id: session-persistence-jsonl\n  config:\n    compression: none\n    root: '
-                           + json.dumps(translate(home / 'sessions')) + '\n') if home else ''
+                           + json.dumps(translate(home / 'headless-sessions')) + '\n') if home else ''
                 patch_file.write_text(
                     legacy_permissions + storage + '- id: credentials\n  disabled: false\n- id: authorization\n  disabled: false\n'
                     '- id: deepseek-account\n  disabled: false\n- id: agent-default-model\n'
@@ -5364,7 +5499,7 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
                 result = subprocess.CompletedProcess(command, exc.details.get('returncode'),
                                                      exc.details.get('partial_stdout', ''), exc.details.get('partial_stderr', ''))
             receipt['invocation_started'] |= process_failure is None or bool(process_failure.details.get('process_started'))
-            raw = _optional_text(output_file)
+            raw = _optional_text(turn_output_file)
             events = list(_json_events(result.stdout.splitlines()))
             outputs.append((result.stdout, result.stderr, events, raw))
             receipt['returncode'] = result.returncode
@@ -5373,7 +5508,7 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
             startup_stderr = all(not line.strip() or _is_quota_exhausted(line)
                                  for line in (result.stderr or '').splitlines())
             receipt['startup_only'] = (_quota_startup_only(result.stdout) and startup_stderr
-                                       and not (output_file.exists() and output_file.stat().st_size))
+                                       and not (turn_output_file.exists() and turn_output_file.stat().st_size))
             if prefix == 'agy' and result.returncode == 0:
                 # 仅解释 stderr 中明确的终止诊断；普通警告不参与失败分类。
                 diagnostics = [line.strip() for line in (result.stderr or '').splitlines()
@@ -5419,14 +5554,14 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
                     raise HarnessError(f'{prefix} 额度不足或已达用量上限，已停止并记录冷却状态',
                                        'quota_exhausted', preflight_blocked=False,
                                        **_quota_user_choices(prefix, cooldown)) from exc
-                if exc.status == 'invalid_output':
+                if exc.status in ('invalid_output', 'timeout'):
                     redacted_stderr = _redact_runtime_secret(result.stderr or '')[-2000:]
                     redacted_raw = _redact_runtime_secret(raw or '')[-1500:]
                     if redacted_stderr and 'stderr' not in exc.details:
                         exc.details['stderr'] = redacted_stderr
-                    if redacted_raw and 'raw_output_excerpt' not in exc.details:
+                    if exc.status == 'invalid_output' and redacted_raw and 'raw_output_excerpt' not in exc.details:
                         exc.details['raw_output_excerpt'] = redacted_raw
-                    if prefix == 'agy' and 'soft-denying' in (result.stderr or '').lower():
+                    if exc.status == 'invalid_output' and prefix == 'agy' and 'soft-denying' in (result.stderr or '').lower():
                         exc.details.setdefault(
                             'diagnostic_hint',
                             'agy 无头只读模式下触发了工具权限软拒绝（soft-denying），通常因尝试读取工作目录外文件所致，请检查目标目录或 --add-dir 范围。',
@@ -5463,6 +5598,7 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
             return None
 
         wrapup_stalled = False
+        wrapup_blocked_reason = ''
         try:
             if needs_stage:
                 stage_dir = _stage_wsl_readonly_workspace(target_dir, temp_path, stage_files, exclude_agent_instructions=clean_room)
@@ -5476,7 +5612,7 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
             if readonly and (inline_readonly is True or (inline_readonly is None and clean_room)):
                 inline_summary = {}
                 prompt = _inline_readonly_prompt(prompt, exec_dir, stage_files, exclude_agent_instructions=clean_room,
-                                                 included=inlined, summary=inline_summary)
+                                                 included=inlined, summary=inline_summary, prefix=prefix)
                 receipt['inline_readonly_summary'] = inline_summary
             if prefix == 'codex' and _is_appcontainer_or_interop_codex(info) and not clean_room and not resume:
                 if readonly:
@@ -5488,7 +5624,8 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
                 else:
                     prompt += (
                         '\n[Windows Codex 沙箱边界] 本沙箱禁止调用 wsl.exe（将返回 Wsl/E_ACCESSDENIED）；'
-                        '若项目门禁涉及 WSL，请在回执 unverified 中如实披露并按授权范围处理，严禁反复重试 wsl.exe。'
+                        '若项目门禁涉及 WSL，请在回执 unverified 中如实披露并按授权范围处理，严禁反复重试 wsl.exe；'
+                        '验证或编译产生的临时目录请置于系统临时区或退出前彻底清理，严禁在工作区根目录遗留未授权临时目录。'
                     )
             try:
                 parsed = turn(readonly, prompt, primary_budget, resume_id)
@@ -5502,14 +5639,31 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
                 if parsed is None:
                     with contextlib.suppress(OSError):
                         session_logs()
+                    primary_stderr = str(exc.details.get('stderr') or '')
+                    if outputs:
+                        primary_stderr = primary_stderr + '\n' + str(outputs[-1][1] or '')
+                    if (
+                        prefix == 'agy'
+                        and exc.details.get('finished_reason') == 'print_timeout'
+                        and 'with turn in progress' in primary_stderr.lower()
+                    ):
+                        wrapup_stalled = True
+                        wrapup_blocked_reason = 'agy_background_turn_in_progress'
+                        receipt['wrapup_stalled'] = True
+                        exc.details['wrapup_stalled'] = True
+                        exc.details['wrapup_status'] = 'skipped_background_turn_active'
+                        raise
                     sid = receipt['provider_session_id']
                     remaining = wall_deadline - time.monotonic()
                     if not (sid and receipt['invocation_started'] and remaining >= 20 and not _CANCELLED.is_set()):
                         raise
-                    output_file.unlink(missing_ok=True)
                     try:
-                        parsed = turn(True, '立即停止工具调用。仅根据已读上下文和已完成工作，按原 JSON Schema 返回结论、已核实证据和未完事项。',
-                                      int(remaining), sid, wrapup=True)
+                        parsed = turn(
+                            True,
+                            '立即停止工具调用。仅根据已读上下文和已完成工作，按原 JSON Schema 紧凑收口：'
+                            '将总输出控制在约 1500 tokens 以内，只保留核心结论、关键阻断项或改动项的精确文件路径与行号及未完事项，严禁长段复述或全文重写。',
+                            int(remaining), sid, wrapup=True,
+                        )
                     except HarnessError as wrapup:
                         if wrapup.status in ('cancelled', 'quota_exhausted'):
                             wrapup.details['primary_status'] = exc.status
@@ -5526,6 +5680,7 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
                                 w_out, _, w_events, w_raw = outputs[-1]
                                 if not _turn_made_model_progress('agy', w_out, w_events, w_raw):
                                     wrapup_stalled = True
+                                    wrapup_blocked_reason = 'agy_wrapup_stalled_without_model_turn'
                                     receipt['wrapup_stalled'] = True
                                     exc.details['wrapup_stalled'] = True
                             raise exc from wrapup
@@ -5560,9 +5715,18 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
                     receipt['session_log_error'] = str(exc)
             timed_out = failure is not None and failure.status == 'timeout'
             usages = [extract_cli_token_usage(prefix, out, err) for out, err, _, _ in outputs]
-            usage = _usage_summary([{'token_usage': u} for u in usages])
-            reported = usage.pop('reported_streams')
-            usage.pop('unreported_streams')
+            if prefix == 'agy' and len(usages) > 1:
+                # agy --conversation 续接返回的 result.usage 为全会话累计值，取各字段最大值避免主回合与收口重复叠加。
+                reported_items = [u for u in usages if u.get('usage_source') != 'unreported_by_cli']
+                reported = len(reported_items)
+                usage = {}
+                for k in ('input_tokens', 'cached_input_tokens', 'output_tokens', 'total_tokens'):
+                    vals = [u[k] for u in reported_items if type(u.get(k)) is int]
+                    usage[k] = max(vals) if vals else None
+            else:
+                usage = _usage_summary([{'token_usage': u} for u in usages])
+                reported = usage.pop('reported_streams')
+                usage.pop('unreported_streams')
             if totals and not resume_id and (reported < len(outputs) or timed_out):
                 rollup = extract_cli_token_usage(prefix, json.dumps({'usage': totals}))
                 if not reported or (rollup['total_tokens'] or 0) >= (usage['total_tokens'] or 0):
@@ -5581,11 +5745,18 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
                 salvage = dict(provider_session_id=sid, resumable=can_resume,
                                actual_files_read=reads, changed_files_on_disk=None, last_messages=messages)
                 if wrapup_stalled:
-                    salvage['resume_blocked_reason'] = 'agy_wrapup_stalled_without_model_turn'
-                    salvage['resume_warning'] = (
-                        'agy 收口续接超时且未进入模型推理（0 token 且无模型响应事件），'
-                        '原会话状态疑似异常或已锁死；禁止继续 followup，请按分片缩减输入后新开会话。'
-                    )
+                    reason_code = wrapup_blocked_reason or 'agy_wrapup_stalled_without_model_turn'
+                    salvage['resume_blocked_reason'] = reason_code
+                    if reason_code == 'agy_background_turn_in_progress':
+                        salvage['resume_warning'] = (
+                            'agy 主回合触发 --print-timeout 时后台回合仍在执行且 CLI 未取消该回合，'
+                            '立即同会话续接将被阻塞卡死；已跳过收口并禁止继续 followup，请按分片缩减输入后新开会话。'
+                        )
+                    else:
+                        salvage['resume_warning'] = (
+                            'agy 收口续接超时且未进入模型推理（0 token 且无模型响应事件），'
+                            '原会话状态疑似异常或已锁死；禁止继续 followup，请按分片缩减输入后新开会话。'
+                        )
                 receipt['timeout_salvage'] = failure.details['timeout_salvage'] = salvage
             if readonly and parsed is not None:
                 receipt['citation_audit'] = _citation_audit(parsed, target_dir, reads, inlined, stage_dir=stage_dir)
@@ -5638,8 +5809,12 @@ def read_agentignore_patterns(root):
     return patterns
 
 
-def snapshot_files(root, ignore_dirs=None, ignore_patterns=None):
-    """对独立任务目录作事后核对，排除 Git 元数据，不撤销文件。"""
+_FAST_SNAPSHOT_FILE_THRESHOLD = 500
+_FAST_SNAPSHOT_BYTES_THRESHOLD = 32 * 1024 * 1024
+
+
+def snapshot_files(root, ignore_dirs=None, ignore_patterns=None, *, fast_stat=None):
+    """对独立任务目录作事后核对，排除 Git 元数据，不撤销文件。大目录自动切换元数据快快照避免全盘哈希耗时。"""
     root = Path(root)
     ignored = set(ignore_dirs) if ignore_dirs is not None else _snapshot_ignored_dirs()
     patterns = list(ignore_patterns) if ignore_patterns is not None else read_agentignore_patterns(root)
@@ -5661,6 +5836,8 @@ def snapshot_files(root, ignore_dirs=None, ignore_patterns=None):
         result = {'.': 'directory:' + str(stat.S_IMODE(root.stat().st_mode))}
     except OSError as exc:
         raise HarnessError(f'无法核对目标目录: {exc}', snapshot_path='.') from exc
+    regular_files = []
+    total_regular_bytes = 0
     for directory, dirs, files in os.walk(root, followlinks=False, onerror=traversal_failed):
         dirs[:] = sorted(d for d in dirs if d not in ignored and not excluded(Path(directory) / d))
         for name in list(dirs):
@@ -5686,11 +5863,27 @@ def snapshot_files(root, ignore_dirs=None, ignore_patterns=None):
                 elif not stat.S_ISREG(st.st_mode):
                     raise HarnessError(f'工作区包含非常规特殊文件，无法安全快照: {rel}', snapshot_path=rel)
                 else:
-                    digest = hashlib.sha256()
-                    with path.open('rb') as stream:
-                        for block in iter(lambda: stream.read(1024 * 1024), b''):
-                            digest.update(block)
-                    result[rel] = digest.hexdigest() + ':' + str(stat.S_IMODE(st.st_mode))
+                    regular_files.append((rel, path, st))
+                    raw_size = getattr(st, 'st_size', 0)
+                    if isinstance(raw_size, int) and not isinstance(raw_size, bool):
+                        total_regular_bytes += raw_size
+            except OSError as exc:
+                raise HarnessError(f'无法核对文件 {rel}: {exc}', snapshot_path=rel) from exc
+    use_fast_stat = (
+        bool(fast_stat)
+        if fast_stat is not None
+        else (len(regular_files) > _FAST_SNAPSHOT_FILE_THRESHOLD or total_regular_bytes > _FAST_SNAPSHOT_BYTES_THRESHOLD)
+    )
+    for rel, path, st in regular_files:
+        if use_fast_stat:
+            result[rel] = f'stat:{st.st_size}:{st.st_mtime_ns}:{st.st_ctime_ns}:{stat.S_IMODE(st.st_mode)}'
+        else:
+            try:
+                digest = hashlib.sha256()
+                with path.open('rb') as stream:
+                    for block in iter(lambda: stream.read(1024 * 1024), b''):
+                        digest.update(block)
+                result[rel] = digest.hexdigest() + ':' + str(stat.S_IMODE(st.st_mode))
             except OSError as exc:
                 raise HarnessError(f'无法核对文件 {rel}: {exc}', snapshot_path=rel) from exc
     return result
@@ -5837,7 +6030,13 @@ def _snapshot_ignore_dirs_for(scopes=(), *, include_build=False):
 
 
 def _changes_report(before, root, scopes, readonly, *, ignore_dirs=None, ignore_patterns=None):
-    changes = changed_files(before, snapshot_files(root, ignore_dirs=ignore_dirs, ignore_patterns=ignore_patterns))
+    before_uses_stat = any(
+        isinstance(val, str) and val.startswith('stat:')
+        for key, val in (before or {}).items()
+        if key != '.' and not key.endswith('/')
+    )
+    after = snapshot_files(root, ignore_dirs=ignore_dirs, ignore_patterns=ignore_patterns, fast_stat=before_uses_stat)
+    changes = changed_files(before, after)
     violations = changes if readonly else [path for path in changes if scopes and not _scope_matches(path, scopes)]
     return {'changed_files': changes, 'scope_violations': violations, 'scope_check': 'post_execution_snapshot',
             'scope_notice': '需使用独立任务目录，快照无法区分并发写入来源，检查不自动回滚。'}
@@ -8725,12 +8924,12 @@ def _suggest_plan_shards(file_records, target_tokens, *, input_budget=None, inli
     return shards
 
 
-def _plan_capacity_assessment(target, files, readonly, channel, inline_readonly, profile, estimated_tokens):
+def _plan_capacity_assessment(target, files, readonly, channel, inline_readonly, profile, estimated_tokens, *, prefix=''):
     hd = _headless_tunables()
     capacity = profile.get('capacity', {})
     selected_window = capacity.get('selected_window_tokens')
     input_budget = capacity.get('input_budget_tokens')
-    inline_cap_bytes = (_positive_int(hd.get('inline_readonly_max_kib')) or 512) * 1024
+    inline_cap_bytes = _inline_readonly_cap_bytes(prefix)
     shard_target = _positive_int(hd.get('default_shard_tokens')) or 120_000
     records = _plan_explicit_file_records(target, files)
     explicit_scope = bool(records)
@@ -8938,7 +9137,7 @@ def _resolve_plan_streams(args, streams, backends):
                                                             redact_usage=getattr(args, 'redact', False),
                                                             ignore_cooldown=getattr(args, 'retry_quota', False))
             cap_assess = _plan_capacity_assessment(
-                target, files, kind not in ('code', 'gate'), channel, False, profile, tokens,
+                target, files, kind not in ('code', 'gate'), channel, False, profile, tokens, prefix=prefix,
             )
             log_dir = home / ('sessions' if prefix == 'codex' else 'projects' if prefix == 'claude' else 'antigravity' if prefix == 'agy' else 'sessions')
             chosen = {**stream, 'stream_id': sid, 'target': str(target), 'kind': kind, 'caller': caller,
@@ -8951,6 +9150,7 @@ def _resolve_plan_streams(args, streams, backends):
                       'over_context_window': cap_assess['over_context_window'],
                       'exceeds_inline_cap': cap_assess['exceeds_inline_cap'],
                       'explicit_bytes': cap_assess['explicit_bytes'],
+                      'inline_cap_bytes': cap_assess['inline_cap_bytes'],
                       'capacity_warnings': cap_assess['capacity_warnings'],
                       **({'suggested_shards': cap_assess['suggested_shards']} if cap_assess['suggested_shards'] else {}),
                       **quota}
@@ -9052,7 +9252,7 @@ def _resolve_plan_streams(args, streams, backends):
                     stream_switched = True
                     continue
                 cap_assess = _plan_capacity_assessment(
-                    target, files, eff_readonly, channel, eff_inline_ro, profile, tokens,
+                    target, files, eff_readonly, channel, eff_inline_ro, profile, tokens, prefix=prefix,
                 )
                 if cap_assess['over_context_window'] and not allow_over_budget:
                     shard_note = (f'（已生成 {len(cap_assess["suggested_shards"])} 组建议分片）'
@@ -9083,6 +9283,7 @@ def _resolve_plan_streams(args, streams, backends):
                           'over_context_window': cap_assess['over_context_window'],
                           'exceeds_inline_cap': cap_assess['exceeds_inline_cap'],
                           'explicit_bytes': cap_assess['explicit_bytes'],
+                          'inline_cap_bytes': cap_assess['inline_cap_bytes'],
                           'capacity_warnings': cap_assess['capacity_warnings'],
                           **({'suggested_shards': cap_assess['suggested_shards']} if cap_assess['suggested_shards'] else {}),
                           **quota}
@@ -9177,7 +9378,7 @@ def _render_plan(ticket):
             window_cell += '）'
         inline_cell = '内联：' + yes_no(stream['inline_readonly']) + '；超时：' + str(stream['timeout']) + ' 秒'
         if stream.get('exceeds_inline_cap') and stream.get('explicit_bytes'):
-            cap_kib = (_positive_int(_headless_tunables().get('inline_readonly_max_kib')) or 512)
+            cap_kib = (stream.get('inline_cap_bytes') or _inline_readonly_cap_bytes(stream.get('client'))) // 1024
             inline_cell += f'（⚠ 显式文件 {stream["explicit_bytes"] / 1024:.1f} KiB > {cap_kib} KiB 内联上限，超限文件将分页读取）'
         values = [stream['stream_id'], stream.get('subtask', '') + '；范围：' + stream['target'],
                   _PLAN_CHANNEL_LABELS[stream['channel']] + ' (' + stream['channel'] + ')',
@@ -10098,9 +10299,25 @@ def cmd_followup(args):
     prompt = ('续接原会话，保持其工作目录和输入范围。' +
               ('仅作只读核对。' if readonly else f'允许写入范围 {scopes}。') +
               '\n' + _task_text(args) + '\n按给定 JSON Schema 返回结果。')
-    invocation, payload = {}, {'target': str(root), 'engine': engine, 'readonly': readonly}
+    prev_model = (
+        previous.get('model')
+        or previous.get('actual_model')
+        or previous.get('model_requested_to_cli')
+        or source.get('model')
+    )
+    prev_status = str(previous.get('status') or source.get('status') or '').strip().lower()
+    was_timeout = prev_status == 'timeout' or bool(salvage)
+    explicit_effort = str(getattr(args, 'effort', '') or getattr(args, 'tier', '') or '').strip().lower()
+    prev_tier = str(previous.get('tier') or '').strip().lower()
+    if explicit_effort and explicit_effort != 'auto':
+        followup_tier = explicit_effort
+    elif was_timeout and prev_tier in ('auto', 'max', 'xhigh', 'high', ''):
+        followup_tier = str(_headless_tunables().get('followup_default_effort') or 'medium').strip().lower()
+    else:
+        followup_tier = previous.get('tier')
+    invocation, payload = {}, {'target': str(root), 'engine': engine, 'model': prev_model, 'readonly': readonly}
     if args.dry_run:
-        return _dispatch_print(args, {**payload, 'status': 'ok', 'dry_run': True,
+        return _dispatch_print(args, {**payload, 'status': 'ok', 'dry_run': True, 'followup_tier': followup_tier,
                                       'changed_files': [], 'scope_violations': [], 'scope_verified': True, 'invocation': invocation})
     backends = _args_backends(args, refresh_model_cache=False)
     ignored = None if readonly else _snapshot_ignore_dirs_for(scopes)
@@ -10111,12 +10328,14 @@ def cmd_followup(args):
     try:
         payload['result'] = invoke_engine(engine, root, prompt, backends, TASK_JSON_SCHEMA, readonly, args.timeout,
                                           previous.get('agent_type', 'readonly-collaborator'), previous.get('files'),
-                                          previous.get('tier'), retry_quota=args.retry_quota, receipt=invocation,
+                                          followup_tier, retry_quota=args.retry_quota, receipt=invocation,
                                           isolation=previous.get('isolation', ''),
                                           resume=previous, plan_dir=state, write_scope=scopes, inline_readonly=False)
         payload['status'] = 'ok'
     except HarnessError as exc:
         payload.update(status=exc.status, error=str(exc), **exc.details)
+    if invocation.get('actual_model') or invocation.get('model_requested_to_cli'):
+        payload['model'] = invocation.get('actual_model') or invocation.get('model_requested_to_cli')
     scope = _safe_changes_report(before, root, scopes, readonly, ignore_dirs=ignored, ignore_patterns=patterns)
     if invocation.get('staged_scope'):
         scope = _merge_staged_scope_report(scope, invocation.pop('staged_scope'))
@@ -10196,6 +10415,10 @@ def build_arg_parser():
     followup = sub.add_parser('followup', help='按既有回执续接指定会话')
     followup.add_argument('--receipt', required=True)
     followup.add_argument('--stream', default='')
+    followup.add_argument('--effort', choices=['low', 'medium', 'high', 'xhigh', 'max'], default='',
+                          help='显式覆盖续接挡位（超时回执未指定时默认按配置降挡防再次超时）')
+    followup.add_argument('--tier', choices=list(TIER_CHOICES), default='',
+                          help='续接挡位策略别名（显式指定时优先生效）')
     for command in (task, plan, batch):
         command.add_argument('--files', action='append', default=[])
         command.add_argument('--negative-scope-file', action='append', default=[])

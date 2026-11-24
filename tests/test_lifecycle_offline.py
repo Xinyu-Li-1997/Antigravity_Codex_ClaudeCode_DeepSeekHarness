@@ -3705,6 +3705,116 @@ class TestHeavyWorkflowLifecycle(unittest.TestCase):
         })
         self.assertEqual(res_after_cp["decision"], "allow")
 
+    def test_v11811_headless_depth_hook_isolation_and_markdown_table_token_bill(self):
+        import reply_repeat_guard
+        import status_guard
+
+        # 1) CAE_HARNESS_DEPTH=1 must unconditionally skip context/handoff/stop hooks even when valid transcripts exist,
+        #    while status_guard keeps enforcing external-write boundaries.
+        codex_tp = self.root / "v11811_codex_rollout.jsonl"
+        _append_jsonl(codex_tp, {"type": "session_meta", "payload": {"id": "cx-depth-1", "source": "cli", "cwd": str(self.root)}})
+        _append_jsonl(codex_tp, {"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "执行核对"}]}})
+        claude_tp = self.root / "v11811_claude.jsonl"
+        _append_jsonl(claude_tp, {"type": "user", "uuid": "u-1", "message": {"role": "user", "content": "执行核对"}})
+        agy_tp = self.root / "v11811_agy.jsonl"
+        _append_jsonl(agy_tp, {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "执行核对"})
+        _append_jsonl(agy_tp, {"step_index": 1, "source": "SYSTEM", "type": "CHECKPOINT"})
+        _append_jsonl(agy_tp, {"step_index": 2, "source": "MODEL", "type": "PLANNER_RESPONSE", "content": "后台任务仍在运行，请稍候。"})
+
+        with unittest.mock.patch.dict(os.environ, {"CAE_HARNESS_DEPTH": "1"}):
+            _, _, _, cx_skip = user_words.codex_hook_session({"session_id": "cx-depth-1", "transcript_path": str(codex_tp)})
+            _, _, _, cl_skip = user_words.claude_hook_session({"session_id": "cl-depth-1", "transcript_path": str(claude_tp)})
+            self.assertTrue(cx_skip)
+            self.assertTrue(cl_skip)
+            self.assertEqual(
+                session_context_loader.handle_context_check({"conversationId": "agy-depth-1", "transcriptPath": str(agy_tp)}),
+                {"injectSteps": []},
+            )
+            self.assertEqual(
+                session_context_loader.handle_codex_session_start({"session_id": "cx-depth-1", "transcript_path": str(codex_tp)}),
+                {},
+            )
+            self.assertEqual(
+                session_context_loader.handle_claude_session_start({"session_id": "cl-depth-1", "transcript_path": str(claude_tp)}),
+                {},
+            )
+            self.assertEqual(
+                handoff_gate.handle_codex_handoff(
+                    {"hook_event_name": "SessionStart", "session_id": "cx-depth-1", "transcript_path": str(codex_tp)},
+                    self.state, mode="enforce", compact_limit=1,
+                ),
+                {},
+            )
+            self.assertEqual(
+                reply_repeat_guard.handle_stop_repeat_guard({
+                    "conversationId": "agy-depth-1", "terminationReason": "model_stop", "transcriptPath": str(agy_tp),
+                }),
+                {"decision": "allow"},
+            )
+            # status_guard still hard-denies external writes inside headless sub-runs
+            proj = self.root / "depth_proj"
+            outside = self.root / "depth_outside"
+            proj.mkdir()
+            outside.mkdir()
+            sg_res = status_guard.handle_pre_tool_use({
+                "conversationId": "agy-depth-1",
+                "cwd": str(proj),
+                "workspacePaths": [str(proj)],
+                "toolCall": {"name": "write_file", "args": {"Path": str(outside / "escape.txt"), "Content": "x"}},
+            })
+            self.assertEqual(sg_res["decision"], "deny")
+
+        # 2) reply_repeat_guard recognizes Markdown table Token columns while rejecting empty Token cells with digits in other columns
+        self.assertTrue(reply_repeat_guard._has_token_report(
+            "| 流号 | 模型 | 状态 | 输入 / 输出 / 总 Token |\n"
+            "| --- | --- | --- | --- |\n"
+            "| S1 | codex:gpt-6.2-astra | 成功 | 120,000 / 3,400 / 123,400 |\n"
+        ))
+        self.assertTrue(reply_repeat_guard._has_token_report(
+            "| 流号 | 模型 | Token 用量 |\n"
+            "| --- | --- | --- |\n"
+            "| S1 | agy:default | 无法统计 |\n"
+        ))
+        self.assertFalse(reply_repeat_guard._has_token_report(
+            "| 流号 | 模型 | 状态 | Token 用量 |\n"
+            "| --- | --- | --- | --- |\n"
+            "| S1 | gpt-6.2-astra | 成功 | — |\n"
+        ))
+
+        cid_tbl = "ag-v11811-tbl-bill"
+        tp_tbl = self.root / "v11811_tbl" / "transcript.jsonl"
+        tp_tbl.parent.mkdir(parents=True, exist_ok=True)
+        _append_jsonl(tp_tbl, {"step_index": 1, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "继续"})
+        rec_tbl = str(self.root / "batch_v11811.json")
+        user_words.atomic_write_json(
+            self.state / "heavy_completions" / f"{cid_tbl}.json",
+            [{
+                "run_id": "run-v11811-tbl",
+                "subcommand": "batch",
+                "all_succeeded": True,
+                "receipt_file": rec_tbl,
+                "streams": [
+                    {"stream_id": "S1", "engine": "codex:gpt-6.2-astra", "model": "gpt-6.2-astra", "succeeded": True, "status": "ok",
+                     "token_usage": {"input_tokens": 120000, "output_tokens": 3400, "total_tokens": 123400}},
+                ],
+                "token_usage_summary": {"total_tokens": 123400},
+            }],
+        )
+        _append_jsonl(tp_tbl, {
+            "step_index": 2, "source": "MODEL", "type": "PLANNER_RESPONSE",
+            "content": (
+                "批处理回执 batch_v11811.json 已执行完成：\n\n"
+                "| 流号 | 模型 | 状态 | Token（输入/输出/总计） |\n"
+                "| --- | --- | --- | --- |\n"
+                "| S1 | gpt-6.2-astra | 成功 | 120,000 / 3,400 / 123,400 |\n"
+            ),
+        })
+        res_tbl = reply_repeat_guard.handle_stop_repeat_guard({
+            "conversationId": cid_tbl, "terminationReason": "model_stop", "transcriptPath": str(tp_tbl),
+        })
+        self.assertEqual(res_tbl["decision"], "allow")
+        self.assertEqual(user_words.load_unreported_heavy_completions(cid_tbl, self.state), [])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

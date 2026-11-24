@@ -2,6 +2,27 @@
 
 本文件记录四客户端共用规则、会话钩子、后台验证工具与上游维护流程的版本演进。当前插件版本以 `template/user-guard/plugin.json` 为准；常驻使用文档只说明机制和配置键，不重复维护版本号与性能日期。
 
+## [1.18.11] - 2026-11-24
+
+基于 Windows 与 WSL2 双端真实重负载轨迹与回执复盘，根治跨端协议边界失配、Windows 文件句柄锁中断抢救、无头子会话钩子二次注入及大仓库全盘快照耗时等五类系统性缺陷：
+
+- **分后端只读内联上限、未内联清单截断与大目录快快照（`fleet_profile.json`、`cae_harness.py`、`tests/test_harness_offline.py`）**：
+  - 在 `runtime_tunables.headless_dispatch` 新增 `agy_inline_readonly_max_kib`（默认 `128`，规避 `agy` CLI 单条输入协议硬截断边界），保留其余后端 `inline_readonly_max_kib`（`512`），`plan` 容量评估、明细卡片与 `_inline_readonly_prompt` 统一按后端口径核算；
+  - 对 `_inline_readonly_prompt` 的未内联清单增加条目与字节双上限截断及回执清单上限标记，并为 `codex` 增设单条提示字符数安全护栏（`_CODEX_MAX_PROMPT_CHARS`）防止超大型仓库触发协议层超长拒收；
+  - `snapshot_files` 升级为两阶段自适应快照：中小目录维持逐字节 SHA-256 校验，超过文件数或字节数阈值的大目录自动切换元数据快快照（`stat:`），`_changes_report` 自动对齐前后快照模式避免跨阈值误报，消除数万文件目录前后全盘哈希耗时。
+- **Windows `[WinError 32]` 容错、紧凑收口与超时续接降挡（`fleet_profile.json`、`cae_harness.py`）**：
+  - 软超时收口改写独立输出文件 `result_wrapup.json`（不再在收口前 `unlink` 主回合 `result.json`），临时目录退出清理改用带重试退避与容错的 `_rmtree_retry`，彻底消除 Windows 子进程短暂句柄未释放导致整次运行和 `timeout_salvage` 被异常中断的问题；
+  - 软超时收口提示词限定紧凑输出预算（约 `1500` tokens 以内）并将 `wrapup_max_sec` 调至 `150` 秒；新增 `followup_default_effort`（默认 `medium`）与 `followup --effort` / `--tier` 参数，续接超时回执未显式指定挡位时自动降挡防二次超时，并补齐回执顶层 `model` 字段；Windows 可写 Codex 沙箱提示补充临时目录清理边界。
+- **`agy` 后台活跃回合短路、`step_update` 真实进展识别、Token 归一化与 `dsh` 独立无头会话目录（`cae_harness.py`）**：
+  - 当 `agy` 主回合因 `--print-timeout` 返回且 stderr 明确报告 `with turn in progress`（后台回合未取消）时，跳过必死锁的同会话收口并标记 `wrapup_status: skipped_background_turn_active`、`timeout_salvage.resumable: false` 与 `resume_blocked_reason: agy_background_turn_in_progress`；
+  - 修复 `_turn_made_model_progress` 对 `agy` 真实 `step_update`（`step_type`）与 `result` 包裹层的解包逻辑，避免累计 `result.usage` 误掩盖零进展卡死；修复 `extract_cli_token_usage` 对 `agy` `cache_read_tokens` 补入 `input_tokens`/`total_tokens` 的口径，并对 `agy` 多回合累计用量改取各字段最大值消除双倍计数；
+  - `dsh` 无头会话持久化目录由 `sessions` 隔离至独立 `headless-sessions`（`_session_logs` 优先扫描新目录并兼容旧目录），消除无压缩配置与既有 `.jsonl.zstd` 压缩日志并存时的启动报错；收紧 `_citation_audit` 噪声过滤，排除裸锚点、纯日期数字、通配符花括号与无文件依据的纯扩展名片段。
+- **无头子会话钩子彻底隔离与 Markdown 表格账单识别（`user_words.py`、`session_context_loader.py`、`handoff_gate.py`、`reply_repeat_guard.py`、`tests/test_lifecycle_offline.py`）**：
+  - 当处于外部无头子进程（`CAE_HARNESS_DEPTH` 非空且非 `0`）时，`codex_hook_session`、`claude_hook_session`、`session_context_loader.py`、`handoff_gate.py` 与 `reply_repeat_guard.py` 入口立即跳过（即使持久化续接存在既有轨迹文件也不再注入原话回溯），同时保留 `status_guard.py` 对无头子任务越界写入的硬阻断；
+  - `reply_repeat_guard.py` 新增 `_has_token_report`，精准识别 Markdown 表格账单中的 Token 列数值或无法统计说明，避免仅因表格换行误拦完工汇报且不被其他列数字误导；同步增补离线回归单测并更新常驻文档。
+
+---
+
 ## [1.18.10] - 2026-11-23
 
 基于真实超长双语文档批次（单流显式传入多份超大文档触发分页、压缩与无头超时）的逐行根因排查，补齐 `plan` 显式只读超窗与内联预算护栏，并修复 `agy` 无头软超时收口与进程回收链路的三处缺陷：

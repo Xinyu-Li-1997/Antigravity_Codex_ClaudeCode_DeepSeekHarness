@@ -2620,6 +2620,8 @@ def _handle_native_handoff(
     _limit_explicit: Optional[bool] = None,
 ) -> Dict[str, Any]:
     label = "Claude" if client == "claude" else "Codex"
+    if os.environ.get("CAE_HARNESS_DEPTH", "").strip() not in ("", "0"):
+        return {}
     event = str(payload.get("hook_event_name") or "")
     if event not in CODEX_EVENTS or mode == "off":
         return {}

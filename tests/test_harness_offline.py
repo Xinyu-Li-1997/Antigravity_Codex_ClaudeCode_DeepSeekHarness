@@ -7337,19 +7337,39 @@ else:
         self.assertTrue(plan_auto['streams'][0]['exceeds_inline_cap'])
 
         # inline_readonly_summary records exact inlined vs cap-omitted files on readonly execution
-        inline_rec = {}
+        # codex uses default 512 KiB cap (1 of 4 420 KiB files inlined), while agy uses 128 KiB cap (0 of 4 inlined)
+        codex_inline_rec = {}
+
+        def _fake_cx_inline(command, cwd, stdin_text, timeout, **kwargs):
+            Path(command[command.index('-o') + 1]).write_text(json.dumps(TASK), encoding='utf-8')
+            return subprocess.CompletedProcess(command, 0, '', '')
+
+        with patch.object(harness, 'run_process', side_effect=_fake_cx_inline):
+            harness.invoke_engine(
+                'codex:gpt-6.2-astra', big_dir, '审查', cap_engines, harness.TASK_JSON_SCHEMA,
+                readonly=True, timeout_sec=60, stage_files=big_files, inline_readonly=True, receipt=codex_inline_rec,
+            )
+        cx_sum = codex_inline_rec.get('inline_readonly_summary') or {}
+        self.assertEqual(cx_sum.get('inlined_count'), 1)
+        self.assertEqual(cx_sum.get('omitted_count'), 3)
+        self.assertEqual(cx_sum.get('cap_omitted_count'), 3)
+        self.assertEqual(cx_sum.get('cap_bytes'), 512 * 1024)
+        self.assertEqual(cx_sum.get('omitted_files'), big_files[1:])
+
+        agy_inline_rec = {}
         with patch.object(harness, 'run_process', return_value=subprocess.CompletedProcess(
             ['agy'], 0, json.dumps({'event': 'result', 'result': {'structured_output': TASK}}), '',
         )):
             harness.invoke_engine(
                 'agy:gemini-4-carbon-high', big_dir, '审查', cap_engines, harness.TASK_JSON_SCHEMA,
-                readonly=True, timeout_sec=60, stage_files=big_files, inline_readonly=True, receipt=inline_rec,
+                readonly=True, timeout_sec=60, stage_files=big_files, inline_readonly=True, receipt=agy_inline_rec,
             )
-        in_sum = inline_rec.get('inline_readonly_summary') or {}
-        self.assertEqual(in_sum.get('inlined_count'), 1)
-        self.assertEqual(in_sum.get('omitted_count'), 3)
-        self.assertEqual(in_sum.get('cap_omitted_count'), 3)
-        self.assertEqual(in_sum.get('omitted_files'), big_files[1:])
+        agy_sum = agy_inline_rec.get('inline_readonly_summary') or {}
+        self.assertEqual(agy_sum.get('inlined_count'), 0)
+        self.assertEqual(agy_sum.get('omitted_count'), 4)
+        self.assertEqual(agy_sum.get('cap_omitted_count'), 4)
+        self.assertEqual(agy_sum.get('cap_bytes'), 128 * 1024)
+        self.assertEqual(agy_sum.get('omitted_files'), big_files)
 
         # 4. _terminate_tree sends SIGTERM before SIGKILL on POSIX
         class _FakeProc:
@@ -7374,6 +7394,284 @@ else:
             errs = harness._terminate_tree(_FakeProc([None, None, 0]))
         self.assertEqual(errs, [])
         self.assertEqual(sent_signals, [(42424, 15), (42424, 9)])
+
+    def test_v11811_root_cause_hardening_caps_winerr32_agy_dsh_snapshot_followup_citations(self):
+        # 1. Per-backend inline cap (agy 128 KiB vs codex 512 KiB), omitted list truncation, and Codex 1M char guard
+        cap_dir = self.root / 'v11811_cap'
+        cap_dir.mkdir()
+        (cap_dir / 'mid.md').write_bytes(b'm' * (180 * 1024))
+        cap_engines = self.four_backends()
+        cap_engines['agy']['models'] = [{'slug': 'gemini-4-carbon-high', 'context_window': 512000, 'priority': 1}]
+        cap_engines['agy']['model'] = 'gemini-4-carbon-high'
+        cap_engines['codex']['models'] = [{'slug': 'gpt-6.2-astra', 'context_window': 872000, 'supported_efforts': ['low', 'medium', 'high', 'max']}]
+        cap_engines['codex']['model'] = 'gpt-6.2-astra'
+        plan_dir = self.root / 'v11811_plans'
+        with patch.object(harness, '_args_backends', return_value=cap_engines):
+            rc_agy, p_agy = self.capture(harness.cmd_plan, self.args(
+                'plan', '--target', str(cap_dir), '--kind', 'review', '--engine', 'agy:gemini-4-carbon-high',
+                '--session-id', 'sess-v11811', '--plan-dir', str(plan_dir), '--save-ticket', '--files', 'mid.md',
+            ))
+            rc_cx, p_cx = self.capture(harness.cmd_plan, self.args(
+                'plan', '--target', str(cap_dir), '--kind', 'review', '--engine', 'codex:gpt-6.2-astra',
+                '--session-id', 'sess-v11811', '--plan-dir', str(plan_dir), '--files', 'mid.md',
+            ))
+        self.assertEqual((rc_agy, rc_cx), (0, 0))
+        self.assertTrue(p_agy['streams'][0]['exceeds_inline_cap'])
+        self.assertEqual(p_agy['streams'][0]['inline_cap_bytes'], 128 * 1024)
+        self.assertIn('128 KiB', Path(p_agy['card_detail_file']).read_text(encoding='utf-8'))
+        self.assertFalse(p_cx['streams'][0]['exceeds_inline_cap'])
+        self.assertEqual(p_cx['streams'][0]['inline_cap_bytes'], 512 * 1024)
+
+        many_dir = self.root / 'v11811_many'
+        many_dir.mkdir()
+        many_rels = []
+        for idx in range(230):
+            rel = f'sub_dir_long_name/file_{idx:04d}.txt'
+            (many_dir / rel).parent.mkdir(parents=True, exist_ok=True)
+            (many_dir / rel).write_bytes(b'x' * 5000)
+            many_rels.append(rel)
+        many_summary = {}
+        many_prompt = harness._inline_readonly_prompt('核查', many_dir, many_rels, summary=many_summary, prefix='agy')
+        self.assertIn('个文件已省略', many_prompt)
+        self.assertLessEqual(len(many_prompt.encode('utf-8')), 160 * 1024)
+        self.assertEqual(len(many_summary['omitted_files']), harness._INLINE_OMITTED_RECEIPT_MAX_ITEMS)
+        self.assertTrue(many_summary['omitted_files_truncated'])
+
+        codex_guard_dir = self.root / 'v11811_cx_guard'
+        codex_guard_dir.mkdir()
+        (codex_guard_dir / 'a.txt').write_text('a' * 1000, encoding='utf-8')
+        (codex_guard_dir / 'b.txt').write_text('b' * 1000, encoding='utf-8')
+        guard_summary = {}
+        with patch.object(harness, '_CODEX_MAX_PROMPT_CHARS', 1500):
+            guarded = harness._inline_readonly_prompt('审查', codex_guard_dir, ['a.txt', 'b.txt'], summary=guard_summary, prefix='codex')
+        self.assertLessEqual(len(guarded), 1500)
+        self.assertEqual(guard_summary['inlined_count'], 1)
+        self.assertEqual(guard_summary['omitted_files'], ['b.txt'])
+
+        # 2. Windows [WinError 32] resilience: wrapup writes to result_wrapup.json without unlinking result.json,
+        #    _rmtree_retry tolerates transient/persistent locks, and wrapup prompt enforces 1500-token compact contract
+        retry_dir = self.root / 'v11811_retry_rm'
+        retry_dir.mkdir()
+        (retry_dir / 'lock.tmp').write_text('x', encoding='utf-8')
+        rm_calls = []
+        orig_rmtree = harness.shutil.rmtree
+
+        def flaky_rmtree(p, *a, **kw):
+            rm_calls.append(p)
+            if len(rm_calls) < 3:
+                raise PermissionError(13, 'WinError 32 locked')
+            return orig_rmtree(p, *a, **kw)
+
+        with patch.object(harness.shutil, 'rmtree', side_effect=flaky_rmtree), patch.object(harness.time, 'sleep'):
+            harness._rmtree_retry(retry_dir, retries=5, delay=0.01)
+        self.assertFalse(retry_dir.exists())
+        self.assertEqual(len(rm_calls), 3)
+
+        cx_wrap_cmds = []
+        cx_wrap_prompts = []
+        cx_now = [0.0]
+
+        def run_cx_wrapup(command, cwd, stdin_text, timeout, **kwargs):
+            cx_wrap_cmds.append(list(command))
+            cx_wrap_prompts.append(stdin_text or '')
+            out_idx = command.index('-o') + 1
+            out_path = Path(command[out_idx])
+            if len(cx_wrap_cmds) == 1:
+                cx_now[0] = 760.0
+                out_path.write_text('partial', encoding='utf-8')
+                raise harness.HarnessError(
+                    'soft timeout', 'timeout', process_started=True,
+                    partial_stdout=json.dumps({'type': 'thread.started', 'thread_id': 'thr-win32'}) + '\n',
+                    partial_stderr='',
+                )
+            out_path.write_text(json.dumps(TASK), encoding='utf-8')
+            return subprocess.CompletedProcess(command, 0, '', '')
+
+        orig_unlink = Path.unlink
+
+        def forbid_result_unlink(path_self, *args, **kwargs):
+            if path_self.name == 'result.json':
+                raise PermissionError(13, 'WinError 32: result.json locked')
+            return orig_unlink(path_self, *args, **kwargs)
+
+        with patch.object(harness.time, 'monotonic', side_effect=lambda: cx_now[0]), \
+             patch.object(harness, 'run_process', side_effect=run_cx_wrapup), \
+             patch.object(Path, 'unlink', autospec=True, side_effect=forbid_result_unlink), \
+             patch.object(harness, '_rmtree_retry', side_effect=lambda p, ignore_errors=False, **kw: None if ignore_errors else orig_rmtree(p)):
+            res_win32 = harness.invoke_engine(
+                'codex:gpt-6.2-astra', self.root, '主任务', cap_engines, harness.TASK_JSON_SCHEMA,
+                readonly=True, timeout_sec=900,
+            )
+        self.assertEqual(res_win32['summary'], TASK['summary'])
+        self.assertEqual(len(cx_wrap_cmds), 2)
+        self.assertEqual(Path(cx_wrap_cmds[0][cx_wrap_cmds[0].index('-o') + 1]).name, 'result.json')
+        self.assertEqual(Path(cx_wrap_cmds[1][cx_wrap_cmds[1].index('-o') + 1]).name, 'result_wrapup.json')
+        self.assertIn('1500 tokens', cx_wrap_prompts[1])
+
+        # 3. agy 'with turn in progress' skips deadlocked wrapup; real step_update + cumulative result.usage detects stalled wrapup
+        agy_bg_calls = []
+
+        def run_agy_bg(command, cwd, stdin_text, timeout, **kwargs):
+            agy_bg_calls.append(list(command))
+            stdout = (
+                json.dumps({'event': 'init', 'init': {'conversation_id': 'conv-bg-1'}}) + '\n'
+                + json.dumps({'event': 'result', 'result': {'finished_reason': 'print_timeout', 'response': ''}}) + '\n'
+            )
+            return subprocess.CompletedProcess(command, 0, stdout, 'Print timed out after 500s with turn in progress.\n')
+
+        bg_rec = {}
+        with patch.object(harness, 'run_process', side_effect=run_agy_bg):
+            with self.assertRaises(harness.HarnessError) as bg_exc:
+                harness.invoke_engine(
+                    'agy:gemini-4-carbon-high', self.root, '审查', cap_engines, harness.TASK_JSON_SCHEMA,
+                    readonly=True, timeout_sec=600, receipt=bg_rec,
+                )
+        self.assertEqual(len(agy_bg_calls), 1, 'with turn in progress 不得继续发起必死锁的同会话 wrapup')
+        self.assertTrue(bg_rec.get('wrapup_stalled'))
+        self.assertEqual(bg_exc.exception.details.get('wrapup_status'), 'skipped_background_turn_active')
+        self.assertFalse(bg_rec['timeout_salvage']['resumable'])
+        self.assertEqual(bg_rec['timeout_salvage']['resume_blocked_reason'], 'agy_background_turn_in_progress')
+
+        # Real agy step_update envelope + cumulative session usage on empty print_timeout must NOT be mistaken for progress
+        stalled_events = [
+            {'event': 'init', 'init': {'conversation_id': 'conv-stalled-2'}},
+            {'event': 'step_update', 'step_update': {'step_type': 'user_input'}},
+            {'event': 'step_update', 'step_update': {'step_type': 'system_message'}},
+            {'event': 'result', 'result': {'finished_reason': 'print_timeout', 'response': '', 'usage': {'input_tokens': 50000, 'output_tokens': 1000, 'total_tokens': 51000}}},
+        ]
+        self.assertFalse(harness._turn_made_model_progress('agy', '\n'.join(json.dumps(e) for e in stalled_events), stalled_events))
+        progressed_events = stalled_events[:2] + [{'event': 'step_update', 'step_update': {'step_type': 'planner_response'}}]
+        self.assertTrue(harness._turn_made_model_progress('agy', '', progressed_events))
+
+        # 4. agy cache_read_tokens normalization and multi-turn cumulative usage deduplication
+        agy_usage_raw = json.dumps({'event': 'result', 'result': {
+            'usage': {'input_tokens': 1000, 'cache_read_tokens': 5000, 'output_tokens': 200, 'total_tokens': 1200},
+        }})
+        norm_u = harness.extract_cli_token_usage('agy', agy_usage_raw)
+        self.assertEqual(norm_u['input_tokens'], 6000)
+        self.assertEqual(norm_u['cached_input_tokens'], 5000)
+        self.assertEqual(norm_u['output_tokens'], 200)
+        self.assertEqual(norm_u['total_tokens'], 6200)
+
+        agy_multi_calls = []
+        agy_now = [0.0]
+
+        def run_agy_multi(command, cwd, stdin_text, timeout, **kwargs):
+            agy_multi_calls.append(list(command))
+            if len(agy_multi_calls) == 1:
+                agy_now[0] = 520.0
+                out1 = (
+                    json.dumps({'event': 'init', 'init': {'conversation_id': 'conv-dedup-1'}}) + '\n'
+                    + json.dumps({'event': 'result', 'result': {
+                        'finished_reason': 'print_timeout', 'response': '',
+                        'usage': {'input_tokens': 1000, 'cache_read_tokens': 4000, 'output_tokens': 300, 'total_tokens': 1300},
+                    }}) + '\n'
+                )
+                return subprocess.CompletedProcess(command, 0, out1, '')
+            out2 = json.dumps({'event': 'result', 'result': {
+                'structured_output': TASK,
+                'usage': {'input_tokens': 1200, 'cache_read_tokens': 4500, 'output_tokens': 500, 'total_tokens': 1700},
+            }}) + '\n'
+            return subprocess.CompletedProcess(command, 0, out2, '')
+
+        dedup_rec = {}
+        with patch.object(harness.time, 'monotonic', side_effect=lambda: agy_now[0]), \
+             patch.object(harness, 'run_process', side_effect=run_agy_multi):
+            harness.invoke_engine(
+                'agy:gemini-4-carbon-high', self.root, '审查', cap_engines, harness.TASK_JSON_SCHEMA,
+                readonly=True, timeout_sec=600, receipt=dedup_rec,
+            )
+        self.assertEqual(len(agy_multi_calls), 2)
+        self.assertEqual(dedup_rec['token_usage']['input_tokens'], 5700)
+        self.assertEqual(dedup_rec['token_usage']['cached_input_tokens'], 4500)
+        self.assertEqual(dedup_rec['token_usage']['output_tokens'], 500)
+        self.assertEqual(dedup_rec['token_usage']['total_tokens'], 6200)
+
+        # 5. dsh writes isolated headless-sessions root and _session_logs scans headless-sessions first
+        dsh_home = self.root / 'v11811_dsh_home'
+        (dsh_home / 'sessions' / 'sid-old').mkdir(parents=True)
+        (dsh_home / 'sessions' / 'sid-old' / 'session.jsonl.zstd').write_bytes(b'zstd')
+        (dsh_home / 'headless-sessions' / 'sid-new').mkdir(parents=True)
+        new_log = dsh_home / 'headless-sessions' / 'sid-new' / 'session.jsonl'
+        new_log.write_text('{}\n', encoding='utf-8')
+        self.assertEqual(harness._session_logs('dsh', dsh_home, 'sid-new', False), [new_log])
+
+        captured_patch = []
+
+        def run_dsh_check(command, cwd, stdin_text, timeout, **kwargs):
+            p_idx = command.index('--patch') + 1
+            captured_patch.append(Path(command[p_idx]).read_text(encoding='utf-8'))
+            return subprocess.CompletedProcess(command, 0, json.dumps(TASK), '')
+
+        cap_engines['dsh']['config_home'] = str(dsh_home)
+        with patch.object(harness, '_dsh_supports_cli_permission_flags', return_value=True), \
+             patch.object(harness, 'run_process', side_effect=run_dsh_check):
+            harness.invoke_engine(
+                'dsh:default', self.root, '检查', cap_engines, harness.TASK_JSON_SCHEMA,
+                readonly=True, timeout_sec=60,
+            )
+        self.assertEqual(len(captured_patch), 1)
+        self.assertIn('headless-sessions', captured_patch[0])
+
+        # 6. Two-stage adaptive fast snapshot_files and symmetric _changes_report
+        snap_dir = self.root / 'v11811_snap'
+        snap_dir.mkdir()
+        for idx in range(7):
+            (snap_dir / f'f{idx}.txt').write_text(f'body-{idx}\n', encoding='utf-8')
+        with patch.object(harness, '_FAST_SNAPSHOT_FILE_THRESHOLD', 5):
+            before_fast = harness.snapshot_files(snap_dir)
+            self.assertTrue(before_fast['f0.txt'].startswith('stat:'))
+            # Delete 4 files (leaving 3 < threshold) and edit f1.txt
+            for idx in range(3, 7):
+                (snap_dir / f'f{idx}.txt').unlink()
+            (snap_dir / 'f1.txt').write_text('body-1-edited-longer\n', encoding='utf-8')
+            rep_fast = harness._changes_report(before_fast, snap_dir, (), readonly=True)
+        self.assertEqual(sorted(rep_fast['changed_files']), ['f1.txt', 'f3.txt', 'f4.txt', 'f5.txt', 'f6.txt'])
+
+        # 7. cmd_followup defaults timeout receipt resume to medium (respecting explicit --effort/--tier) and sets model
+        fu_rec_path = self.root / 'v11811_timeout_rec.json'
+        fu_rec_path.write_text(json.dumps({
+            'status': 'timeout',
+            'target': str(self.root),
+            'engine': 'codex:gpt-6.2-astra',
+            'readonly': True,
+            'invocation': {
+                'provider_session_id': 'thr-fu-1',
+                'target_dir': str(self.root),
+                'engine': 'codex:gpt-6.2-astra',
+                'model_requested_to_cli': 'gpt-6.2-astra',
+                'readonly': True,
+                'tier': 'auto',
+                'timeout_salvage': {'provider_session_id': 'thr-fu-1', 'resumable': True},
+            },
+        }), encoding='utf-8')
+        rc_fu_def, out_fu_def = self.capture(harness.cmd_followup, self.args(
+            'followup', '--receipt', str(fu_rec_path), '--task', '继续核对', '--dry-run',
+        ))
+        self.assertEqual(rc_fu_def, 0)
+        self.assertEqual(out_fu_def['followup_tier'], 'medium')
+        self.assertEqual(out_fu_def['model'], 'gpt-6.2-astra')
+
+        rc_fu_exp, out_fu_exp = self.capture(harness.cmd_followup, self.args(
+            'followup', '--receipt', str(fu_rec_path), '--task', '继续核对', '--effort', 'high', '--dry-run',
+        ))
+        self.assertEqual(rc_fu_exp, 0)
+        self.assertEqual(out_fu_exp['followup_tier'], 'high')
+
+        # 8. _citation_audit filters non-path noise while preserving real missing files and dotfiles
+        cit_dir = self.root / 'v11811_cit'
+        (cit_dir / 'paper').mkdir(parents=True)
+        (cit_dir / 'paper' / 'existing.md').write_text('l1\nl2\nl3\nl4\nl5\nl6\n', encoding='utf-8')
+        (cit_dir / '.gitignore').write_text('*.pyc\n', encoding='utf-8')
+        cit_res = {
+            'content': '噪声测试 #L22、2026/11/24:10、.en.md:8、100:2、docs/4_STUDIES.{zh,en}.md:10、`10–11｜paper/existing.md:5`',
+            'evidence': ['真实存在 10–11｜paper/existing.md:5 与 .gitignore:1，真实缺失 src/missing_mod.py#L10'],
+            'findings': [],
+        }
+        cit_audit = harness._citation_audit(cit_res, cit_dir, ['paper/existing.md', '.gitignore'], [])
+        self.assertEqual(cit_audit['missing_files'], ['src/missing_mod.py'])
+        self.assertEqual(cit_audit['out_of_range_lines'], [])
+        self.assertEqual(cit_audit['unopened_cited_files'], ['src/missing_mod.py'])
 
 
 if __name__ == '__main__':
