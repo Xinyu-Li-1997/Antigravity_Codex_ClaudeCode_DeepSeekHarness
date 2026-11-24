@@ -67,8 +67,8 @@
       ],
       "recommended_client": "codex",
       "recommended_model_family": "sol",
-      "recommended_tier": "max",
-      "strengths": "现阶段独立代码与文档审查优先跨客户端调用 Codex gpt-6.2-sol（872,000 token 窗口）、DeepSeek Harness 内置 DeepSeek-V4-Pro（1,048,576 token 窗口）及 Antigravity carbon 系列（agy:@review 与深度审查默认选低幻觉 carbon，neon 按显式点名或编码角色调用）；Claude Code 客户端保留完整的五类生命周期钩子、原生 --json-schema 结构化输出校验及本地 router.py 与 CC Switch 卡片通道，按 subscription_matrix 中已启用的卡片模型参与调度。",
+      "recommended_tier": "high",
+      "strengths": "现阶段独立代码与文档审查优先跨客户端调用 Codex gpt-6.2-sol（872,000 token 窗口）、DeepSeek Harness 内置 DeepSeek-V4-Pro（1,048,576 token 窗口）及 Antigravity carbon 系列（agy:@review 与深度审查默认选低幻觉 carbon，neon 按显式点名或编码角色调用）；常规审查默认走 high 挡以兼顾吞吐与防过度挑刺，命中物理守恒、离散算子、边界条件、并发死锁或权限越界等高危关键词时由 select_task_tier 自动升至 max 挡深审；Claude Code 客户端保留完整的五类生命周期钩子、原生 --json-schema 结构化输出校验及本地 router.py 与 CC Switch 卡片通道，按 subscription_matrix 中已启用的卡片模型参与调度。",
       "defects_and_mitigations": "Claude Code 当前启用的 DeepSeek 卡片为轻量模型 deepseek-flash[1M]，由脚本硬性拦截其冒充非 fast 审查角色主力；严禁接入第三方 Responses API 协议转换反代，无头只读调用固定附加 --permission-mode dontAsk 以规避 auto 分类器限流报错。"
     },
     "fast": {
@@ -440,7 +440,7 @@
       "unlisted_window_fallback_tokens": 120000,
       "default_shard_tokens": 120000,
       "default_timeout_sec": 600,
-      "default_gate_max_rounds": 3,
+      "default_gate_max_rounds": 2,
       "quota_default_cooldown_sec": 3600,
       "quota_max_horizon_days": 45,
       "catalog_max_age_days": 7,

@@ -7673,6 +7673,37 @@ else:
         self.assertEqual(cit_audit['out_of_range_lines'], [])
         self.assertEqual(cit_audit['unopened_cited_files'], ['src/missing_mod.py'])
 
+    def test_review_severity_prompt_and_risk_tiered_effort(self):
+        # 1. Audit and review task prompts enforce blocking vs advisory severity separation
+        audit_p = harness._build_audit_prompt({'files': ['solver.py']}, '边界与一致性')
+        self.assertIn('critical/high', audit_p)
+        self.assertIn('medium/low', audit_p)
+        review_p = harness._task_prompt('review', 'antigravity', self.root, True, [], '检查辅助脚本', '')
+        self.assertIn('阻断级', review_p)
+        non_review_p = harness._task_prompt('code', 'antigravity', self.root, False, ['a.py'], '实现函数', '')
+        self.assertNotIn('【审查分级】', non_review_p)
+
+        # 2. When role:review recommends high, routine reviews stay high while high-risk domain/security reviews escalate to max
+        high_review_profile = json.loads(json.dumps(harness._fleet_profile()))
+        high_review_profile['roles']['review']['recommended_tier'] = 'high'
+        with patch.object(harness, '_fleet_profile', return_value=high_review_profile):
+            self.assertEqual(
+                harness.select_task_tier('auto', 'review', '审查普通辅助脚本与文档表述', engine='role:review'),
+                ('high', 'role_profile_review_high'),
+            )
+            self.assertEqual(
+                harness.select_task_tier('auto', 'review', '核查守恒通量与边界条件离散', engine='role:review'),
+                ('max', 'complexity_high_domain_max'),
+            )
+            self.assertEqual(
+                harness.select_task_tier('auto', 'review', '审查安全钩子权限越界拦截逻辑', engine='role:review'),
+                ('max', 'complexity_high_domain_max'),
+            )
+            self.assertEqual(
+                harness.select_task_tier('auto', 'direction', '梳理整体路线方案', engine='role:orchestrator'),
+                ('high', 'role_profile_orchestrator_high'),
+            )
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

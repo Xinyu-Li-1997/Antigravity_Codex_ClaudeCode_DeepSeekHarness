@@ -94,6 +94,7 @@ HIGH_COMPLEXITY_CUES = (
     '证明', 'prove', '定理', '引理', '推导', 'derive', '变分',
     '根因', 'root cause', '死锁', 'deadlock', '竞态', 'race condition', '并发', 'concurrency',
     '数值耗散', '激波',
+    '越权', '越界', '安全钩子', '权限', '数据丢失',
 )
 
 
@@ -2074,6 +2075,8 @@ def select_task_tier(requested_tier='auto', kind='review', text='', file_count=1
             return 'max', f'task_specialty_{kind}_max' if kind in ('math', 'direction') else 'complexity_high_domain_max'
         return 'high', 'economy_adaptive_high'
     if role_tier and role_tier != 'max':
+        if role_name == 'review' and _has_positive_cue(sample, HIGH_COMPLEXITY_CUES):
+            return 'max', 'complexity_high_domain_max'
         return role_tier, f'role_profile_{role_name}_{role_tier}'
     if kind in ('math', 'direction'):
         return 'max', f'task_specialty_{kind}_max'
@@ -6179,7 +6182,9 @@ def _normalize_rel_file(file_str, target_dir):
 def _build_audit_prompt(unit, focus):
     files = '\n'.join('- ' + path for path in unit['files'])
     return ('在当前目录按指定范围只读审查，给出文件和真实行号。不要修改文件，严禁在目标工作目录外创建或改动任何文件或目录（含严禁 git worktree add），且不要另行调用本编排器。\n重点: '
-            + (focus or '物理守恒、边界条件、数值稳定性及代码一致性') + '\n计划文件清单:\n' + files
+            + (focus or '物理守恒、边界条件、数值稳定性及代码一致性')
+            + '\n分级标准: 仅将具有明确触发或复现链路的实质缺陷标为 critical/high（阻断级），其余细节与风格建议标为 medium/low（参考级），不借极端假想反复打回。\n计划文件清单:\n'
+            + files
             + '\n按 JSON Schema 返回发现，read_files 列出已读取文件，unread_files 逐文件说明未完成的原因。')
 
 
@@ -6580,9 +6585,11 @@ def _task_prompt(kind, caller, target, readonly, scopes, text, boundary):
     access = '只读完成任务，正文通过回执返回。' if readonly else f"允许写入范围 {scopes or '调用方授权的目标工作目录'}。"
     polish = ('【润色防幻觉硬约束】严禁新增原稿与任务说明中不存在的陌生学科术语、虚构算例名称（如未在代码中出现的领域词）、'
               '未声明的命令行参数、文件名或无依据的定量数字；仅优化表达清晰度与逻辑结构。\n' if kind == 'polish' else '')
+    review = ('【审查分级】仅将具有明确失效或复现链路的实质缺陷标为阻断级，其余细节建议仅作参考记录，不借极端假想反复打回。\n'
+              if kind == 'review' else '')
     return (f'任务类型 {kind}。当前总控 {caller}。工作目录为当前目录。任务目标 {location}。\n' + access
             + '严禁在目标工作目录外创建、修改或删除任何文件或目录（含严禁向目录外执行 git worktree add）。'
-            + '不要调用本编排器，不要修改其他会话或全局配置。\n' + boundary + '\n' + polish + text
+            + '不要调用本编排器，不要修改其他会话或全局配置。\n' + boundary + '\n' + polish + review + text
             + '\n按给定 JSON Schema 返回正文、证据及未验证事项。')
 
 

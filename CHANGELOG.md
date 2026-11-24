@@ -2,6 +2,22 @@
 
 本文件记录四客户端共用规则、会话钩子、后台验证工具与上游维护流程的版本演进。当前插件版本以 `template/user-guard/plugin.json` 为准；常驻使用文档只说明机制和配置键，不重复维护版本号与性能日期。
 
+## [1.18.12] - 2026-11-24
+
+围绕“防规则膨胀、降派工摩擦、控审查过拟合”完成常驻规则与公开文档整篇减负重写，并补齐审查阻断/建议分级、风险分层选挡与 2 轮门禁收敛：
+
+- **常驻规则与技能文档系统减法（`AGENTS.md`、`template/user-guard/rules/AGENTS.md`、`template/user-guard/skills/cae-harness/SKILL.md`、`template/user-guard/skills/fleet-evolve/SKILL.md`）**：
+  - 在 `R0` 与仓库治理边界确立“反复踩坑优先下沉为单测、类型约束或钩子守卫，已被机械检查守住的细则及时从文字规则减薄”的原则；大幅精简四份常驻与技能文档体积，同步清理与钩子源码重复的底层实现复述，降低日常上下文负担；
+  - 在日常协作规程中补齐三项务实约定：零碎小修与高频交互对齐直接由主会话闭环（接口清晰的成块模块再跨端派工）、重大架构与建模路线支持无草稿盲出独立双方案防锚定，以及按风险分层的审查节奏控制。
+- **审查分级、风险分层选挡与 2 轮门禁收敛（`cae_harness.py`、`fleet_profile.json`、`tests/test_harness_offline.py`）**：
+  - 在 `_build_audit_prompt` 与 `_task_prompt(kind='review')` 注入审查严重度分级约束：仅将具有明确触发或复现链路的实质缺陷标为 `critical`/`high`（阻断级），细节与风格建议记为 `medium`/`low`（参考级），避免借极端假想反复打回；
+  - 在 `HIGH_COMPLEXITY_CUES` 补充工程高危词（`越权`、`越界`、`安全钩子`、`权限`、`数据丢失`），并在 `select_task_tier` 中为 `role:review` 增加风险分层：常规文档与辅助脚本审查默认走 `fleet_profile.json` 中的 `recommended_tier: high`，命中物理守恒、离散算子、边界条件、并发死锁或安全权限高危词时自动升至 `max` 挡深审；
+  - 将 `runtime_tunables.headless_dispatch.default_gate_max_rounds` 由 `3` 收敛至 `2`，两轮门禁仍未收敛即停下交由人工拍板，并补充离线回归单测 `test_review_severity_prompt_and_risk_tiered_effort`。
+- **公开网页文档人话润色与脱敏核验（`README.md`、`docs/workflow-guide.md`、`docs/architecture-and-hooks.md`、`template/user-guard/README.md`）**：
+  - 拆解四份公开文档中的超长嵌套句与重复实现细目，按工程师阅读习惯以更自然平实的书面语整篇理顺，同步反映新版协作边界、无草稿独立双方案、审查分级与 2 轮门禁机制，并完成全仓 `check-grounding --strict` 词法锚定与脱敏复核。
+
+---
+
 ## [1.18.11] - 2026-11-24
 
 基于 Windows 与 WSL2 双端真实重负载轨迹与回执复盘，根治跨端协议边界失配、Windows 文件句柄锁中断抢救、无头子会话钩子二次注入及大仓库全盘快照耗时等五类系统性缺陷：
