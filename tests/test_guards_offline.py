@@ -4283,6 +4283,72 @@ class TestDispatchAndBillingGuards(unittest.TestCase):
         self.assertEqual(res_carbon.get("decision"), "continue")
         self.assertNotIn("编码高吞吐系列", res_carbon.get("reason", ""))
 
+    def test_v203_gui_hang_guard_and_conversation_delete_rpc_boundary(self):
+        """禁止无 timeout 直接调用桌面 GUI 二进制导致后台挂死，并把 ConversationService/DeleteConversation 纳入边界确认。"""
+        def run_cmd(cmd: str, is_daemon: bool = False, headless: bool = False):
+            args = {"CommandLine": cmd}
+            if is_daemon:
+                args["IsDaemon"] = True
+            env = {"CAE_HARNESS_DEPTH": "1"} if headless else {}
+            with unittest.mock.patch.dict(os.environ, env, clear=False):
+                if not headless:
+                    os.environ.pop("CAE_HARNESS_DEPTH", None)
+                return status_guard.handle_pre_tool_use({
+                    "conversationId": "v203-gui-rpc-guard",
+                    "cwd": str(self.project),
+                    "workspacePaths": [str(self.project)],
+                    "toolCall": {"name": "run_command", "args": args},
+                })
+
+        # 1) 直接或经 wsl/bash/命令替换/管道调用桌面 GUI 二进制探版本均被阻断
+        for bad_gui in (
+            "antigravity --version",
+            "/usr/local/bin/antigravity --version",
+            """wsl.exe -d Ubuntu-24.04 -- bash -lc 'echo "ver=$(/usr/local/bin/antigravity --version)"'""",
+            '& "C:\\Apps\\CC Switch\\cc-switch.exe" --version',
+            "/usr/bin/cc-switch --version | head -n 1",
+            "cc-switch",
+            '"C:\\Apps\\DeepSeek Harness.exe" --version',
+            '"C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.1120\\app\\Codex.exe" --version',
+        ):
+            res = run_cmd(bad_gui)
+            self.assertEqual(res["decision"], "deny", bad_gui)
+            self.assertIn("桌面 GUI 应用", res.get("reason", ""), bad_gui)
+
+        # 2) 真正的 CLI、带 timeout 包裹、纯元数据读取、Start-Process 或 IsDaemon=True 均正常放行
+        for ok_cmd in (
+            "agy --version",
+            "codex --version",
+            '"C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.1120\\app\\resources\\codex.exe" --version',
+            "claude --version",
+            "dsh --version",
+            "timeout 3 /usr/bin/cc-switch --version",
+            'echo "$(timeout 3 /usr/local/bin/antigravity --version)"',
+            "dpkg -s cc-switch",
+            'Get-Item "C:\\Apps\\Antigravity.exe"',
+            'Start-Process "C:\\Apps\\cc-switch.exe"',
+        ):
+            self.assertEqual(run_cmd(ok_cmd)["decision"], "allow", ok_cmd)
+        self.assertEqual(run_cmd("cc-switch", is_daemon=True)["decision"], "allow")
+
+        # 3) ConversationService/DeleteConversation 经 HTTP 客户端或内联 Python 调用时，交互态 force_ask、无头态 deny
+        for del_rpc in (
+            """curl -sS -X POST http://127.0.0.1:42000/product.v1.ConversationService/DeleteConversation -d '{"conversationId":"abc"}'""",
+            'Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:42000/product.v1.ConversationService/DeleteConversation"',
+            '''python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:1/product.v1.ConversationService/DeleteConversation', data=b'{}')"''',
+        ):
+            self.assertEqual(run_cmd(del_rpc, headless=False)["decision"], "force_ask", del_rpc)
+            self.assertEqual(run_cmd(del_rpc, headless=True)["decision"], "deny", del_rpc)
+
+        # 4) 只读 ListConversations、代码搜索、git commit 文本及只读 Python 文本检索不误拦
+        for safe_rpc in (
+            """curl -sS -X POST http://127.0.0.1:42000/product.v1.ConversationService/ListConversations -d '{}'""",
+            'rg "DeleteConversation" .',
+            'git commit -m "guard /product.v1.ConversationService/DeleteConversation"',
+            '''python -c "print('/product.v1.ConversationService/DeleteConversation' in 'x')"''',
+        ):
+            self.assertEqual(run_cmd(safe_rpc)["decision"], "allow", safe_rpc)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

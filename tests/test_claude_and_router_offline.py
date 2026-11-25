@@ -2352,7 +2352,10 @@ class TestClaudeInstallerAndUpgradeAudit(OfflineSandbox):
         user_words.atomic_write_json(gemini / "antigravity-cli/cache/cae_models_cache.json", {"models": [
             {"slug": "gemini-4-carbon-high"},
             {"slug": "gemini-4-argon-high"},
+            {"slug": "gemini-pro-orchestrator-argon"},
             {"slug": "gemini-3.8-flash-low"},
+            {"slug": "claude-sonnet-4-6-high"},
+            {"slug": "claude-opus-4-6-medium"},
             {"slug": "gpt-oss-120b-medium"},
         ]})
         user_words.atomic_write_json(self.codex / "models_cache.json", {"models": [
@@ -2376,7 +2379,10 @@ class TestClaudeInstallerAndUpgradeAudit(OfflineSandbox):
         self.assertEqual(rep_sbx["codex"]["hooks_trust"]["trusted_count"], 0)
         self.assertNotIn("review_codex_hook_trust", rep_sbx["summary"]["recommended_actions"])
         self.assertIn("gemini-4-argon-high", rep_sbx["antigravity"]["retiring_models"])
+        self.assertIn("gemini-pro-orchestrator-argon", rep_sbx["antigravity"]["retiring_models"])
         self.assertIn("gemini-3.8-flash-low", rep_sbx["antigravity"]["retiring_models"])
+        self.assertIn("claude-sonnet-4-6-high", rep_sbx["antigravity"]["retiring_models"])
+        self.assertIn("claude-opus-4-6-medium", rep_sbx["antigravity"]["retiring_models"])
         self.assertIn("gpt-oss-120b-medium", rep_sbx["antigravity"]["retiring_models"])
         self.assertNotIn("gemini-4-carbon-high", rep_sbx["antigravity"]["retiring_models"])
 
@@ -2475,7 +2481,8 @@ class TestClaudeInstallerAndUpgradeAudit(OfflineSandbox):
             kwargs["dir"] = str(tmp_parent)
             return orig_mkdtemp(*args, **kwargs)
 
-        with mock.patch.object(installer.subprocess, "Popen", side_effect=_HangingProc), \
+        with mock.patch.object(installer, "_read_desktop_app_version", return_value=None), \
+                mock.patch.object(installer.subprocess, "Popen", side_effect=_HangingProc), \
                 mock.patch.object(installer.tempfile, "mkdtemp", side_effect=_mkdtemp_in_sandbox), \
                 mock.patch.object(installer.os, "killpg", side_effect=lambda pid, sig: killed_groups.append((pid, sig)), create=True):
             rep = installer._audit_cli({"native_installed": True, "native_binary": "/usr/bin/cc-switch"})
@@ -2485,6 +2492,25 @@ class TestClaudeInstallerAndUpgradeAudit(OfflineSandbox):
         if os.name != "nt":
             self.assertEqual(len(killed_groups), 1)
             self.assertEqual(killed_groups[0][0], 424242)
+
+    def test_audit_cli_cc_switch_prefers_offline_metadata_without_spawning_gui(self):
+        """cc-switch 存在离线包元数据时直接零进程返回版本，不拉起 Popen；dpkg 状态文件解析仅认已安装包。"""
+        status_file = self.root / "dpkg_status"
+        status_file.write_text(
+            "Package: cc-switch-old\nStatus: deinstall ok config-files\nVersion: 4.0.10\n\n"
+            "Package: cc-switch\nStatus: install ok installed\nVersion: 4.0.42\n\n",
+            encoding="utf-8",
+        )
+        with mock.patch.object(installer.os, "name", "posix"):
+            self.assertEqual(installer._read_dpkg_package_version("cc-switch", status_path=status_file), "4.0.42")
+            self.assertIsNone(installer._read_dpkg_package_version("cc-switch-old", status_path=status_file))
+            self.assertIsNone(installer._read_dpkg_package_version("missing-pkg", status_path=status_file))
+
+        with mock.patch.object(installer, "_read_desktop_app_version", return_value="4.0.42"), \
+                mock.patch.object(installer.subprocess, "Popen", side_effect=AssertionError("must not spawn cc-switch GUI")):
+            rep = installer._audit_cli({"native_installed": True, "native_binary": "/usr/bin/cc-switch"})
+        self.assertEqual(rep["version"], "4.0.42")
+        self.assertEqual(rep["desktop_version"], "4.0.42")
 
     @unittest.skipIf(os.name == "nt", "POSIX 进程组孤儿子进程清理回归仅在类 Unix 环境执行")
     def test_audit_cli_posix_real_orphan_child_killed_and_tempdir_removed(self):

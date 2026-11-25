@@ -16,12 +16,12 @@
 | [fleet_profile.json](../template/user-guard/skills/cae-harness/fleet_profile.json) | 通用 + 上游 | 唯一动态配置源：维护五角色 `roles`、四端 `native_agent_profiles`、`runtime_tunables`、`subscription_matrix` 与 `capability_ledger` |
 | [cae_harness.py](../template/user-guard/skills/cae-harness/scripts/cae_harness.py) | 通用 + 上游 | 跨端无头调度与离线诊断总控：P0 点名锁定、角色选路与风险升挡、`--isolation` 四级隔离、持久化会话与超时抢救、`<ticket_id>_card.md` 落盘，以及 `check-grounding`（含 `--doc-hygiene`）、`read-plan`、`cross-check`、`reconcile` 四项离线确定性工具 |
 | [user_words.py](../template/user-guard/hooks/user_words.py) | 通用 + 上游 | 钩子共用基础库：跨平台文件锁、原子写、三端轨迹去噪与子代理摘要提取、历史确认单折叠及账单存取 |
-| `hooks/_lib/` | 通用 + 上游 | `fs_safety.py`（重解析点防御原子写）、`shell_lex.py`（Shell 拆壳与 PowerShell 续行归一化）、`adaptive_policy.py`（按窗口与强度缩放阈值）、`process_guard.py`（墙钟自毁与 POSIX 条件虚拟内存上限） |
+| `hooks/_lib/` | 通用 + 上游 | `fs_safety.py`（重解析点防御原子写）、`shell_lex.py`（Shell 拆壳与 PowerShell 续行归一化）、`adaptive_policy.py`（读取 `modelName` 与挡位并按窗口缩放阈值）、`process_guard.py`（墙钟自毁与 POSIX 条件虚拟内存上限） |
 | [session_context_loader.py](../template/user-guard/hooks/session_context_loader.py) | 通用 + 上游 | 恢复与调用前门禁：普通回合零字节注入；压缩后分块补回原话、实质子代理摘要、未决票据总览与有界对账及阅读计划指针 |
-| [status_guard.py](../template/user-guard/hooks/status_guard.py) | 通用 + 上游 | 工具执行前门禁：静态解析文件工具、Shell 包装与内联 Python AST，拦截越界写删、外部 `git worktree`、空转轮询与裸调 CLI，核验已批票据与原生通道容量 |
+| [status_guard.py](../template/user-guard/hooks/status_guard.py) | 通用 + 上游 | 工具执行前门禁：静态解析文件工具、Shell 包装与内联 Python AST，拦截越界写删、本地会话删除 RPC、外部 `git worktree`、未分页 Git、无 `timeout` 桌面 GUI 挂死调用、空转轮询与裸调 CLI，核验已批票据与原生通道容量 |
 | [reply_repeat_guard.py](../template/user-guard/hooks/reply_repeat_guard.py) | 通用 + 上游 | 回合结束门禁（无头子进程 `CAE_HARNESS_DEPTH` 自动跳过）：拦截空等刷屏、重复贴票、局部补测冒充全过，单次扫描三端轨迹统一守卫零探测否定、局部排查全称缺口与长文单端整写免审（联动 `code_families` 角色提示），并按 `run_id` 核验回执与 `reconcile_file` 链接 |
-| [handoff_gate.py](../template/user-guard/hooks/handoff_gate.py) | 通用 + 上游 | 长会话分级交接门禁：追踪压缩次数、轨迹体积与读图字节，在 `drain`/`freeze` 阶段限制新派工并核验【新对话提示词】与待拍板占位符保护 |
-| [install.py](../install.py)、`install.ps1`、`install.sh` | 上游专属 | 校验非符号链接与非重解析点后幂等分发四端配置；提供零写入的配置漂移、Windows 与 WSL2 双端对齐、DSH 协议探测及科学计算包 ABI 风险体检 |
+| [handoff_gate.py](../template/user-guard/hooks/handoff_gate.py) | 通用 + 上游 | 长会话分级交接门禁：追踪压缩次数、轨迹体积与读图字节，在 `drain`/`freeze` 阶段放行界面进度与权限只读工具、拦截会话创建删除 RPC 与新派工，并核验【新对话提示词】与待拍板占位符保护 |
+| [install.py](../install.py)、`install.ps1`、`install.sh` | 上游专属 | 校验非符号链接与非重解析点后幂等分发四端配置；支持零进程读取 PE 与 dpkg 桌面应用版本，提供配置漂移、Windows 与 WSL2 双端对齐、DSH 协议探测及科学计算包 ABI 风险体检 |
 | [fleet_state.py](../template/user-guard/skills/fleet-evolve/scripts/fleet_state.py) | 上游专属 | 核验 `upstream_config_repo` 身份；管理提案审批锁（`propose`/`approve`）、重启重入锁（`record-pass1`/`verify-pass2`）与终审事实锚定门禁 |
 | [router.py](../template/claude/router/router.py)、[ccswitch_admin.py](../template/claude/router/ccswitch_admin.py) | 通用 + 上游 | 本地回环 `/v1/messages` 前缀分流（向非回环上游注入密钥时强制 HTTPS、输出脱敏单行日志、遇 401 或 403 使缓存失效），以及带 SQLite 在线备份的 CC Switch 切卡 |
 

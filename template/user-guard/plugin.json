@@ -2,9 +2,27 @@
   "$schema": "https://antigravity.google/schemas/v1/plugin.json",
   "name": "user-guard",
   "displayName": "User Guard & Scientific Standards",
-  "version": "2.0.2",
+  "version": "2.0.3",
   "description": "Engineering rules, session lifecycle hooks, read-only review subagents, and headless CLI verification scripts for Antigravity, Codex, Claude Code, and DeepSeek Harness in scientific computing and CAE workflows.",
+  "author": {
+    "name": "Xinyu Li (Xinyu-Li-1997)",
+    "url": "https://github.com/Xinyu-Li-1997"
+  },
+  "homepage": "https://github.com/Xinyu-Li-1997/Antigravity_Codex_ClaudeCode_DeepSeekHarness",
+  "repository": "https://github.com/Xinyu-Li-1997/Antigravity_Codex_ClaudeCode_DeepSeekHarness",
   "license": "Apache-2.0",
   "logo": "assets/logo.svg",
-  "repository": "https://github.com/Xinyu-Li-1997/Antigravity_Codex_ClaudeCode_DeepSeekHarness"
+  "suggestedPrompts": [
+    "只读体检本机四客户端配置漂移、Windows 与 WSL2 对齐状态及 ABI 风险",
+    "先运行 read-plan 评估当前项目体积并规划分片审查方案",
+    "全仓运行 check-grounding --strict --doc-hygiene 核查文档事实与卫生"
+  ],
+  "keywords": [
+    "scientific-computing",
+    "cae",
+    "cfd",
+    "fea",
+    "hooks",
+    "verification"
+  ]
 }

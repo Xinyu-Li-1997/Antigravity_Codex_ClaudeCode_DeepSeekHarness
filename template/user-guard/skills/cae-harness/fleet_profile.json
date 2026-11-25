@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "profile_id": "fleet-snapshot-v2",
-  "evaluated_at": "2026-11-25",
+  "evaluated_at": "2026-11-26",
   "evaluation_policy": {
     "bidirectional_strength_and_defect_audit": true,
     "all_roles_dynamic": true,
@@ -28,7 +28,7 @@
       "recommended_model_family": "carbon",
       "recommended_tier": "high",
       "strengths": "现阶段中文工程表达自然平实，无工具事实幻觉率与超长上下文召回表现更稳健，适合承担课题需求澄清、架构权衡、论文/技术文档重写与主会话统筹；Gemini 4 Carbon 提供 Low、Medium、High 三挡，底层原生 1,000,000 token 窗口、Antigravity 客户端实享活跃上限 512,000 token（单分片安全预算 460,800 token），CLI 支持流式 JSON 与原生 --json-schema 结构化输出校验，直接使用客户端订阅的模型组滚动配额（5 小时窗口与 7 天周期额度），无需单独按量采购 API。同代 Gemini 4 Neon 保持启用，在外部编码代理（agy:@code，XHigh）与内部 Swarm 并行编码 worker（native_swarm，High）承担高速实现角色。",
-      "defects_and_mitigations": "Antigravity 各表面（App、IDE、插件以及 CLI 有头与无头模式）共享服务端与客户端内置的 512,000 token 活跃窗口与自动检查点压缩上限；虽较此前约 256,000 token 翻倍、每轮压缩频率约降 3.5 倍，仍低于底层 1,000,000 token API 窗口且不可通过配置文件手改，仅支持以 /compact 提前手动压缩，且 agy models 命令不输出整数窗口字段；Carbon 输出吞吐与代理编码速度慢于同代 Neon。通过 R9 钩子按 runtime_tunables.compaction_recovery.per_client.antigravity 与 hooks/_lib/adaptive_policy.py 基于 512,000 token 实享窗口动态缩放恢复预算并恢复历轮用户原话与实质子代理返回摘要，在 cae_harness.py 中按 512,000 token 窗口（安全预算 460,800 token）规划审查，将编码代理与并行编码 worker 按角色分流至 Neon，并继续以 R6 原文行号复核、check-grounding --strict 及 blocked_auto_tokens / agy_retiring_patterns 保证事实准确与跳过复合/待退役模型。"
+      "defects_and_mitigations": "Antigravity 各表面（App、IDE、插件以及 CLI 有头与无头模式）共享服务端与客户端内置的 512,000 token 活跃窗口与自动检查点压缩上限；虽较此前约 256,000 token 翻倍、每轮压缩频率约降 3.5 倍，仍低于底层 1,000,000 token API 窗口。App 与 IDE 不提供配置文件手改上限（支持以 /compact 提前手动压缩），CLI 自 v1.5.15 起支持通过 AGY_CLI_AUTO_COMPACT_OVERRIDE 在窗口上限内调整自动压缩触发阈值，且 agy models 命令不输出整数窗口字段；Carbon 输出吞吐与代理编码速度慢于同代 Neon。通过 R9 钩子按 runtime_tunables.compaction_recovery.per_client.antigravity 与 hooks/_lib/adaptive_policy.py（同步读取 camelCase modelName）基于 512,000 token 实享窗口动态缩放恢复预算并恢复历轮用户原话与实质子代理返回摘要，在 cae_harness.py 中按 512,000 token 窗口（安全预算 460,800 token）规划审查，将编码代理与并行编码 worker 按角色分流至 Neon，并继续以 R6 原文行号复核、check-grounding --strict 及 blocked_auto_tokens / agy_retiring_patterns 保证事实准确与跳过复合/待退役模型。"
     },
     "math": {
       "candidates": [
@@ -81,7 +81,7 @@
       "recommended_client": "dsh",
       "recommended_model_family": "deepseek-flash",
       "recommended_tier": "low",
-      "strengths": "现阶段通过官方账号登录（deepseek-account）或 DEEPSEEK_API_KEY（~/.dsh/.credentials.yaml 或 .env）即可直连，内置 DeepSeek-V4-Pro 与 DeepSeek-V4.1-Flash 均声明 1,048,576 token 窗口（单分片安全预算 943,718 token，支持 off、low、high、max 四挡）；Antigravity 同代轻量系列 Gemini 4 Hydrogen 同时提供 Low 与 XHigh 挡位。既可单客户端独立使用，也可在显式省额度或其他客户端进入配额冷却时无损接替。",
+      "strengths": "现阶段通过官方账号登录（deepseek-account）或 DEEPSEEK_API_KEY（~/.dsh/.credentials.yaml 或 .env）即可直连，内置 DeepSeek-V4-Pro 与 DeepSeek-V4.1-Flash 均声明 1,048,576 token 窗口（单分片安全预算 943,718 token，支持 off、low、high、max 四挡）；Antigravity 同代轻量系列 Gemini 4 Hydrogen 提供 Low、Medium、High 与 XHigh 四挡。既可单客户端独立使用，也可在显式省额度或其他客户端进入配额冷却时无损接替。",
       "defects_and_mitigations": "DSH 命令行暂未内置生命周期钩子与原生 --json-schema 参数，长文本回执偶发包裹代码块围栏或附带底层 DSML 停止标记；由 cae_harness.py 注入单 JSON 对象输出约束并执行平衡对象解码与 DSML 尾部清洗。轻量挡仅用于显式省额度或快速表面检查，不静默替代高严谨度推导与核心审查。"
     }
   },
@@ -175,9 +175,9 @@
       }
     ],
     "agy_retiring_patterns": [
-      "claude[- ]?4[.-]6",
+      "claude(?:[- ]+(?:sonnet|opus|haiku))?[- ]?4[.-]6",
       "gpt[- ]oss[- ]120b",
-      "gemini[- ]?4[- ]?argon",
+      "(?:gemini[- ]?4[- ]?|orchestrator[- (]+)argon",
       "gemini[- ]?3[.-]8[- ]?flash"
     ]
   },
@@ -499,7 +499,7 @@
     }
   },
   "capability_ledger": {
-    "last_online_refresh_at": "2026-11-25",
+    "last_online_refresh_at": "2026-11-26",
     "local_bench_verified_at": "2026-11-19",
     "online_refresh_module": "fleet-evolve",
     "dispatch_online_lookup": false

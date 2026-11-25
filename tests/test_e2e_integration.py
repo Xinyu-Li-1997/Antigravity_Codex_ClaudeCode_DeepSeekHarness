@@ -490,6 +490,9 @@ class TestEndToEndIntegration(unittest.TestCase):
             "homepage",
             "repository",
             "disabled",
+            "keywords",
+            "skills",
+            "extensions",
         }
         self.assertEqual(plugin_json.get("name"), "user-guard")
         self.assertEqual(plugin_json.get("$schema"), "https://antigravity.google/schemas/v1/plugin.json")

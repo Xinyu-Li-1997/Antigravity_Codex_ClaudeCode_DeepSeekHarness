@@ -199,6 +199,15 @@ _PY_FALLBACK_PAIRS = (
         r"""\bshutil\.copy\w*\s*\([^,]+,\s*(['"][^'"]+['"])""")),
 )
 
+_CONVERSATION_DELETE_RPC_RE = re.compile(
+    r"/product\.v1\.ConversationService/DeleteConversation\b", re.IGNORECASE
+)
+_RPC_EXEC_VERBS = {
+    "curl", "wget", "irm", "iwr", "invoke-restmethod", "invoke-webrequest",
+    "grpcurl", "http", "https", "xh", "fetch",
+    "node", "deno", "bun", "python", "python3", "py", "ruby", "perl", "php",
+}
+
 _SHELL_DELETE_VERBS = {"rm", "rmdir", "rd", "del", "erase", "remove-item", "ri"}
 _SHELL_CREATE_WRITE_VERBS = {
     "mkdir",
@@ -2296,6 +2305,14 @@ def _scan_inline_python_code(
                 continue
     if saw_recursion_error:
         return "内联 Python 语法树嵌套深度超出静态审查上限", "<AST_RECURSION_LIMIT>", _compact_snippet(used_src)
+    if _CONVERSATION_DELETE_RPC_RE.search(used_src) and re.search(
+        r"\b(?:urlopen|Request|request|post|send|connect|http\.client|requests|httpx|aiohttp)\b", used_src
+    ):
+        return (
+            "调用本地会话删除接口 (ConversationService/DeleteConversation)",
+            "<CONVERSATION_DELETE_RPC>",
+            _compact_snippet(used_src),
+        )
 
     bindings = {_AST_CWD: frozenset((base_cwd,)), "open": frozenset((_AstCallable("builtins.open"),))}
 
@@ -3681,6 +3698,13 @@ def _detect_command_external_mutation(
                     return "创建项目外 Git 工作树 (git worktree add)", wt_path, _compact_snippet(clause)
             continue
 
+        if head_low in _RPC_EXEC_VERBS and _CONVERSATION_DELETE_RPC_RE.search(clause):
+            return (
+                "调用本地会话删除接口 (ConversationService/DeleteConversation)",
+                "<CONVERSATION_DELETE_RPC>",
+                _compact_snippet(clause),
+            )
+
         action_label: Optional[str] = None
         targets: List[str] = []
 
@@ -4350,6 +4374,125 @@ def _find_unpaged_git_command(command: str, depth: int = 0) -> Optional[str]:
     return None
 
 
+_GUI_HANG_HINT_RE = re.compile(r"(?:antigravity|cc-switch|deepseek[\s_-]?harness|codex\.exe)", re.I)
+_GUI_PROBE_ARGS = {"--version", "-v", "--help", "-h", "--status"}
+
+
+def _find_hanging_gui_command(command: str, depth: int = 0) -> Optional[str]:
+    """识别在非后台/无 timeout 壳命令中直接调用桌面 GUI 二进制（易忽略 --version 或弹窗挂死）。"""
+    if depth > MAX_WRAPPER_DEPTH or not command or not _GUI_HANG_HINT_RE.search(command):
+        return None
+    for sub_expr in _extract_cmd_substitutions(command):
+        hit = _find_hanging_gui_command(sub_expr, depth + 1)
+        if hit:
+            return hit
+    masked = _shell_lex.strip_quoted_segments(command)
+    pos = 0
+    clauses: List[str] = []
+    for m in re.finditer(r"\r?\n|;|&&|\|\||\|", masked):
+        clauses.append(command[pos:m.start()])
+        pos = m.end()
+    clauses.append(command[pos:])
+    for raw_clause in clauses:
+        clause = raw_clause.strip().strip("()")
+        if not clause or not _GUI_HANG_HINT_RE.search(clause):
+            continue
+        inner = _unwrap_shell_script_with_tail(clause)
+        if inner is not None and inner[0] and inner[0] != _INVALID_ENCODED_SENTINEL:
+            hit = _find_hanging_gui_command(inner[0], depth + 1)
+            if hit:
+                return hit
+            continue
+        tokens = _safe_split_tokens(clause)
+        bounded_by_timeout = False
+        while tokens:
+            tok0 = _unquote_shell_word(tokens[0])
+            head = Path(tok0.replace("\\", "/")).name.lower().removesuffix(".exe")
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tok0):
+                tokens.pop(0)
+                continue
+            if head in ("&", "call", "if", "then", "else", "elif", "while", "until", "do", "!", "command", "exec", "nohup"):
+                tokens.pop(0)
+                continue
+            if head == "timeout":
+                bounded_by_timeout = True
+                break
+            if head in ("wsl", "sudo", "nice", "env"):
+                takes_val = {
+                    "wsl": ("-d", "--distribution", "-u", "--user", "--cd"),
+                    "sudo": ("-u", "--user", "-g", "--group", "-h", "--host", "-p", "--prompt", "-C", "--close-from", "-T", "--command-timeout", "-r", "--role", "-t", "--type", "-D", "--chdir", "-R", "--chroot"),
+                    "nice": ("-n", "--adjustment"),
+                    "env": ("-u", "--unset", "-C", "--chdir"),
+                }[head]
+                idx = 1
+                while idx < len(tokens) and (tokens[idx].startswith("-") or (head == "env" and "=" in tokens[idx])):
+                    fl = tokens[idx]
+                    idx += 1
+                    if fl == "--" or (head == "wsl" and fl in ("-e", "--exec")):
+                        break
+                    if fl in takes_val and idx < len(tokens):
+                        idx += 1
+                tokens = tokens[idx:]
+                if tokens:
+                    m_sh = re.search(r"\b(?:(?:ba|z)?sh|pwsh|powershell)(?:\.exe)?\s+(?:-[A-Za-z]*c|-command)\s+", clause, re.I)
+                    if m_sh:
+                        hit = _find_hanging_gui_command(_shell_lex.unquote_shell_word(clause[m_sh.end():].strip()), depth + 1)
+                        if hit:
+                            return hit
+                        tokens = []
+                        break
+                    sub_inner = _unwrap_shell_script_with_tail(" ".join(shlex.quote(t) for t in tokens))
+                    if sub_inner is not None and sub_inner[0] and sub_inner[0] != _INVALID_ENCODED_SENTINEL:
+                        hit = _find_hanging_gui_command(sub_inner[0], depth + 1)
+                        if hit:
+                            return hit
+                        tokens = []
+                        break
+                continue
+            if head in ("bash", "sh", "zsh", "pwsh", "powershell", "cmd"):
+                m_sh = re.search(r"\b(?:(?:ba|z)?sh|pwsh|powershell)(?:\.exe)?\s+(?:-[A-Za-z]*c|-command)\s+", clause, re.I)
+                if m_sh:
+                    hit = _find_hanging_gui_command(_shell_lex.unquote_shell_word(clause[m_sh.end():].strip()), depth + 1)
+                    if hit:
+                        return hit
+                    tokens = []
+                    break
+                sub_inner = _unwrap_shell_script_with_tail(" ".join(shlex.quote(t) for t in tokens))
+                if sub_inner is not None and sub_inner[0] and sub_inner[0] != _INVALID_ENCODED_SENTINEL:
+                    hit = _find_hanging_gui_command(sub_inner[0], depth + 1)
+                    if hit:
+                        return hit
+                elif head == "cmd":
+                    mk = next((k for k, tok in enumerate(tokens[1:], 1) if tok.lower() in ("/c", "/k")), None)
+                    if mk is not None:
+                        hit = _find_hanging_gui_command(" ".join(tokens[mk + 1:]), depth + 1)
+                        if hit:
+                            return hit
+                else:
+                    mk = next((k for k, tok in enumerate(tokens[1:], 1) if tok.lower() == "-command" or re.fullmatch(r"-[a-z]*c", tok.lower())), None)
+                    if mk is not None and mk + 1 < len(tokens):
+                        hit = _find_hanging_gui_command(" ".join(tokens[mk + 1:]), depth + 1)
+                        if hit:
+                            return hit
+                tokens = []
+                break
+            break
+        if bounded_by_timeout or not tokens:
+            continue
+        exec_norm = _unquote_shell_word(tokens[0]).replace("\\", "/")
+        exec_low = exec_norm.lower()
+        exec_stem = Path(exec_norm).name.lower().removesuffix(".exe")
+        is_gui_bin = (
+            exec_stem in ("antigravity", "cc-switch", "deepseek-harness", "deepseek harness")
+            or exec_low.endswith("/app/codex.exe")
+        )
+        if is_gui_bin:
+            rest = [_unquote_shell_word(t).lower() for t in tokens[1:]]
+            if not rest or any(arg in _GUI_PROBE_ARGS for arg in rest):
+                return " ".join(tokens[:min(len(tokens), 4)])
+    return None
+
+
 def _check_dispatch_locked(payload, tool_name, args, sid, state_dir):
     if _is_headless_subtask() or os.environ.get("USER_GUARD_DISABLE_TICKET_GATE") == "1":
         return None
@@ -4379,6 +4522,15 @@ def _check_dispatch_locked(payload, tool_name, args, sid, state_dir):
                 f"【user-guard】禁止在伪终端裸跑可能拉起交互式分页器的 Git 命令（{unpaged_git}），"
                 "否则 /usr/bin/pager (less) 会等待按键卡死后台任务；请改用 `git --no-pager ...` 或前置 `GIT_PAGER=cat`。"
             )
+        if not args.get("IsDaemon"):
+            hanging_gui = _find_hanging_gui_command(command)
+            if hanging_gui:
+                return (
+                    f"【user-guard】禁止在无超时上限的命令行直接调用桌面 GUI 应用（{hanging_gui}），"
+                    "这类程序常忽略 --version/--help 或拉起界面导致后台任务永久卡死；"
+                    "查询版本请改用 `install.py --audit-upgrade` 或只读包元数据（PE/product.json/dpkg），"
+                    "调用 CLI 请使用 `agy`/`codex`/`claude`/`dsh`，确需测试可执行文件请外包 `timeout`。"
+                )
         for tokens in _dispatch_commands(command):
             names = [
                 re.sub(r"\.(?:exe|cmd|bat|ps1)$", "", Path(t.replace(chr(92), "/")).name.lower())

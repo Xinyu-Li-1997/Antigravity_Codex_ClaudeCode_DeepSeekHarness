@@ -2823,6 +2823,85 @@ def _validate_claude_assets(repo_root: Path, claude_root: Path, args: argparse.N
 # 七、零写入升级体检
 
 
+def _read_pe_file_version(binary_path: Path) -> Optional[str]:
+    """Windows 纯文件只读提取原生 PE 可执行文件版本（零进程、不启动 GUI）。"""
+    if os.name != "nt":
+        return None
+    try:
+        if not binary_path.is_file() or _is_link_or_junction(binary_path):
+            return None
+        import ctypes
+        import ctypes.wintypes as wt
+
+        ver = ctypes.windll.version
+        ver.GetFileVersionInfoSizeW.argtypes = [wt.LPCWSTR, ctypes.POINTER(wt.DWORD)]
+        ver.GetFileVersionInfoSizeW.restype = wt.DWORD
+        ver.GetFileVersionInfoW.argtypes = [wt.LPCWSTR, wt.DWORD, wt.DWORD, wt.LPVOID]
+        ver.GetFileVersionInfoW.restype = wt.BOOL
+        ver.VerQueryValueW.argtypes = [wt.LPCVOID, wt.LPCWSTR, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wt.UINT)]
+        ver.VerQueryValueW.restype = wt.BOOL
+
+        path_str = str(binary_path)
+        size = int(ver.GetFileVersionInfoSizeW(path_str, None))
+        if size <= 0 or size > 4 * 1024 * 1024:
+            return None
+        buf = ctypes.create_string_buffer(size)
+        if not ver.GetFileVersionInfoW(path_str, 0, size, buf):
+            return None
+        ptr = ctypes.c_void_p()
+        length = wt.UINT()
+        if not ver.VerQueryValueW(buf, "\\", ctypes.byref(ptr), ctypes.byref(length)):
+            return None
+        if not ptr.value or length.value < 52:
+            return None
+        vals = (ctypes.c_uint32 * 6).from_address(ptr.value)
+        if vals[0] != 0xFEEF04BD:
+            return None
+        ms, ls = (vals[4] or vals[2]), (vals[5] or vals[3])
+        if not (ms or ls):
+            return None
+        parts = [(ms >> 16) & 0xFFFF, ms & 0xFFFF, (ls >> 16) & 0xFFFF, ls & 0xFFFF]
+        while len(parts) > 3 and parts[-1] == 0:
+            parts.pop()
+        return ".".join(str(part) for part in parts)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+
+
+def _read_dpkg_package_version(
+    package_name: str, status_path: Path = Path("/var/lib/dpkg/status"),
+) -> Optional[str]:
+    """Debian/Ubuntu 纯文件只读解析 dpkg 已安装包版本（不启动 GUI 或子进程）。"""
+    if os.name == "nt" or not package_name:
+        return None
+    try:
+        if not status_path.is_file() or _is_link_or_junction(status_path) or status_path.stat().st_size > 64 * 1024 * 1024:
+            return None
+        target = package_name.strip().lower()
+        cur_pkg = ""
+        cur_installed = False
+        cur_ver = ""
+        with status_path.open("r", encoding="utf-8", errors="replace") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if not line:
+                    if cur_pkg == target and cur_installed and cur_ver:
+                        return cur_ver
+                    cur_pkg, cur_installed, cur_ver = "", False, ""
+                    continue
+                if line.startswith("Package:"):
+                    cur_pkg = line.split(":", 1)[1].strip().lower()
+                elif line.startswith("Status:"):
+                    cur_installed = "installed" in line.split(":", 1)[1].lower().split()
+                elif line.startswith("Version:"):
+                    cur_ver = line.split(":", 1)[1].strip()
+        if cur_pkg == target and cur_installed and cur_ver:
+            return cur_ver
+    except OSError:
+        return None
+    return None
+
+
 def _read_desktop_app_version(desktop_binary: Optional[str]) -> Optional[str]:
     """纯文件只读提取桌面应用包版本（不启动 GUI 进程）。"""
     if not desktop_binary:
@@ -2903,6 +2982,20 @@ def _read_desktop_app_version(desktop_binary: Optional[str]) -> Optional[str]:
                                 return ver.strip()
         except (OSError, ValueError, TypeError, RecursionError, struct.error):
             continue
+    if os.name == "nt" and real_bin.suffix.lower() == ".exe":
+        pe_ver = _read_pe_file_version(real_bin)
+        if pe_ver:
+            return pe_ver
+    if (
+        os.name != "nt"
+        and real_bin.name.lower() == "cc-switch"
+        and real_bin.as_posix().startswith(("/usr/bin/", "/usr/sbin/", "/opt/"))
+        and real_bin.is_file()
+        and not _is_link_or_junction(real_bin)
+    ):
+        dpkg_ver = _read_dpkg_package_version("cc-switch")
+        if dpkg_ver:
+            return dpkg_ver
     return None
 
 
@@ -2914,6 +3007,13 @@ def _audit_cli(info: Dict[str, Any]) -> Dict[str, Any]:
     report["desktop_version"] = _read_desktop_app_version(info.get("native_desktop_binary"))
     binary = info.get("native_binary")
     if binary:
+        if "cc-switch" in str(binary).lower():
+            offline_ver = _read_desktop_app_version(str(binary))
+            if offline_ver:
+                report["version"] = offline_ver
+                if not report["desktop_version"]:
+                    report["desktop_version"] = offline_ver
+                return report
         try:
             cmd = (
                 [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", binary, "--version"]

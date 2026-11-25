@@ -2,6 +2,25 @@
 
 本文件记录四客户端共用规则、会话钩子、后台验证工具与上游维护流程的版本演进。当前插件版本以 `template/user-guard/plugin.json` 为准；常驻使用文档只说明机制和配置键，不重复维护版本号与性能日期。
 
+## [2.0.3] - 2026-11-26
+
+适配 Antigravity `v2.35.2` 与 CLI `v1.5.17` 协议及清单规范，补齐桌面 GUI 进程防卡死守卫、零进程版本探测与模型退役模式修复：
+
+- **Antigravity 新版事件载荷、工具集与本地会话接口适配（`adaptive_policy.py`、`handoff_gate.py`、`status_guard.py`、`plugin.json`、`tests/test_e2e_integration.py`、`tests/test_lifecycle_offline.py`）**：
+  - `adaptive_policy.py` 兼容读取 Antigravity 钩子载荷中的 `modelName` 字段，并在缺少独立强度字段时从后缀或括号标识自动派生推理挡位，确保按窗口与挡位动态缩放恢复与交接阈值准确生效；
+  - `handoff_gate.py` 在 `drain` 与 `freeze` 收口期放行 `update_focus`、`update_steps`、`list_permissions` 与 `list_plugin_accounts` 辅助查询工具而不扣减预算，同时阻断 `ConversationService` 的会话创建与删除 RPC；
+  - `status_guard.py` 将经 HTTP 客户端或内联 Python 调用本地 `ConversationService/DeleteConversation` 纳入边界确认门禁（交互态触发确认，无头子进程直接拒绝）；
+  - `template/user-guard/plugin.json` 补齐官方 schema 支持的 `author`、`homepage`、`suggestedPrompts` 与 `keywords` 元数据，同步更新 `test_e2e_integration.py` 清单键白名单。
+- **桌面 GUI 后台卡死根治与零进程版本读取（`install.py`、`status_guard.py`、`ccswitch_admin.py`、`tests/test_claude_and_router_offline.py`、`tests/test_guards_offline.py`）**：
+  - `install.py` 新增纯文件只读的 Windows PE 版本提取（`_read_pe_file_version`）与 Debian/Ubuntu 包状态解析（`_read_dpkg_package_version`）；`_audit_cli` 探测 `cc-switch` 时优先走零进程元数据快路径，避免在 WSL2 无头环境拉起 GUI 进程等待超时；
+  - `status_guard.py` 在 `PreToolUse` 新增 `_find_hanging_gui_command`，拦截非后台守护且未包裹 `timeout` 的桌面 GUI 二进制直接调用（含经 `wsl`、子 Shell、管道与命令替换的嵌套形式），防止后台命令因 GUI 忽略 `--version` 或弹窗而永久挂死；
+  - 核验 CC Switch `v4.0.42` SQLite `schema 28` 列兼容性并将 `ccswitch_admin.py` 的 `TESTED_MAX_SCHEMA` 升级至 `28`。
+- **模型退役目录校正与实战指南更新（`fleet_profile.json`、`docs/architecture-and-hooks.md`、`docs/workflow-guide.md`）**：
+  - 修正 `agy_retiring_patterns` 正则，使 `gemini-pro-orchestrator-argon`、`claude-sonnet-4-6-*` 与 `claude-opus-4-6-*` 全部命中离线退役核查，刷新 `evaluated_at` 与 `capability_ledger.last_online_refresh_at` 至 `2026-11-26`，并补充 `Hydrogen` 四挡强度说明；
+  - 更新 [docs/architecture-and-hooks.md](docs/architecture-and-hooks.md) 与 [docs/workflow-guide.md](docs/workflow-guide.md)，补记新版门禁行为及按“上下文污染度”切分长任务防过早压缩的实战准则。
+
+---
+
 ## [2.0.2] - 2026-11-25
 
 适配新版 Codex 钩子信任哈希机制与 Antigravity 官方模型退役目录更新，并围绕跨格式正式文档交付卫生、三端统一回合实证守卫与安装器子进程清理竞态完成系统性重构：

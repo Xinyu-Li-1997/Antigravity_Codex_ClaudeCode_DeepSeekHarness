@@ -138,11 +138,19 @@ AGY_INSPECTION_TOOLS = {
     "read_board",
     "list_resources",
     "read_resource",
+    "list_permissions",
+    "list_plugin_accounts",
     "manage_task",
     "manage_subagents",
+    "update_focus",
+    "update_steps",
     "ask_question",
     "finish",
 }
+_CONVERSATION_MUTATE_RPC_RE = re.compile(
+    r"/product\.v1\.ConversationService/(?:Create|Delete)Conversation\b",
+    re.IGNORECASE,
+)
 MEDIA_TOOLS = {"generate_image", "imagegen", "view_image", "open_image"}
 
 READONLY_BINARIES = {
@@ -895,6 +903,9 @@ def _classify_run_command(cmd_str: str, is_daemon: bool = False, _depth: int = 0
                 has_mutating = True
             else:
                 continue
+
+        if _CONVERSATION_MUTATE_RPC_RE.search(clause):
+            return "blocked_always"
 
         if head == "py" or head.startswith("python"):
             py_args = tokens[1:]

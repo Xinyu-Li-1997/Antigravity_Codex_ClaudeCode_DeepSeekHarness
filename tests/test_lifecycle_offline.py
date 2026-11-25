@@ -3880,6 +3880,65 @@ class TestHeavyWorkflowLifecycle(unittest.TestCase):
         self.assertLessEqual(sum(len(b) for b in bounded_blocks), 2400)
         self.assertIn("run_0_reconcile.md", "\n".join(bounded_blocks))
 
+    def test_v203_agy_modelname_extraction_and_handoff_ui_rpc_rules(self):
+        """验证 Antigravity camelCase modelName 提取、UI/权限查询工具交接豁免及 ConversationService 写接口阻断。"""
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("v203_adaptive_policy", HOOKS_DIR / "_lib" / "adaptive_policy.py")
+        adaptive_policy = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(adaptive_policy)
+
+        # 1) adaptive_policy 读取 Antigravity modelName 并从后缀或括号派生缺失 effort
+        self.assertEqual(
+            adaptive_policy.extract_runtime_model_and_effort("antigravity", {"modelName": "gemini-4-neon-xhigh"}),
+            ("gemini-4-neon-xhigh", "xhigh"),
+        )
+        self.assertEqual(
+            adaptive_policy.extract_runtime_model_and_effort("antigravity", {"modelName": "Gemini 4 Carbon (High)"}),
+            ("Gemini 4 Carbon (High)", "high"),
+        )
+        self.assertEqual(
+            adaptive_policy.extract_runtime_model_and_effort("antigravity", {"modelName": "gemini-4-neon-low", "effort": "max"}),
+            ("gemini-4-neon-low", "max"),
+        )
+
+        # 2) handoff_gate 在 drain/freeze 阶段放行新 UI/权限查询工具，不消耗收尾预算，并硬阻断 ConversationService 写接口
+        cid_ui = "v203-ui-rpc-handoff"
+        st_ui = handoff_gate.load_gate_state(self.state, cid_ui)
+        st_ui["phase"] = "drain"
+        st_ui["drainActionsUsed"] = 0
+        handoff_gate.save_gate_state(self.state, cid_ui, st_ui)
+        for ui_tool in ("update_focus", "update_steps", "list_permissions", "list_plugin_accounts"):
+            self.assertIn(ui_tool, handoff_gate.AGY_INSPECTION_TOOLS)
+            self.assertIsNone(
+                handoff_gate.check_pre_tool_use_locked(
+                    {"conversationId": cid_ui, "toolCall": {"name": ui_tool, "args": {}}},
+                    self.state,
+                ),
+                ui_tool,
+            )
+        self.assertEqual(handoff_gate.load_gate_state(self.state, cid_ui)["drainActionsUsed"], 0)
+
+        # 3) handoff_gate 在交接期硬阻断 ConversationService Create/Delete RPC，放行只读检索
+        for mut_rpc in (
+            "curl -sS -X POST http://127.0.0.1:42000/product.v1.ConversationService/CreateConversation -d '{}'",
+            "Invoke-RestMethod -Uri http://127.0.0.1:42000/product.v1.ConversationService/DeleteConversation",
+        ):
+            self.assertEqual(handoff_gate._classify_run_command(mut_rpc), "blocked_always", mut_rpc)
+            blocked = handoff_gate.check_pre_tool_use_locked(
+                {"conversationId": cid_ui, "toolCall": {"name": "run_command", "args": {"CommandLine": mut_rpc}}},
+                self.state,
+            )
+            self.assertIsNotNone(blocked)
+            self.assertEqual(blocked["decision"], "deny", mut_rpc)
+        self.assertNotEqual(
+            handoff_gate._classify_run_command("curl -sS http://127.0.0.1:42000/product.v1.ConversationService/ListConversations"),
+            "blocked_always",
+        )
+        self.assertNotEqual(
+            handoff_gate._classify_run_command('rg "CreateConversation" .'),
+            "blocked_always",
+        )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

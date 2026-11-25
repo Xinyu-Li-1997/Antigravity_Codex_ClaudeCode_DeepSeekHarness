@@ -80,13 +80,32 @@ def _clean_str(val: Any) -> str:
     return val.strip() if isinstance(val, str) else ""
 
 
+def _extract_model_effort_hint(model_name: str) -> str:
+    raw = _strip_ctx_suffix(model_name, strip_1m=True).strip()
+    if not raw:
+        return ""
+    m_paren = _TIER_PAREN_RE.search(raw)
+    if m_paren:
+        tok = re.sub(r"[\s()]+", "", m_paren.group(0)).lower()
+        tok = "medium" if tok == "med" else tok
+        if tok in _EFFORT_SCALES:
+            return tok
+    m_suf = _TIER_SUFFIX_RE.search(raw)
+    if m_suf:
+        tok = m_suf.group(0).lstrip("-").lower()
+        tok = "medium" if tok == "med" else tok
+        if tok in _EFFORT_SCALES:
+            return tok
+    return ""
+
+
 def extract_runtime_model_and_effort(
     client: str = "",
     payload: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, str]:
     data = payload if isinstance(payload, dict) else {}
     c_norm = _normalize_client_name(client)
-    model = _clean_str(data.get("model")) or _clean_str(data.get("model_name"))
+    model = _clean_str(data.get("model")) or _clean_str(data.get("modelName")) or _clean_str(data.get("model_name"))
     effort = (
         _clean_str(data.get("effort"))
         or _clean_str(data.get("reasoning_effort"))
@@ -106,6 +125,8 @@ def extract_runtime_model_and_effort(
             effort = _clean_str(os.environ.get("CODEX_REASONING_EFFORT"))
         elif c_norm == "antigravity":
             effort = _clean_str(os.environ.get("AGY_EFFORT")) or _clean_str(os.environ.get("ANTIGRAVITY_EFFORT"))
+    if not effort and model:
+        effort = _extract_model_effort_hint(model)
     return model, effort
 
 
