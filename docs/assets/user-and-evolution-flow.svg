@@ -19,18 +19,18 @@
   </style>
   <rect width="1440" height="880" rx="18" fill="#f4f7fb"/>
   <text x="36" y="48" class="title">日常课题协作与配置仓库维护流程</text>
-  <text x="36" y="78" class="subtitle">一次运行 install.py 同步至本机客户端配置目录后，系统按工作区模式自动区分日常课题开发与配置仓库维护。</text>
+  <text x="36" y="78" class="subtitle">运行 install.py 同步至用户级配置目录后，系统按工作区自动区分日常课题研发与配置仓库维护。</text>
 
-  <!-- Left Lane Container: general_project -->
+  <!-- Left Lane Container: everyday project -->
   <rect x="28" y="102" width="668" height="748" rx="16" fill="#eaf2ff" stroke="#adc6eb" stroke-width="1.5"/>
-  <text x="52" y="138" class="lane">日常业务课题目录（general_project）</text>
-  <text x="52" y="163" class="lane-sub">任意 C++、Fortran、Rust、Python 课题目录直接使用，无需复制配置文件</text>
+  <text x="52" y="138" class="lane">日常课题与工程目录（通用研发模式）</text>
+  <text x="52" y="163" class="lane-sub">任意 C++、Fortran、Rust、Python 课题目录直接使用，不向项目目录复制配置文件</text>
 
   <g>
     <rect x="50" y="184" width="624" height="96" rx="12" fill="#ffffff" stroke="#b8cde8"/>
-    <text x="72" y="216" class="heading">1. 自然中文输入（主会话联动 cae_harness.py）</text>
-    <text x="72" y="244" class="body">主会话保留你自己选定的客户端、模型与推理强度；单端可独立工作。</text>
-    <text x="72" y="268" class="body">Antigravity、Codex、Claude Code、DSH 四端处于同一对等层级。</text>
+    <text x="72" y="216" class="heading">1. 自然中文输入与主会话分流</text>
+    <text x="72" y="244" class="body">主会话保留用户自选客户端、模型与强度；局部小修改在主会话直接闭环。</text>
+    <text x="72" y="268" class="body">Antigravity、Codex、Claude Code 与 DSH 四端对等，单端亦可独立运行。</text>
   </g>
 
   <path class="link" d="M 200 280 L 200 310"/>
@@ -38,19 +38,19 @@
 
   <g>
     <rect x="50" y="310" width="302" height="168" rx="12" fill="#fff8e8" stroke="#dbb464"/>
-    <text x="68" y="342" class="heading">2A. 明确点名（P0 优先）</text>
+    <text x="68" y="342" class="heading">2A. 显式指定（最高优先级）</text>
     <text x="68" y="370" class="body">指定客户端、具体模型或挡位。</text>
-    <text x="68" y="396" class="body">无头调用自动补全声明最大窗口、</text>
-    <text x="68" y="422" class="body">非委派挡位、行号内联与快照。</text>
-    <text x="68" y="448" class="body">不可用直接报错，绝不静默降级。</text>
+    <text x="68" y="396" class="body">无头调用自动补全声明窗口、</text>
+    <text x="68" y="422" class="body">只读行号内联、快照与脱敏。</text>
+    <text x="68" y="448" class="body">目标不可用直接报错，不静默降级。</text>
   </g>
 
   <g>
     <rect x="372" y="310" width="302" height="168" rx="12" fill="#ffffff" stroke="#b8cde8"/>
-    <text x="390" y="342" class="heading">2B. 模糊交办（角色选路）</text>
-    <text x="390" y="370" class="body">只交代推导、编码或独立审查目标。</text>
-    <text x="390" y="396" class="body">按 orchestrator、math、code、</text>
-    <text x="390" y="422" class="body">review、fast 五角色动态选路。</text>
+    <text x="390" y="342" class="heading">2B. 按任务目标自动选路</text>
+    <text x="390" y="370" class="body">仅说明推导、实现或审查目标。</text>
+    <text x="390" y="396" class="body">按统筹、数理、编码、审查与快检</text>
+    <text x="390" y="422" class="body">五类动态角色从可用端自动分配。</text>
     <text x="390" y="448" class="body">关键审查优先跨客户端独立执行。</text>
   </g>
 
@@ -59,20 +59,20 @@
 
   <g>
     <rect x="50" y="508" width="624" height="142" rx="12" fill="#ffffff" stroke="#b8cde8"/>
-    <text x="72" y="540" class="heading">3. 轻任务静默执行 · 重负载发 3 句话简报与明细链接</text>
-    <text x="72" y="568" class="body">大仓库先用 read-plan 评估体积并分片；重负载委派先由 plan 生成确认单。</text>
-    <text x="72" y="594" class="body">完整方案落盘至明细文件，聊天框仅发 3 句话确认提示与可点击链接。</text>
-    <text x="72" y="620" class="body">压缩后自动还原未决任务总览；获批登记后持 --ticket 放行执行。</text>
+    <text x="72" y="540" class="heading">3. 读前分片、简洁确认与压缩恢复</text>
+    <text x="72" y="568" class="body">大仓库先经 read-plan 评估体积并切分保守波次，避免上下文溢出。</text>
+    <text x="72" y="594" class="body">重负载任务先落盘明细文件，对话仅展示三句话摘要与链接，确认后放行。</text>
+    <text x="72" y="620" class="body">长对话压缩后自动分块恢复用户原话、实质子任务结论与未决任务总览。</text>
   </g>
 
   <path class="link" d="M 362 650 L 362 680"/>
 
   <g>
     <rect x="50" y="680" width="624" height="146" rx="12" fill="#eefaf4" stroke="#82bfa0"/>
-    <text x="72" y="712" class="heading">4. 定量验证、完成回执检查与主会话原文终审</text>
-    <text x="72" y="740" class="body">只读任务比对自适应快照；可写 gate 锁范围并强制跑通 --verify-cmd。</text>
-    <text x="72" y="766" class="body">严禁放宽容差与守恒判据；文档盲读支持 --isolation 四级隔离与事实锚定。</text>
-    <text x="72" y="792" class="body">完工硬出 reconcile 机械对账表；多端经 cross-check 查盲区与分歧。</text>
+    <text x="72" y="712" class="heading">4. 定量验收、机械对账与对称核验</text>
+    <text x="72" y="740" class="body">只读任务比对文件快照；可写 gate 锁定写入白名单并强制跑通验收命令。</text>
+    <text x="72" y="766" class="body">完工自动产出 reconcile 机械对账表；多端审查经 cross-check 核对盲区与分歧。</text>
+    <text x="72" y="792" class="body">回合结束对称拦截矛盾全过宣称与未实查否定结论；文档支持 --doc-hygiene 校验。</text>
   </g>
 
   <!-- Center Workspace Mode Isolation Divider -->
@@ -83,36 +83,36 @@
   <text x="720" y="500" text-anchor="middle" class="badge">隔</text>
   <text x="720" y="522" text-anchor="middle" class="badge">离</text>
 
-  <!-- Right Lane Container: upstream_config_repo -->
+  <!-- Right Lane Container: upstream config repo -->
   <rect x="744" y="102" width="668" height="748" rx="16" fill="#f4effc" stroke="#bdaae0" stroke-width="1.5"/>
-  <text x="768" y="138" class="lane">本配置仓库维护与更新（upstream_config_repo）</text>
-  <text x="768" y="163" class="lane-sub">模型换代或订阅变化时直接在本仓库维护更新；普通课题误调返回退出码 2</text>
+  <text x="768" y="138" class="lane">本配置仓库维护与更新（上游维护模式）</text>
+  <text x="768" y="163" class="lane-sub">模型换代或机制演进时在本仓库维护；普通课题误调维护脚本返回退出码 2</text>
 
   <g>
     <rect x="766" y="184" width="624" height="122" rx="12" fill="#ffffff" stroke="#c5b6e3"/>
-    <text x="788" y="216" class="heading">1. 按维护需求选择 fleet-evolve 三种模式</text>
-    <text x="788" y="244" class="body">全面更新（full）：四维盘点客户端、双端、native_agent_profiles 与五角色。</text>
-    <text x="788" y="270" class="body">代码与文档整理（hygiene）：选型不变，修复代码问题并同步文档。</text>
-    <text x="788" y="294" class="body">只读检查（audit）：只读检查漂移、cross_side_status、DSH 协议与 ABI 风险。</text>
+    <text x="788" y="216" class="heading">1. 按维护需求选择三种模式（fleet-evolve）</text>
+    <text x="788" y="244" class="body">全面更新（full）：盘点四端客户端、双端环境、内生代理档案与五类角色。</text>
+    <text x="788" y="270" class="body">机制与文档整理（hygiene）：选型不变，将问题下沉为单测守卫并分层整理文档。</text>
+    <text x="788" y="294" class="body">只读巡检（audit）：零修改检查配置漂移、双端对齐、DSH 协议与 ABI 风险。</text>
   </g>
 
   <path class="link" d="M 1078 306 L 1078 336"/>
 
   <g>
     <rect x="766" y="336" width="624" height="142" rx="12" fill="#ffffff" stroke="#c5b6e3"/>
-    <text x="788" y="368" class="heading">2. 联网能力核查与本机可用性探测（full 模式）</text>
-    <text x="788" y="396" class="body">结合官方资料、本机报错与实测证据，同时标明模型优势与已知短板。</text>
-    <text x="788" y="422" class="body">同步展示本机各端与模型是否就绪、配置的额度类型及退订候选。</text>
-    <text x="788" y="448" class="body">在 capability_ledger 记录离线性能更新时间，日常派工不联网查榜单。</text>
+    <text x="788" y="368" class="heading">2. 能力评估与本机可用性探测（full 模式）</text>
+    <text x="788" y="396" class="body">结合官方资料、本机报错与实测证据，同时记录模型优势与已知局限。</text>
+    <text x="788" y="422" class="body">同步核实本机各端安装状态、订阅启停状态与可用额度类型。</text>
+    <text x="788" y="448" class="body">离线刷新时间记入动态配置文件，日常派工仅离线复查，不触发联网刷新。</text>
   </g>
 
   <path class="link" d="M 1078 478 L 1078 508"/>
 
   <g>
     <rect x="766" y="508" width="624" height="142" rx="12" fill="#fff8e8" stroke="#dbb464"/>
-    <text x="788" y="540" class="heading">3. 四项人工确认要求（full / hygiene 涉及变更时）</text>
-    <text x="788" y="568" class="body">① 审定推荐配置、运行参数与 subscription_matrix 启停；</text>
-    <text x="788" y="594" class="body">② 写入本机全局配置目录（先 --dry-run 预览）或切换主客户端；</text>
+    <text x="788" y="540" class="heading">3. 四类人工确认节点（涉及变更时触发）</text>
+    <text x="788" y="568" class="body">① 审定客户端与模型推荐矩阵、运行阈值及订阅启停开关；</text>
+    <text x="788" y="594" class="body">② 写入本机全局配置目录（先 --dry-run 预览）或切换主会话客户端；</text>
     <text x="788" y="620" class="body">③ Python、CUDA、WSL 等编译型科学计算包 ABI 升级；④ git push。</text>
   </g>
 
@@ -120,9 +120,9 @@
 
   <g>
     <rect x="766" y="680" width="624" height="146" rx="12" fill="#eefaf4" stroke="#82bfa0"/>
-    <text x="788" y="712" class="heading">4. 双端确认同步、主客户端重启核验与事实锚定</text>
-    <text x="788" y="740" class="body">确认后按 cross_side_status 在 Win/WSL2 分别同步并核验 all_aligned。</text>
-    <text x="788" y="766" class="body">涉及主客户端更新时经 record-pass1 与 verify-pass2 重启核验。</text>
-    <text x="788" y="792" class="body">最终运行 clear --verified --readback-done 通过事实锚定后归位。</text>
+    <text x="788" y="712" class="heading">4. 双端同步、重启核验与全仓验收</text>
+    <text x="788" y="740" class="body">获批后在 Windows 与 WSL2 分别同步，并通过 --audit-upgrade 核验零漂移。</text>
+    <text x="788" y="766" class="body">涉及主会话客户端更新时，经重启前后两步状态锁核验归位。</text>
+    <text x="788" y="792" class="body">最终通过全量离线回归、公开脱敏与 check-grounding --strict --doc-hygiene 门禁。</text>
   </g>
 </svg>

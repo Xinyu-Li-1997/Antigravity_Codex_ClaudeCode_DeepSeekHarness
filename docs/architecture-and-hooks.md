@@ -1,6 +1,6 @@
 # 架构设计、共有生命周期钩子与运维参考
 
-本文面向配置仓库维护者、安全审计人员和需要排查门禁行为的工程师，作为底层机制、配置键名、预算公式、上游维护与卸载步骤的唯一权威参考。入门说明见 [仓库总说明](../README.md)，日常用法见 [日常工作流实战指南](workflow-guide.md)。
+本文面向配置仓库维护者、安全审计人员与排查门禁行为的工程师，集中说明底层机制、配置键名、预算公式、上游维护与卸载步骤。入门说明见 [仓库总说明](../README.md)，日常用法见 [日常工作流指南](workflow-guide.md)。
 
 ![固定机制层、动态配置层与全通道派工架构](assets/architecture-overview.svg)
 
@@ -12,7 +12,7 @@
 
 | 模块与路径 | 适用范围 | 核心职责 |
 | --- | --- | --- |
-| [rules/AGENTS.md](../template/user-guard/rules/AGENTS.md) | 通用 + 上游 | `R0–R11` 全局规则唯一模板；贯彻受众分层、机械下沉与对称诚实披露，零时期性模型名 |
+| [rules/AGENTS.md](../template/user-guard/rules/AGENTS.md) | 通用 + 上游 | `R0–R11` 全局规则唯一模板；约束受众分层、机械下沉与对称诚实披露，不含时期性模型名 |
 | [fleet_profile.json](../template/user-guard/skills/cae-harness/fleet_profile.json) | 通用 + 上游 | 唯一动态配置源：维护五角色 `roles`、四端 `native_agent_profiles`、`runtime_tunables`、`subscription_matrix` 与 `capability_ledger` |
 | [cae_harness.py](../template/user-guard/skills/cae-harness/scripts/cae_harness.py) | 通用 + 上游 | 跨端无头调度与离线诊断总控：P0 点名锁定、角色选路与风险升挡、`--isolation` 四级隔离、持久化会话与超时抢救、`<ticket_id>_card.md` 落盘，以及 `check-grounding`（含 `--doc-hygiene`）、`read-plan`、`cross-check`、`reconcile` 四项离线确定性工具 |
 | [user_words.py](../template/user-guard/hooks/user_words.py) | 通用 + 上游 | 钩子共用基础库：跨平台文件锁、原子写、三端轨迹去噪与子代理摘要提取、历史确认单折叠及账单存取 |
@@ -21,9 +21,9 @@
 | [status_guard.py](../template/user-guard/hooks/status_guard.py) | 通用 + 上游 | 工具执行前门禁：静态解析文件工具、Shell 包装与内联 Python AST，拦截越界写删、外部 `git worktree`、空转轮询与裸调 CLI，核验已批票据与原生通道容量 |
 | [reply_repeat_guard.py](../template/user-guard/hooks/reply_repeat_guard.py) | 通用 + 上游 | 回合结束门禁（无头子进程 `CAE_HARNESS_DEPTH` 自动跳过）：拦截空等刷屏、重复贴票、局部补测冒充全过、未实查或探测全败却宣称已核实否定结论，并按 `run_id` 核验回执与 `reconcile_file` 链接 |
 | [handoff_gate.py](../template/user-guard/hooks/handoff_gate.py) | 通用 + 上游 | 长会话分级交接门禁：追踪压缩次数、轨迹体积与读图字节，在 `drain`/`freeze` 阶段限制新派工并核验【新对话提示词】与待拍板占位符保护 |
-| [install.py](../install.py)、`install.ps1`、`install.sh` | 上游专属 | 校验非符号链接与非重解析点后幂等分发四端配置；提供零写入配置漂移、Windows/WSL2 双端对齐、DSH 协议探测与科学计算包 ABI 风险体检 |
+| [install.py](../install.py)、`install.ps1`、`install.sh` | 上游专属 | 校验非符号链接与非重解析点后幂等分发四端配置；提供零写入的配置漂移、Windows 与 WSL2 双端对齐、DSH 协议探测及科学计算包 ABI 风险体检 |
 | [fleet_state.py](../template/user-guard/skills/fleet-evolve/scripts/fleet_state.py) | 上游专属 | 核验 `upstream_config_repo` 身份；管理提案审批锁（`propose`/`approve`）、重启重入锁（`record-pass1`/`verify-pass2`）与终审事实锚定门禁 |
-| [router.py](../template/claude/router/router.py)、[ccswitch_admin.py](../template/claude/router/ccswitch_admin.py) | 通用 + 上游 | 本地回环 `/v1/messages` 前缀分流（向非回环上游注密钥强制 HTTPS、脱敏单行日志、401/403 缓存失效）与 CC Switch SQLite 在线备份安全切卡 |
+| [router.py](../template/claude/router/router.py)、[ccswitch_admin.py](../template/claude/router/ccswitch_admin.py) | 通用 + 上游 | 本地回环 `/v1/messages` 前缀分流（向非回环上游注入密钥时强制 HTTPS、输出脱敏单行日志、遇 401 或 403 使缓存失效），以及带 SQLite 在线备份的 CC Switch 切卡 |
 
 `workspace_mode` 依据工作区或父目录是否同时存在 `install.py` 与 `template/user-guard/plugin.json`，自动区分 `upstream_config_repo`（上游配置仓）与 `general_project`（通用课题仓）。独立安装的 `fleet_state.py` 在通用目录未传 `--repo` 时返回 `not_upstream_config_repo`（退出码 `2`）。
 
@@ -31,19 +31,19 @@
 
 ## 二、两阶段可用性检查与 `fleet_profile.json` 结构
 
-可用性核查拆成互不干扰的两道门：
+可用性核查分为互不干扰的两个阶段：
 
-1. **维护期联网评估（`fleet-evolve`）**：联网核对客户端和模型变化，经用户拍板写入 `subscription_matrix`（`enabled: false` 全局跳过），刷新时间记入 `capability_ledger`。
-2. **派工前纯离线复查（`cae_harness.py plan`）**：仅查本机可执行文件、凭据、本地回环路由、本地会话滚动窗口百分比、CC Switch 卡片类型与配额冷却记录；未暴露的服务端余额如实标为未知。
+1. **维护期联网评估（`fleet-evolve`）**：联网核对客户端与模型变化，经用户确认后写入 `subscription_matrix`（`enabled: false` 全局跳过），刷新时间记入 `capability_ledger`。
+2. **派工前纯离线复查（`cae_harness.py plan`）**：仅核查本机可执行文件、凭据、本地回环路由、本地会话滚动窗口百分比、CC Switch 卡片类型与配额冷却记录；未暴露的服务端余额如实标为未知。
 
 `fleet_profile.json` 的顶层配置结构如下（单测可用 `CAE_FLEET_PROFILE` 隔离覆盖）：
 
 | 配置分区 | 核心键名 | 工程作用 |
 | --- | --- | --- |
-| `roles` | `orchestrator`、`math`、`code`、`review`、`fast` 候选、推荐挡位与短板隔离 | 五角色全动态，不绑定单一客户端；用户点名按 P0 锁定；`review` 配合 `select_task_tier` 按风险升挡 |
+| `roles` | `orchestrator`、`math`、`code`、`review`、`fast` 候选、推荐挡位与短板隔离 | 动态配置五个角色，不绑定单一客户端；用户点名按 P0 锁定；`review` 配合 `select_task_tier` 按风险升挡 |
 | `native_agent_profiles` | 四端主模型策略、原生子代理机制、只读代理与钩子协议 | 独立描述各端内生代理能力，与外部无头调度解耦 |
-| `subscription_matrix` 与 `capability_ledger` | 客户端及模型启停开关、额度类型与离线刷新时间戳 | `enabled: false` 全局跳过；日常派工仅离线读时间戳，不联网查榜 |
-| `runtime_tunables.compaction_recovery` | `per_client` 预算、`recent_subagent_window`、`min_substantive_subagent_chars`、`subagent_head_ratio` | 必保最新一条子代理返回，其余择优保留实质结论并按窗口与强度缩放 |
+| `subscription_matrix` 与 `capability_ledger` | 客户端及模型启停开关、额度类型与离线刷新时间戳 | `enabled: false` 全局跳过；日常派工仅离线读取时间戳，不发起联网核查 |
+| `runtime_tunables.compaction_recovery` | `per_client` 预算、`recent_subagent_window`、`min_substantive_subagent_chars`、`subagent_head_ratio` | 固定保留最新一条子代理返回，其余择优保留实质结论并按窗口与强度缩放 |
 | `runtime_tunables.handoff_thresholds` | `default_mode`、压缩次数、轨迹体积、读图阈值与 `drain` 收尾预算 | Antigravity 默认分段交接；Codex 与 Claude Code 默认 `advisory` 提醒 |
 | `runtime_tunables.loop_guards` | `hook_safety`（墙钟与 POSIX 条件 `max_rss_mib`）、`reply_repeat`、`status_guard`、`lifecycle_log` | 防止钩子卡死或内存失控，同时拦截空转轮询与重复空等 |
 | `runtime_tunables.headless_dispatch` | `persist_sessions_by_default`、`soft_timeout_ratio`、`wrapup_min_sec`、`followup_default_effort`、`default_gate_max_rounds`、分后端内联上限与并发上限 | 统一控制持久化会话、软超时降挡收口（`result_wrapup.json`）、硬超时抢救、超时续接降挡与快照过滤 |
@@ -75,19 +75,19 @@
 | **工具执行前** | `status_guard.py` + `handoff_gate.py` | 守卫项目外写删边界与同会话外部目录续租（不禁止本机只读诊断），拦截空转轮询与裸调 CLI，交接期放行只读核验 |
 | **回合结束时** | `reply_repeat_guard.py` + `handoff_gate.py` | 拦截空等刷屏、重复贴票、局部补测冒充全过、零执行或探测全败却宣称已核实否定结论，并核验回执、`reconcile_file` 链接与交接提示词 |
 
-各客户端按原生协议接入同一套钩子（不含任何客户端私有扩展字段依赖）：
+各客户端按原生协议接入同一套钩子，不依赖客户端私有扩展字段：
 
 | 客户端 | 全局目录与宿主事件适配 |
 | --- | --- |
 | **Antigravity** (`agy`) | 同步至 `~/.gemini/config/plugins/user-guard`；原生 `hooks.json` 挂 4 类事件并联动 `handoff_gate.py`；遇截断字段回查 `transcript_full.jsonl`；`--isolation` 拒绝 `hooks_only` 与 `clean_room` |
 | **Codex** (`codex`) | 同步至 `~/.codex`；`hooks.json` 挂 5 类事件，实质未变时不覆写以保护宿主信任记录；合并 `sessions/` 与 `archived_sessions/` 提取记录；完整支持全部四档 `--isolation` |
 | **Claude Code** (`claude`) | 同步至 `~/.claude`；向 `settings.json` 合并 5 类事件并默认同步 `ccswitch_admin.py`（`--no-claude-hooks` 跳过）；无头只读传 `--permission-mode dontAsk`，`clean_room` 附加 `--bare` 与 `--disable-slash-commands` |
-| **DeepSeek Harness** (`dsh`) | 同步至 `~/.dsh/AGENTS.md` 与 `skills/`，不改 `.credentials.yaml`；当前 CLI 为 `soft_rules_only`（`--audit-upgrade` 持续探测 `hook_protocol`）；无头会话隔离在 `headless-sessions`，支持 `clean_room` 与尾随 `DSML` 清洗 |
+| **DeepSeek Harness** (`dsh`) | 同步至 `~/.dsh/AGENTS.md` 与 `skills/`，不修改 `.credentials.yaml`；当前 CLI 为 `soft_rules_only`（由 `--audit-upgrade` 按需探测 `hook_protocol`）；无头会话隔离于 `headless-sessions`，支持 `clean_room` 与尾随 `DSML` 清洗 |
 
 ### 3. 压缩双块恢复与跨会话接力不变量
 
-- **防二次截断与围栏闭合**：最近 `recent_subagent_window` 条子代理返回必保最新一条，归档与内联均基于完整 `raw_body` 独立截取；切中代码块时由 `_close_unbalanced_fence` 自动闭合围栏。
-- **未决工作流独立分区**：`collapse_historical_cards` 折叠历史长表；`render_pending_workflow_block` 独立于原话预算直接读取磁盘 `<ticket_id>.json`（有常规非链接明细文件时仅注 4 列总览与链接，缺项标 `未记录`）。`plan --resume-ticket` 保留原 `session_id` 不自动改绑，跨会话执行须重建当前会话票据。
+- **防二次截断与围栏闭合**：在最近 `recent_subagent_window` 条子代理返回中固定保留最新一条，归档与内联均基于完整 `raw_body` 独立截取；截断位置处于代码块内时，由 `_close_unbalanced_fence` 自动闭合围栏。
+- **未决工作流独立分区**：`collapse_historical_cards` 折叠历史长表；`render_pending_workflow_block` 独立于原话预算直接读取磁盘 `<ticket_id>.json`（存在非符号链接的常规明细文件时，仅注入 4 列总览与文件链接，缺项标为 `未记录`）。`plan --resume-ticket` 保留原 `session_id` 且不自动改绑，跨会话执行须重建当前会话票据。
 
 ---
 
@@ -97,14 +97,14 @@
 
 ### 1. 零黑名单事实锚定与文档卫生守卫（`check-grounding`）
 
-- **词法事实锚定（`--strict`）**：扫描源码、配置与 `NOTICE`（刻意跳过 `tests/` 与 Markdown 代理契约，对 Codex `.toml` 仅提键名，把三端代理正文作为被审对象），构建标识符、CLI 选项、定量数字与双字词干集合，逐行拦截无代码依据的参数、文件名、陌生缩写与失步数字。
-- **通用文档卫生守卫（`--doc-hygiene`）**：零硬编码黑名单，额外拦截 4 类结构腐化问题。前两类针对行文结构：引导句计数与紧邻表格或列表行数矛盾（`count_structure_mismatch`），以及补丁超长句与四段以上中文斜杠串（`runon_patch_sentence`、`slash_chain`）。后两类针对分层治理：长技术细则跨 ≥ 3 份文档逐字复读（`cross_doc_duplication`），以及根目录 `README.md` 超体积预算、泄漏 `_xxx` 私有符号或单段堆砌过多行内代码（`landing_size_budget`、`landing_private_symbol`、`landing_jargon_density`）。
+- **词法事实锚定（`--strict`）**：扫描源码、配置与 `NOTICE` 以构建标识符、CLI 选项、定量数字与双字词干集合，逐行拦截无代码依据的参数、文件名、陌生缩写与失步数字。扫描阶段跳过 `tests/` 与 Markdown 代理契约，对 Codex `.toml` 仅提取键名，并将三端代理正文列为被审对象。
+- **通用文档卫生守卫（`--doc-hygiene`）**：不依赖硬编码黑名单，额外拦截 4 类文档结构与分层问题。前两类针对行文结构：引导句计数与紧邻表格或列表行数不一致（`count_structure_mismatch`），以及叠加补丁的超长句与四段以上中文斜杠串（`runon_patch_sentence`、`slash_chain`）。后两类针对分层治理：长段技术细则跨 ≥ 3 份文档逐字重复（`cross_doc_duplication`），以及根目录 `README.md` 超出体积预算、包含 `_xxx` 私有符号或单段过多行内代码（`landing_size_budget`、`landing_private_symbol`、`landing_jargon_density`）。
 
 ### 2. 读前分片、跨端核对与机械对账（`read-plan` / `cross-check` / `reconcile`）
 
-- **`read-plan`（读前尺寸评估与保守层级分片）**：同时按安全输入 Token 预算（扣减 `--context-used-tokens` 与输出预留）和真实 UTF-8 带行号内联字节上限（扣减 `--shared-files`）双口径评估体积。超大单文件按 Markdown 标题或 Python 顶层定义切成带重叠连续行段，按 AST 与 Markdown 依赖聚类并标记跨片边（`cross_shard_edges`）。默认以保守并发（总并发 `<= 2` 且守每端上限）按 `risk-tiered` 或 `all-engines` 排波，落盘 `<plan_dir>/read_plans/<plan_id>_read_plan.md` 与可选 `--emit-spec`，并如实披露被默认跳过的归档目录（可传 `--include-dirs` 纳入）。
-- **`cross-check`（跨端覆盖矩阵与分歧保留）**：消费多份回执与可选 `--read-plan` 计划分母，确定性输出计划分母 × 客户端覆盖矩阵、全端共同盲区（`shared_blind_spots`）与失败/超时格（不从分母剔除）。多端同位发现保留各端原文并检出严重度或极性分歧（`severity_divergent`），绝不把同位置冒充共识。结果同步生成 `r6_source_check_list` 原文件精确行号清单，落盘至 `<plan_dir>/reconcile/<run_id>_cross_check.md`。
-- **`reconcile`（双入口确定性机械对账表）**：支持用户点名运行，也由重负载派单在 `record_heavy_completion_for_stop_hook` 完工时硬触发落盘至 `<plan_dir>/reconcile/<run_id>_reconcile.md`（永不污染业务仓库，校验非符号链接）。改动范围按“开工冻结基线 / `--baseline-file` → `--base-ref` → 回执 `changed_files` → `git diff HEAD`”依次定界，隔离任务前已脏文件，无基线时标 `unknown`。依赖分析仅将 Python AST 导入、Markdown 显式链接与反引号精确路径或已变顶层符号列为 `pending_review`（首屏前 10 项），普通提及仅记 `weak_mention_docs` 计数防噪声；同步结算读写义务并支持 `--cross-check` 并轨。
+- **`read-plan`（读前尺寸评估与保守层级分片）**：同时按安全输入 Token 预算（扣减 `--context-used-tokens` 与输出预留）和真实 UTF-8 带行号内联字节上限（扣减 `--shared-files`）双口径评估体积。超大单文件按 Markdown 标题或 Python 顶层定义切分为带重叠的连续行段，按 AST 与 Markdown 依赖聚类并标记跨片边（`cross_shard_edges`）。默认采用保守并发策略（总并发 `<= 2` 且受每端并发上限约束），按 `risk-tiered` 或 `all-engines` 编排波次，落盘 `<plan_dir>/read_plans/<plan_id>_read_plan.md` 与可选 `--emit-spec`，并如实列出默认跳过的归档目录（可传 `--include-dirs` 纳入）。
+- **`cross-check`（跨端覆盖矩阵与分歧保留）**：读取多份回执与可选 `--read-plan` 计划分母，确定性输出计划分母 × 客户端覆盖矩阵、全端共同盲区（`shared_blind_spots`）以及失败或超时项（不从分母剔除）。多端同位发现保留各端原文并检出严重度或极性分歧（`severity_divergent`），不将同位置结论直接合并为共识。结果同步生成 `r6_source_check_list` 原文件精确行号清单，落盘至 `<plan_dir>/reconcile/<run_id>_cross_check.md`。
+- **`reconcile`（双入口确定性机械对账表）**：支持用户点名运行，也在重负载派单完成时由 `record_heavy_completion_for_stop_hook` 自动触发，校验目标非符号链接后落盘至 `<plan_dir>/reconcile/<run_id>_reconcile.md`，不写入业务仓库目录。改动范围按“开工冻结基线或 `--baseline-file` → `--base-ref` → 回执 `changed_files` → `git diff HEAD`”依次定界，隔离任务前已有未提交改动的文件，无基线时标为 `unknown`。依赖分析仅将 Python AST 导入、Markdown 显式链接与反引号精确路径或已变顶层符号列为 `pending_review`（首屏前 10 项），普通提及仅记入 `weak_mention_docs` 计数以降低噪声，同时结算读写义务并支持 `--cross-check` 并轨。
 
 ### 3. 单分片安全输入预算公式（`_execution_budget`）
 
@@ -124,7 +124,7 @@ $$
 
 ### 1. 上游维护（`fleet-evolve`）与 `--audit-upgrade` 建议码
 
-本仓库自身目录启用 `fleet-evolve` 三种维护模式：`full`（四维盘点与联网能力更新）、`hygiene`（修缺陷、机械下沉与文档整理）、`audit`（零修改巡检）。四类高危节点须先经用户确认：调整推荐矩阵与 `runtime_tunables`（先 `fleet_state.py propose`）、写入宿主机全局目录（先 `install.py --dry-run --yes`）、跨版本 ABI 强耦合升级、执行 `git push`。
+在上游配置仓库目录中，`fleet-evolve` 提供三种维护模式：`full`（四维盘点与联网能力更新）、`hygiene`（缺陷修复、机械下沉与文档整理）、`audit`（零修改巡检）。以下四类关键变更节点须先经用户确认：调整推荐矩阵与 `runtime_tunables`（先执行 `fleet_state.py propose`）、写入宿主机全局目录（先执行 `install.py --dry-run --yes`）、跨版本 ABI 强耦合升级、执行 `git push`。
 
 涉及主会话重启更新时，使用 `record-pass1`、`verify-pass2` 和 `clear --verified --readback-done` 归位；终审默认校验文档事实锚定，并对未过期活跃提案、活跃 `AWAITING_MASTER_RELOAD` Pass 2 重启锁及损坏状态文件拒绝清除（已认领会话可传 `--session-id` 归位，其余须显式 `--force`）。
 
@@ -138,8 +138,8 @@ $$
 
 ### 2. 自定义尾段保留与全链路自动脱敏
 
-- **自定义规则保留**：Antigravity 装在独立插件目录 `plugins/user-guard`，不动 `~/.gemini/GEMINI.md`；其余三端更新至 `## 工具与运行环境`（含 `R10.`、`R11.`），自动保留其后任意二级自定义章节（兼容标题不同的 `## 工具与...` 段），冲突编号迁为 `L1.`、`L2.`。
-- **全链路自动脱敏**：`install.py --audit-upgrade` 与 `cae_harness.py`（`--output` 默认脱敏、`--redact` 脱敏标准输出）自动擦除用户主目录名、私网 IPv4/IPv6、API Key、常见令牌前缀（`Bearer`/`Basic`/`sk-`/`ghp_`/`AIza`/`ya29.`/JWT/`AKIA`/`ASIA`/`hf_`/`glpat-`/PEM）、带凭据或查询参数的 URL 与精确费用字段。`router.py` 与 `user_words.py` 写日志前同样脱敏且不记录正文。
+- **自定义规则保留**：Antigravity 安装于独立插件目录 `plugins/user-guard`，不修改 `~/.gemini/GEMINI.md`；其余三端更新至 `## 工具与运行环境`（含 `R10.`、`R11.`），自动保留其后任意二级自定义章节（兼容标题不同的 `## 工具与...` 段），冲突编号自动迁移为 `L1.`、`L2.`。
+- **全链路自动脱敏**：`install.py --audit-upgrade` 与 `cae_harness.py`（`--output` 默认脱敏，`--redact` 脱敏标准输出）自动擦除用户主目录名、私网 IPv4 与 IPv6、API Key、带凭据或查询参数的 URL 及精确费用字段。常见令牌前缀与格式（`Bearer`、`Basic`、`sk-`、`ghp_`、`AIza`、`ya29.`、JWT、`AKIA`、`ASIA`、`hf_`、`glpat-`、PEM）同样纳入自动擦除范围。`router.py` 与 `user_words.py` 写日志前同样脱敏且不记录正文。
 
 ### 3. 本地回环路由与 CC Switch 安全切卡
 
@@ -161,7 +161,7 @@ python -B -X utf8 "$HOME\.claude\hooks\ccswitch_admin.py" switch-card "<目标�
   python -B -X utf8 install.py --app codex --codex-handoff-mode off
   python -B -X utf8 install.py --app claude --claude-handoff-mode off
   ```
-- **按托管文件名精确卸载**（`install.py` 原地幂等同步不留 `.bak-*`；切勿整目录删除 `hooks/` 以免误伤自建脚本）：
+- **按托管文件名精确卸载**（`install.py` 采用原地幂等同步且不留 `.bak-*` 文件；卸载时请勿删除整个 `hooks/` 目录，以免误删自建脚本）：
   1. **Antigravity**：删除 `~/.gemini/config/plugins/user-guard` 与 `~/.gemini/antigravity/plugin_data/user-guard`。
   2. **Codex 与 Claude Code 托管钩子**：仅删除 `hooks/` 下托管脚本 `user_words.py`、`session_context_loader.py`、`status_guard.py`、`reply_repeat_guard.py`、`handoff_gate.py`（Claude 含 `ccswitch_admin.py`）、`hooks/_lib/` 及不再使用的 `hooks/state/`、`hooks/logs/`。
   3. **代理、技能与可选路由**：删除 `~/.codex/agents/` 与 `~/.claude/agents/` 下的 `readonly-*`，三端 `skills/` 下的 `cae-harness` 与 `fleet-evolve`，以及可选的 `~/.claude/router/`。
