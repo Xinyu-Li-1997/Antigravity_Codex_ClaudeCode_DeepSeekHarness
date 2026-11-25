@@ -27,6 +27,7 @@ HOOKS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(HOOKS_DIR))
 import handoff_gate  # noqa: E402
 import user_words  # noqa: E402
+from _lib import adaptive_policy as _adaptive_policy  # noqa: E402
 from _lib.process_guard import install_hook_self_guard  # noqa: E402
 
 user_words.ensure_utf8_stdio()
@@ -1073,7 +1074,7 @@ def _check_test_suite_locked(payload, reply, state_file, state, sid, turn_key, d
 
 
 _UNVERIFIED_NEG_META_RE = re.compile(
-    r"(?:不得宣称|严禁宣称|禁止宣称|不应宣称|未实查即下否定|守卫零执行|否定宣称拦截|user-guard)"
+    r"(?:不得宣称|严禁宣称|禁止宣称|不应宣称|未实查即下否定|守卫零执行|否定宣称拦截|局部排查防全称|长文交付自审|user-guard)"
 )
 _UNVERIFIED_NEG_HEDGE_RE = re.compile(
     r"(?:尚未核实|尚未确认|暂未确认|未核实|待核实|待确认|尚不确定|仅核查了|只核查了|仅排查了|只查了|探测失败|命令报错|命令失败)"
@@ -1083,7 +1084,22 @@ _EMPIRICAL_CLAIM_RE = re.compile(
     re.I,
 )
 _STRONG_NEGATIVE_CLAIM_RE = re.compile(
-    r"(?:未连接|没有连接|并未连接|并没有连接|没有连到|并没有连到|未挂载|没有映射|无映射网络盘|查不到|无法访问|不存在|未安装|没有安装|未配置|没有现成的?远端连接|\bnot\s+connected\b|\bnot\s+mounted\b|\bnot\s+installed\b|\bdoes\s+not\s+exist\b|\bnot\s+available\b)",
+    r"(?:未连接|没有连接|并未连接|并没有连接|没有连到|并没有连到|未挂载|没有映射|无映射网络盘|查不到|无法访问|不存在|未安装|没有安装|未配置|不可用|没有现成的?远端连接|\bnot\s+connected\b|\bnot\s+mounted\b|\bnot\s+installed\b|\bdoes\s+not\s+exist\b|\bnot\s+available\b)",
+    re.I,
+)
+_SWEEPING_GAP_VERDICT_RE = re.compile(
+    r"(?:(?:现有|当前|仓库|底层|整体|全套)?(?:数据|算例|实验|图件|图表|证据|材料|代码|实现)(?:本身)?(?:确实|明显|严重|根本|整体)?(?:不够|不足|缺失(?:很多|大量|严重)|不支撑|撑不起|无法支撑|达不到)"
+    r"|(?:必须|只能|需要)(?:重做|重跑整套|重写整套|推倒重来|补齐核心算法|新增算法创新)"
+    r"|\b(?:underlying|existing|current)\s+(?:data|results|evidence|benchmarks)\s+(?:is|are)\s+(?:insufficient|lacking|missing)\b"
+    r"|\binsufficient\s+(?:data|results|evidence|benchmarks)\b)",
+    re.I,
+)
+_SCOPE_DISCLOSURE_RE = re.compile(
+    r"(?:仅核查了|只核查了|仅查看了|只看了|仅检查了|只检查了|仅扫描了|单从(?:该|此|上述)|尚未核查|尚未排查|尚未盘点|未全量盘点|基于已读|仅基于|\bchecked\s+only\b|\bonly\s+inspected\b|\bhaven'?t\s+checked\b)",
+    re.I,
+)
+_UNREVIEWED_DISCLOSURE_RE = re.compile(
+    r"(?:初稿|草稿|未经(?:跨端|独立)(?:审查|审校|核验|复核)|尚未(?:跨端|独立|运行)[^\n。；]{0,12}(?:审查|审校|核验|复核|check-grounding)|待(?:跨端|独立)?(?:审查|审校|复核|验证)|\bunreviewed\s+draft\b|\bnot\s+yet\s+reviewed\b)",
     re.I,
 )
 _NONZERO_EXIT_RE = re.compile(
@@ -1094,19 +1110,64 @@ _TOOL_DENIED_OR_ERR_RE = re.compile(
     r"(?:Encountered error in step execution|tool call denied|denied by pre-tool hook)",
     re.I,
 )
+_BACKGROUND_PENDING_RE = re.compile(
+    r"(?:running\s+as\s+a\s+background\s+task|running\s+in\s+(?:the\s+)?background|background\s+task.*started|Task\s+id\s+\S+\s+started)",
+    re.I,
+)
+_INDEX_PATH_HINTS = (
+    "map", "index", "manifest", "catalog", "scope", "spec", "rulings", "studies",
+    "inventory", "readme", "agents", "claude", "outline", "toc", "overview",
+    "总览", "索引", "目录", "清单", "规范", "总纲",
+)
+_BROAD_SEARCH_CMD_RE = re.compile(
+    r"(?:\b(?:find|tree|rg|ripgrep|fd)\b|\bgrep\s+-[A-Za-z]*[rR]|\bgit\s+ls-files\b|\bGet-ChildItem\b[^\n]*-Recurse)",
+    re.I,
+)
+_SINGLE_FILE_EXT_RE = re.compile(
+    r"(?:^|[\s\"'])([^\s\"']+\.(?:md|tex|rst|txt|json|toml|yaml|yml|py|f90|f95|f03|c|cpp|h|hpp|jl|rs|go|sh|ps1|csv|log))(?:[\s\"']|$)",
+    re.I,
+)
+_HARNESS_REVIEW_CMD_RE = re.compile(
+    r"cae_harness\.py[\"']?\s+(?:audit|batch|task|gate|followup|check-grounding|cross-check|reconcile)\b",
+    re.I,
+)
+_FORMAL_DOC_EXTS = frozenset({".tex", ".md", ".rst"})
+_FORMAL_DOC_SKIP_DIRS = frozenset({
+    "tests", "test", "scratch", "tmp", "temp", ".git", "plugin_data",
+    "state", "logs", "handoff", "archive", "archived",
+})
+_FORMAL_DOC_SKIP_NAMES = frozenset({
+    "changelog.md", "license.md", "notice.md", "todo.md", "notes.md",
+    "plan.md", "implementation_plan.md", "walkthrough.md",
+})
+_FORMAL_DOC_SKIP_SUFFIXES = (
+    "_card.md", "_reconcile.md", "_read_plan.md", "_cross_check.md", "_user_words.md",
+)
+_LARGE_DOC_REWRITE_MIN_CHARS = 4000
 
 
 def _strip_inline_code_spans(text: str) -> str:
     return re.sub(r"`[^`\r\n]*`", " ", text)
 
 
-def _has_empirical_negative_claim(reply: str) -> bool:
-    plain = _strip_inline_code_spans("\n".join(user_words.markdown_unquoted_lines(reply)))
+def _has_empirical_negative_claim(text: str, *, preprocessed: bool = False) -> bool:
+    plain = text if preprocessed else _strip_inline_code_spans("\n".join(user_words.markdown_unquoted_lines(text)))
     for clause in re.split(r"[。！？；\n]+", plain):
         seg = clause.strip()
         if not seg or _UNVERIFIED_NEG_META_RE.search(seg) or _UNVERIFIED_NEG_HEDGE_RE.search(seg):
             continue
         if _EMPIRICAL_CLAIM_RE.search(seg) and _STRONG_NEGATIVE_CLAIM_RE.search(seg):
+            return True
+    return False
+
+
+def _has_sweeping_gap_verdict(plain: str) -> bool:
+    for sentence in re.split(r"[。！？\n]+", plain):
+        seg = sentence.strip()
+        if (not seg or _UNVERIFIED_NEG_META_RE.search(seg)
+                or _UNVERIFIED_NEG_HEDGE_RE.search(seg) or _SCOPE_DISCLOSURE_RE.search(seg)):
+            continue
+        if _SWEEPING_GAP_VERDICT_RE.search(seg):
             return True
     return False
 
@@ -1120,25 +1181,242 @@ def _is_trivial_ui_ok_output(text: str) -> bool:
     return len(lines) == 1 and lines[0] == "OK"
 
 
-def _turn_tool_probe_stats(path: Path) -> Optional[Tuple[int, int, int]]:
-    """统计本回合内跨三端轨迹的实质工具执行结果：(total, succeeded, failed)。"""
+def _is_formal_deliverable_doc(raw_path: str) -> Tuple[bool, str]:
+    norm = user_words._unquote_proto_scalar(raw_path).replace("\\", "/").strip()
+    if not norm:
+        return False, ""
+    p = Path(norm)
+    ext = p.suffix.lower()
+    if ext not in _FORMAL_DOC_EXTS:
+        return False, norm
+    low_name = p.name.lower()
+    if (low_name in _FORMAL_DOC_SKIP_NAMES
+            or low_name.endswith(_FORMAL_DOC_SKIP_SUFFIXES)
+            or any(tag in low_name for tag in ("handoff", "prompt", "task_"))):
+        return False, norm
+    if any(part.lower() in _FORMAL_DOC_SKIP_DIRS for part in p.parts[:-1]):
+        return False, norm
+    return True, norm
+
+
+def _is_index_path(path_str: str) -> bool:
+    low = path_str.replace("\\", "/").lower()
+    return any(hint in low for hint in _INDEX_PATH_HINTS)
+
+
+def _is_broad_shell_search(cmd_str: str) -> bool:
+    if not _BROAD_SEARCH_CMD_RE.search(cmd_str):
+        return False
+    # 针对单文件的 rg/grep 命令不视为全仓检索
+    file_args = _SINGLE_FILE_EXT_RE.findall(cmd_str)
+    if file_args and not re.search(r"\b(?:git\s+ls-files|tree|find)\b|-[A-Za-z]*[rR]|-Recurse|\*", cmd_str, re.I):
+        return False
+    return True
+
+
+def _extract_entry_model(entry: Dict[str, Any]) -> str:
+    if isinstance(entry.get("model"), str) and entry["model"].strip():
+        return entry["model"].strip()
+    payload = entry.get("payload")
+    if isinstance(payload, dict) and isinstance(payload.get("model"), str) and payload["model"].strip():
+        return payload["model"].strip()
+    msg = entry.get("message")
+    if isinstance(msg, dict) and isinstance(msg.get("model"), str) and msg["model"].strip():
+        return msg["model"].strip()
+    return ""
+
+
+def _iter_entry_tool_calls(entry: Dict[str, Any]):
+    """统一抽取 Antigravity / Codex / Claude 单条轨迹记录中的工具调用 (call_id, tool_name, parsed_args, raw_text)。"""
+    for obj in user_words._HarnessArchiveCollector._objects(entry, parse_text=False):
+        kind = obj.get("type")
+        is_call = kind in ("function_call", "custom_tool_call", "local_shell_call", "tool_use") or (
+            obj.get("name") and any(key in obj for key in ("args", "arguments", "input"))
+        )
+        if not is_call:
+            continue
+        call_id = user_words._tool_call_id(obj, is_call=True)
+        name = str(obj.get("name") or ("shell" if kind == "local_shell_call" else "")).strip()
+        raw_args = obj.get("arguments", obj.get("args", obj.get("input", {})))
+        if kind == "local_shell_call" and isinstance(obj.get("action"), dict):
+            raw_args = obj["action"]
+        parsed = user_words._parse_codex_json_maybe(raw_args)
+        parsed_dict = parsed if isinstance(parsed, dict) else {}
+        raw_text = raw_args if isinstance(raw_args, str) else json.dumps(raw_args, ensure_ascii=False)
+        yield call_id, name, parsed_dict, raw_text
+
+
+def _inspect_turn_evidence(path: Path) -> Optional[Dict[str, Any]]:
+    """单次扫描跨三端轨迹窗口，绑定工具调用与终态结果，汇总本回合探测、范围、长文整写与审查证据。"""
     if not path.is_file():
         return None
-    steps, _ = _read_tail_steps_with_offset(path)
-    start = next(
+    steps, start_offset = _read_tail_steps_with_offset(path)
+    user_boundary = next(
         (
-            i + 1
+            i
             for i in range(len(steps) - 1, -1, -1)
             if _is_explicit_user_step(steps[i]) or user_words.transcript_user_text(steps[i], path)
         ),
-        0,
+        None,
     )
+    start = (user_boundary + 1) if user_boundary is not None else 0
+    turn_truncated = bool(start_offset > 0 and user_boundary is None)
+
+    active_model = ""
     total = 0
     succeeded = 0
     failed = 0
-    for entry in steps[start:]:
+    checked_paths: Set[str] = set()
+    consulted_index = False
+    large_doc_writes: List[Dict[str, Any]] = []
+    seen_writes: Set[str] = set()
+    result_seq = 0
+    latest_write_seq = -1
+    verified_review_seq = -1
+
+    pending_by_id: Dict[str, Dict[str, Any]] = {}
+    pending_unid: List[Dict[str, Any]] = []
+
+    def _settle_result(call_id: str, text: str, is_err: bool) -> None:
+        nonlocal total, succeeded, failed, consulted_index, result_seq, latest_write_seq, verified_review_seq
+        result_seq += 1
+        meta = pending_by_id.pop(call_id, None) if call_id else None
+        if meta is None and not call_id and pending_unid:
+            meta = pending_unid.pop(0)
+
+        if meta is not None:
+            kind = meta["kind"]
+            if kind == "ui":
+                return
+            if is_err:
+                if kind == "probe":
+                    total += 1
+                    failed += 1
+                return
+            if kind == "write_doc":
+                doc_info = meta["doc_info"]
+                if doc_info and doc_info["path"] not in seen_writes:
+                    seen_writes.add(doc_info["path"])
+                    large_doc_writes.append(doc_info)
+                latest_write_seq = result_seq
+                return
+            if kind == "review":
+                if not _BACKGROUND_PENDING_RE.search(text):
+                    verified_review_seq = result_seq
+                return
+            if kind == "probe":
+                total += 1
+                succeeded += 1
+                for p in meta["paths"]:
+                    checked_paths.add(p)
+                    if _is_index_path(p):
+                        consulted_index = True
+                if meta["broad_search"]:
+                    consulted_index = True
+                return
+            # kind == "other"（非探测性成功写入/编辑等）不充当 Gate A 只读探测成功证据
+            return
+
+        # 无对应调用记录的纯输出条目（兼容精简轨迹或单测夹具）
+        total += 1
+        if is_err:
+            failed += 1
+        else:
+            succeeded += 1
+
+    for idx, entry in enumerate(steps):
         if entry.get("isSidechain") is True or entry.get("isMeta") is True:
             continue
+        m_name = _extract_entry_model(entry)
+        if m_name:
+            active_model = m_name
+        if idx < start:
+            continue
+
+        for call_id, tool_name, parsed, raw_text in _iter_entry_tool_calls(entry):
+            tlow = tool_name.lower()
+            raw_cmd = parsed.get("CommandLine") or parsed.get("command") or parsed.get("cmd") or ""
+            cmd_str = (
+                " ".join(str(x) for x in raw_cmd)
+                if isinstance(raw_cmd, list)
+                else user_words._unquote_proto_scalar(raw_cmd)
+            )
+            meta: Dict[str, Any] = {"kind": "other", "paths": [], "broad_search": False, "doc_info": None}
+            if tlow in ("update_focus", "update_steps"):
+                meta["kind"] = "ui"
+            elif _HARNESS_REVIEW_CMD_RE.search(cmd_str or raw_text):
+                meta["kind"] = "review"
+            elif tlow in ("invoke_subagent", "spawn_agent", "agent", "task", "subagent", "dispatch_agent", "run_workflow", "swarm"):
+                if re.search(r"(?:audit|review|collaborator|verifier|readonly-auditor|readonly-collaborator)", raw_text, re.I):
+                    meta["kind"] = "review"
+            elif tlow in ("read_file", "read", "view_file", "list_dir", "ls"):
+                meta["kind"] = "probe"
+                p_val = user_words._unquote_proto_scalar(
+                    parsed.get("Path") or parsed.get("file_path") or parsed.get("path") or parsed.get("DirectoryPath") or ""
+                )
+                if p_val:
+                    meta["paths"].append(p_val.replace("\\", "/").lower())
+            elif tlow in ("grep_search", "grep", "find_by_name", "glob"):
+                meta["kind"] = "probe"
+                p_val = user_words._unquote_proto_scalar(
+                    parsed.get("SearchPath") or parsed.get("SearchDirectory") or parsed.get("path") or ""
+                )
+                if p_val:
+                    meta["paths"].append(p_val.replace("\\", "/").lower())
+                # 仅当目标不是单个明确扩展名文件时才视为目录/全仓级检索
+                meta["broad_search"] = not (p_val and Path(p_val).suffix and "*" not in p_val)
+            elif tlow in ("run_command", "bash", "exec_command", "shell", "local_shell_call"):
+                meta["kind"] = "probe"
+                meta["broad_search"] = _is_broad_shell_search(cmd_str)
+                for tok in re.findall(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+(?:\.[A-Za-z0-9]+)?|\b[A-Za-z0-9_.-]+\.(?:md|tex|rst|json|toml|yaml|yml|py|f90|cpp|c|h)\b", cmd_str):
+                    meta["paths"].append(tok.replace("\\", "/").lower())
+            elif tlow in ("write_file", "write_to_file", "write", "create_file"):
+                raw_target = (
+                    parsed.get("Path") or parsed.get("file_path") or parsed.get("TargetFile") or parsed.get("path") or ""
+                )
+                is_append = str(parsed.get("Append") or parsed.get("append") or "").strip().lower() == "true"
+                ok_doc, norm_doc = _is_formal_deliverable_doc(str(raw_target))
+                if ok_doc and not is_append:
+                    content = user_words._unquote_proto_scalar(
+                        parsed.get("Content") or parsed.get("content") or parsed.get("CodeContent") or ""
+                    )
+                    size_chars = len(content)
+                    if size_chars < _LARGE_DOC_REWRITE_MIN_CHARS:
+                        try:
+                            disk_p = Path(norm_doc)
+                            if disk_p.is_file():
+                                size_chars = max(size_chars, disk_p.stat().st_size)
+                        except OSError:
+                            pass
+                    if size_chars >= _LARGE_DOC_REWRITE_MIN_CHARS:
+                        meta["kind"] = "write_doc"
+                        meta["doc_info"] = {"path": norm_doc, "chars": size_chars}
+            elif tlow == "apply_patch":
+                patch_text = str(parsed.get("input") or parsed.get("patch") or raw_text or "")
+                cur_doc = ""
+                cur_added = 0
+                best_doc: Optional[Dict[str, Any]] = None
+                for pline in patch_text.splitlines():
+                    pm = re.match(r"^\*\*\*\s+(?:Add|Update)\s+File:\s+(.+)$", pline.strip())
+                    if pm:
+                        if cur_doc and cur_added >= _LARGE_DOC_REWRITE_MIN_CHARS and (best_doc is None or cur_added > best_doc["chars"]):
+                            best_doc = {"path": cur_doc, "chars": cur_added}
+                        ok_doc, norm_doc = _is_formal_deliverable_doc(pm.group(1))
+                        cur_doc = norm_doc if ok_doc else ""
+                        cur_added = 0
+                    elif cur_doc and pline.startswith("+") and not pline.startswith("+++"):
+                        cur_added += len(pline)
+                if cur_doc and cur_added >= _LARGE_DOC_REWRITE_MIN_CHARS and (best_doc is None or cur_added > best_doc["chars"]):
+                    best_doc = {"path": cur_doc, "chars": cur_added}
+                if best_doc is not None:
+                    meta["kind"] = "write_doc"
+                    meta["doc_info"] = best_doc
+
+            if call_id:
+                pending_by_id[call_id] = meta
+            else:
+                pending_unid.append(meta)
+
         if entry.get("type") in ("GENERIC", "TOOL_RESULT", "TOOL_RESPONSE"):
             result = entry.get("tool_result")
             raw = entry.get("content")
@@ -1146,74 +1424,173 @@ def _turn_tool_probe_stats(path: Path) -> Optional[Tuple[int, int, int]]:
                 raw = result.get("output") if isinstance(result, dict) else entry.get("output")
             text = re.sub(r"\x1b\[[0-9;]*m", "", user_words._codex_output_to_text(raw))
             status_err = str(entry.get("status") or "").strip().upper() == "ERROR"
+            res_cid = user_words._tool_call_id(entry) or (
+                user_words._tool_call_id(result) if isinstance(result, dict) else ""
+            )
             if not status_err and (not text.strip() or _is_trivial_ui_ok_output(text)):
+                # 同步弹出对应的 ui/空回执调用，避免队列错位
+                if res_cid:
+                    pending_by_id.pop(res_cid, None)
+                elif pending_unid:
+                    pending_unid.pop(0)
                 continue
-            total += 1
-            if status_err or _NONZERO_EXIT_RE.search(text) or _TOOL_DENIED_OR_ERR_RE.search(text):
-                failed += 1
-            else:
-                succeeded += 1
+            is_err = bool(status_err or _NONZERO_EXIT_RE.search(text) or _TOOL_DENIED_OR_ERR_RE.search(text))
+            _settle_result(res_cid, text, is_err)
         else:
             for obj in user_words._HarnessArchiveCollector._objects(entry, parse_text=False):
                 if obj.get("type") not in ("function_call_output", "custom_tool_call_output", "local_shell_call_output", "tool_result"):
                     continue
+                res_cid = user_words._tool_call_id(obj) or str(obj.get("tool_use_id") or "")
                 raw = obj.get("output", obj.get("content"))
+                is_err = obj.get("is_error") is True
                 if isinstance(raw, dict):
+                    meta_obj = raw.get("metadata")
+                    ec_raw = meta_obj.get("exit_code") if isinstance(meta_obj, dict) else raw.get("exit_code")
+                    if isinstance(ec_raw, int) and ec_raw != 0:
+                        is_err = True
                     raw_text = raw.get("stdout") or raw.get("output") or json.dumps(raw, ensure_ascii=False)
                 else:
                     raw_text = user_words._codex_output_to_text(raw)
                 text = re.sub(r"\x1b\[[0-9;]*m", "", raw_text)
-                is_err = obj.get("is_error") is True
                 if not is_err and text.strip().startswith("{"):
                     try:
-                        parsed = json.loads(text)
-                        if isinstance(parsed, dict):
-                            meta = parsed.get("metadata")
-                            ec = meta.get("exit_code") if isinstance(meta, dict) else parsed.get("exit_code")
+                        parsed_out = json.loads(text)
+                        if isinstance(parsed_out, dict):
+                            meta_p = parsed_out.get("metadata")
+                            ec = meta_p.get("exit_code") if isinstance(meta_p, dict) else parsed_out.get("exit_code")
                             if isinstance(ec, int) and ec != 0:
                                 is_err = True
                     except ValueError:
                         pass
                 if not is_err and (not text.strip() or _is_trivial_ui_ok_output(text)):
+                    if res_cid:
+                        pending_by_id.pop(res_cid, None)
+                    elif pending_unid:
+                        pending_unid.pop(0)
                     continue
-                total += 1
-                if is_err or _NONZERO_EXIT_RE.search(text) or _TOOL_DENIED_OR_ERR_RE.search(text):
-                    failed += 1
-                else:
-                    succeeded += 1
-    return total, succeeded, failed
+                is_err = bool(is_err or _NONZERO_EXIT_RE.search(text) or _TOOL_DENIED_OR_ERR_RE.search(text))
+                _settle_result(res_cid, text, is_err)
+
+    return {
+        "total": total,
+        "succeeded": succeeded,
+        "failed": failed,
+        "turn_truncated": turn_truncated,
+        "checked_paths": checked_paths,
+        "consulted_index": consulted_index,
+        "large_doc_writes": large_doc_writes,
+        "has_independent_review": bool(latest_write_seq >= 0 and verified_review_seq > latest_write_seq),
+        "active_model": active_model,
+    }
 
 
-def _check_unverified_negative_claim_locked(payload, reply, state_file, state, sid, turn_key, decision):
+def _code_family_mismatch_hint(client: str, active_model: str, payload: Dict[str, Any]) -> str:
+    """按 fleet_profile.json 的 code_families / deep_families 判断当前主会话是否以编码高吞吐系列承担长文定稿。"""
+    model = active_model or _adaptive_policy.extract_runtime_model_and_effort(client, payload)[0]
+    if not model:
+        return ""
+    profile = user_words.load_fleet_profile(HOOKS_DIR)
+    rules = profile.get("client_catalog_rules") if isinstance(profile.get("client_catalog_rules"), dict) else {}
+    agent_key = "agy" if client == "antigravity" else client
+    c_rule = rules.get(agent_key) if isinstance(rules.get(agent_key), dict) else {}
+    code_fams = [str(x).strip().lower() for x in (c_rule.get("code_families") or []) if str(x).strip()]
+    deep_fams = [str(x).strip().lower() for x in (c_rule.get("deep_families") or []) if str(x).strip()]
+    if not code_fams or not deep_fams:
+        return ""
+    m_low = model.lower()
+    in_code = any(re.search(rf"(?<![a-z0-9]){re.escape(fam)}(?![a-z0-9])", m_low) for fam in code_fams)
+    in_deep = any(re.search(rf"(?<![a-z0-9]){re.escape(fam)}(?![a-z0-9])", m_low) for fam in deep_fams)
+    if in_code and not in_deep:
+        return (
+            f"另检测到当前主会话运行在编码高吞吐系列（`{model}`），"
+            f"正式长文、证明与技术规格定稿建议切用审慎推理系列（如 {'/'.join(deep_fams)}）或交由跨端独立审查把关。"
+        )
+    return ""
+
+
+def _check_turn_evidence_locked(
+    payload: Dict[str, Any],
+    reply: str,
+    state_file: Path,
+    state: Dict[str, Any],
+    sid: str,
+    turn_key: str,
+    decision: str,
+    *,
+    client: str = "antigravity",
+) -> Optional[Tuple[str, Dict[str, Any]]]:
+    """统一执行三端回合实证核验（单次扫描，每回合至多拦截一次）：零探测否定、局部排查全称缺口、长文单端免审。"""
     record = state["turns"][turn_key]
-    if record["blockedSignatures"] or not _has_empirical_negative_claim(reply):
+    if record["blockedSignatures"]:
         return None
     raw_path = payload.get("transcriptPath") or payload.get("transcript_path")
     if not raw_path:
         return None
-    stats = _turn_tool_probe_stats(user_words.resolve_compact_transcript_path(Path(raw_path).expanduser()))
-    if stats is None:
+    unquoted = "\n".join(user_words.markdown_unquoted_lines(reply))
+    # 仅豁免【新对话提示词】正文段落，保留其之前的事实汇报继续受检
+    body_for_check = unquoted.split("【新对话提示词】", 1)[0].strip() if "【新对话提示词】" in unquoted else unquoted
+    if not body_for_check:
         return None
-    total, succeeded, failed = stats
-    if succeeded > 0:
+    plain = _strip_inline_code_spans(body_for_check)
+    has_emp_neg = _has_empirical_negative_claim(plain, preprocessed=True)
+    has_gap_verdict = _has_sweeping_gap_verdict(plain)
+    ev = _inspect_turn_evidence(user_words.resolve_compact_transcript_path(Path(raw_path).expanduser()))
+    if ev is None:
         return None
-    if _heavy_report_blocked(state_file.parent, sid, turn_key, payload):
-        return None
-    record["blockedSignatures"].append("unverified-negative-claim")
-    _save_repeat_state(state_file, state, sid)
-    if failed > 0:
+
+    # Gate A: 零成功探测或全报错探测却宣称“已核实未连接/不存在/不可用”（尾窗截断时不误拦）
+    if has_emp_neg and ev["succeeded"] == 0 and not ev["turn_truncated"]:
+        if _heavy_report_blocked(state_file.parent, sid, turn_key, payload):
+            return None
+        record["blockedSignatures"].append("unverified-negative-claim")
+        _save_repeat_state(state_file, state, sid)
+        if ev["failed"] > 0:
+            reason = (
+                f"【user-guard 未实查即下否定结论拦截】本轮探测命令均报错或被拦截（成功 0 条、失败 {ev['failed']} 条），"
+                "尚无有效只读成功输出，不得宣称“已核实未连接/不存在/不可用”。"
+                "请按 R3.6 先修复命令完成只读查证，或如实说明探测失败与尚未核实的范围。"
+            )
+        else:
+            reason = (
+                "【user-guard 未实查即下否定结论拦截】本轮尚未执行任何实质只读或命令核查（成功 0 条），"
+                "不得直接宣称“已核实未连接/不存在/不可用”。"
+                "请按 R3.6/R4 先对本机已连渠道执行只读核实，或如实标明尚未核查。"
+            )
+        return "unverified_negative_claim", {"decision": decision, "reason": reason}
+
+    # Gate B: 仅核查少量局部路径（未读索引/清单且未做全仓检索）却下“现有数据/材料不足或需整体重做”的全称缺口定论
+    if (has_gap_verdict and ev["succeeded"] > 0 and not ev["turn_truncated"]
+            and not ev["consulted_index"] and len(ev["checked_paths"]) <= 3):
+        if _heavy_report_blocked(state_file.parent, sid, turn_key, payload):
+            return None
+        record["blockedSignatures"].append("partial-scope-verdict")
+        _save_repeat_state(state_file, state, sid)
         reason = (
-            f"【user-guard 未实查即下否定结论拦截】本轮探测命令均报错或被拦截（成功 0 条、失败 {failed} 条），"
-            "尚无有效只读成功输出，不得宣称“已核实未连接/不存在/不可用”。"
-            "请按 R3.6 先修复命令完成只读查证，或如实说明探测失败与尚未核实的范围。"
+            "【user-guard 局部排查防全称缺口结论】本轮仅核查了少量局部路径（未读取项目总览/资产索引，也未执行全仓检索），"
+            "却直接给出了“现有数据/材料/实现不足或需整体重做”的全局定论。"
+            "请按 R3.6 先补查项目索引、资产目录或全仓检索核实存量，或如实标明“仅核查了哪些路径、尚未核查其余目录”。"
         )
-    else:
+        return "partial_scope_verdict", {"decision": decision, "reason": reason}
+
+    # Gate C: 单端整篇写入正式长文（.tex / .md / .rst）却无覆盖当前交付的独立复核记录且未标明初稿待审
+    if (ev["large_doc_writes"] and not ev["has_independent_review"]
+            and not _UNREVIEWED_DISCLOSURE_RE.search(plain)):
+        if _heavy_report_blocked(state_file.parent, sid, turn_key, payload):
+            return None
+        record["blockedSignatures"].append("solo-deliverable-review")
+        _save_repeat_state(state_file, state, sid)
+        doc_names = "、".join(Path(item["path"]).name for item in ev["large_doc_writes"][:3])
+        model_hint = _code_family_mismatch_hint(client, ev["active_model"], payload)
         reason = (
-            "【user-guard 未实查即下否定结论拦截】本轮尚未执行任何实质只读或命令核查（成功 0 条），"
-            "不得直接宣称“已核实未连接/不存在/不可用”。"
-            "请按 R3.6/R4 先对本机已连渠道执行只读核实，或如实标明尚未核查。"
+            f"【user-guard 长文交付自审提醒】本轮单端整篇写入了正式文档（{doc_names}），"
+            "尚未见覆盖当前版本的独立复核或 `check-grounding --doc-hygiene` 核验记录，且回复未标明“未经独立审校的初稿”。"
+            "请先运行 `check-grounding --strict --doc-hygiene` 或按 R3.1 发起跨端独立审查；"
+            "若确为阶段初稿，请如实标明“初稿待独立审校”及未核验范围。"
+            + (f" {model_hint}" if model_hint else "")
         )
-    return {"decision": decision, "reason": reason}
+        return "solo_deliverable_review", {"decision": decision, "reason": reason}
+
+    return None
 
 
 _PENDING_TICKET_STATUS_RE = re.compile(
@@ -1322,9 +1699,12 @@ def _handle_stop_locked(payload: Dict[str, Any], state_dir: Path, conversation_i
 
     if correction := _check_test_suite_locked(payload, latest_reply, state_file, state, conversation_id, turn_key, "continue"):
         return correction
-    if neg_block := _check_unverified_negative_claim_locked(payload, latest_reply, state_file, state, conversation_id, turn_key, "continue"):
-        log_event("Stop:reply_repeat_guard", conversation_id, f"BLOCKED unverified negative claim in {turn_key}")
-        return neg_block
+    if ev_hit := _check_turn_evidence_locked(
+        payload, latest_reply, state_file, state, conversation_id, turn_key, "continue", client="antigravity",
+    ):
+        ev_kind, ev_resp = ev_hit
+        log_event("Stop:reply_repeat_guard", conversation_id, f"BLOCKED {ev_kind} in {turn_key}")
+        return ev_resp
 
     # 同一 step_index 幂等保护（防止重复投递误累加）
     last_step = turn_rec.get("lastStepIndex")
@@ -1651,11 +2031,14 @@ def handle_claude_stop_repeat_guard(payload: Dict[str, Any], state_dir: Optional
             })
             if correction := _check_test_suite_locked(payload, reply, state_file, state, sid, turn_key, "block"):
                 return correction
-            if neg_block := _check_unverified_negative_claim_locked(payload, reply, state_file, state, sid, turn_key, "block"):
+            if ev_hit := _check_turn_evidence_locked(
+                payload, reply, state_file, state, sid, turn_key, "block", client=client,
+            ):
+                ev_kind, ev_resp = ev_hit
                 user_words.append_jsonl_log(logs_dir / "lifecycle.log", {
-                    "event": "Stop:unverified_negative_claim", "client": client, "session_id": sid, "turn_key": turn_key,
+                    "event": f"Stop:{ev_kind}", "client": client, "session_id": sid, "turn_key": turn_key,
                 })
-                return neg_block
+                return ev_resp
             if ((step is not None and step == record["lastStepIndex"])
                     or (message_id and message_id == record.get("lastMessageId"))):
                 return {}

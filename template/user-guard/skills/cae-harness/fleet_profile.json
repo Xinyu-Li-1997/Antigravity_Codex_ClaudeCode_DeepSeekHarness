@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "profile_id": "fleet-snapshot-v2",
-  "evaluated_at": "2026-11-23",
+  "evaluated_at": "2026-11-25",
   "evaluation_policy": {
     "bidirectional_strength_and_defect_audit": true,
     "all_roles_dynamic": true,
@@ -176,7 +176,9 @@
     ],
     "agy_retiring_patterns": [
       "claude[- ]?4[.-]6",
-      "gpt[- ]oss[- ]120b"
+      "gpt[- ]oss[- ]120b",
+      "gemini[- ]?4[- ]?argon",
+      "gemini[- ]?3[.-]8[- ]?flash"
     ]
   },
   "client_catalog_rules": {
@@ -184,7 +186,6 @@
       "family_priority": [
         "carbon",
         "neon",
-        "argon",
         "pro"
       ],
       "code_families": [
@@ -498,7 +499,7 @@
     }
   },
   "capability_ledger": {
-    "last_online_refresh_at": "2026-11-23",
+    "last_online_refresh_at": "2026-11-25",
     "local_bench_verified_at": "2026-11-19",
     "online_refresh_module": "fleet-evolve",
     "dispatch_online_lookup": false

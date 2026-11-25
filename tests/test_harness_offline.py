@@ -3036,13 +3036,22 @@ else:
         self.assertEqual(rep['selected_tier'], 'low')
         self.assertEqual(captured_efforts, ['low'])
 
-        # 4) agy 自动选模遵守 blocked_auto_tokens，codex 编码选模遵守 workhorse_families 顺序
+        # 4) agy 自动选模遵守 blocked_auto_tokens 与 agy_retiring_patterns，codex 编码选模遵守 workhorse_families 顺序
         engines['agy']['models'] = [
             {'slug': 'auto-router-high', 'supported_efforts': ['high']},
             {'slug': 'gemini-4-argon-high', 'supported_efforts': ['high']},
+            {'slug': 'gemini-3.8-flash-low', 'supported_efforts': ['low']},
+            {'slug': 'gemini-4-carbon-high', 'supported_efforts': ['high']},
         ]
         engines['agy']['model'] = ''
-        self.assertEqual(harness.resolve_execution_profile(engines, 'agy:default', 'max', kind='code')['model'], 'gemini-4-argon-high')
+        self.assertEqual(harness.resolve_execution_profile(engines, 'agy:default', 'max', kind='code')['model'], 'gemini-4-carbon-high')
+        engines['agy']['models'] = [
+            {'slug': 'gemini-4-argon-high', 'supported_efforts': ['high']},
+            {'slug': 'gemini-3.8-flash-low', 'supported_efforts': ['low']},
+        ]
+        retiring_only = harness.resolve_execution_profile(engines, 'agy:default', 'max', kind='code')
+        self.assertIsNone(retiring_only['model'])
+        self.assertEqual(retiring_only['profile_source'], 'no_native_catalog_candidate')
         engines['codex']['models'] = [
             {'slug': 'gpt-6.9-unknown', 'priority': 99, 'supported_efforts': ['max']},
             {'slug': 'gpt-6.1-sol', 'priority': 10, 'supported_efforts': ['max']},
@@ -8175,6 +8184,133 @@ else:
         )
         self.assertEqual(code_clean, 0, rep_clean)
         self.assertTrue(rep_clean['ok'])
+
+    def test_doc_hygiene_cross_format_media_and_theorem_shells(self):
+        """跨格式交付卫生：覆盖 .tex/.md/.rst 的本地图件断链与多命题零证明空壳，且不误报合法LaTeX宏与大纲文件。"""
+        proj = self.root / 'cross_format_hygiene'
+        (proj / 'paper' / 'figures').mkdir(parents=True)
+        (proj / 'docs').mkdir(parents=True)
+        (proj / 'src').mkdir(parents=True)
+        (proj / 'src' / 'dgsem.f90').write_text('! DGSEM flux solver\nsubroutine dgsem_step()\nend subroutine\n', encoding='utf-8')
+        (proj / 'paper' / 'refs.bib').write_text('@article{Cahn1958, title={Free Energy}, journal={JCP}}\n', encoding='utf-8')
+        (proj / 'paper' / 'figures' / 'valid_plot.pdf').write_bytes(b'%PDF-1.4\n')
+        (proj / 'paper' / 'old').mkdir(parents=True)
+        (proj / 'paper' / 'old' / 'old_only.pdf').write_bytes(b'%PDF-1.4\n')
+        (proj / 'root_only.png').write_bytes(b'\x89PNG\r\n\x1a\n')
+        (proj / 'docs' / 'ok.png').write_bytes(b'\x89PNG\r\n\x1a\n')
+        (proj / 'docs' / 'mesh(v2).png').write_bytes(b'\x89PNG\r\n\x1a\n')
+
+        # 1) .tex 含有效图（依赖 \graphicspath 与自动扩展名）、注释掉的 \graphicspath、断链图、以及自定义 \newtheorem 2 条 0 证明
+        (proj / 'paper' / 'manuscript.tex').write_text(
+            '\\documentclass{article}\n'
+            '\\usepackage{graphicx}\n'
+            '\\graphicspath{{figures/}}\n'
+            '% \\graphicspath{{old/}}\n'
+            '\\newtheorem{thm}{Theorem}\n'
+            '\\begin{document}\n'
+            '\\section{Method}\n'
+            'The DGSEM solver obeys energy stability \\cite{Cahn1958}.\n'
+            '% \\includegraphics{commented_missing.pdf}\n'
+            '\\includegraphics[width=0.8\\linewidth]{valid_plot}\n'
+            '\\includegraphics[width=0.8\\linewidth]{old_only}\n'
+            '\\includegraphics[width=0.8\\linewidth]{missing_fig.pdf}\n'
+            '\\begin{thm}[Energy bound]\n'
+            'Discrete free energy decays.\n'
+            '\\end{thm}\n'
+            '\\begin{thm}[Mass conservation]\n'
+            'Total mass is conserved.\n'
+            '\\end{thm}\n'
+            '\\end{document}\n',
+            encoding='utf-8',
+        )
+        # 1b) 被 \input 纳入的章节文件：首行含注释 % \begin{document} 与同行公式后跟无锚定大写缩写，不应被吞掉
+        (proj / 'paper' / 'chapter.tex').write_text(
+            '% \\begin{document}\n'
+            '\\begin{equation}x=1\\end{equation} BOGUSACR appears after inline equation.\n',
+            encoding='utf-8',
+        )
+        # 2) .md 含引用框命题 2 条 0 证明、断链本地图（含仅存在于仓库根的同名图）、带括号合法图名、以及合法外链
+        (proj / 'docs' / 'report.md').write_text(
+            '# 数值分析报告\n\n'
+            '![有效图](ok.png)\n'
+            '![带括号图](mesh(v2).png)\n'
+            '![外链图](https://example.com/demo.png)\n'
+            '![仅根存在断链](root_only.png)\n'
+            '![断链图](figures/missing_chart.png)\n\n'
+            '> **命题 1（半离散守恒）**\n'
+            '> 总质量守恒。\n\n'
+            '> **命题 2（自由能衰减）**\n'
+            '> 自由能单调衰减。\n',
+            encoding='utf-8',
+        )
+        # 3) .rst 含断链本地图与原生下划线标题命题 2 条 0 证明
+        (proj / 'docs' / 'notes.rst').write_text(
+            'Analysis\n========\n\n'
+            '.. figure:: missing_rst.svg\n\n'
+            'Theorem 1\n---------\n\nMass holds.\n\n'
+            'Theorem 2\n---------\n\nEnergy holds.\n',
+            encoding='utf-8',
+        )
+        # 4) 大纲文档声明命题清单但不应误报 unproved_theorem_shell
+        (proj / 'docs' / 'paper_outline.md').write_text(
+            '# 论文大纲\n\n'
+            '**Theorem 1.** Energy stability.\n\n'
+            '**Theorem 2.** Mass conservation.\n',
+            encoding='utf-8',
+        )
+
+        rep = harness.audit_doc_grounding(proj, root_dir=proj, doc_hygiene=True)
+        self.assertIn('paper/manuscript.tex', rep['checked_files'])
+        self.assertFalse(rep['ok'])
+        by_file_cat = {(f['file'], f['category'], f['token']) for f in rep['findings']}
+        self.assertIn(('paper/manuscript.tex', 'broken_local_media_ref', 'missing_fig.pdf'), by_file_cat)
+        self.assertIn(('paper/manuscript.tex', 'broken_local_media_ref', 'old_only'), by_file_cat)
+        self.assertIn(('paper/manuscript.tex', 'unproved_theorem_shell', '2 formal claims, 0 proofs'), by_file_cat)
+        self.assertIn(('paper/chapter.tex', 'ungrounded_acronym', 'BOGUSACR'), by_file_cat)
+        self.assertIn(('docs/report.md', 'broken_local_media_ref', 'figures/missing_chart.png'), by_file_cat)
+        self.assertIn(('docs/report.md', 'broken_local_media_ref', 'root_only.png'), by_file_cat)
+        self.assertIn(('docs/report.md', 'unproved_theorem_shell', '2 formal claims, 0 proofs'), by_file_cat)
+        self.assertIn(('docs/notes.rst', 'broken_local_media_ref', 'missing_rst.svg'), by_file_cat)
+        self.assertIn(('docs/notes.rst', 'unproved_theorem_shell', '2 formal claims, 0 proofs'), by_file_cat)
+        # 不误报有效图、带括号有效图、注释图、外链图、大纲文件与常规 LaTeX 宏
+        self.assertFalse(any(f['file'] == 'docs/paper_outline.md' for f in rep['findings']))
+        self.assertFalse(any(f['token'] in ('valid_plot', 'commented_missing.pdf', 'ok.png', 'mesh(v2).png') for f in rep['findings']))
+        self.assertFalse(any(f['file'] == 'paper/manuscript.tex' and f['category'].startswith('ungrounded_') for f in rep['findings']))
+
+        # 补齐证明（或显式指向补充材料）并修复图件与无锚定词后应零告警通过
+        (proj / 'paper' / 'chapter.tex').write_text('% \\begin{document}\n\\begin{equation}x=1\\end{equation} DGSEM text.\n', encoding='utf-8')
+        (proj / 'paper' / 'manuscript.tex').write_text(
+            '\\documentclass{article}\n'
+            '\\graphicspath{{figures/}}\n'
+            '\\newtheorem{thm}{Theorem}\n'
+            '\\begin{document}\n'
+            'The DGSEM solver obeys energy stability \\cite{Cahn1958}.\n'
+            '\\includegraphics{valid_plot}\n'
+            '\\begin{thm}A\\end{thm}\n'
+            '\\begin{proof}Direct integration.\\end{proof}\n'
+            '\\begin{thm}B\\end{thm}\n'
+            '\\end{document}\n',
+            encoding='utf-8',
+        )
+        (proj / 'docs' / 'report.md').write_text(
+            '# 数值分析报告\n\n'
+            '![有效图](ok.png)\n'
+            '![带括号图](mesh(v2).png)\n\n'
+            '> **命题 1（半离散守恒）**\n\n'
+            '> **命题 2（自由能衰减）**\n\n'
+            '上述两条命题的完整证明详见补充材料。\n',
+            encoding='utf-8',
+        )
+        (proj / 'docs' / 'notes.rst').write_text(
+            'Analysis\n========\n\n'
+            '.. image:: ok.png\n\n'
+            'Theorem 1\n---------\n\nMass holds.\n\n'
+            '.. proof::\n   Direct integration.\n\n'
+            'Theorem 2\n---------\n\nEnergy holds.\n',
+            encoding='utf-8',
+        )
+        rep_fixed = harness.audit_doc_grounding(proj, root_dir=proj, doc_hygiene=True)
+        self.assertTrue(rep_fixed['ok'], rep_fixed['findings'])
 
 
 if __name__ == '__main__':

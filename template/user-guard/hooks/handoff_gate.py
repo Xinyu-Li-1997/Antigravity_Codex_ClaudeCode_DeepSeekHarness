@@ -1507,7 +1507,7 @@ def _build_drain_message(gate_state: Dict[str, Any], tel: Dict[str, Any]) -> str
         f"- 当前进入原子收口排空期（剩余模型调用 {gate_state['drainInvocationsRemaining']} 次 / 写或运行动作 {gate_state['drainActionsRemaining']} 次）：\n"
         "  1. 禁止新开 subagent/run_workflow/swarm/schedule/browser/cae_harness 派工、禁止读图及 `git push`；\n"
         "  2. 仅完成手头未闭环的局部收尾与本地验收，`git add`/`git commit`；\n"
-        "  3. 全量整理当前已验证进展、未尽事项与可直接粘贴的【新对话提示词】写入交接文档或在终局回复给出，随后立即停机。"
+        "  3. 全量整理当前已验证进展、Git/工作区状态、未尽事项与可直接粘贴的【新对话提示词】（须保留项目顶层规范/总纲与资产索引入口；长文写作应与重算或批量读图拆分为独立新会话），写入交接文档或在终局回复给出，随后立即停机。"
         + goal_line
     )
 
@@ -1518,7 +1518,7 @@ def _build_freeze_message(gate_state: Dict[str, Any], tel: Dict[str, Any]) -> st
         f"【长会话强收口冻结 · Stage-2 freeze】触发源：{', '.join(gate_state.get('triggers') or ['pressure'])} "
         f"（{_format_telemetry_brief(tel)}）。\n"
         "- 排空预算已耗尽！当前仅允许：① 非图片文件只读核对 / `manage_task` / `manage_subagents`；② 编写交接档案；③ 本地 `git add`/`git commit`。\n"
-        f"- 请立即整理已实测状态、未决问题与【新对话提示词】{goal_line}，直接收尾停机交由新对话接续。"
+        f"- 请立即整理已实测状态、Git/工作区状态、未决问题与【新对话提示词】（保留项目顶层规范与资产索引入口，避免将重算/读图与长文写作混入同一会话）{goal_line}，直接收尾停机交由新对话接续。"
     )
 
 
@@ -2124,7 +2124,8 @@ def _codex_notice(phase: str, count: int, mode: str, client_label: str = "Codex"
         return prefix + f"已按用户明确指令继续；宽限到其后第 {OVERRIDE_SNOOZE_CPS} 个新压缩事件，再按已配置策略评估。"
     if phase in ("drain", "freeze"):
         return (prefix + "请收尾当前小步，核对用户原话与最新裁定，整理已验证进展、Git/工作区状态、"
-                "未完成事项及可复制的新对话提示词。结束当前回合不等于取消目标循环或终止后台任务；"
+                "未完成事项及可复制的新对话提示词（保留项目顶层规范与资产索引入口，重算/读图与长文写作宜分会话接续）。"
+                "结束当前回合不等于取消目标循环或终止后台任务；"
                 "须如实登记其状态，不得把未完成目标标成完成。"
                 + ("当前仅提醒，不阻断工具。" if mode == "advisory" else "暂停新派工、读图和推送；冻结后仅允许非图片只读核对与交接。"))
     return prefix + "先核对压缩恢复的原话与当前状态，再继续工作；本提醒不表示上下文已失效。"

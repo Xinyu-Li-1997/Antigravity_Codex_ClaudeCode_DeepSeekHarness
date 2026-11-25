@@ -23,12 +23,14 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import stat
 import sqlite3
 import struct
 import subprocess
 import sys
 import tempfile
+import time
 
 if sys.version_info < (3, 11):
     sys.stderr.write("[!] 错误：需要 Python 3.11 或更高版本 (Python 3.11+ is required).\n")
@@ -2447,6 +2449,7 @@ def _sync_codex_hooks(
     else:
         _atomic_write(plan.change)
         print(f"[+] 已合并 Codex 钩子注册表 {hooks_path}（交接模式 {mode}，压缩次数阈值 {compact_limit}）")
+        print("[!] 若本机 Codex 已启用钩子信任哈希（[hooks.state]），请在 Codex 交互终端执行 /hooks 复核并重新信任变更后的钩子。")
 
 
 def _validate_codex_assets(
@@ -2919,11 +2922,46 @@ def _audit_cli(info: Dict[str, Any]) -> Dict[str, Any]:
             )
             options = dict(capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=3)
             if "cc-switch" in str(binary).lower():
-                with tempfile.TemporaryDirectory(prefix="cc-switch-audit-") as isolated_home:
-                    isolated_env = dict(os.environ)
-                    for key in ("HOME", "XDG_CONFIG_HOME", "APPDATA", "LOCALAPPDATA"):
-                        isolated_env[key] = isolated_home
-                    proc = subprocess.run(cmd, env=isolated_env, **options)
+                isolated_home = tempfile.mkdtemp(prefix="cc-switch-audit-")
+                isolated_env = dict(os.environ)
+                for key in ("HOME", "XDG_CONFIG_HOME", "APPDATA", "LOCALAPPDATA"):
+                    isolated_env[key] = isolated_home
+                proc_handle = None
+                try:
+                    popen_kwargs: Dict[str, Any] = dict(
+                        env=isolated_env,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                    )
+                    if os.name != "nt":
+                        popen_kwargs["start_new_session"] = True
+                    proc_handle = subprocess.Popen(cmd, **popen_kwargs)
+                    try:
+                        out, err = proc_handle.communicate(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        if os.name != "nt":
+                            try:
+                                os.killpg(proc_handle.pid, signal.SIGKILL)
+                            except OSError:
+                                proc_handle.kill()
+                        else:
+                            proc_handle.kill()
+                        try:
+                            proc_handle.communicate(timeout=2)
+                        except (OSError, subprocess.SubprocessError):
+                            pass
+                        raise
+                    proc = subprocess.CompletedProcess(cmd, proc_handle.returncode, out, err)
+                finally:
+                    for _attempt in range(3):
+                        shutil.rmtree(isolated_home, ignore_errors=True)
+                        if not os.path.exists(isolated_home):
+                            break
+                        time.sleep(0.05)
             else:
                 proc = subprocess.run(cmd, **options)
             match = re.search(r"\b\d+(?:\.\d+){1,3}(?:-[A-Za-z0-9.]+)?\b", proc.stdout or "")
@@ -3179,6 +3217,105 @@ def _build_adaptive_meta_summary(
             "adaptive_compact_limit": hg.get("default_compact_limit"),
         }
     return out
+
+
+def _audit_codex_hook_trust(
+    codex_root: Path,
+    codex_hooks_path: Path,
+    codex_doc: Dict[str, Any],
+    config: Dict[str, Any],
+    *,
+    codex_version: Any,
+    is_sandbox_run: bool,
+    hooks_aligned: bool = True,
+) -> Dict[str, Any]:
+    """只读核对 Codex config.toml 的 [hooks.state.*] 受管槽位覆盖情况（不复算 Codex 内部哈希）。"""
+    def _norm_state_path(raw: str) -> str:
+        cleaned = raw[4:] if raw.startswith("\\\\?\\") else raw
+        if os.name == "nt":
+            cleaned = cleaned.replace("/", "\\")
+            return os.path.normcase(os.path.normpath(cleaned))
+        return os.path.normpath(cleaned)
+
+    managed_slots: List[Tuple[str, int, int]] = []
+    seen_slots: Set[Tuple[str, int, int]] = set()
+    hooks_map = codex_doc.get("hooks") if isinstance(codex_doc, dict) else None
+    if codex_hooks_path.is_file() and isinstance(hooks_map, dict):
+        for event, groups in hooks_map.items():
+            if not isinstance(event, str) or not isinstance(groups, list):
+                continue
+            event_snake = re.sub(r"(?<!^)(?=[A-Z])", "_", event).lower()
+            for g_idx, group in enumerate(groups):
+                if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
+                    continue
+                for h_idx, handler in enumerate(group["hooks"]):
+                    if not isinstance(handler, dict):
+                        continue
+                    try:
+                        tokens = _codex_hook_tokens(handler)
+                    except (ValueError, TypeError):
+                        continue
+                    for tok in tokens[1:]:
+                        sname = Path(tok).name
+                        if sname in CODEX_HOOK_ENTRIES and _same_nonlink_path(
+                            Path(tok).expanduser(), codex_root / "hooks" / sname
+                        ):
+                            slot = (event_snake, g_idx, h_idx)
+                            if slot not in seen_slots:
+                                seen_slots.add(slot)
+                                managed_slots.append(slot)
+                            break
+
+    hooks_cfg = config.get("hooks") if isinstance(config, dict) else None
+    hooks_state = hooks_cfg.get("state") if isinstance(hooks_cfg, dict) else None
+    state_table_present = isinstance(hooks_state, dict) and bool(hooks_state)
+    expected_paths = {_norm_state_path(str(codex_hooks_path))}
+    try:
+        expected_paths.add(_norm_state_path(str(codex_hooks_path.resolve())))
+    except OSError:
+        pass
+    trusted_slots: Set[Tuple[str, int, int]] = set()
+    if isinstance(hooks_state, dict):
+        for raw_key, entry in hooks_state.items():
+            if not isinstance(raw_key, str) or not isinstance(entry, dict):
+                continue
+            trusted_hash = entry.get("trusted_hash")
+            if not isinstance(trusted_hash, str) or not trusted_hash.strip():
+                continue
+            parts = raw_key.rsplit(":", 3)
+            if len(parts) != 4:
+                continue
+            raw_path, ev_name, g_str, h_str = parts
+            if not (g_str.isdigit() and h_str.isdigit()):
+                continue
+            if _norm_state_path(raw_path) in expected_paths:
+                trusted_slots.add((ev_name.lower(), int(g_str), int(h_str)))
+
+    missing_entries = [
+        f"<codex>/hooks.json:{ev}:{g_idx}:{h_idx}"
+        for ev, g_idx, h_idx in managed_slots
+        if (ev, g_idx, h_idx) not in trusted_slots
+    ]
+    managed_count = len(managed_slots)
+    trusted_count = managed_count - len(missing_entries)
+    ver_tuple = tuple(int(part) for part in re.findall(r"\d+", str(codex_version or "")))
+    trust_gate_active = state_table_present or (not is_sandbox_run and ver_tuple >= (0, 171, 0))
+    if managed_count == 0 or not codex_hooks_path.is_file():
+        status = "not_applicable"
+    elif not missing_entries and hooks_aligned:
+        status = "slots_recorded"
+    elif trust_gate_active:
+        status = "untrusted_or_partial"
+    else:
+        status = "unrecorded"
+    return {
+        "status": status,
+        "hash_verified": False,
+        "managed_count": managed_count,
+        "trusted_count": trusted_count,
+        "missing_entries": missing_entries,
+        "state_table_present": state_table_present,
+    }
 
 
 def audit_upgrade_status(
@@ -3442,6 +3579,11 @@ def audit_upgrade_status(
         cx["hooks_aligned"] = False
     if not cx["hooks_aligned"]:
         cx["drift_files"].append("hooks.json")
+    cx["hooks_trust"] = _audit_codex_hook_trust(
+        codex_root, codex_hooks_path, codex_doc, config,
+        codex_version=cx.get("version"), is_sandbox_run=is_sandbox_run,
+        hooks_aligned=cx["hooks_aligned"],
+    )
 
     cl = _audit_cli(detection.get("claude", {}))
     settings_path = claude_root / "settings.json"
@@ -3704,6 +3846,8 @@ def audit_upgrade_status(
             actions.append("sync_codex")
         if cx["upgrade_recommended"]:
             actions.append("sync_codex_model_defaults" if latest else "refresh_codex_model_catalog")
+        if (cx.get("hooks_trust") or {}).get("status") == "untrusted_or_partial":
+            actions.append("review_codex_hook_trust")
     if cl_active:
         if cl["drift_files"]:
             actions.append("sync_claude")

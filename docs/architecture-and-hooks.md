@@ -19,7 +19,7 @@
 | `hooks/_lib/` | 通用 + 上游 | `fs_safety.py`（重解析点防御原子写）、`shell_lex.py`（Shell 拆壳与 PowerShell 续行归一化）、`adaptive_policy.py`（按窗口与强度缩放阈值）、`process_guard.py`（墙钟自毁与 POSIX 条件虚拟内存上限） |
 | [session_context_loader.py](../template/user-guard/hooks/session_context_loader.py) | 通用 + 上游 | 恢复与调用前门禁：普通回合零字节注入；压缩后分块补回原话、实质子代理摘要、未决票据总览与有界对账及阅读计划指针 |
 | [status_guard.py](../template/user-guard/hooks/status_guard.py) | 通用 + 上游 | 工具执行前门禁：静态解析文件工具、Shell 包装与内联 Python AST，拦截越界写删、外部 `git worktree`、空转轮询与裸调 CLI，核验已批票据与原生通道容量 |
-| [reply_repeat_guard.py](../template/user-guard/hooks/reply_repeat_guard.py) | 通用 + 上游 | 回合结束门禁（无头子进程 `CAE_HARNESS_DEPTH` 自动跳过）：拦截空等刷屏、重复贴票、局部补测冒充全过、未实查或探测全败却宣称已核实否定结论，并按 `run_id` 核验回执与 `reconcile_file` 链接 |
+| [reply_repeat_guard.py](../template/user-guard/hooks/reply_repeat_guard.py) | 通用 + 上游 | 回合结束门禁（无头子进程 `CAE_HARNESS_DEPTH` 自动跳过）：拦截空等刷屏、重复贴票、局部补测冒充全过，单次扫描三端轨迹统一守卫零探测否定、局部排查全称缺口与长文单端整写免审（联动 `code_families` 角色提示），并按 `run_id` 核验回执与 `reconcile_file` 链接 |
 | [handoff_gate.py](../template/user-guard/hooks/handoff_gate.py) | 通用 + 上游 | 长会话分级交接门禁：追踪压缩次数、轨迹体积与读图字节，在 `drain`/`freeze` 阶段限制新派工并核验【新对话提示词】与待拍板占位符保护 |
 | [install.py](../install.py)、`install.ps1`、`install.sh` | 上游专属 | 校验非符号链接与非重解析点后幂等分发四端配置；提供零写入的配置漂移、Windows 与 WSL2 双端对齐、DSH 协议探测及科学计算包 ABI 风险体检 |
 | [fleet_state.py](../template/user-guard/skills/fleet-evolve/scripts/fleet_state.py) | 上游专属 | 核验 `upstream_config_repo` 身份；管理提案审批锁（`propose`/`approve`）、重启重入锁（`record-pass1`/`verify-pass2`）与终审事实锚定门禁 |
@@ -73,7 +73,7 @@
 | **会话恢复与调用前** | `session_context_loader.py` + `handoff_gate.py` | 无新压缩时零字节注入；压缩后分块补回原话、实质子代理摘要、未决票据总览及有界对账与 `read-plan` 指针 |
 | **新指令提交时** | `handoff_gate.py`（Antigravity 在 `PreInvocation` 对账） | 识别用户简短明确的交接或暂缓指令，长文引用不误触 |
 | **工具执行前** | `status_guard.py` + `handoff_gate.py` | 守卫项目外写删边界与同会话外部目录续租（不禁止本机只读诊断），拦截空转轮询与裸调 CLI，交接期放行只读核验 |
-| **回合结束时** | `reply_repeat_guard.py` + `handoff_gate.py` | 拦截空等刷屏、重复贴票、局部补测冒充全过、零执行或探测全败却宣称已核实否定结论，并核验回执、`reconcile_file` 链接与交接提示词 |
+| **回合结束时** | `reply_repeat_guard.py` + `handoff_gate.py` | 拦截空等刷屏、重复贴票、局部补测冒充全过及三类回合实证失实（零探测否定、局部排查全称缺口、长文单端整写免审），并核验回执、`reconcile_file` 链接与交接提示词 |
 
 各客户端按原生协议接入同一套钩子，不依赖客户端私有扩展字段：
 
@@ -97,8 +97,8 @@
 
 ### 1. 零黑名单事实锚定与文档卫生守卫（`check-grounding`）
 
-- **词法事实锚定（`--strict`）**：扫描源码、配置与 `NOTICE` 以构建标识符、CLI 选项、定量数字与双字词干集合，逐行拦截无代码依据的参数、文件名、陌生缩写与失步数字。扫描阶段跳过 `tests/` 与 Markdown 代理契约，对 Codex `.toml` 仅提取键名，并将三端代理正文列为被审对象。
-- **通用文档卫生守卫（`--doc-hygiene`）**：不依赖硬编码黑名单，额外拦截 4 类文档结构与分层问题。前两类针对行文结构：引导句计数与紧邻表格或列表行数不一致（`count_structure_mismatch`），以及叠加补丁的超长句与四段以上中文斜杠串（`runon_patch_sentence`、`slash_chain`）。后两类针对分层治理：长段技术细则跨 ≥ 3 份文档逐字重复（`cross_doc_duplication`），以及根目录 `README.md` 超出体积预算、包含 `_xxx` 私有符号或单段过多行内代码（`landing_size_budget`、`landing_private_symbol`、`landing_jargon_density`）。
+- **词法事实锚定（`--strict`）**：扫描源码、配置、`.lean`、`.bib` 与 `NOTICE` 构建标识符、CLI 选项、定量数字与双字词干集合，覆盖 `.md`、`.tex`、`.rst` 与 `.svg` 文档（LaTeX 自动跳过导言区、数学环境、注释与结构宏参数），逐行拦截无代码依据的参数、文件名、陌生缩写与失步数字。扫描阶段跳过 `tests/` 与 Markdown 代理契约，对 Codex `.toml` 仅提取键名，并将三端代理正文列为被审对象。
+- **通用文档卫生守卫（`--doc-hygiene`）**：不依赖硬编码黑名单，统一覆盖三类跨格式与分层质量问题。其一是跨格式交付完整度（面向 `.md`、`.tex` 与 `.rst`）：按文档所在目录校验本地图件引用是否真实存在（`broken_local_media_ref`，LaTeX 兼容 `\graphicspath` 与自动扩展名，Markdown 兼容含括号文件名）。同时识别正式文稿声明多条定理或命题却全文缺失证明段落的空壳问题（`unproved_theorem_shell`，兼容 LaTeX 自定义 `\newtheorem` 与 reST 原生下划线标题）。其二是 Markdown 行文结构：拦截引导句计数与紧邻表格或列表行数矛盾（`count_structure_mismatch`），以及补丁超长句与四段以上中文斜杠串（`runon_patch_sentence`、`slash_chain`）。其三是分层治理：拦截长段技术细则跨 ≥ 3 份文档逐字重复（`cross_doc_duplication`），以及根目录 `README.md` 超体积预算、暴露 `_xxx` 私有符号或单段过多行内代码（`landing_size_budget`、`landing_private_symbol`、`landing_jargon_density`）。
 
 ### 2. 读前分片、跨端核对与机械对账（`read-plan` / `cross-check` / `reconcile`）
 
@@ -132,6 +132,7 @@ $$
 
 - `refresh_codex_model_catalog`：登录一次客户端生成本地模型目录缓存；
 - `sync_codex_model_defaults` 或 `sync_claude_model_defaults`：需同步推荐默认模型与强度时，加 `--sync-model-defaults` 重跑 `install.py`；
+- `review_codex_hook_trust`：Codex 已启用钩子信任记录但部分受管槽位缺失，或 `hooks.json` 存在漂移（只读体检按槽位覆盖度报告 `slots_recorded` 且不复算宿主内部哈希），请在 Codex 交互终端执行 `/hooks` 复核并重新批准；
 - `start_cc_router`：按需启动本地 `router.py`；
 - `upgrade_dsh_hook_protocol`：官方 DSH CLI 已开放硬钩子，可纳入上游演进；
 - 若 `cross_side_status.dual_side_sync_required` 为 `true`，请在 Windows 与 WSL2 两侧分别同步。

@@ -2,6 +2,25 @@
 
 本文件记录四客户端共用规则、会话钩子、后台验证工具与上游维护流程的版本演进。当前插件版本以 `template/user-guard/plugin.json` 为准；常驻使用文档只说明机制和配置键，不重复维护版本号与性能日期。
 
+## [2.0.2] - 2026-11-25
+
+适配新版 Codex 钩子信任哈希机制与 Antigravity 官方模型退役目录更新，并围绕跨格式正式文档交付卫生、三端统一回合实证守卫与安装器子进程清理竞态完成系统性重构：
+
+- **Codex `hooks.state` 信任槽位只读体检与 CLI 探测清理修复（`install.py`、`docs/architecture-and-hooks.md`、`tests/test_claude_and_router_offline.py`）**：
+  - 在 `install.py --audit-upgrade` 新增 `codex.hooks_trust` 只读检查，核对 `~/.codex/config.toml` 的 `[hooks.state.*]` 受管槽位覆盖情况并脱敏报告为 `<codex>/hooks.json:<event>:<group>:<handler>`；受管槽位齐备且 `hooks.json` 无漂移时如实返回 `status: slots_recorded`（`hash_verified: false`，不臆断宿主内部哈希）；
+  - 当检测到缺失槽位或 `hooks.json` 发生漂移且处于 `[hooks.state]` 启用态或非沙箱 Codex `>= 0.171.0` 时，返回 `status: untrusted_or_partial` 并在 `summary.recommended_actions` 输出 `review_codex_hook_trust`（同步更新 `hooks.json` 时打印 `/hooks` 复核提醒）；干净沙箱与旧版环境保持 `unrecorded` 不误报；
+  - 修复 `_audit_cli` 探测 `cc-switch --version` 超时时未终止 POSIX 进程组导致临时目录 `cc-switch-audit-*` 偶发残留的竞态缺陷，并补充 POSIX 真实孤儿子进程回归测试。
+- **Antigravity 2026-11-30 模型退役前瞻更新（`fleet_profile.json`、`tests/test_harness_offline.py`、`tests/test_claude_and_router_offline.py`）**：
+  - 依据官方模型文档，将 2026-11-30 待下线的 `gemini-4-argon` 与 `gemini-3.8-flash` 纳入 `excluded_or_retiring.agy_retiring_patterns`，从 `client_catalog_rules.agy.family_priority` 移除 `argon`，并刷新 `evaluated_at` 与 `capability_ledger.last_online_refresh_at` 至 `2026-11-25`（保留原 `local_bench_verified_at` 不变）。
+- **跨格式正式文档锚定与通用交付卫生（`cae_harness.py`、`README.md`、`tests/test_harness_offline.py`）**：
+  - `audit_doc_grounding` 纳入 `.tex` 文档扫描与 `.lean`/`.bib` 锚点语料，`_iter_visible_doc_lines` 先剥离 `%` 注释再识别导言区与行内数学环境边界，避免注释中的 `\begin{document}` 或同行公式吞掉可见正文；
+  - 在 `_audit_docs_hygiene` 新增跨 `.md`、`.tex`、`.rst` 通用的本地图件引用核查（`broken_local_media_ref`，Markdown 与 reST 严格按文档所在目录解析并兼容含括号文件名，LaTeX 跳过注释中的 `\graphicspath` 并支持自动扩展名）及多条定理或命题缺证明空壳核查（`unproved_theorem_shell`，兼容 LaTeX 自定义 `\newtheorem`、Markdown 标题/粗体/引用框与 reST 原生下划线标题）。
+- **三端单次扫描回合实证守卫与交接提纲加固（`reply_repeat_guard.py`、`handoff_gate.py`、`template/user-guard/rules/AGENTS.md`、`AGENTS.md`、`docs/workflow-guide.md`、`tests/test_guards_offline.py`）**：
+  - 将 `reply_repeat_guard.py` 的回合轨迹核查重构为单次扫描 `_inspect_turn_evidence` 与统一入口 `_check_turn_evidence_locked`（绑定调用用途、终态结果与单调顺序，区分 256 KiB 尾窗截断与零探测，每回合至多阻断 1 次且续跑放行），统一守卫零探测否定（补齐中文“不可用”）、局部排查全称缺口（逐句绑定范围声明、单文件 `rg` 不充当全仓检索）与长文单端整写免审（失败写入不误拦、仅采信覆盖当前写入后的成功复核，并按 `fleet_profile.json` 动态附带 `code_families`/`deep_families` 提示）；
+  - 在 `handoff_gate.py` 原位对齐 `drain`/`freeze` 交接文案（补齐 Git/工作区状态、项目顶层规范与资产索引入口及分会话拆分提醒），同步整篇精炼 `R2`、`R3.6`、`R9` 及分层公开文档。
+
+---
+
 ## [2.0.1] - 2026-11-25
 
 围绕人类可读性、中立客观工程书面语与首页示例完整度，对全套公开文档与首页流程图完成独立审校润色与逐行校核：

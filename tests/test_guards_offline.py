@@ -4089,6 +4089,200 @@ class TestDispatchAndBillingGuards(unittest.TestCase):
                 self.assertNotIn("reason", run_case(client, f"hedge-{client}", [], hedged_reply))
                 self.assertNotIn("reason", run_case(client, f"meta-{client}", [], meta_reply))
 
+    def test_turn_evidence_partial_scope_and_solo_doc_review_three_clients(self):
+        """Antigravity / Codex / Claude 三端统一守卫：局部排查全称缺口定论拦截 + 跨格式正式长文单端免审提醒与模型角色提示。"""
+        gap_verdict = "现有数据本身确实不够，必须重做整套算法才能支撑发表。"
+        scoped_gap = "仅核查了 MATRIX.json，单从该文件看数据不足，尚未核查其余目录，建议先核实存量。"
+        solo_done = "已按要求彻底重写全文并定稿交付，可直接用于投稿。"
+        draft_disclosed = "已先写出初稿（未经跨端独立审查，待后续跑 check-grounding 与复核）。"
+        big_body = ("# Formal Specification\n\n" + ("Discrete conservation property and boundary treatment.\n" * 120))
+
+        def write_rows(path, rows):
+            path.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n", encoding="utf-8")
+
+        def run_case(client, sid, tool_entries, reply, active=False):
+            tp = self.root / f"ev_{client}_{sid}.jsonl"
+            if client == "antigravity":
+                rows = [{"step_index": 0, "type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "核对数据并重写文稿"}]
+                rows.extend(tool_entries)
+                rows.append({"step_index": len(rows), "type": "PLANNER_RESPONSE", "content": reply})
+                write_rows(tp, rows)
+                payload = {
+                    "conversationId": sid,
+                    "transcriptPath": str(tp),
+                    "terminationReason": "model_stop",
+                    "continuationActive": active,
+                }
+                with unittest.mock.patch.object(reply_repeat_guard, "get_data_dirs", return_value=(self.state, self.logs)):
+                    return reply_repeat_guard.handle_stop_repeat_guard(payload)
+            if client == "codex":
+                rows = [{"type": "event_msg", "payload": {"type": "user_message", "message": "核对数据并重写文稿"}}]
+                rows.extend(tool_entries)
+                rows.append({"type": "event_msg", "payload": {"type": "task_complete", "last_agent_message": reply}})
+                write_rows(tp, rows)
+                payload = {
+                    "_client": "codex",
+                    "session_id": sid,
+                    "transcript_path": str(tp),
+                    "last_assistant_message": reply,
+                    "stop_hook_active": active,
+                }
+                return reply_repeat_guard.handle_claude_stop_repeat_guard(payload, state_dir=self.state, logs_dir=self.logs)
+            rows = [{"type": "user", "uuid": "u-ev", "message": {"role": "user", "content": "核对数据并重写文稿"}}]
+            rows.extend(tool_entries)
+            rows.append({"type": "assistant", "uuid": "a-ev", "message": {"id": f"m-{sid}", "content": [{"type": "text", "text": reply}]}})
+            write_rows(tp, rows)
+            payload = {
+                "_client": "claude",
+                "session_id": sid,
+                "transcript_path": str(tp),
+                "last_assistant_message": reply,
+                "stop_hook_active": active,
+            }
+            return reply_repeat_guard.handle_claude_stop_repeat_guard(payload, state_dir=self.state, logs_dir=self.logs)
+
+        def make_read_rows(client, file_path):
+            if client == "antigravity":
+                return [
+                    {"step_index": 1, "type": "PLANNER_RESPONSE", "model": "gemini-4-carbon-high",
+                     "tool_calls": [{"name": "read_file", "args": {"Path": json.dumps(file_path)}}]},
+                    {"step_index": 2, "type": "GENERIC", "status": "DONE", "content": "file contents ok"},
+                ]
+            if client == "codex":
+                return [
+                    {"type": "response_item", "payload": {"type": "function_call", "name": "exec_command", "call_id": "r1",
+                                                          "arguments": json.dumps({"cmd": f"cat {file_path}"})}},
+                    {"type": "response_item", "payload": {"type": "function_call_output", "call_id": "r1", "output": "Exit code: 0\ncontent"}},
+                ]
+            return [
+                {"type": "assistant", "message": {"model": "k3.1-pro[1m]", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "Read", "input": {"file_path": file_path}}
+                ]}},
+                {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "t1", "content": "content"}]}},
+            ]
+
+        def make_write_rows(client, file_path, content, *, model="", with_review=False, write_err=False, review_err=False):
+            rows = []
+            if client == "antigravity":
+                tcs = [{"name": "write_file", "args": {"Path": json.dumps(file_path), "Content": json.dumps(content)}}]
+                if with_review:
+                    tcs.append({"name": "run_command", "args": {"CommandLine": json.dumps("python cae_harness.py check-grounding --target . --strict --doc-hygiene")}})
+                rows.append({"step_index": 1, "type": "PLANNER_RESPONSE", "model": model or "gemini-4-carbon-high", "tool_calls": tcs})
+                rows.append({"step_index": 2, "type": "GENERIC", "status": "ERROR" if write_err else "DONE",
+                             "content": "tool call denied by pre-tool hook" if write_err else "Wrote file"})
+                if with_review:
+                    rows.append({"step_index": 3, "type": "GENERIC", "status": "ERROR" if review_err else "DONE",
+                                 "content": "Command exited with code 2." if review_err else "Command exited with code 0.\nok"})
+                return rows
+            if client == "codex":
+                if model:
+                    rows.append({"type": "turn_context", "payload": {"model": model}})
+                patch = f"*** Begin Patch\n*** Add File: {file_path}\n" + "\n".join("+" + ln for ln in content.splitlines()) + "\n*** End Patch"
+                rows.append({"type": "response_item", "payload": {"type": "custom_tool_call", "name": "apply_patch", "call_id": "w1", "arguments": patch}})
+                rows.append({"type": "response_item", "payload": {"type": "custom_tool_call_output", "call_id": "w1",
+                                                                  "output": "Exit code: 1\ndenied" if write_err else "Success"}})
+                if with_review:
+                    rows.append({"type": "response_item", "payload": {"type": "function_call", "name": "exec_command", "call_id": "w2",
+                                                                      "arguments": json.dumps({"cmd": "python3 cae_harness.py audit --target ."})}})
+                    rows.append({"type": "response_item", "payload": {"type": "function_call_output", "call_id": "w2",
+                                                                      "output": "Exit code: 1\nfailed" if review_err else "Exit code: 0\nok"}})
+                return rows
+            blocks = [{"type": "tool_use", "id": "w1", "name": "Write", "input": {"file_path": file_path, "content": content}}]
+            if with_review:
+                blocks.append({"type": "tool_use", "id": "w2", "name": "Bash", "input": {"command": "python3 cae_harness.py check-grounding --target ."}})
+            rows.append({"type": "assistant", "message": {"model": model or "k3.1-pro[1m]", "content": blocks}})
+            results = [{"type": "tool_result", "tool_use_id": "w1", "is_error": write_err, "content": "denied" if write_err else "ok"}]
+            if with_review:
+                results.append({"type": "tool_result", "tool_use_id": "w2", "is_error": review_err, "content": "Command exited with code 2" if review_err else "ok"})
+            rows.append({"type": "user", "message": {"content": results}})
+            return rows
+
+        for client in ("antigravity", "codex", "claude"):
+            expected_block = "continue" if client == "antigravity" else "block"
+            with self.subTest(evidence_client=client):
+                # Gate B: 仅读单个局部文件即下全称缺口定论 -> 拦截；披露局部范围、读过索引文件或续跑态 -> 放行
+                narrow_rows = make_read_rows(client, "data/MATRIX.json")
+                res_gap = run_case(client, f"gap-{client}", narrow_rows, gap_verdict)
+                self.assertEqual(res_gap.get("decision"), expected_block)
+                self.assertIn("局部排查防全称缺口结论", res_gap.get("reason", ""))
+                self.assertNotIn("reason", run_case(client, f"gap-cont-{client}", narrow_rows, gap_verdict, active=True))
+                self.assertNotIn("reason", run_case(client, f"gap-scoped-{client}", narrow_rows, scoped_gap))
+                # 跨句拼接的未限定全称定论仍须拦截（范围声明仅豁免所在句）
+                split_gap = "仅核查了 MATRIX.json。现有数据本身确实不够，必须重做整套算法。"
+                self.assertEqual(run_case(client, f"gap-split-{client}", narrow_rows, split_gap).get("decision"), expected_block)
+                index_rows = make_read_rows(client, "docs/records/repository_map.md")
+                self.assertNotIn("reason", run_case(client, f"gap-idx-{client}", index_rows, gap_verdict))
+
+                # Gate C: 通用覆盖 .md 与 .tex 整篇大改单端免审 -> 拦截；标明初稿、已跑门禁、写入失败或非交付文件 -> 放行；失败审查不豁免
+                for doc_path in ("docs/design_spec.md", "paper/main.tex"):
+                    tag = Path(doc_path).suffix.lstrip(".")
+                    w_rows = make_write_rows(client, doc_path, big_body)
+                    res_solo = run_case(client, f"solo-{tag}-{client}", w_rows, solo_done)
+                    self.assertEqual(res_solo.get("decision"), expected_block)
+                    self.assertIn("长文交付自审提醒", res_solo.get("reason", ""))
+                    self.assertNotIn("reason", run_case(client, f"draft-{tag}-{client}", w_rows, draft_disclosed))
+                    w_rev = make_write_rows(client, doc_path, big_body, with_review=True)
+                    self.assertNotIn("reason", run_case(client, f"rev-{tag}-{client}", w_rev, solo_done))
+                    w_rev_fail = make_write_rows(client, doc_path, big_body, with_review=True, review_err=True)
+                    self.assertEqual(run_case(client, f"revfail-{tag}-{client}", w_rev_fail, solo_done).get("decision"), expected_block)
+                    w_denied = make_write_rows(client, doc_path, big_body, write_err=True)
+                    self.assertNotIn("reason", run_case(client, f"werr-{tag}-{client}", w_denied, solo_done))
+
+                # 非正式交付文件（CHANGELOG.md / tests/）不误拦
+                non_deliv = make_write_rows(client, "CHANGELOG.md", big_body)
+                self.assertNotIn("reason", run_case(client, f"chg-{client}", non_deliv, solo_done))
+
+        # Gate A / B 边界回归：中文“不可用”纳入拦截；无关成功写入不充当探测证据；单文件 rg 不视作全仓检索；尾窗截断不误拦
+        self.assertEqual(run_case("antigravity", "neg-unavail", [], "已核实该通道不可用。").get("decision"), "continue")
+        probe_fail_plus_write = [
+            {"step_index": 1, "type": "PLANNER_RESPONSE", "tool_calls": [
+                {"name": "run_command", "args": {"CommandLine": json.dumps("ssh peer")}},
+                {"name": "write_file", "args": {"Path": json.dumps("notes.txt"), "Content": json.dumps("hi")}},
+            ]},
+            {"step_index": 2, "type": "GENERIC", "status": "DONE", "content": "Command exited with code 1.\nfailed"},
+            {"step_index": 3, "type": "GENERIC", "status": "DONE", "content": "Wrote file"},
+        ]
+        self.assertEqual(
+            run_case("antigravity", "neg-write-no-probe", probe_fail_plus_write, "已核实对端未连接。").get("decision"),
+            "continue",
+        )
+        single_file_rg = [
+            {"step_index": 1, "type": "PLANNER_RESPONSE", "tool_calls": [
+                {"name": "run_command", "args": {"CommandLine": json.dumps("rg energy docs/chapter.md")}},
+            ]},
+            {"step_index": 2, "type": "GENERIC", "status": "DONE", "content": "Command exited with code 0.\nline 1"},
+        ]
+        self.assertEqual(
+            run_case("antigravity", "gap-single-rg", single_file_rg, gap_verdict).get("decision"),
+            "continue",
+        )
+        # 超过 256 KiB 尾窗截断时（无回合起点）不将缺失早期探测误判为零探测
+        tp_big = self.root / "ev_truncated.jsonl"
+        big_rows = [
+            {"step_index": 0, "type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "查对端"},
+            {"step_index": 1, "type": "GENERIC", "status": "DONE", "content": "Command exited with code 0.\nok"},
+            {"step_index": 2, "type": "PLANNER_RESPONSE", "content": "x" * (300 * 1024)},
+            {"step_index": 3, "type": "PLANNER_RESPONSE", "content": "已核实对端未连接。"},
+        ]
+        write_rows(tp_big, big_rows)
+        with unittest.mock.patch.object(reply_repeat_guard, "get_data_dirs", return_value=(self.state, self.logs)):
+            res_trunc = reply_repeat_guard.handle_stop_repeat_guard({
+                "conversationId": "trunc-agy", "transcriptPath": str(tp_big), "terminationReason": "model_stop",
+            })
+        self.assertEqual(res_trunc.get("decision"), "allow")
+
+        # 动态模型角色提示：Antigravity 运行在 fleet_profile.json code_families (neon) 整写正式长文时附带 deep_families (carbon) 提示
+        neon_rows = make_write_rows("antigravity", "docs/architecture_spec.md", big_body, model="gemini-4-neon-xhigh")
+        res_neon = run_case("antigravity", "solo-neon-hint", neon_rows, solo_done)
+        self.assertEqual(res_neon.get("decision"), "continue")
+        self.assertIn("gemini-4-neon-xhigh", res_neon.get("reason", ""))
+        self.assertIn("carbon", res_neon.get("reason", ""))
+
+        carbon_rows = make_write_rows("antigravity", "docs/architecture_spec.md", big_body, model="gemini-4-carbon-high")
+        res_carbon = run_case("antigravity", "solo-carbon-nohint", carbon_rows, solo_done)
+        self.assertEqual(res_carbon.get("decision"), "continue")
+        self.assertNotIn("编码高吞吐系列", res_carbon.get("reason", ""))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

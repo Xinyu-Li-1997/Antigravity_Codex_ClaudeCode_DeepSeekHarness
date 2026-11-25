@@ -6927,7 +6927,7 @@ _GROUNDING_REPO_SCRIPT_TOKENS = (
 _GROUNDING_ANCHOR_EXTS = frozenset({
     '.py', '.f90', '.f95', '.f03', '.f08', '.f', '.for', '.c', '.cpp', '.cc', '.cxx', '.cu', '.cuh',
     '.h', '.hpp', '.hh', '.jl', '.rs', '.go', '.ts', '.js', '.cmake', '.toml', '.yaml', '.yml', '.json',
-    '.sh', '.bash', '.ps1', '.cfg', '.ini',
+    '.sh', '.bash', '.ps1', '.cfg', '.ini', '.lean', '.bib',
 })
 
 
@@ -7113,9 +7113,39 @@ def _build_grounding_anchor(root_dir, exclude_rels, allow_files=None, extra_allo
     }
 
 
+_TEX_SKIP_ENVS = frozenset({
+    'equation', 'equation*', 'align', 'align*', 'gather', 'gather*',
+    'multline', 'multline*', 'eqnarray', 'eqnarray*', 'flalign', 'flalign*',
+    'verbatim', 'verbatim*', 'lstlisting', 'minted', 'tikzpicture', 'thebibliography', 'comment',
+})
+_TEX_DROP_ARG_CMD_RE = re.compile(
+    r'\\(?:label|ref|eqref|pageref|autoref|[Cc]ref|cite[pt]?|documentclass|usepackage|'
+    r'includegraphics|graphicspath|bibliographystyle|bibliography|hypersetup|definecolor|'
+    r'begin|end|input|include)\*?(?:\[[^\]]*\])*\{[^}]*\}'
+)
+
+
+def _strip_tex_comment(line):
+    """剥离行内未转义的 LaTeX `%` 注释，保留 `\\%`。"""
+    out = []
+    idx = 0
+    while idx < len(line):
+        ch = line[idx]
+        if ch == '\\' and idx + 1 < len(line):
+            out.append(line[idx : idx + 2])
+            idx += 2
+            continue
+        if ch == '%':
+            break
+        out.append(ch)
+        idx += 1
+    return ''.join(out)
+
+
 def _iter_visible_doc_lines(rel_path, raw_text):
-    """提取文档或 SVG 中需要做事实锚定核验的可见文本行（跳过代码块围栏，SVG 仅提取 <text> 节点）。"""
-    if rel_path.lower().endswith('.svg'):
+    """提取文档（Markdown/LaTeX/reST）或 SVG 中需要做事实锚定核验的可见文本行。"""
+    low_rel = rel_path.lower()
+    if low_rel.endswith('.svg'):
         for m in re.finditer(r'<text\b[^>]*>([\s\S]*?)</text>', raw_text, re.I):
             line_no = raw_text.count('\n', 0, m.start()) + 1
             plain = re.sub(r'<[^>]+>', ' ', m.group(1))
@@ -7123,6 +7153,78 @@ def _iter_visible_doc_lines(rel_path, raw_text):
                      .replace('&quot;', '"').replace('&#39;', "'")).strip()
             if plain:
                 yield line_no, plain
+        return
+    if low_rel.endswith('.tex'):
+        stripped_lines = [(ln_no, _strip_tex_comment(raw_line)) for ln_no, raw_line in enumerate(raw_text.splitlines(), 1)]
+        has_doc_env = any(r'\begin{document}' in ln for _, ln in stripped_lines)
+        in_body = not has_doc_env
+        skip_env = ''
+        in_display_math = False
+        for line_no, line in stripped_lines:
+            if not in_body:
+                if r'\begin{document}' in line:
+                    in_body = True
+                    line = line.split(r'\begin{document}', 1)[1]
+                else:
+                    continue
+            if r'\end{document}' in line:
+                line = line.split(r'\end{document}', 1)[0]
+                in_body = False
+            # 逐段剥离数学与字面环境，保留同行环境外可见正文
+            visible_parts = []
+            cur = line
+            while cur:
+                if skip_env:
+                    m_end = re.search(rf'\\end\{{{re.escape(skip_env)}\}}', cur)
+                    if not m_end:
+                        cur = ''
+                        break
+                    skip_env = ''
+                    cur = cur[m_end.end():]
+                    continue
+                if in_display_math:
+                    m_dm_end = re.search(r'\\\]|\$\$', cur)
+                    if not m_dm_end:
+                        cur = ''
+                        break
+                    in_display_math = False
+                    cur = cur[m_dm_end.end():]
+                    continue
+                m_env = re.search(r'\\begin\{([A-Za-z*]+)\}', cur)
+                if m_env and m_env.group(1) not in _TEX_SKIP_ENVS:
+                    m_env = None
+                m_dm = re.search(r'\\\[|\$\$', cur)
+                candidates = [m for m in (m_env, m_dm) if m is not None]
+                if not candidates:
+                    visible_parts.append(cur)
+                    break
+                first_m = min(candidates, key=lambda m: m.start())
+                visible_parts.append(cur[:first_m.start()])
+                rest = cur[first_m.end():]
+                if first_m is m_env:
+                    env_name = first_m.group(1)
+                    m_end = re.search(rf'\\end\{{{re.escape(env_name)}\}}', rest)
+                    if m_end:
+                        cur = rest[m_end.end():]
+                    else:
+                        skip_env = env_name
+                        cur = ''
+                else:
+                    close_pat = r'\\\]' if first_m.group(0) == r'\[' else r'\$\$'
+                    m_close = re.search(close_pat, rest)
+                    if m_close:
+                        cur = rest[m_close.end():]
+                    else:
+                        in_display_math = True
+                        cur = ''
+            joined = ' '.join(visible_parts)
+            cleaned = _TEX_DROP_ARG_CMD_RE.sub(' ', joined)
+            cleaned = re.sub(r'\\[A-Za-z@]+\*?', ' ', cleaned)
+            cleaned = cleaned.replace('{', ' ').replace('}', ' ').replace('~', ' ')
+            if cleaned.strip():
+                yield line_no, cleaned
+            if not in_body:
+                break
         return
     fence_marker = ''
     fence_len = 0
@@ -7564,9 +7666,279 @@ def _hygiene_following_block_count(lines_meta, start_pos):
     return None, 0
 
 
+_HYGIENE_MD_IMG_RE = re.compile(r'!\[[^\]]*\]\(((?:[^()\r\n]|\([^()\r\n]*\))+)\)')
+_HYGIENE_TEX_IMG_RE = re.compile(r'\\includegraphics(?:\[[^\]]*\])?\{([^}\r\n]+)\}')
+_HYGIENE_RST_IMG_RE = re.compile(r'^\s*\.\.\s+(?:image|figure)::\s+(\S+)')
+_HYGIENE_TEX_GRAPHICSPATH_RE = re.compile(r'\\graphicspath\{((?:\s*\{[^}]+\}\s*)+)\}')
+_HYGIENE_TEX_NEWTHEOREM_RE = re.compile(
+    r'\\newtheorem\*?\{([A-Za-z0-9_*-]+)\}(?:\[[^\]]*\])?\{([^}]*)\}'
+)
+_HYGIENE_CLAIM_TITLE_RE = re.compile(
+    r'(?:\b(?:theorem|proposition|lemma|corollary|claim)\b|定理|命题|引理|推论)',
+    re.I,
+)
+_HYGIENE_TEX_PROOF_RE = re.compile(
+    r'\\begin\{proof\*?\}|\\(?:input|include)\{[^}]*proof[^}]*\}|\\(?:sub)*section\*?\{[^}]*(?:proof|证明)[^}]*\}',
+    re.I,
+)
+_HYGIENE_MD_CLAIM_RE = re.compile(
+    r'^(?:#{1,6}\s+|\*{2}|__)(?:Theorem|Proposition|Lemma|Corollary|定理|命题|引理|推论)\s*(?:\d+(?:\.\d+)*|[IVX]+)\b',
+    re.I,
+)
+_HYGIENE_MD_PROOF_RE = re.compile(
+    r'^(?:(?:#{1,6}\s+|\*{2}|__|_|\*)\s*(?:Proof|证明|证明要点|Proof\s+Sketch)\b|\\begin\{proof\*?\})',
+    re.I,
+)
+_HYGIENE_RST_CLAIM_HEADING_RE = re.compile(
+    r'^(?:Theorem|Proposition|Lemma|Corollary|定理|命题|引理|推论)\s*(?:\d+(?:\.\d+)*|[IVX]+)\b',
+    re.I,
+)
+_HYGIENE_RST_CLAIM_DIRECTIVE_RE = re.compile(
+    r'^\s*\.\.\s+(?:theorem|proposition|lemma|corollary)::',
+    re.I,
+)
+_HYGIENE_RST_PROOF_RE = re.compile(
+    r'^(?:\s*\.\.\s+proof::|\s*(?:\*{2}|__)?(?:Proof|证明|证明要点|Proof\s+Sketch)(?:\*{2}|__)?\s*[:：.]?\s*$)',
+    re.I,
+)
+_HYGIENE_RST_UNDERLINE_RE = re.compile(r'^([=\-~^"\'`:#*+])\1{2,}\s*$')
+_HYGIENE_PROOF_DEFERRED_RE = re.compile(
+    r'(?:proofs?\s+(?:are|appear|deferred|omitted|provided|located)\s+in\s+(?:the\s+)?(?:supplementary|online\s+supplement|companion)'
+    r'|证明(?:详见|载于|附于)(?:外部|补充材料|配套附录|独立附录))',
+    re.I,
+)
+_HYGIENE_OUTLINE_TITLE_RE = re.compile(
+    r'(?:\b(?:outline|index|toc|table\s+of\s+contents|roadmap|summary|map)\b|目录|大纲|提纲|总纲|索引|路线图)',
+    re.I,
+)
+_TEX_IMAGE_AUTO_EXTS = ('', '.pdf', '.png', '.jpg', '.jpeg', '.eps', '.svg')
+
+
+def _iter_tex_active_lines(doc_text):
+    """剥离 LaTeX 注释并跳过 verbatim/lstlisting/minted/comment 环境，产出 (line_no, active_line)。"""
+    skip_env = ''
+    for line_no, raw_line in enumerate(doc_text.splitlines(), 1):
+        line = _strip_tex_comment(raw_line)
+        if skip_env:
+            m_end = re.search(rf'\\end\{{{re.escape(skip_env)}\}}', line)
+            if not m_end:
+                continue
+            skip_env = ''
+            line = line[m_end.end():]
+        m_begin = re.search(r'\\begin\{(verbatim\*?|lstlisting|minted|comment)\}', line)
+        if m_begin:
+            env_name = m_begin.group(1)
+            m_end = re.search(rf'\\end\{{{re.escape(env_name)}\}}', line[m_begin.end():])
+            if m_end:
+                line = line[:m_begin.start()] + ' ' + line[m_begin.end() + m_end.end():]
+            else:
+                line = line[:m_begin.start()]
+                skip_env = env_name
+        if line.strip():
+            yield line_no, line
+
+
+def _hygiene_clean_local_media_target(raw_target):
+    target = str(raw_target or '').strip()
+    if not target:
+        return ''
+    if target.startswith('<') and '>' in target:
+        target = target[1:target.index('>')].strip()
+    else:
+        target = re.split(r'\s+(?=["\'])', target, maxsplit=1)[0].strip()
+    target = target.split('#', 1)[0].split('?', 1)[0].strip()
+    if not target:
+        return ''
+    low = target.lower()
+    if low.startswith(('http://', 'https://', 'data:', 'mailto:', 'ftp://', 'file://', '//')):
+        return ''
+    if any(ch in target for ch in ('<', '>', '{', '}', '*', '$', '\\', '#')):
+        return ''
+    if target.startswith('/') or re.match(r'^[A-Za-z]:[/\\]', target):
+        return ''
+    return target
+
+
+def _hygiene_audit_local_media_refs(rel_path, doc_text, fpath, root_dir, record):
+    """跨格式校验 Markdown / LaTeX / reST 的本地相对图表或媒体引用是否真实存在。"""
+    if fpath is None:
+        return
+    base_dir = Path(fpath).parent
+    ext = Path(rel_path).suffix.lower()
+
+    def exists_local(rel_target, *, allow_tex_auto_ext=False, search_dirs=(base_dir,)):
+        exts = _TEX_IMAGE_AUTO_EXTS if (allow_tex_auto_ext and not Path(rel_target).suffix) else ('',)
+        for parent in search_dirs:
+            for suffix in exts:
+                cand = parent / f'{rel_target}{suffix}'
+                if cand.is_file():
+                    return True
+        return False
+
+    if ext == '.tex':
+        active_lines = list(_iter_tex_active_lines(doc_text))
+        gpaths = []
+        for _, line in active_lines:
+            for gm in _HYGIENE_TEX_GRAPHICSPATH_RE.finditer(line):
+                for sub in re.findall(r'\{([^}]+)\}', gm.group(1)):
+                    sub_clean = sub.strip()
+                    if sub_clean and not sub_clean.startswith('/'):
+                        gpaths.append(base_dir / sub_clean)
+        tex_dirs = [base_dir, *gpaths]
+        if root_dir is not None and Path(root_dir).resolve() != base_dir.resolve():
+            tex_dirs.append(Path(root_dir).resolve())
+        for line_no, line in active_lines:
+            for m in _HYGIENE_TEX_IMG_RE.finditer(line):
+                target = _hygiene_clean_local_media_target(m.group(1))
+                if target and not exists_local(target, allow_tex_auto_ext=True, search_dirs=tex_dirs):
+                    record(
+                        rel_path, line_no, 'broken_local_media_ref', target,
+                        '本地图表或媒体相对引用指向的文件不存在，请核对路径或补齐对应图件',
+                    )
+        return
+
+    if ext == '.rst':
+        for line_no, raw_line in enumerate(doc_text.splitlines(), 1):
+            m = _HYGIENE_RST_IMG_RE.match(raw_line)
+            if not m:
+                continue
+            target = _hygiene_clean_local_media_target(m.group(1))
+            if target and not exists_local(target, search_dirs=(base_dir,)):
+                record(
+                    rel_path, line_no, 'broken_local_media_ref', target,
+                    '本地图表或媒体相对引用指向的文件不存在，请核对路径或补齐对应图件',
+                )
+        return
+
+    for line_no, raw_line, in_fence, in_math in _hygiene_iter_unmasked_lines(doc_text):
+        if in_fence or in_math:
+            continue
+        cleaned = re.sub(r'<!--.*?-->', ' ', raw_line)
+        cleaned = re.sub(r'`[^`\r\n]*`', ' ', cleaned)
+        for m in _HYGIENE_MD_IMG_RE.finditer(cleaned):
+            target = _hygiene_clean_local_media_target(m.group(1))
+            if target and not exists_local(target, search_dirs=(base_dir,)):
+                record(
+                    rel_path, line_no, 'broken_local_media_ref', target,
+                    '本地图表或媒体相对引用指向的文件不存在，请核对路径或补齐对应图件',
+                )
+
+
+def _hygiene_audit_theorem_shells(rel_path, doc_text, record):
+    """跨格式检测正式文稿中声明多条定理/命题但全文缺失证明段落的空壳问题。"""
+    ext = Path(rel_path).suffix.lower()
+    if ext not in ('.tex', '.md', '.rst'):
+        return
+    if _HYGIENE_OUTLINE_TITLE_RE.search(Path(rel_path).stem):
+        return
+    if ext == '.tex':
+        active_lines = list(_iter_tex_active_lines(doc_text))
+        title_m = re.search(r'\\title(?:\[[^\]]*\])?\{([^}]*)\}', '\n'.join(ln for _, ln in active_lines))
+        if title_m and _HYGIENE_OUTLINE_TITLE_RE.search(title_m.group(1)):
+            return
+        claim_envs = {'theorem', 'proposition', 'lemma', 'corollary'}
+        for _, line in active_lines:
+            for nm in _HYGIENE_TEX_NEWTHEOREM_RE.finditer(line):
+                if _HYGIENE_CLAIM_TITLE_RE.search(nm.group(2)):
+                    claim_envs.add(nm.group(1).rstrip('*'))
+        claim_pat = re.compile(
+            r'\\begin\{(?:' + '|'.join(re.escape(e) for e in sorted(claim_envs)) + r')\*?\}'
+        )
+        claims = 0
+        proofs = 0
+        first_claim_line = 0
+        deferred = False
+        for line_no, line in active_lines:
+            c_hits = claim_pat.findall(line)
+            if c_hits:
+                if not first_claim_line:
+                    first_claim_line = line_no
+                claims += len(c_hits)
+            if _HYGIENE_TEX_PROOF_RE.search(line):
+                proofs += 1
+            if _HYGIENE_PROOF_DEFERRED_RE.search(line):
+                deferred = True
+        if claims >= 2 and proofs == 0 and not deferred:
+            record(
+                rel_path, first_claim_line or 1, 'unproved_theorem_shell',
+                f'{claims} formal claims, 0 proofs',
+                '正式文稿声明了多条定理或命题但全文缺失证明段落，请补齐完整证明或显式指向外部证明附录',
+            )
+        return
+
+    if ext == '.rst':
+        raw_lines = doc_text.splitlines()
+        for idx, raw_line in enumerate(raw_lines[:15]):
+            s = raw_line.strip()
+            if s and idx + 1 < len(raw_lines) and _HYGIENE_RST_UNDERLINE_RE.match(raw_lines[idx + 1].strip()):
+                if _HYGIENE_OUTLINE_TITLE_RE.search(s):
+                    return
+                break
+        claims = 0
+        proofs = 0
+        first_claim_line = 0
+        deferred = False
+        for idx, raw_line in enumerate(raw_lines):
+            line_no = idx + 1
+            s = raw_line.strip()
+            if not s:
+                continue
+            has_underline = (idx + 1 < len(raw_lines) and bool(_HYGIENE_RST_UNDERLINE_RE.match(raw_lines[idx + 1].strip())))
+            if _HYGIENE_RST_CLAIM_DIRECTIVE_RE.match(raw_line) or (has_underline and _HYGIENE_RST_CLAIM_HEADING_RE.match(s)) or _HYGIENE_MD_CLAIM_RE.match(s):
+                if not first_claim_line:
+                    first_claim_line = line_no
+                claims += 1
+            if _HYGIENE_RST_PROOF_RE.match(raw_line) or _HYGIENE_MD_PROOF_RE.match(s):
+                proofs += 1
+            if _HYGIENE_PROOF_DEFERRED_RE.search(s):
+                deferred = True
+        if claims >= 2 and proofs == 0 and not deferred:
+            record(
+                rel_path, first_claim_line or 1, 'unproved_theorem_shell',
+                f'{claims} formal claims, 0 proofs',
+                '正式文稿声明了多条定理或命题但全文缺失证明段落，请补齐完整证明或显式指向外部证明附录',
+            )
+        return
+
+    lines_meta = list(_hygiene_iter_unmasked_lines(doc_text))
+    for _, raw_line, in_f, in_m in lines_meta[:15]:
+        if in_f or in_m:
+            continue
+        s = raw_line.strip()
+        if s.startswith('# ') and _HYGIENE_OUTLINE_TITLE_RE.search(s):
+            return
+    claims = 0
+    proofs = 0
+    first_claim_line = 0
+    deferred = False
+    for line_no, raw_line, in_f, in_m in lines_meta:
+        if in_f or in_m:
+            continue
+        s = raw_line.strip()
+        if not s:
+            continue
+        s_box = re.sub(r'^(?:>\s*)+', '', s).strip()
+        if _HYGIENE_MD_CLAIM_RE.match(s_box):
+            if not first_claim_line:
+                first_claim_line = line_no
+            claims += 1
+        if _HYGIENE_MD_PROOF_RE.match(s_box):
+            proofs += 1
+        if _HYGIENE_PROOF_DEFERRED_RE.search(s_box):
+            deferred = True
+    if claims >= 2 and proofs == 0 and not deferred:
+        record(
+            rel_path, first_claim_line or 1, 'unproved_theorem_shell',
+            f'{claims} formal claims, 0 proofs',
+            '正式文稿声明了多条定理或命题但全文缺失证明段落，请补齐完整证明或显式指向外部证明附录',
+        )
+
+
 def _audit_docs_hygiene(
     doc_entries,
     *,
+    root_dir=None,
+    file_paths=None,
     landing_max_bytes=18000,
     max_cjk_sentence_chars=220,
     max_ascii_sentence_chars=480,
@@ -7575,7 +7947,7 @@ def _audit_docs_hygiene(
     dup_min_files=3,
     landing_max_inline_codes=8,
 ):
-    """通用零黑名单文档卫生校验：计数一致、补丁长句/斜杠串、跨文档复读与 T0 入口清晰度。"""
+    """通用零黑名单文档卫生校验：跨格式图件引用与证明完整度、计数一致、补丁长句、跨文档复读与入口清晰度。"""
     findings = []
     seen = set()
 
@@ -7593,13 +7965,24 @@ def _audit_docs_hygiene(
         })
 
     dup_index = {}  # norm_clause -> list[(rel_path, line_no, raw_clause)]
+    path_lookup = dict(file_paths or {})
 
     for rel_path, doc_text in doc_entries:
-        if not rel_path.lower().endswith('.md'):
+        ext = Path(rel_path).suffix.lower()
+        if ext not in ('.md', '.tex', '.rst'):
             continue
         is_changelog = Path(rel_path).name.upper() == 'CHANGELOG.MD'
         is_agent_prompt = '/agents/' in f'/{rel_path}'
         is_landing = rel_path == 'README.md'
+
+        # 0. 跨格式（Markdown / LaTeX / reST）通用交付卫生：本地图件链接与定理空壳检测
+        if not is_changelog and not is_agent_prompt:
+            _hygiene_audit_local_media_refs(rel_path, doc_text, path_lookup.get(rel_path), root_dir, record)
+            if not is_landing:
+                _hygiene_audit_theorem_shells(rel_path, doc_text, record)
+
+        if ext != '.md':
+            continue
 
         # 1. T0 入口文档体积预算
         if is_landing:
@@ -7801,7 +8184,7 @@ def audit_doc_grounding(
                 resolved_f = fpath.resolve()
                 rel = resolved_f.relative_to(root).as_posix() if resolved_f.is_relative_to(root) else resolved_f.relative_to(target).as_posix()
                 is_codex_toml = _is_codex_agent_toml_rel(rel)
-                if fpath.suffix.lower() not in ('.md', '.svg', '.rst') and not is_codex_toml:
+                if fpath.suffix.lower() not in ('.md', '.tex', '.svg', '.rst') and not is_codex_toml:
                     continue
                 if rel in skip_rels or rel.startswith('tests/') or rel == 'template/user-guard/assets/logo.svg':
                     continue
@@ -7812,11 +8195,13 @@ def audit_doc_grounding(
     all_findings = []
     checked_files = []
     hygiene_entries = []
+    hygiene_paths = {}
     for fpath, rel in doc_files:
         checked_files.append(rel)
         raw_doc = _optional_text(fpath)
-        if doc_hygiene and fpath.suffix.lower() == '.md':
+        if doc_hygiene and fpath.suffix.lower() in ('.md', '.tex', '.rst'):
             hygiene_entries.append((rel, raw_doc))
+            hygiene_paths[rel] = fpath
         baseline_txt = ''
         if verified_commit and git_toplevel:
             resolved_doc = fpath.resolve()
@@ -7841,7 +8226,7 @@ def audit_doc_grounding(
                 baseline_txt = _extract_latest_changelog_section(baseline_txt)
         all_findings.extend(_audit_single_doc_text(rel, raw_doc, anchor, baseline_txt))
     if doc_hygiene:
-        all_findings.extend(_audit_docs_hygiene(hygiene_entries))
+        all_findings.extend(_audit_docs_hygiene(hygiene_entries, root_dir=root, file_paths=hygiene_paths))
     by_category = collections.Counter(item['category'] for item in all_findings)
     return {
         'ok': not all_findings,

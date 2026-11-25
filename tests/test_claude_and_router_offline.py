@@ -1576,7 +1576,23 @@ class TestClaudeInstallerAndUpgradeAudit(OfflineSandbox):
                 self.assertEqual(os.environ["USERPROFILE"], before["USERPROFILE"])
             return subprocess.CompletedProcess(command, 0, "fixture 1.2.3\n", "")
 
-        with mock.patch.object(installer.subprocess, "run", side_effect=probe):
+        class _ProbePopen:
+            def __init__(self, command, **kwargs):
+                self.pid = 31337
+                self._command = command
+                self._kwargs = kwargs
+                self.returncode = 0
+
+            def communicate(self, timeout=None):
+                res = probe(self._command, **self._kwargs)
+                self.returncode = res.returncode
+                return res.stdout, res.stderr
+
+            def kill(self):
+                pass
+
+        with mock.patch.object(installer.subprocess, "run", side_effect=probe), \
+                mock.patch.object(installer.subprocess, "Popen", side_effect=_ProbePopen):
             for binary in ("cc-switch", "cc-switch.exe", "codex", "claude", "agy", "dsh"):
                 self.assertEqual(installer._audit_cli({"native_binary": binary})["version"], "1.2.3")
         self.assertEqual(dict(os.environ), before)
@@ -1597,8 +1613,26 @@ class TestClaudeInstallerAndUpgradeAudit(OfflineSandbox):
                     isolated.append(root)
                     raise failure
 
+                class _FailingPopen:
+                    def __init__(self, command, **kwargs):
+                        self.pid = 31338
+                        self._command = command
+                        self._kwargs = kwargs
+                        self.returncode = None
+                        self._calls = 0
+
+                    def communicate(self, timeout=None):
+                        self._calls += 1
+                        if self._calls == 1:
+                            return probe(self._command, **self._kwargs)
+                        return "", ""
+
+                    def kill(self):
+                        pass
+
                 with mock.patch.object(installer.tempfile, "tempdir", str(self.root)), \
-                        mock.patch.object(installer.subprocess, "run", side_effect=probe):
+                        mock.patch.object(installer.subprocess, "Popen", side_effect=_FailingPopen), \
+                        mock.patch.object(installer.os, "killpg", side_effect=lambda *_: None, create=True):
                     report = installer._audit_cli({"native_binary": "cc-switch", "native_installed": True})
                 self.assertIsNone(report["version"])
                 self.assertTrue(report["native_installed"])
@@ -2311,6 +2345,188 @@ class TestClaudeInstallerAndUpgradeAudit(OfflineSandbox):
         self.assertIn("repair_unreadable_configs", report["summary"]["recommended_actions"])
         self.assertNotIn(str(self.home), json.dumps(report))
         self.assertTrue(all(not key.startswith(str(self.codex)) for key in report["read_errors"]))
+
+    def test_audit_codex_hook_trust_and_agy_retiring_models(self):
+        self.install(*self.all_args())
+        gemini = self.plugin.parent.parent.parent
+        user_words.atomic_write_json(gemini / "antigravity-cli/cache/cae_models_cache.json", {"models": [
+            {"slug": "gemini-4-carbon-high"},
+            {"slug": "gemini-4-argon-high"},
+            {"slug": "gemini-3.8-flash-low"},
+            {"slug": "gpt-oss-120b-medium"},
+        ]})
+        user_words.atomic_write_json(self.codex / "models_cache.json", {"models": [
+            {"slug": "gpt-6.2-sol", "max_context_window": 872000, "supported_efforts": ["low", "medium", "high", "xhigh", "max"]},
+        ]})
+        cfg_path = self.codex / "config.toml"
+        base_cfg = cfg_path.read_text(encoding="utf-8")
+        detection_v171 = {
+            "antigravity": {"native_installed": False},
+            "codex": {"native_installed": True, "version": "0.171.0-alpha.13.2"},
+            "claude": {"native_installed": False},
+            "cc_switch": {"native_installed": False},
+        }
+        # 1) 沙箱无 [hooks.state] 不误报 review_codex_hook_trust，但准确识别退役模型
+        rep_sbx = installer.audit_upgrade_status(
+            self.source, self.plugin, self.codex, self.claude_home,
+            self.root / "missing.db", detection=detection_v171, is_sandbox_run=True,
+        )
+        self.assertEqual(rep_sbx["codex"]["hooks_trust"]["status"], "unrecorded")
+        self.assertEqual(rep_sbx["codex"]["hooks_trust"]["managed_count"], 8)
+        self.assertEqual(rep_sbx["codex"]["hooks_trust"]["trusted_count"], 0)
+        self.assertNotIn("review_codex_hook_trust", rep_sbx["summary"]["recommended_actions"])
+        self.assertIn("gemini-4-argon-high", rep_sbx["antigravity"]["retiring_models"])
+        self.assertIn("gemini-3.8-flash-low", rep_sbx["antigravity"]["retiring_models"])
+        self.assertIn("gpt-oss-120b-medium", rep_sbx["antigravity"]["retiring_models"])
+        self.assertNotIn("gemini-4-carbon-high", rep_sbx["antigravity"]["retiring_models"])
+
+        # 2) 非沙箱且 Codex >= 0.171.0 缺少信任哈希时触发 review_codex_hook_trust，且脱敏不泄露主目录路径
+        with mock.patch.object(installer, "_audit_cli", side_effect=lambda info: dict(info)):
+            rep_host_missing = installer.audit_upgrade_status(
+                self.source, self.plugin, self.codex, self.claude_home,
+                self.root / "missing.db", detection=detection_v171, is_sandbox_run=False,
+            )
+        self.assertEqual(rep_host_missing["codex"]["hooks_trust"]["status"], "untrusted_or_partial")
+        self.assertIn("review_codex_hook_trust", rep_host_missing["summary"]["recommended_actions"])
+        self.assertTrue(all(item.startswith("<codex>/hooks.json:") for item in rep_host_missing["codex"]["hooks_trust"]["missing_entries"]))
+        self.assertNotIn(str(self.home), json.dumps(rep_host_missing))
+
+        # 3) 仅信任部分槽位时在沙箱也报 untrusted_or_partial 与 review_codex_hook_trust
+        hooks_path_str = str((self.codex / "hooks.json").resolve())
+        all_slots = [
+            "session_start:0:0", "session_start:0:1", "post_compact:0:0",
+            "user_prompt_submit:0:0", "pre_tool_use:0:0", "pre_tool_use:0:1",
+            "stop:0:0", "stop:0:1",
+        ]
+        partial_blocks = "\n".join(
+            f"\n[hooks.state.'{hooks_path_str}:{slot}']\ntrusted_hash = \"sha256:abc123\"\n"
+            for slot in all_slots[:-1]
+        )
+        cfg_path.write_text(base_cfg + partial_blocks, encoding="utf-8")
+        rep_partial = installer.audit_upgrade_status(
+            self.source, self.plugin, self.codex, self.claude_home,
+            self.root / "missing.db", detection=detection_v171, is_sandbox_run=True,
+        )
+        self.assertEqual(rep_partial["codex"]["hooks_trust"]["status"], "untrusted_or_partial")
+        self.assertEqual(rep_partial["codex"]["hooks_trust"]["trusted_count"], 7)
+        self.assertEqual(rep_partial["codex"]["hooks_trust"]["missing_entries"], ["<codex>/hooks.json:stop:0:1"])
+        self.assertIn("review_codex_hook_trust", rep_partial["summary"]["recommended_actions"])
+
+        # 4) 8 条受管钩子全部记录且 hooks.json 无漂移时 status == slots_recorded（诚实标明 hash_verified=False）
+        full_blocks = "\n".join(
+            f"\n[hooks.state.'{hooks_path_str}:{slot}']\ntrusted_hash = \"sha256:abc123\"\n"
+            for slot in all_slots
+        )
+        cfg_path.write_text(base_cfg + full_blocks, encoding="utf-8")
+        rep_trusted = installer.audit_upgrade_status(
+            self.source, self.plugin, self.codex, self.claude_home,
+            self.root / "missing.db", detection=detection_v171, is_sandbox_run=True,
+        )
+        self.assertEqual(rep_trusted["codex"]["hooks_trust"]["status"], "slots_recorded")
+        self.assertFalse(rep_trusted["codex"]["hooks_trust"]["hash_verified"])
+        self.assertEqual(rep_trusted["codex"]["hooks_trust"]["trusted_count"], 8)
+        self.assertEqual(rep_trusted["codex"]["hooks_trust"]["missing_entries"], [])
+        self.assertNotIn("review_codex_hook_trust", rep_trusted["summary"]["recommended_actions"])
+
+        # 5) 即使保留了旧 8 槽信任记录，一旦 hooks.json 发生命令漂移，仍须退回 untrusted_or_partial 并建议 /hooks 复核
+        hooks_json_path = self.codex / "hooks.json"
+        drifted_hooks = json.loads(hooks_json_path.read_text(encoding="utf-8"))
+        drifted_hooks["hooks"]["Stop"][0]["hooks"][0]["command"] += " --extra-drift"
+        hooks_json_path.write_text(json.dumps(drifted_hooks, ensure_ascii=False, indent=2), encoding="utf-8")
+        rep_drifted = installer.audit_upgrade_status(
+            self.source, self.plugin, self.codex, self.claude_home,
+            self.root / "missing.db", detection=detection_v171, is_sandbox_run=True,
+        )
+        self.assertFalse(rep_drifted["codex"]["hooks_aligned"])
+        self.assertEqual(rep_drifted["codex"]["hooks_trust"]["status"], "untrusted_or_partial")
+        self.assertIn("review_codex_hook_trust", rep_drifted["summary"]["recommended_actions"])
+
+    def test_audit_cli_cc_switch_timeout_cleans_isolated_tempdir(self):
+        """cc-switch --version 探测超时时应终止进程（POSIX 下终止整组）并彻底清理 cc-switch-audit-* 临时目录。"""
+        tmp_parent = self.root / "audit_tmp"
+        tmp_parent.mkdir()
+        captured_env = {}
+
+        class _HangingProc:
+            def __init__(self, cmd, **kwargs):
+                self.pid = 424242
+                self.returncode = None
+                self.killed = False
+                self._calls = 0
+                captured_env.update(kwargs.get("env") or {})
+                # 模拟子进程在隔离目录内落盘文件
+                home_dir = Path(captured_env["HOME"])
+                (home_dir / "nested").mkdir(parents=True, exist_ok=True)
+                (home_dir / "nested" / "lock").write_text("busy", encoding="utf-8")
+
+            def communicate(self, timeout=None):
+                self._calls += 1
+                if self._calls == 1:
+                    raise subprocess.TimeoutExpired(cmd="cc-switch --version", timeout=timeout)
+                return ("", "")
+
+            def kill(self):
+                self.killed = True
+
+        killed_groups = []
+        orig_mkdtemp = tempfile.mkdtemp
+
+        def _mkdtemp_in_sandbox(*args, **kwargs):
+            kwargs["dir"] = str(tmp_parent)
+            return orig_mkdtemp(*args, **kwargs)
+
+        with mock.patch.object(installer.subprocess, "Popen", side_effect=_HangingProc), \
+                mock.patch.object(installer.tempfile, "mkdtemp", side_effect=_mkdtemp_in_sandbox), \
+                mock.patch.object(installer.os, "killpg", side_effect=lambda pid, sig: killed_groups.append((pid, sig)), create=True):
+            rep = installer._audit_cli({"native_installed": True, "native_binary": "/usr/bin/cc-switch"})
+
+        self.assertIsNone(rep["version"])
+        self.assertEqual(list(tmp_parent.iterdir()), [])
+        if os.name != "nt":
+            self.assertEqual(len(killed_groups), 1)
+            self.assertEqual(killed_groups[0][0], 424242)
+
+    @unittest.skipIf(os.name == "nt", "POSIX 进程组孤儿子进程清理回归仅在类 Unix 环境执行")
+    def test_audit_cli_posix_real_orphan_child_killed_and_tempdir_removed(self):
+        """POSIX 真实子进程回归：cc-switch 组长先退出但后代继续持有 stdout 管道并写隔离目录时，超时仍可杀清整组并删净临时目录。"""
+        tmp_parent = self.root / "posix_orphan_tmp"
+        tmp_parent.mkdir()
+        pid_file = self.root / "orphan_child.pid"
+        fake_bin = self.root / "cc-switch"
+        fake_bin.write_text(
+            "#!/bin/sh\n"
+            f'python3 -c "import os, time, pathlib; pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid())); '
+            'pathlib.Path(os.environ[\'HOME\'], \'lock\').write_text(\'x\'); time.sleep(30)" &\n'
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        fake_bin.chmod(0o755)
+        orig_mkdtemp = tempfile.mkdtemp
+
+        def _mkdtemp_here(*args, **kwargs):
+            kwargs["dir"] = str(tmp_parent)
+            return orig_mkdtemp(*args, **kwargs)
+
+        with mock.patch.object(installer.tempfile, "mkdtemp", side_effect=_mkdtemp_here):
+            rep = installer._audit_cli({"native_installed": True, "native_binary": str(fake_bin)})
+
+        self.assertIsNone(rep["version"])
+        self.assertEqual(list(tmp_parent.iterdir()), [])
+        self.assertTrue(pid_file.is_file())
+        child_pid = int(pid_file.read_text(encoding="utf-8").strip())
+        # 给内核极短回收窗口，随后确认孤儿子进程已不存在
+        import time as _time
+        alive = True
+        for _ in range(20):
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                alive = False
+                break
+            except PermissionError:
+                break
+            _time.sleep(0.05)
+        self.assertFalse(alive, f"孤儿子进程 {child_pid} 仍存活")
 
     def test_status_guard_installer_flags_and_claude_subagent_skips(self):
         project = self.project / "repo"
