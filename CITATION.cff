@@ -10,14 +10,16 @@ url: "https://doi.org/10.5281/zenodo.24293507"
 doi: 10.5281/zenodo.24293507
 license: Apache-2.0
 abstract: >-
-  Shared engineering rules (R0-R11), deterministic session lifecycle hooks,
-  read-only review subagents, lexical grounding checks, pre-read sizing and
-  conservative sharding, cross-client coverage verification, deterministic
-  mechanical reconciliation tables, and cross-client headless verification
-  workflows across Google Antigravity, OpenAI Codex, Claude Code, and DeepSeek
-  Harness for scientific computing, CAE, CFD, FEA, numerical PDE solvers, HPC,
-  and high-reliability software engineering, implemented purely on the Python
-  3.11+ standard library across Windows, WSL2, and Linux. 本仓库所载研究成果由作者独立完成，仅接受国家留学基金管理委员会（CSC，学号 202506280162，批准文号 留金选[2025]37号）资助，未接受任何其他单位或个人任何形式的资助、项目、资源、设施、行政或机构性支持。
+  Shared engineering rules (R0-R11), symmetrical deterministic session lifecycle
+  hooks (guarding both overclaimed verification and unverified negative claims),
+  read-only review subagents, zero-blacklist lexical grounding and document
+  hygiene checks, pre-read sizing and conservative sharding, cross-client
+  coverage verification, deterministic mechanical reconciliation tables, and
+  cross-client headless verification workflows across Google Antigravity,
+  OpenAI Codex, Claude Code, and DeepSeek Harness for scientific computing,
+  CAE, CFD, FEA, numerical PDE solvers, HPC, and high-reliability software
+  engineering, implemented purely on the Python 3.11+ standard library across
+  Windows, WSL2, and Linux. 本仓库所载研究成果由作者独立完成，仅接受国家留学基金管理委员会（CSC，学号 202506280162，批准文号 留金选[2025]37号）资助，未接受任何其他单位或个人任何形式的资助、项目、资源、设施、行政或机构性支持。
 keywords:
   - scientific-computing
   - computer-aided-engineering
@@ -27,4 +29,5 @@ keywords:
   - coding-agents
   - verification-harness
   - deterministic-reconciliation
+  - documentation-hygiene
   - reproducible-workflows

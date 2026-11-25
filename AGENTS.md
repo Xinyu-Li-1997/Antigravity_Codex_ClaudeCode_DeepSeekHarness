@@ -18,6 +18,15 @@
 | 项目自更新层 | `fleet_profile.json`、`fleet-evolve`、`install.py --audit-upgrade` | `fleet_profile.json` 由 `fleet-evolve` 评估并经用户确认后更新，驱动模型矩阵、自适应策略参数及升级体检。 |
 | 分发给其他 Agent 的配置层 | `~/.gemini/config/plugins/user-guard/`、`~/.codex/`、`~/.claude/`、`~/.dsh/` | 由 `install.py` 按宿主协议分发同步并保留用户自定义尾段，属于部署产物，不在目标端手工硬改主干逻辑。 |
 
+公开文档按受众分四级单点维护，由 `cae_harness.py check-grounding --strict --doc-hygiene` 机械守卫受众边界、计数一致、句长与跨文档去重：
+
+| 文档层级 | 唯一归属文件 | 目标读者与禁入红线 |
+| --- | --- | --- |
+| T0 入口页 | `README.md` | 首次接触的 CAE/科学计算用户；严控精简体积，不堆砌内部私有符号、钩子实现细节或上游维护步骤。 |
+| T1 实战手册 | `docs/workflow-guide.md` | 已安装工具的日常研发工程师；聚焦派工分工、分片阅读、算例闭环与 L1–L4 验收，不复读架构细节。 |
+| T2 架构与运维 | `docs/architecture-and-hooks.md`、`template/user-guard/README.md` | 维护者与安全审计人员；独占模块表、配置键、钩子细节、预算公式、体检建议码与精确卸载。 |
+| T3 契约与日志 | `AGENTS.md`、`rules/AGENTS.md`、`SKILL.md`、`CHANGELOG.md` | 面向 Agent 执行的精简规则与参数契约；版本增量历史只记入 `CHANGELOG.md`。 |
+
 `workspace_mode` 区分通用课题项目（`general_project`）与上游配置仓库（`upstream_config_repo`，同时包含 `install.py` 与 `template/user-guard/plugin.json`）。独立安装的 `fleet_state.py` 在非上游目录未传 `--repo` 时返回 `not_upstream_config_repo`（退出码 `2`）。修改前核对本轮授权与 Git 状态，保留其他任务改动；全局写入、推荐矩阵与 `runtime_tunables` 调整、ABI 强耦合升级及 `git push` 均须取得相应批准。
 
 ## 安装与共有机制同步职责
@@ -40,7 +49,7 @@
 | 恢复与调用前 | `session_context_loader.py`（联动 `handoff_gate.py`；Antigravity 挂 `SessionStart`、`PreInvocation`；Codex 与 Claude Code 挂 `SessionStart`、`PostCompact`）去噪恢复原话、实质子代理与超时抢救摘要、完整未决票据总览及有界完工对账链接与活跃 `read-plan` 指针，并评估交接阶段。 |
 | 新指令提交时 | `handoff_gate.py`（Codex 与 Claude Code 挂 `UserPromptSubmit`；Antigravity 在 `PreInvocation` 对账轨迹步）更新交接判断或宽限期。 |
 | 工具执行前 | `status_guard.py`（联动 `handoff_gate.py`；三端挂 `PreToolUse`）守卫写边界与同会话外部目录批准租约、归一化 PowerShell 续行、拦截日志轮询与裸调 CLI、核验重负载与 `followup` 票据及交接限制（收口期放行 `check-grounding`/`reconcile`/`read-plan`/`cross-check` 诊断）。 |
-| 回合结束时 | `reply_repeat_guard.py`（联动 `handoff_gate.py`；三端挂 `Stop`）拦截空等刷屏、同回合重复贴票、全量测试失败后零复跑或局部补测冒充全过及含失败项宣称全过，核验重负载完工回执（按 `run_id` 销账、同名回执消歧并核验 `reconcile_file` 链接；单路省略默认流号 `S1` 时须匹配具体模型名，仅在未记录具体模型名时可用任务状态词替代）与强制交接提示词及待拍板占位符保护。 |
+| 回合结束时 | `reply_repeat_guard.py`（联动 `handoff_gate.py`；三端挂 `Stop`）拦截空等刷屏、同回合重复贴票、全量测试失败后零复跑或局部补测冒充全过、含失败项宣称全过以及零执行或探测全败却宣称已核实否定结论，按 `run_id` 核验重负载完工回执与 `reconcile_file` 链接（单流销账细则见 `cae-harness` 技能）并核查强制交接提示词及待拍板占位符保护。 |
 
 Antigravity 默认启用长会话分段收口；Codex 与 Claude Code 默认交接模式为 `advisory`。Claude 默认随钩子同步 `~/.claude/hooks/ccswitch_admin.py`（`--no-claude-hooks` 跳过，`--with-cc-router` 另行分发 `~/.claude/router/`）；仅在获授权并传 `--disable-ccswitch-prompts` 或 `--purge-ccswitch-legacy` 时，先在线备份 `cc-switch.db` 再处理旧记录。
 
@@ -67,7 +76,7 @@ python -B -X utf8 install.py --dry-run --yes
 上游维护遵循 [fleet-evolve/SKILL.md](template/user-guard/skills/fleet-evolve/SKILL.md)，先以 `fleet_state.py status` 核对身份与状态锁。验收严禁放宽容差、守恒或收敛阶判据，严禁删改断言：
 
 ```powershell
-python -B -X utf8 template/user-guard/skills/cae-harness/scripts/cae_harness.py check-grounding --target . --strict
+python -B -X utf8 template/user-guard/skills/cae-harness/scripts/cae_harness.py check-grounding --target . --strict --doc-hygiene
 python -B -X utf8 -m unittest tests.test_e2e_integration
 ```
 

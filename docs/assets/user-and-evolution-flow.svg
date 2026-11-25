@@ -59,10 +59,10 @@
 
   <g>
     <rect x="50" y="508" width="624" height="142" rx="12" fill="#ffffff" stroke="#b8cde8"/>
-    <text x="72" y="540" class="heading">3. 轻任务静默执行 · 重负载发 3 句话确认条与明细链接</text>
-    <text x="72" y="568" class="body">大仓库先用 read-plan 双口径分片；重负载委派统一先运行 plan。</text>
-    <text x="72" y="594" class="body">4 列总览与 14 项明细写入 &lt;ticket_id&gt;_card.md，日常对话仅展 chat_brief。</text>
-    <text x="72" y="620" class="body">压缩时按窗口缩放预算并折叠历史明细；获批后凭 --ticket 放行。</text>
+    <text x="72" y="540" class="heading">3. 轻任务静默执行 · 重负载发 3 句话简报与明细链接</text>
+    <text x="72" y="568" class="body">大仓库先用 read-plan 评估体积并分片；重负载委派先由 plan 生成确认单。</text>
+    <text x="72" y="594" class="body">完整方案落盘至明细文件，聊天框仅发 3 句话确认提示与可点击链接。</text>
+    <text x="72" y="620" class="body">压缩后自动还原未决任务总览；获批登记后持 --ticket 放行执行。</text>
   </g>
 
   <path class="link" d="M 362 650 L 362 680"/>

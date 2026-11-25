@@ -1072,6 +1072,150 @@ def _check_test_suite_locked(payload, reply, state_file, state, sid, turn_key, d
     return None
 
 
+_UNVERIFIED_NEG_META_RE = re.compile(
+    r"(?:不得宣称|严禁宣称|禁止宣称|不应宣称|未实查即下否定|守卫零执行|否定宣称拦截|user-guard)"
+)
+_UNVERIFIED_NEG_HEDGE_RE = re.compile(
+    r"(?:尚未核实|尚未确认|暂未确认|未核实|待核实|待确认|尚不确定|仅核查了|只核查了|仅排查了|只查了|探测失败|命令报错|命令失败)"
+)
+_EMPIRICAL_CLAIM_RE = re.compile(
+    r"(?<!未)(?<!没)(?<!尚)(?<!暂)(?:已核实|已实查|经核查|经核实|已亲自核查|实查结果|本机实际查到|已确认(?:本机|本地|当前|环境)?|\bverified\s+locally\b|\bconfirmed\s+locally\b)",
+    re.I,
+)
+_STRONG_NEGATIVE_CLAIM_RE = re.compile(
+    r"(?:未连接|没有连接|并未连接|并没有连接|没有连到|并没有连到|未挂载|没有映射|无映射网络盘|查不到|无法访问|不存在|未安装|没有安装|未配置|没有现成的?远端连接|\bnot\s+connected\b|\bnot\s+mounted\b|\bnot\s+installed\b|\bdoes\s+not\s+exist\b|\bnot\s+available\b)",
+    re.I,
+)
+_NONZERO_EXIT_RE = re.compile(
+    r"(?:Command exited with code|Process exited with code|Exit code)\s*[:：]?\s*[1-9]\d*",
+    re.I,
+)
+_TOOL_DENIED_OR_ERR_RE = re.compile(
+    r"(?:Encountered error in step execution|tool call denied|denied by pre-tool hook)",
+    re.I,
+)
+
+
+def _strip_inline_code_spans(text: str) -> str:
+    return re.sub(r"`[^`\r\n]*`", " ", text)
+
+
+def _has_empirical_negative_claim(reply: str) -> bool:
+    plain = _strip_inline_code_spans("\n".join(user_words.markdown_unquoted_lines(reply)))
+    for clause in re.split(r"[。！？；\n]+", plain):
+        seg = clause.strip()
+        if not seg or _UNVERIFIED_NEG_META_RE.search(seg) or _UNVERIFIED_NEG_HEDGE_RE.search(seg):
+            continue
+        if _EMPIRICAL_CLAIM_RE.search(seg) and _STRONG_NEGATIVE_CLAIM_RE.search(seg):
+            return True
+    return False
+
+
+def _is_trivial_ui_ok_output(text: str) -> bool:
+    lines = [
+        ln.strip()
+        for ln in text.splitlines()
+        if ln.strip() and not ln.strip().startswith(("Created At:", "Completed At:"))
+    ]
+    return len(lines) == 1 and lines[0] == "OK"
+
+
+def _turn_tool_probe_stats(path: Path) -> Optional[Tuple[int, int, int]]:
+    """统计本回合内跨三端轨迹的实质工具执行结果：(total, succeeded, failed)。"""
+    if not path.is_file():
+        return None
+    steps, _ = _read_tail_steps_with_offset(path)
+    start = next(
+        (
+            i + 1
+            for i in range(len(steps) - 1, -1, -1)
+            if _is_explicit_user_step(steps[i]) or user_words.transcript_user_text(steps[i], path)
+        ),
+        0,
+    )
+    total = 0
+    succeeded = 0
+    failed = 0
+    for entry in steps[start:]:
+        if entry.get("isSidechain") is True or entry.get("isMeta") is True:
+            continue
+        if entry.get("type") in ("GENERIC", "TOOL_RESULT", "TOOL_RESPONSE"):
+            result = entry.get("tool_result")
+            raw = entry.get("content")
+            if raw is None:
+                raw = result.get("output") if isinstance(result, dict) else entry.get("output")
+            text = re.sub(r"\x1b\[[0-9;]*m", "", user_words._codex_output_to_text(raw))
+            status_err = str(entry.get("status") or "").strip().upper() == "ERROR"
+            if not status_err and (not text.strip() or _is_trivial_ui_ok_output(text)):
+                continue
+            total += 1
+            if status_err or _NONZERO_EXIT_RE.search(text) or _TOOL_DENIED_OR_ERR_RE.search(text):
+                failed += 1
+            else:
+                succeeded += 1
+        else:
+            for obj in user_words._HarnessArchiveCollector._objects(entry, parse_text=False):
+                if obj.get("type") not in ("function_call_output", "custom_tool_call_output", "local_shell_call_output", "tool_result"):
+                    continue
+                raw = obj.get("output", obj.get("content"))
+                if isinstance(raw, dict):
+                    raw_text = raw.get("stdout") or raw.get("output") or json.dumps(raw, ensure_ascii=False)
+                else:
+                    raw_text = user_words._codex_output_to_text(raw)
+                text = re.sub(r"\x1b\[[0-9;]*m", "", raw_text)
+                is_err = obj.get("is_error") is True
+                if not is_err and text.strip().startswith("{"):
+                    try:
+                        parsed = json.loads(text)
+                        if isinstance(parsed, dict):
+                            meta = parsed.get("metadata")
+                            ec = meta.get("exit_code") if isinstance(meta, dict) else parsed.get("exit_code")
+                            if isinstance(ec, int) and ec != 0:
+                                is_err = True
+                    except ValueError:
+                        pass
+                if not is_err and (not text.strip() or _is_trivial_ui_ok_output(text)):
+                    continue
+                total += 1
+                if is_err or _NONZERO_EXIT_RE.search(text) or _TOOL_DENIED_OR_ERR_RE.search(text):
+                    failed += 1
+                else:
+                    succeeded += 1
+    return total, succeeded, failed
+
+
+def _check_unverified_negative_claim_locked(payload, reply, state_file, state, sid, turn_key, decision):
+    record = state["turns"][turn_key]
+    if record["blockedSignatures"] or not _has_empirical_negative_claim(reply):
+        return None
+    raw_path = payload.get("transcriptPath") or payload.get("transcript_path")
+    if not raw_path:
+        return None
+    stats = _turn_tool_probe_stats(user_words.resolve_compact_transcript_path(Path(raw_path).expanduser()))
+    if stats is None:
+        return None
+    total, succeeded, failed = stats
+    if succeeded > 0:
+        return None
+    if _heavy_report_blocked(state_file.parent, sid, turn_key, payload):
+        return None
+    record["blockedSignatures"].append("unverified-negative-claim")
+    _save_repeat_state(state_file, state, sid)
+    if failed > 0:
+        reason = (
+            f"【user-guard 未实查即下否定结论拦截】本轮探测命令均报错或被拦截（成功 0 条、失败 {failed} 条），"
+            "尚无有效只读成功输出，不得宣称“已核实未连接/不存在/不可用”。"
+            "请按 R3.6 先修复命令完成只读查证，或如实说明探测失败与尚未核实的范围。"
+        )
+    else:
+        reason = (
+            "【user-guard 未实查即下否定结论拦截】本轮尚未执行任何实质只读或命令核查（成功 0 条），"
+            "不得直接宣称“已核实未连接/不存在/不可用”。"
+            "请按 R3.6/R4 先对本机已连渠道执行只读核实，或如实标明尚未核查。"
+        )
+    return {"decision": decision, "reason": reason}
+
+
 _PENDING_TICKET_STATUS_RE = re.compile(
     r"票据(?:[：:]|\s+)\s*`*([0-9a-fA-F_-]{8,64})`*[^\n]*?状态[：:]\s*`*PENDING`*\b",
     re.I,
@@ -1178,6 +1322,9 @@ def _handle_stop_locked(payload: Dict[str, Any], state_dir: Path, conversation_i
 
     if correction := _check_test_suite_locked(payload, latest_reply, state_file, state, conversation_id, turn_key, "continue"):
         return correction
+    if neg_block := _check_unverified_negative_claim_locked(payload, latest_reply, state_file, state, conversation_id, turn_key, "continue"):
+        log_event("Stop:reply_repeat_guard", conversation_id, f"BLOCKED unverified negative claim in {turn_key}")
+        return neg_block
 
     # 同一 step_index 幂等保护（防止重复投递误累加）
     last_step = turn_rec.get("lastStepIndex")
@@ -1504,6 +1651,11 @@ def handle_claude_stop_repeat_guard(payload: Dict[str, Any], state_dir: Optional
             })
             if correction := _check_test_suite_locked(payload, reply, state_file, state, sid, turn_key, "block"):
                 return correction
+            if neg_block := _check_unverified_negative_claim_locked(payload, reply, state_file, state, sid, turn_key, "block"):
+                user_words.append_jsonl_log(logs_dir / "lifecycle.log", {
+                    "event": "Stop:unverified_negative_claim", "client": client, "session_id": sid, "turn_key": turn_key,
+                })
+                return neg_block
             if ((step is not None and step == record["lastStepIndex"])
                     or (message_id and message_id == record.get("lastMessageId"))):
                 return {}

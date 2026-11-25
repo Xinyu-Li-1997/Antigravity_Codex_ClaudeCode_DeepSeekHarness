@@ -2,6 +2,21 @@
 
 本文件记录四客户端共用规则、会话钩子、后台验证工具与上游维护流程的版本演进。当前插件版本以 `template/user-guard/plugin.json` 为准；常驻使用文档只说明机制和配置键，不重复维护版本号与性能日期。
 
+## [2.0.0] - 2026-11-25
+
+面向科学计算与 CAE 工程研发的 **V2.0 架构里程碑版**：在 `V1.18.13` 四客户端通用防遗漏与防爆窗底座（`read-plan`、`cross-check`、`reconcile`）之上，系统性根治两类“单向负向约束失衡”元问题——确立四级受众文档分层架构与通用机械文档卫生门禁（`--doc-hygiene`），并补齐跨三端的对称防偷懒否定结论守卫，同时面向真实科研与工程读者整篇重写全套公开文档：
+
+- **通用文档卫生守卫与四级受众分层（`cae_harness.py`、`.github/workflows/ci.yml`、`AGENTS.md`、`tests/test_harness_offline.py`、`tests/test_e2e_integration.py`）**：
+  - 在 `cae_harness.py check-grounding` 新增零硬编码黑名单的通用 `--doc-hygiene` 检查（已接入 CI 与 `test_51`），确定性拦截引导句计数与紧邻表格或列表行数矛盾（`count_structure_mismatch`）、补丁沉积超长句与四段以上中文斜杠串（`runon_patch_sentence`、`slash_chain`）、相同长技术细则跨 ≥ 3 份文档逐字复读（`cross_doc_duplication`），以及根目录 `README.md` 超体积预算、泄漏 `_xxx` 私有符号或单段堆砌过多行内代码（`landing_size_budget`、`landing_private_symbol`、`landing_jargon_density`）；
+  - 在 `AGENTS.md` 与 `R0` 确立 T0 入口页（`README.md`）、T1 实战手册（`docs/workflow-guide.md`）、T2 架构与运维参考（`docs/architecture-and-hooks.md`、`template/user-guard/README.md`）、T3 契约与日志（`AGENTS.md`、`rules/AGENTS.md`、`SKILL.md`、`CHANGELOG.md`）四级单点归属边界；重构 `test_51` 与 `test_45`，解除历史测试对 6 份文档粘贴 `S1` 销账细则及向入口 `README.md` 强插内部键名的反分层约束。
+- **对称诚实披露规则与三端未实查否定结论守卫（`template/user-guard/rules/AGENTS.md`、`template/user-guard/hooks/reply_repeat_guard.py`、`tests/test_guards_offline.py`）**：
+  - 补正 `R3.6`、`R4` 与 `R11` 的对称边界：明确对“未连接、不存在、查不到、不可用”等否定结论与“全部通过”同等要求实证，项目外写边界不禁止对本机已连通资源做只读诊断，公开脱敏仅约束对外或入仓输出而严禁在本机排障命令中提前遮蔽导致自我致盲，且不得以 `R11` 为由跳过用户提示已就绪渠道的本地只读核查；
+  - 在 `reply_repeat_guard.py` 新增跨 Antigravity、Codex、Claude Code 三端通用的 `_check_unverified_negative_claim_locked`（复用三端轨迹统计 `_turn_tool_probe_stats`）：本回合零实质探测或探测命令全部报错退出（成功 `0` 条）却宣称“已核实未连接/不存在/不可用”时触发 1 次拦截，续跑态、至少一条实质探测成功以及诚实标明局部排查范围或仅转述规则时均不误拦。
+- **全套公开文档与配图整篇重写（`README.md`、`docs/workflow-guide.md`、`docs/architecture-and-hooks.md`、`template/user-guard/README.md`、`SKILL.md`、`docs/assets/*.svg`、`CITATION.cff`）**：
+  - 彻底清理入口文档中的内部行话堆砌与跨文档 4 倍复读：`README.md` 由 `30 KB` 精简至约 `13 KB`，`template/user-guard/README.md` 精简至 `2.4 KB`，拆解 `docs/workflow-guide.md`、`docs/architecture-and-hooks.md` 与 `cae-harness/SKILL.md` 的全部超长补丁句，并同步更新流程图文案与学术引用摘要；全仓 22 份文档在 `check-grounding --target . --strict --doc-hygiene` 下零告警通过。
+
+---
+
 ## [1.18.13] - 2026-11-25
 
 面向四客户端通用架构补齐三阶段确定性防遗漏与防爆窗机制——确定性机械对账表（`reconcile`）、读前双口径尺寸评估与保守层级分片（`read-plan`）、跨端分片盲读汇总核对（`cross-check`），并根治三项既有生命周期门禁漏洞：

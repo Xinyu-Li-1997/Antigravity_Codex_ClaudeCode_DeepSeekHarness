@@ -8088,6 +8088,94 @@ else:
         self.assertIn('shared_blind_spot', merged_text)
         self.assertIn('cross_client_finding_divergence', merged_text)
 
+    def test_doc_hygiene_universal_checks(self):
+        """通用文档卫生守卫：拦截计数失步、补丁超长句与斜杠串、跨文档逐字复读及入口页内部符号与密度超标。"""
+        proj = self.root / 'doc_hygiene_proj'
+        (proj / 'docs').mkdir(parents=True)
+        (proj / 'src').mkdir(parents=True)
+        (proj / 'src' / 'solver.py').write_text(
+            'def _internal_helper():\n    return 1\n\ndef compute_flux(dt, cfl, rtol, atol, nstep, mesh, bc, lim):\n    return dt\n',
+            encoding='utf-8',
+        )
+        dup_clause = '单路求解流在省略默认通道编号时必须匹配具体模型名称并且不得以占位词替代核心校验项'
+        long_sent = '本求解器支持' + ('高阶间断有限元离散与隐式时间推进及自适应网格加密并保持守恒性' * 8) + '。'
+        (proj / 'README.md').write_text(
+            '# 求解器总览\n\n'
+            '下面把最容易出错的三个环节列成清单：\n\n'
+            '| 环节 | 说明 |\n'
+            '| --- | --- |\n'
+            '| 1 | 网格 |\n'
+            '| 2 | 通量 |\n'
+            '| 3 | 边界 |\n'
+            '| 4 | 验收 |\n\n'
+            '核心流程调用 `_internal_helper` 处理异常，并联动 `dt`、`cfl`、`rtol`、`atol`、`nstep`、`mesh`、`bc`、`lim` 八个参数。\n\n'
+            '注意防范 零复跑/局部补测/矛盾宣称/漏报 这类斜杠串。\n\n'
+            f'{long_sent}\n\n'
+            f'说明（{dup_clause}）。\n',
+            encoding='utf-8',
+        )
+        (proj / 'docs' / 'guide.md').write_text(
+            '# 使用指南\n\n'
+            f'执行约束（补充：{dup_clause}）。\n',
+            encoding='utf-8',
+        )
+        (proj / 'docs' / 'arch.md').write_text(
+            '# 架构说明\n\n'
+            f'底层规则（细则：{dup_clause}）。\n',
+            encoding='utf-8',
+        )
+
+        # 默认 check-grounding 仅做词法锚定，不报错；开启 --doc-hygiene 检出全部结构卫生缺陷
+        code_hyg, rep_hyg = self.capture(
+            harness.cmd_check_grounding,
+            self.args('check-grounding', '--target', str(proj), '--root', str(proj), '--strict', '--doc-hygiene'),
+        )
+        self.assertEqual(code_hyg, 2)
+        self.assertFalse(rep_hyg['ok'])
+        cats = set(rep_hyg['counts_by_category'])
+        self.assertIn('count_structure_mismatch', cats)
+        self.assertIn('landing_private_symbol', cats)
+        self.assertIn('landing_jargon_density', cats)
+        self.assertIn('slash_chain', cats)
+        self.assertIn('runon_patch_sentence', cats)
+        self.assertIn('cross_doc_duplication', cats)
+
+        # 超大入口 README 触发 landing_size_budget
+        big_proj = self.root / 'doc_hygiene_big'
+        big_proj.mkdir()
+        (big_proj / 'README.md').write_text('# Big\n\n' + ('简洁说明段落。\n\n' * 1000), encoding='utf-8')
+        rep_big = harness.audit_doc_grounding(big_proj, root_dir=big_proj, doc_hygiene=True)
+        self.assertIn('landing_size_budget', rep_big['counts_by_category'])
+
+        # 干净的分层文档（含合法 2 项列表、带引号口诀、POSIX 路径与唯一真源细则）应零告警通过
+        clean_proj = self.root / 'doc_hygiene_clean'
+        (clean_proj / 'docs').mkdir(parents=True)
+        (clean_proj / 'src').mkdir(parents=True)
+        (clean_proj / 'src' / 'solver.py').write_text('def compute_flux(u):\n    return u\n', encoding='utf-8')
+        (clean_proj / 'README.md').write_text(
+            '# 求解器总览\n\n'
+            '只需记住“两步定位，三步验算”就行：\n\n'
+            '1. 安装依赖。\n'
+            '2. 运行算例，脚本位于 `src/solver.py`。\n\n'
+            '以下两项为核心特性：\n\n'
+            '| 特性 | 说明 |\n'
+            '| --- | --- |\n'
+            '| 守恒 | 离散质量守恒 |\n'
+            '| 稳定 | 显隐时间推进 |\n',
+            encoding='utf-8',
+        )
+        (clean_proj / 'docs' / 'arch.md').write_text(
+            '# 架构说明\n\n'
+            f'唯一真源细则（{dup_clause}）。\n',
+            encoding='utf-8',
+        )
+        code_clean, rep_clean = self.capture(
+            harness.cmd_check_grounding,
+            self.args('check-grounding', '--target', str(clean_proj), '--root', str(clean_proj), '--strict', '--doc-hygiene'),
+        )
+        self.assertEqual(code_clean, 0, rep_clean)
+        self.assertTrue(rep_clean['ok'])
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

@@ -37,7 +37,7 @@
   <g><rect x="32" y="652" width="850" height="150" rx="14" fill="#eefaf4" stroke="#81bfa0"/>
     <text x="54" y="686" class="heading">完成核验与主会话 R6 终审：按验证深度如实披露</text>
     <text x="54" y="717" class="body">派单完工硬出机械对账表（&lt;run_id&gt;_reconcile.md）；多端回执用 cross-check 查覆盖矩阵与分歧。</text>
-    <text x="54" y="743" class="body">Stop 核验成败、Token、同名回执消歧与 reconcile_file 链接，拦截零复跑与矛盾宣称全过。</text>
+    <text x="54" y="743" class="body">Stop 对称拦截矛盾宣称全过与未实查否定结论，核验 Token、回执与对账链接。</text>
     <text x="54" y="769" class="body">主会话亲自核对原文件行号与算术汇总，区分配置就位、离线单测与实际环境实测。</text>
   </g>
   <g><rect x="914" y="112" width="494" height="248" rx="14" fill="#f3efff" stroke="#b8a7dc"/>
@@ -68,9 +68,9 @@
     <text x="54" y="876" class="heading">共有钩子模块分工与各客户端宿主事件适配</text>
     <text x="54" y="907" class="body">恢复与调用前：session_context_loader.py 与 handoff_gate.py 还原原话、关键返回与未决确认单并评估交接阶段。</text>
     <text x="54" y="933" class="body">工具执行前：status_guard.py 与 handoff_gate.py 检查写边界、重复读日志、直接调 CLI、批准票据与收尾限制。</text>
-    <text x="54" y="959" class="body">回合结束时：reply_repeat_guard.py 与 handoff_gate.py 检查刷屏、零复跑/矛盾宣称、完成回执、reconcile_file 与交接词。</text>
+    <text x="54" y="959" class="body">回合结束时：reply_repeat_guard.py 与 handoff_gate.py 拦刷屏、矛盾全过与未实查否定，核对回执与对账。</text>
     <text x="54" y="985" class="body">协议映射：Antigravity 挂 4 类事件；Codex/Claude 挂 5 类事件；DSH 为 soft_rules_only 并由 install.py 探测 hook_protocol。</text>
     <text x="54" y="1011" class="body">共享基础库：user_words.py 与 hooks/_lib/ 承载跨平台锁、自适应阈值、轨迹解析与完成回执记录持久化。</text>
-    <text x="54" y="1037" class="body">离线确定性核验：check-grounding、read-plan、cross-check 与 reconcile 零模型调用，四端通用且不替代运行验证。</text>
+    <text x="54" y="1037" class="body">离线确定性工具：check-grounding（含 --doc-hygiene）、read-plan、cross-check 与 reconcile 四端通用。</text>
   </g>
 </svg>

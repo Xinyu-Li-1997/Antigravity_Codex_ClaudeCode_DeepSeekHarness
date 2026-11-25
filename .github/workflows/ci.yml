@@ -81,7 +81,7 @@ jobs:
           assert all(name in payload for name in ("antigravity", "codex", "claude", "dsh", "cc_switch")), payload
 
           grounding = subprocess.run(
-              [*py, "template/user-guard/skills/cae-harness/scripts/cae_harness.py", "check-grounding", "--target", ".", "--strict"],
+              [*py, "template/user-guard/skills/cae-harness/scripts/cae_harness.py", "check-grounding", "--target", ".", "--strict", "--doc-hygiene"],
               cwd=repo, capture_output=True, text=True, encoding="utf-8", errors="replace",
           )
           if grounding.returncode != 0:

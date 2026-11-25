@@ -3030,8 +3030,9 @@ raise SystemExit(module.main(sys.argv[3:]))
         self.assertIn("China Scholarship Council", readme_text)
         self.assertIn("202506280162", readme_text)
         self.assertIn("留金选[2025]37号", readme_text)
-        self.assertIn("general_project", readme_text)
-        self.assertIn("upstream_config_repo", readme_text)
+        arch_text_mode = (REPO_ROOT / "docs" / "architecture-and-hooks.md").read_text(encoding="utf-8")
+        self.assertIn("general_project", arch_text_mode)
+        self.assertIn("upstream_config_repo", arch_text_mode)
 
         # 2. 验证安装后的 fleet_state.py 在通用课题目录返回结构化退出码 2，且终审归位强制校验文档事实锚定
         state_py = TEMPLATE_DIR / "skills" / "fleet-evolve" / "scripts" / "fleet_state.py"
@@ -3296,6 +3297,8 @@ raise SystemExit(module.main(sys.argv[3:]))
             self.assertIn("install.py", all_managed)
             self.assertIn("README.md", all_managed)
 
+        # 按 R0 单点归属原则：单流省略 S1 销账细则由 cae-harness/SKILL.md 单点维护，不再强制广播复读进 6 份文档；
+        # 全仓所有文档均不得残留旧版模糊表述。
         s1_clause = "省略默认流号 `S1` 时须匹配具体模型名，仅在未记录具体模型名时可用任务状态词替代"
         s1_docs = (
             TEMPLATE_DIR / "rules" / "AGENTS.md",
@@ -3305,18 +3308,17 @@ raise SystemExit(module.main(sys.argv[3:]))
             TEMPLATE_DIR / "skills" / "cae-harness" / "SKILL.md",
             TEMPLATE_DIR / "skills" / "fleet-evolve" / "SKILL.md",
         )
+        harness_skill_text = (TEMPLATE_DIR / "skills" / "cae-harness" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn(s1_clause, harness_skill_text, "cae-harness/SKILL.md 须作为单流省略 S1 销账契约的唯一真源")
         for doc_path in s1_docs:
             rel_doc = doc_path.relative_to(REPO_ROOT).as_posix()
             doc_body = doc_path.read_text(encoding="utf-8")
-            self.assertIn(s1_clause, doc_body, f"{rel_doc} 缺少统一的单流省略 S1 销账契约表述")
             self.assertNotIn("可用模型名或任务状态替代", doc_body, f"{rel_doc} 残留旧版 S1 销账表述")
             self.assertNotIn("可用模型名或任务状态代替默认流号", doc_body, f"{rel_doc} 残留旧版 S1 销账表述")
 
         wf_text = (REPO_ROOT / "docs" / "workflow-guide.md").read_text(encoding="utf-8")
-        self.assertIn("单路 `gate`", wf_text)
         self.assertNotIn("单轮 `gate`", wf_text)
 
-        harness_skill_text = (TEMPLATE_DIR / "skills" / "cae-harness" / "SKILL.md").read_text(encoding="utf-8")
         self.assertIn("禁止微调 `engine`", harness_skill_text)
         self.assertIn('"$HARNESS" probe --caller auto --redact', harness_skill_text)
         self.assertIn('"$HARNESS" assess --caller auto --redact', harness_skill_text)
@@ -3332,10 +3334,19 @@ raise SystemExit(module.main(sys.argv[3:]))
         self.assertNotIn("改用 `python3 -B -X utf8` 与 `~`", arch_text)
         self.assertIsNone(re.search(r'"~[/\\]', arch_text))
         self.assertIn("活跃 `AWAITING_MASTER_RELOAD` Pass 2 重启锁及损坏状态文件", arch_text)
+        self.assertIn("`sync_codex_model_defaults`", arch_text)
+        self.assertIn("`sync_claude_model_defaults`", arch_text)
 
-        readme_text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn("`sync_codex_model_defaults`", readme_text)
-        self.assertIn("`sync_claude_model_defaults`", readme_text)
+        # 全仓文档同时通过零黑名单事实锚定与通用文档卫生守卫（受众分层、计数一致、防补丁长句与跨文档复读）
+        harness_py = TEMPLATE_DIR / "skills" / "cae-harness" / "scripts" / "cae_harness.py"
+        hyg_proc = subprocess.run(
+            [sys.executable, "-B", "-X", "utf8", str(harness_py), "check-grounding", "--target", ".", "--strict", "--doc-hygiene"],
+            cwd=REPO_ROOT, capture_output=True, text=True, encoding="utf-8", timeout=30,
+        )
+        self.assertEqual(hyg_proc.returncode, 0, hyg_proc.stdout + hyg_proc.stderr)
+        hyg_rep = json.loads(hyg_proc.stdout)
+        self.assertTrue(hyg_rep.get("ok"), hyg_rep)
+        self.assertEqual(hyg_rep.get("finding_count"), 0, hyg_rep)
 
 
 if __name__ == "__main__":

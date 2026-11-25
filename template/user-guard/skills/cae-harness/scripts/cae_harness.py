@@ -7435,7 +7435,313 @@ def _audit_single_doc_text(rel_path, doc_text, anchor, baseline_text=''):
     return findings
 
 
-def audit_doc_grounding(target_path, root_dir=None, *, base_ref=None, allow_files=None, extra_allowed_text=''):
+_HYGIENE_CN_NUMS = {'两': 2, '二': 2, '三': 3, '四': 4, '五': 5, '六': 6, '七': 7, '八': 8, '九': 9, '十': 10}
+_HYGIENE_COUNT_CLAIM_RE = re.compile(
+    r'(?<!前)(?<!至少)(?<!最多)(?<!至多)(?<!约)(?<!每)(?<!含)(?<!其中)(?<!第)(?<!共)'
+    r'([两二三四五六七八九十]|\b(?:[2-9]|1\d|20)\b)\s*(?:个|类|项|步|条|层|道|种|大)'
+    r'(?:[^\n。；，,：:]{0,18})[：:]\s*$'
+)
+_HYGIENE_TABLE_SEP_RE = re.compile(r'^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*$')
+_HYGIENE_LIST_ITEM_RE = re.compile(r'^([ \t]*)(?:[-*+]|\d+\.)\s+\S')
+_HYGIENE_SLASH_CHAIN_RE = re.compile(
+    r'(?<![A-Za-z0-9_./:\\-])([\u4e00-\u9fffA-Za-z0-9_-]{1,20}(?:/[\u4e00-\u9fffA-Za-z0-9_-]{1,20}){3,})(?![A-Za-z0-9_./:-])'
+)
+_HYGIENE_PRIVATE_SYM_RE = re.compile(r'^_([a-z][a-z0-9_]{2,})$')
+_HYGIENE_DUP_EXEMPT_RE = re.compile(
+    r'(?:Apache\s*License|Copyright\s+\d{4}|国家留学基金|China\s+Scholarship\s+Council|留金选|python3?\s+-B\s+-X\s+utf8)',
+    re.I,
+)
+
+
+def _hygiene_parse_count(tok):
+    if tok in _HYGIENE_CN_NUMS:
+        return _HYGIENE_CN_NUMS[tok]
+    try:
+        return int(tok)
+    except ValueError:
+        return None
+
+
+def _hygiene_iter_unmasked_lines(doc_text):
+    """产出 (line_no, raw_line, in_fence, in_math) 元组，跳过围栏代码块与独立数学公式块。"""
+    in_fence = False
+    fence_char = ''
+    fence_len = 0
+    in_math = False
+    for idx, raw in enumerate(doc_text.splitlines(), 1):
+        s = raw.lstrip()
+        m = re.match(r'^(`{3,}|~{3,})(.*)$', s)
+        if m:
+            ticks, rest = m.group(1), m.group(2)
+            if not in_fence:
+                if ticks[0] not in rest:
+                    in_fence = True
+                    fence_char = ticks[0]
+                    fence_len = len(ticks)
+                yield idx, raw, True, in_math
+                continue
+            if ticks[0] == fence_char and len(ticks) >= fence_len and not rest.strip():
+                in_fence = False
+                fence_char = ''
+                fence_len = 0
+                yield idx, raw, True, in_math
+                continue
+        if not in_fence and s.strip() == '$$':
+            in_math = not in_math
+            yield idx, raw, False, True
+            continue
+        yield idx, raw, in_fence, in_math
+
+
+def _hygiene_following_block_count(lines_meta, start_pos):
+    """检查紧随声明行之后的结构块，若是 Markdown 表格或顶层列表则返回 (kind, count)。"""
+    n = len(lines_meta)
+    pos = start_pos
+    while pos < n:
+        _, raw, in_f, in_m = lines_meta[pos]
+        if in_f or in_m:
+            return None, 0
+        if not raw.strip():
+            pos += 1
+            continue
+        break
+    if pos >= n:
+        return None, 0
+
+    # 1. Markdown 表格：header + separator + data rows
+    _, first_raw, in_f, in_m = lines_meta[pos]
+    if not in_f and not in_m and '|' in first_raw and pos + 1 < n and _HYGIENE_TABLE_SEP_RE.match(lines_meta[pos + 1][1]):
+        rows = 0
+        cur = pos + 2
+        while cur < n:
+            _, rline, rf, rm = lines_meta[cur]
+            if rf or rm or not rline.strip() or '|' not in rline:
+                break
+            rows += 1
+            cur += 1
+        return ('table', rows) if rows >= 2 else (None, 0)
+
+    # 2. 顶层有序/无序列表：统计相同起始缩进的连续条目
+    m0 = _HYGIENE_LIST_ITEM_RE.match(first_raw)
+    if m0:
+        base_indent = len(m0.group(1).expandtabs(4))
+        items = 0
+        cur = pos
+        while cur < n:
+            _, rline, rf, rm = lines_meta[cur]
+            if rf or rm:
+                # 缩进围栏代码块可属于当前列表项
+                cur += 1
+                continue
+            if not rline.strip():
+                # 仅当后续非空行仍是同缩进或更深缩进的列表/续行时继续
+                nxt = cur + 1
+                while nxt < n and not lines_meta[nxt][1].strip() and not lines_meta[nxt][2]:
+                    nxt += 1
+                if nxt >= n:
+                    break
+                nm = _HYGIENE_LIST_ITEM_RE.match(lines_meta[nxt][1])
+                nxt_indent = len(lines_meta[nxt][1]) - len(lines_meta[nxt][1].lstrip(' \t'))
+                if (nm and len(nm.group(1).expandtabs(4)) == base_indent) or nxt_indent > base_indent:
+                    cur += 1
+                    continue
+                break
+            if rline.lstrip().startswith('#') or rline.lstrip().startswith('---'):
+                break
+            lm = _HYGIENE_LIST_ITEM_RE.match(rline)
+            if lm:
+                cur_indent = len(lm.group(1).expandtabs(4))
+                if cur_indent == base_indent:
+                    items += 1
+                elif cur_indent < base_indent:
+                    break
+            else:
+                cur_indent = len(rline) - len(rline.lstrip(' \t'))
+                if cur_indent <= base_indent:
+                    break
+            cur += 1
+        return ('list', items) if items >= 2 else (None, 0)
+    return None, 0
+
+
+def _audit_docs_hygiene(
+    doc_entries,
+    *,
+    landing_max_bytes=18000,
+    max_cjk_sentence_chars=220,
+    max_ascii_sentence_chars=480,
+    max_sentence_semicolons=4,
+    dup_min_chars=36,
+    dup_min_files=3,
+    landing_max_inline_codes=8,
+):
+    """通用零黑名单文档卫生校验：计数一致、补丁长句/斜杠串、跨文档复读与 T0 入口清晰度。"""
+    findings = []
+    seen = set()
+
+    def record(rel_path, line_no, category, token, reason):
+        key = (rel_path, line_no, category, str(token)[:80])
+        if key in seen:
+            return
+        seen.add(key)
+        findings.append({
+            'file': rel_path,
+            'line': line_no,
+            'category': category,
+            'token': str(token)[:120],
+            'reason': reason,
+        })
+
+    dup_index = {}  # norm_clause -> list[(rel_path, line_no, raw_clause)]
+
+    for rel_path, doc_text in doc_entries:
+        if not rel_path.lower().endswith('.md'):
+            continue
+        is_changelog = Path(rel_path).name.upper() == 'CHANGELOG.MD'
+        is_agent_prompt = '/agents/' in f'/{rel_path}'
+        is_landing = rel_path == 'README.md'
+
+        # 1. T0 入口文档体积预算
+        if is_landing:
+            utf8_size = len(doc_text.encode('utf-8'))
+            if utf8_size > landing_max_bytes:
+                record(
+                    rel_path, 1, 'landing_size_budget',
+                    f'{utf8_size} B > {landing_max_bytes} B',
+                    '根目录 README.md 超过入口页精简预算，建议将底层架构或维护细节下沉到 docs/ 子文档',
+                )
+
+        if is_changelog:
+            continue
+
+        lines_meta = list(_hygiene_iter_unmasked_lines(doc_text))
+        for idx, (line_no, raw_line, in_fence, in_math) in enumerate(lines_meta):
+            if in_fence or in_math:
+                continue
+            stripped = raw_line.strip()
+            if not stripped or stripped.startswith('<!--') or stripped.startswith('>'):
+                continue
+
+            is_heading = stripped.startswith('#')
+            is_table = stripped.startswith('|') or bool(_HYGIENE_TABLE_SEP_RE.match(stripped))
+
+            # 2. 计数声明与紧邻表格/列表行数一致性
+            if not is_heading and not is_table:
+                no_code = re.sub(r'`[^`\r\n]*`', ' ', stripped)
+                no_quotes = re.sub(r'“[^”\n]*”|"[^"\n]*"', ' ', no_code)
+                cm = _HYGIENE_COUNT_CLAIM_RE.search(no_quotes)
+                if cm:
+                    declared = _hygiene_parse_count(cm.group(1))
+                    kind, actual = _hygiene_following_block_count(lines_meta, idx + 1)
+                    if declared is not None and kind and actual >= 2 and actual != declared:
+                        label = '表格数据行' if kind == 'table' else '顶层列表项'
+                        record(
+                            rel_path, line_no, 'count_structure_mismatch',
+                            f'{cm.group(0).strip()} ({declared} != {actual})',
+                            f'引导句声明 {declared} 项，但紧随其后的{label}为 {actual} 项，存在补丁残留计数失步',
+                        )
+
+            # 3. 散文补丁超长句与连续斜杠术语串
+            if not is_heading and not is_table:
+                prose = re.sub(r'!\[[^\]]*\]\([^)]+\)', ' ', stripped)
+                prose = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', prose)
+                prose = re.sub(r'https?://\S+', ' ', prose)
+                prose_no_code = re.sub(r'`[^`\r\n]*`', ' ', prose)
+                # 连续 4 段以上含中文斜杠术语串
+                for sm in _HYGIENE_SLASH_CHAIN_RE.finditer(prose_no_code):
+                    tok = sm.group(1)
+                    if re.search(r'[\u4e00-\u9fff]', tok):
+                        record(
+                            rel_path, line_no, 'slash_chain', tok,
+                            '散文存在四段及以上连续斜杠术语串，建议改写为自然工程表述',
+                        )
+                # 补丁沉积超长单句 / 多重分号串烧
+                prose_clean = re.sub(r'\*\*|__|`', '', prose)
+                for sent in re.split(r'[。！？]+|(?<=\.)\s+(?=[A-Z])', prose_clean):
+                    seg = sent.strip()
+                    if not seg:
+                        continue
+                    has_cjk = bool(re.search(r'[\u4e00-\u9fff]', seg))
+                    limit = max_cjk_sentence_chars if has_cjk else max_ascii_sentence_chars
+                    semi_count = seg.count('；') + seg.count(';')
+                    if len(seg) > limit or semi_count >= max_sentence_semicolons:
+                        record(
+                            rel_path, line_no, 'runon_patch_sentence',
+                            f'{seg[:48]}... ({len(seg)} chars, {semi_count} semicolons)',
+                            '单句过长或堆叠过多分号补丁，建议拆分为清晰的短句或独立条目',
+                        )
+
+            # 4. T0 入口页防内部私有符号与高密度反引号行话
+            if is_landing:
+                code_spans = [sp.strip() for sp in re.findall(r'`([^`\r\n]+)`', stripped) if sp.strip()]
+                for sp in code_spans:
+                    if not (sp.startswith('__') and sp.endswith('__')) and _HYGIENE_PRIVATE_SYM_RE.match(sp):
+                        record(
+                            rel_path, line_no, 'landing_private_symbol', sp,
+                            '根目录 README.md 不应直接暴露内部下划线私有符号，建议下沉至架构参考文档',
+                        )
+                if not is_heading and not is_table:
+                    uniq_codes = set(code_spans)
+                    if len(uniq_codes) >= landing_max_inline_codes:
+                        record(
+                            rel_path, line_no, 'landing_jargon_density',
+                            f'{len(uniq_codes)} inline code tokens',
+                            '根目录 README.md 单段散文堆砌过多行内代码标识符，建议改用自然工程语言并把细节链接到子文档',
+                        )
+
+            # 5. 收集跨文档逐字复读候选子句（跳过镜像代理模板与纯标题/表头）
+            if not is_agent_prompt and not is_heading and not _HYGIENE_TABLE_SEP_RE.match(stripped):
+                clean_dup = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', stripped)
+                clean_dup = re.sub(r'https?://\S+', ' ', clean_dup)
+                for clause in re.split(r'[。；！？\n|（）]+', clean_dup):
+                    raw_c = clause.strip()
+                    if not raw_c or _HYGIENE_DUP_EXEMPT_RE.search(raw_c):
+                        continue
+                    norm_c = re.sub(r'[\s`*_~“”"\'()【】\[\]、，,：:·\-—]+', '', raw_c)
+                    if len(norm_c) < dup_min_chars:
+                        continue
+                    if len(re.findall(r'[\u4e00-\u9fff]', norm_c)) < 16:
+                        continue
+                    # 按固定窗口取归一化切片，既能抓整句复读也能抓换个前缀的细则粘贴
+                    win = dup_min_chars
+                    stride = max(6, win // 4)
+                    offsets = list(range(0, max(1, len(norm_c) - win + 1), stride))
+                    tail_off = len(norm_c) - win
+                    if tail_off > 0 and tail_off not in offsets:
+                        offsets.append(tail_off)
+                    for off in offsets:
+                        shingle = norm_c[off : off + win]
+                        if len(re.findall(r'[\u4e00-\u9fff]', shingle)) >= 16:
+                            dup_index.setdefault(shingle, []).append((rel_path, line_no, raw_c))
+
+    # 每个文档至多针对同一行报告一次跨文档复读（避免相邻切片重复刷屏）
+    reported_dup_lines = set()
+    for shingle, occs in dup_index.items():
+        distinct_files = sorted({r for r, _, _ in occs})
+        if len(distinct_files) >= dup_min_files:
+            file_list = ', '.join(distinct_files[:4]) + ('...' if len(distinct_files) > 4 else '')
+            for rel_path, line_no, raw_c in occs:
+                if (rel_path, line_no) in reported_dup_lines:
+                    continue
+                reported_dup_lines.add((rel_path, line_no))
+                record(
+                    rel_path, line_no, 'cross_doc_duplication',
+                    f'{shingle[:44]} ({len(distinct_files)} files)',
+                    f'相同长技术细则在 {len(distinct_files)} 份文档中重复粘贴（{file_list}），建议单点维护并改用交叉链接',
+                )
+
+    return findings
+
+
+def audit_doc_grounding(
+    target_path,
+    root_dir=None,
+    *,
+    base_ref=None,
+    allow_files=None,
+    extra_allowed_text='',
+    doc_hygiene=False,
+):
     """对目标文档或目录执行零黑名单确定性事实锚定核验（标识符、缩写、容量数字与举例词干）。"""
     target = Path(target_path).expanduser().resolve()
     if not target.exists():
@@ -7505,9 +7811,12 @@ def audit_doc_grounding(target_path, root_dir=None, *, base_ref=None, allow_file
                                      target=target)
     all_findings = []
     checked_files = []
+    hygiene_entries = []
     for fpath, rel in doc_files:
         checked_files.append(rel)
         raw_doc = _optional_text(fpath)
+        if doc_hygiene and fpath.suffix.lower() == '.md':
+            hygiene_entries.append((rel, raw_doc))
         baseline_txt = ''
         if verified_commit and git_toplevel:
             resolved_doc = fpath.resolve()
@@ -7531,12 +7840,15 @@ def audit_doc_grounding(target_path, root_dir=None, *, base_ref=None, allow_file
             if baseline_txt:
                 baseline_txt = _extract_latest_changelog_section(baseline_txt)
         all_findings.extend(_audit_single_doc_text(rel, raw_doc, anchor, baseline_txt))
+    if doc_hygiene:
+        all_findings.extend(_audit_docs_hygiene(hygiene_entries))
     by_category = collections.Counter(item['category'] for item in all_findings)
     return {
         'ok': not all_findings,
         'root': str(root),
         'target': str(target),
         'base_ref': base_ref or None,
+        'doc_hygiene': bool(doc_hygiene),
         'checked_file_count': len(checked_files),
         'checked_files': checked_files,
         'finding_count': len(all_findings),
@@ -7551,6 +7863,7 @@ def cmd_check_grounding(args):
         args.root or None,
         base_ref=args.base_ref or None,
         allow_files=args.allow_from_file or (),
+        doc_hygiene=bool(getattr(args, 'doc_hygiene', False)),
     )
     status = 'verification_failed' if (args.strict and not report['ok']) else 'ok'
     return _print({'status': status, 'workspace_mode': detect_workspace_mode(args.root or args.target), **report})
@@ -13265,6 +13578,7 @@ def build_arg_parser():
     grounding.add_argument('--base-ref', default='', help='可选 Git 基线引用（如 HEAD），额外拦截改写期间新增的无依据领域短语')
     grounding.add_argument('--allow-from-file', action='append', default=[], help='额外纳入允许锚点语料的说明或需求文件路径')
     grounding.add_argument('--strict', action='store_true', help='检出任何无依据标识符、缩写、定量数字或举例词干时返回非零退出码')
+    grounding.add_argument('--doc-hygiene', action='store_true', help='额外执行通用文档卫生检查：计数与结构一致、补丁长句与斜杠串、跨文档逐字复读及入口页清晰度')
     reconcile = sub.add_parser('reconcile', help='纯确定性离线机械对账表：核对实改与未更新代码/文档、强显式依赖与义务结算')
     reconcile.add_argument('--target', default='.', help='待对账的仓库或目录路径')
     reconcile.add_argument('--base-ref', default='', help='可选 Git 基线引用（如 HEAD 或提交哈希），用于独立点名核对工作区改动')

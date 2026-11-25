@@ -32,7 +32,7 @@ description: >
 
 评估结果交用户在审批节点决定启停，写入 `subscription_matrix`（`enabled: false` 全局跳过），并按两条正交能力轴拆解角色归属：① **无确定性验证器场景下的审慎拒答校准**（未闭环理论总控、论文定稿与正向立论）；② **有硬验证器约束下的代理闭环执行与挑刺吞吐**（受 `--write-scope` 与 `--verify-cmd` 约束的实现流、并行编码流与反例挑刺流）。联网刷新与本机实测日期分别写入 `capability_ledger`。
 
-第二道离线复查门禁、确认单票据、压缩恢复与完工回执核验由 `cae_harness.py` 及四阶段钩子统一守卫（单路 `task` 或 `gate` 省略默认流号 `S1` 时须匹配具体模型名，仅在未记录具体模型名时可用任务状态词替代），操作细则见 [cae-harness/SKILL.md](../cae-harness/SKILL.md)。
+第二道离线复查门禁、确认单票据、压缩恢复与完工回执核验由 `cae_harness.py` 及四阶段钩子统一守卫，操作细则见 [cae-harness/SKILL.md](../cae-harness/SKILL.md)。
 
 ## 四类必须经用户审批的节点
 
@@ -56,7 +56,7 @@ python -B -X utf8 template/user-guard/skills/cae-harness/scripts/cae_harness.py 
 重要文档按需做 `clean_room` 盲读、主会话整篇精炼重写、源码事实与公开脱敏校核。文件采用 UTF-8 无 BOM 和 LF；两份 `AGENTS.md` 各自严格小于 `16,000 B`。公开文档禁含真实用户名、内网 IP、具体硬件型号、凭据、账号精确账单指纹或会话唯一标识。验收严禁放宽容差、守恒残差与收敛阶判据，严禁删改断言或将局部补测冒充全量回归通过：
 
 ```powershell
-python -B -X utf8 template/user-guard/skills/cae-harness/scripts/cae_harness.py check-grounding --target . --strict
+python -B -X utf8 template/user-guard/skills/cae-harness/scripts/cae_harness.py check-grounding --target . --strict --doc-hygiene
 python -B -X utf8 -m unittest tests.test_e2e_integration
 python -B -X utf8 -m unittest discover -s tests -p "test_*.py" -v
 ```

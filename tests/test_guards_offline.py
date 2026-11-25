@@ -3994,6 +3994,101 @@ class TestDispatchAndBillingGuards(unittest.TestCase):
                 self.assertNotIn("reason", with_link)
                 self.assertTrue(json.loads(rec_ledger.read_text(encoding="utf-8"))[0]["reported_to_user"])
 
+    def test_unverified_negative_claim_guard_three_clients(self):
+        """Antigravity / Codex / Claude 三端统一拦截零执行或全报错探测后的绝对否定宣称，实查成功或如实保留不确定性则放行。"""
+        claim_reply = "已核实本机状态：当前并没有连接到第二台物理主机，也没有映射网络盘。"
+        hedged_reply = "仅核查了 SSH 配置（未找到对端条目），尚未核实直连网口邻居与共享目录，需进一步确认。"
+        meta_reply = "规则 R3.6 规定，本轮命令报错时不得宣称已核实未连接。"
+
+        def write_rows(path, rows):
+            path.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n", encoding="utf-8")
+
+        def run_case(client, sid, tool_entries, reply, active=False):
+            tp = self.root / f"neg_{client}_{sid}.jsonl"
+            if client == "antigravity":
+                rows = [{"step_index": 0, "type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "查一下网线对端"}]
+                rows.extend(tool_entries)
+                rows.append({"step_index": len(rows), "type": "PLANNER_RESPONSE", "content": reply})
+                write_rows(tp, rows)
+                payload = {
+                    "conversationId": sid,
+                    "transcriptPath": str(tp),
+                    "terminationReason": "model_stop",
+                    "continuationActive": active,
+                }
+                with unittest.mock.patch.object(reply_repeat_guard, "get_data_dirs", return_value=(self.state, self.logs)):
+                    return reply_repeat_guard.handle_stop_repeat_guard(payload)
+            if client == "codex":
+                rows = [{"type": "event_msg", "payload": {"type": "user_message", "message": "查一下网线对端"}}]
+                rows.extend(tool_entries)
+                rows.append({"type": "event_msg", "payload": {"type": "task_complete", "last_agent_message": reply}})
+                write_rows(tp, rows)
+                payload = {
+                    "_client": "codex",
+                    "session_id": sid,
+                    "transcript_path": str(tp),
+                    "last_assistant_message": reply,
+                    "stop_hook_active": active,
+                }
+                return reply_repeat_guard.handle_claude_stop_repeat_guard(payload, state_dir=self.state, logs_dir=self.logs)
+            rows = [{"type": "user", "uuid": "u-neg", "message": {"role": "user", "content": "查一下网线对端"}}]
+            rows.extend(tool_entries)
+            rows.append({"type": "assistant", "uuid": "a-neg", "message": {"id": f"m-{sid}", "content": [{"type": "text", "text": reply}]}})
+            write_rows(tp, rows)
+            payload = {
+                "_client": "claude",
+                "session_id": sid,
+                "transcript_path": str(tp),
+                "last_assistant_message": reply,
+                "stop_hook_active": active,
+            }
+            return reply_repeat_guard.handle_claude_stop_repeat_guard(payload, state_dir=self.state, logs_dir=self.logs)
+
+        for client in ("antigravity", "codex", "claude"):
+            expected_block = "continue" if client == "antigravity" else "block"
+            with self.subTest(neg_client=client):
+                # 1) 零实质探测（Antigravity 仅有 update_focus OK 亦不算实质探测）-> 拦截
+                trivial = [{"step_index": 1, "type": "GENERIC", "content": "Created At: t\nCompleted At: t\nOK"}] if client == "antigravity" else []
+                res_zero = run_case(client, f"zero-{client}", trivial, claim_reply)
+                self.assertEqual(res_zero.get("decision"), expected_block)
+                self.assertIn("未实查即下否定结论拦截", res_zero.get("reason", ""))
+
+                # 2) 所有探测命令均报错/非零退出 -> 拦截并报告失败数
+                if client == "antigravity":
+                    failed_rows = [
+                        {"step_index": 1, "type": "GENERIC", "status": "DONE", "content": "Command exited with code 1.\nbash syntax error"},
+                        {"step_index": 2, "type": "GENERIC", "status": "ERROR", "content": "tool call denied by pre-tool hook"},
+                    ]
+                    ok_rows = [{"step_index": 1, "type": "GENERIC", "status": "DONE", "content": "Command exited with code 0.\npeer-host reachable"}]
+                elif client == "codex":
+                    failed_rows = [
+                        {"type": "response_item", "payload": {"type": "function_call_output", "call_id": "c1", "output": "Exit code: 1\nsyntax error"}},
+                        {"type": "response_item", "payload": {"type": "local_shell_call_output", "call_id": "c2", "output": json.dumps({"output": "err", "metadata": {"exit_code": 2}})}},
+                    ]
+                    ok_rows = [{"type": "response_item", "payload": {"type": "function_call_output", "call_id": "c1", "output": "Exit code: 0\nno shares"}}]
+                else:
+                    failed_rows = [
+                        {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "t1", "is_error": True, "content": "bash syntax error"}]}},
+                        {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "t2", "content": "Command exited with code 1"}]}},
+                    ]
+                    ok_rows = [{"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "t1", "content": "Command exited with code 0\nno shares"}]}}]
+
+                res_fail = run_case(client, f"allfail-{client}", failed_rows, claim_reply)
+                self.assertEqual(res_fail.get("decision"), expected_block)
+                self.assertIn("失败 2 条", res_fail.get("reason", ""))
+
+                # 3) 续跑态不二次拦截
+                res_cont = run_case(client, f"allfail-{client}", failed_rows, claim_reply, active=True)
+                self.assertNotIn("reason", res_cont)
+
+                # 4) 有至少一条实质探测成功 -> 放行
+                res_ok = run_case(client, f"ok-{client}", ok_rows, claim_reply)
+                self.assertNotIn("reason", res_ok)
+
+                # 5) 诚实标明局部排查范围或仅转述规则条文 -> 零探测亦不误拦
+                self.assertNotIn("reason", run_case(client, f"hedge-{client}", [], hedged_reply))
+                self.assertNotIn("reason", run_case(client, f"meta-{client}", [], meta_reply))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
