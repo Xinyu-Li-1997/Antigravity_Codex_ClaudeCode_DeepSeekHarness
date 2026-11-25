@@ -3815,6 +3815,71 @@ class TestHeavyWorkflowLifecycle(unittest.TestCase):
         self.assertEqual(res_tbl["decision"], "allow")
         self.assertEqual(user_words.load_unreported_heavy_completions(cid_tbl, self.state), [])
 
+    def test_stage23_handoff_allowlist_and_three_client_bounded_workflow_recovery(self):
+        # 1) handoff_gate 放行 reconcile / read-plan / cross-check（无写标志为 readonly_inspect，带写标志非 blocked_always）
+        for sub in ("reconcile", "read-plan", "cross-check"):
+            self.assertEqual(
+                handoff_gate._classify_run_command(f"python -B -X utf8 cae_harness.py {sub} --target ."),
+                "readonly_inspect",
+            )
+            self.assertEqual(
+                handoff_gate._classify_run_command(f"python -B -X utf8 cae_harness.py {sub} --target . --output-md out.md"),
+                "mutating_other",
+            )
+
+        # 2) 三端（含 Codex/Claude session-context 子目录）恢复时均带回 reconcile_file 与活跃 read-plan 指针
+        base_state = self.root / "three_client_state"
+        sub_state = base_state / "session-context"
+        sub_state.mkdir(parents=True, exist_ok=True)
+        sid = "stage23-rec-sid"
+        user_words.atomic_write_json(
+            base_state / "dispatch_plans" / "read_plans" / f"session_{sid}_latest.json",
+            {
+                "plan_id": "rp-123", "session_id": sid,
+                "report_file": str(base_state / "dispatch_plans" / "read_plans" / "rp-123_read_plan.md"),
+                "plan_json_file": str(base_state / "dispatch_plans" / "read_plans" / "rp-123_read_plan.json"),
+                "summary_line": "共 12 文件；拆为 3 片、2 波次",
+            },
+        )
+        user_words.atomic_write_json(
+            sub_state / "heavy_completions" / f"{sid}.json",
+            [{
+                "run_id": "run-rec-1", "all_succeeded": True, "reported_to_user": False, "subcommand": "batch",
+                "receipt_file": str(base_state / "r1.json"),
+                "reconcile_file": str(base_state / "reconcile" / "run-rec-1_reconcile.md"),
+                "reconcile_summary": "实改 2 文件；强关联未更新文档 1 份",
+                "streams": [{"stream_id": "S1", "engine": "codex", "model": "m1", "succeeded": True, "status": "ok", "token_usage": {"total_tokens": 99}}],
+                "token_usage_summary": {"total_tokens": 99},
+            }],
+        )
+        blocks = session_context_loader._workflow_recovery_blocks(sid, sub_state)
+        joined = "\n".join(blocks)
+        self.assertIn("run-rec-1_reconcile.md", joined)
+        self.assertIn("rp-123_read_plan.md", joined)
+        self.assertIn("活跃读前分片计划", joined)
+
+        # 3) S2-H4 附加块有界保护：堆积多条大账单时严格收口在 max_chars 内，且保留待批票据与对账表文件名
+        big_sid = "stage23-bounded-sid"
+        many_completions = [
+            {
+                "run_id": f"run-many-{i}", "all_succeeded": True, "reported_to_user": False, "subcommand": "batch",
+                "receipt_file": f"receipts/run_{i}.json",
+                "reconcile_file": f"reconcile/run_{i}_reconcile.md",
+                "reconcile_summary": "实改 1 文件",
+                "streams": [
+                    {"stream_id": f"S{j}", "engine": "codex:gpt-6.2-sol", "model": "gpt-6.2-sol", "succeeded": True,
+                     "status": "ok", "token_usage": {"input_tokens": 1000 * j, "output_tokens": 200 * j, "total_tokens": 1200 * j}}
+                    for j in range(1, 6)
+                ],
+                "token_usage_summary": {"total_tokens": 18000},
+            }
+            for i in range(15)
+        ]
+        user_words.atomic_write_json(self.state / "heavy_completions" / f"{big_sid}.json", many_completions)
+        bounded_blocks = session_context_loader._workflow_recovery_blocks(big_sid, self.state, max_chars=2400)
+        self.assertLessEqual(sum(len(b) for b in bounded_blocks), 2400)
+        self.assertIn("run_0_reconcile.md", "\n".join(bounded_blocks))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

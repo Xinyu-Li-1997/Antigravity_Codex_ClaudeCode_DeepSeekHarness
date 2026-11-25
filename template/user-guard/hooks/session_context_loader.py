@@ -15,6 +15,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 import traceback
@@ -667,9 +668,54 @@ def build_compaction_system_message(
 
 # ⑤ Antigravity 恢复流程与兼容入口
 
-def _workflow_recovery_blocks(session_id: str, state_dir: Path, ticket=None) -> List[str]:
-    """专项计划与未报账单独立于有界原话摘要，不随摘要截断。"""
-    blocks = []
+_WORKFLOW_RECOVERY_MAX_CHARS = 4800
+
+
+def _load_session_read_plan_pointer(session_id: str, state_dir: Path) -> Optional[Dict[str, Any]]:
+    """跨三端（Antigravity / Codex / Claude）统一查找绑定本会话的轻量阅读分片计划指针。"""
+    if not session_id or not user_words.valid_session_id(session_id):
+        return None
+    safe_sid = re.sub(r"[^A-Za-z0-9._-]+", "_", session_id.strip())
+    if not safe_sid:
+        return None
+    bases = [state_dir]
+    if state_dir.name == "session-context":
+        bases.append(state_dir.parent)
+    for base in bases:
+        ptr = base / "dispatch_plans" / "read_plans" / f"session_{safe_sid}_latest.json"
+        if not ptr.is_file() or ptr.is_symlink():
+            continue
+        data = user_words._read_state_json(ptr)
+        if isinstance(data, dict) and data.get("report_file"):
+            return data
+    return None
+
+
+def _render_heavy_completions_block(completions: List[Dict[str, Any]], *, compact: bool = False) -> str:
+    lines = ["【待汇报重负载完工账单】"]
+    for entry in completions:
+        head = (
+            "运行：" + str(entry.get("run_id"))
+            + "；全部成功：" + str(entry.get("all_succeeded"))
+            + "；回执：" + str(entry.get("receipt_file") or "未记录")
+        )
+        if entry.get("reconcile_file"):
+            rec_sum = str(entry.get("reconcile_summary") or "").strip()
+            head += "；机械对账：" + str(entry["reconcile_file"]) + (f"（{rec_sum}）" if rec_sum else "")
+        lines.append(head)
+        if not compact:
+            for stream in entry.get("streams", []):
+                lines.append("流：" + str(stream.get("stream_id")) + "；引擎：" + str(stream.get("engine"))
+                             + "；模型：" + str(stream.get("model")) + "；成功：" + str(stream.get("succeeded"))
+                             + "；状态：" + str(stream.get("status")) + "；Token："
+                             + json.dumps(stream.get("token_usage"), ensure_ascii=False, sort_keys=True))
+        lines.append("Token 汇总：" + json.dumps(entry.get("token_usage_summary"), ensure_ascii=False, sort_keys=True))
+    return "\n".join(lines)
+
+
+def _workflow_recovery_blocks(session_id: str, state_dir: Path, ticket=None, *, max_chars: int = _WORKFLOW_RECOVERY_MAX_CHARS) -> List[str]:
+    """专项待批票据按 R9 独立完整保留；完工账单（含机械对账链接）与活跃阅读计划指针受确定性字符上限保护防膨胀。"""
+    ticket_blocks: List[str] = []
     if isinstance(ticket, list):
         pending_tickets = [item for item in ticket if isinstance(item, dict)]
     elif isinstance(ticket, dict):
@@ -677,21 +723,54 @@ def _workflow_recovery_blocks(session_id: str, state_dir: Path, ticket=None) -> 
     else:
         pending_tickets = user_words.find_session_pending_tickets(session_id, state_dir)
     for pending_ticket in pending_tickets:
-        blocks.append(user_words.render_pending_workflow_block(pending_ticket))
+        ticket_blocks.append(user_words.render_pending_workflow_block(pending_ticket))
+
     completions = user_words.load_unreported_heavy_completions(session_id, state_dir)
-    if completions:
-        lines = ["【待汇报重负载完工账单】"]
-        for entry in completions:
-            lines.append("运行：" + str(entry.get("run_id")) + "；全部成功：" + str(entry.get("all_succeeded"))
-                         + "；回执：" + str(entry.get("receipt_file") or "未记录"))
-            for stream in entry.get("streams", []):
-                lines.append("流：" + str(stream.get("stream_id")) + "；引擎：" + str(stream.get("engine"))
-                             + "；模型：" + str(stream.get("model")) + "；成功：" + str(stream.get("succeeded"))
-                             + "；状态：" + str(stream.get("status")) + "；Token："
-                             + json.dumps(stream.get("token_usage"), ensure_ascii=False, sort_keys=True))
-            lines.append("Token 汇总：" + json.dumps(entry.get("token_usage_summary"), ensure_ascii=False, sort_keys=True))
-        blocks.append("\n".join(lines))
-    return blocks
+    comp_block = _render_heavy_completions_block(completions, compact=False) if completions else ""
+
+    read_ptr_block = ""
+    read_ptr = _load_session_read_plan_pointer(session_id, state_dir)
+    if read_ptr:
+        summary_short = str(read_ptr.get("summary_line") or "").strip()[:140]
+        read_ptr_block = (
+            f"【活跃读前分片计划】{summary_short}；清单：{read_ptr['report_file']}"
+            + (f"（计划 JSON：{read_ptr['plan_json_file']}）" if read_ptr.get("plan_json_file") else "")
+        )
+
+    aux_blocks: List[str] = []
+    if comp_block:
+        aux_blocks.append(comp_block)
+    if read_ptr_block:
+        aux_blocks.append(read_ptr_block)
+
+    cap = max(1200, int(max_chars or _WORKFLOW_RECOVERY_MAX_CHARS))
+    if aux_blocks and sum(len(b) for b in aux_blocks) > cap:
+        # 完工账单与阅读指针超上限时先折叠逐路冗余 JSON，仅保留运行号、成败、回执与机械对账链接
+        compact_aux: List[str] = []
+        if completions:
+            compact_aux.append(_render_heavy_completions_block(completions, compact=True))
+        if read_ptr_block:
+            compact_aux.append(read_ptr_block)
+        if sum(len(b) for b in compact_aux) <= cap:
+            aux_blocks = compact_aux
+        else:
+            trimmed: List[str] = []
+            used = 0
+            for blk in compact_aux:
+                rem = cap - used
+                if rem <= 120:
+                    break
+                if len(blk) <= rem:
+                    trimmed.append(blk)
+                    used += len(blk)
+                else:
+                    suffix = "\n…（完工账单与阅读指针已按安全上限折叠，完整明细请直接查阅上述磁盘回执/对账表文件）"
+                    trimmed.append(blk[: max(0, rem - len(suffix))] + suffix)
+                    used = cap
+                    break
+            aux_blocks = trimmed
+
+    return ticket_blocks + aux_blocks
 
 
 def _handle_context_locked(conversation_id: str, event_name: str, explicit_source: str,

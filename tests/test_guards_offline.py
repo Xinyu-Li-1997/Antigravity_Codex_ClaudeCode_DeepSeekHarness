@@ -2508,25 +2508,37 @@ class TestDispatchAndBillingGuards(unittest.TestCase):
     def test_suite_claim_uses_only_current_tool_results_and_strict_size_thresholds(self):
         full_fail = "Ran 20 tests in 1s\n\nFAILED (failures=1)"
         local_pass = "2 passed in 0.1s"
-        cases = (
+        allowed_cases = (
             ("19-failed", [full_fail.replace("20", "19"), local_pass], "全量单测全部通过"),
-            ("no-local", [full_fail], "20 项测试全绿"),
-            ("wrong-order", [local_pass, full_fail], "20 passed"),
             ("exact-half", [full_fail, "10 passed in 0.2s"], "全量单测全部通过"),
             ("full-rerun", [full_fail, local_pass, "Ran 21 tests in 1s\n\nOK"], "全量单测全部通过"),
             ("different-count", [full_fail, local_pass], "120 passed"),
             ("quoted-claim", [full_fail, local_pass], "> 全量单测全部通过\n以上是待核对的旧记载。"),
             ("prior-turn", [full_fail, None, local_pass], "全量单测全部通过"),
             ("honest-claim", [full_fail, local_pass], "20 项测试未全部通过，2 项局部补测全部通过"),
+            ("honest-no-rerun", [full_fail], "20 项测试未全绿，存在 1 项失败"),
         )
-        for name, outputs, claim in cases:
-            with self.subTest(name=name):
+        for name, outputs, claim in allowed_cases:
+            with self.subTest(allowed=name):
                 self.trace.write_text("", encoding="utf-8")
                 for index, output in enumerate(outputs):
                     row = ({"type": "USER_INPUT", "content": "开始新回合"} if output is None else
                            {"type": "TOOL_RESULT", "content": output})
                     _append_jsonl(self.trace, dict(row, step_index=index))
                 self.assertEqual(self.stop("antigravity", f"suite-{name}", claim), {"decision": "allow"})
+        # S2-H2 收紧：全量套件失败后未复跑或复跑发生在失败之前，不得宣称全套测试全绿/全部通过
+        blocked_cases = (
+            ("no-local", [full_fail], "20 项测试全绿"),
+            ("wrong-order", [local_pass, full_fail], "20 passed"),
+        )
+        for name, outputs, claim in blocked_cases:
+            with self.subTest(blocked=name):
+                self.trace.write_text("", encoding="utf-8")
+                for index, output in enumerate(outputs):
+                    _append_jsonl(self.trace, {"type": "TOOL_RESULT", "content": output, "step_index": index})
+                resp = self.stop("antigravity", f"suite-blk-{name}", claim)
+                self.assertEqual(resp["decision"], "continue")
+                self.assertIn("尚未有全量复跑通过记录", resp["reason"])
         self.trace.write_text("", encoding="utf-8")
         _append_jsonl(self.trace, {"type": "PLANNER_RESPONSE", "source": "MODEL", "content": full_fail})
         _append_jsonl(self.trace, {"type": "TOOL_RESULT", "content": local_pass})
@@ -3881,6 +3893,106 @@ class TestDispatchAndBillingGuards(unittest.TestCase):
         saved_hc = json.loads(hc_file.read_text(encoding="utf-8"))
         self.assertTrue(saved_hc[0]["reported_to_user"])
         self.assertFalse(saved_hc[1]["reported_to_user"])
+
+    def test_stage1_ps_backtick_contradicted_dup_receipt_and_reconcile_three_clients(self):
+        from _lib import shell_lex
+
+        # 1) PowerShell 尾部反引号续行在 _dispatch_commands 中合并，不误拆 --ticket / --plan-dir
+        ps_cmd = (
+            'python -B -X utf8 cae_harness.py batch `\r\n'
+            '  --ticket deadbeef1234 `\r\n'
+            '  --plan-dir "C:/tmp/plan_state" `\r\n'
+            '  --session-id s-ps'
+        )
+        dispatches = list(status_guard._dispatch_commands(ps_cmd))
+        self.assertEqual(len(dispatches), 1)
+        self.assertIn("batch", dispatches[0])
+        self.assertIn("--ticket", dispatches[0])
+        self.assertIn("deadbeef1234", dispatches[0])
+        self.assertIn("--plan-dir", dispatches[0])
+
+        # POSIX 多行反引号命令替换不得被错误合并：交互式触发确认 (ask)，无头模式硬阻断 (deny)
+        posix_backtick = "echo `\nrm -rf /opt/outside_secret\n`"
+        self.assertEqual(shell_lex.join_powershell_line_continuations(posix_backtick), posix_backtick)
+        posix_payload = {
+            "hook_event_name": "PreToolUse", "session_id": "ps-posix-1", "cwd": str(self.project),
+            "tool_name": "Bash", "tool_input": {"command": posix_backtick},
+        }
+        self.assertEqual(
+            status_guard.handle_claude_pre_tool_use(posix_payload, self.state, self.logs)
+            .get("hookSpecificOutput", {}).get("permissionDecision"),
+            "ask",
+        )
+        with unittest.mock.patch.dict(os.environ, {"CAE_HARNESS_DEPTH": "1"}):
+            self.assertEqual(
+                status_guard.handle_claude_pre_tool_use(posix_payload, self.state, self.logs)
+                .get("hookSpecificOutput", {}).get("permissionDecision"),
+                "deny",
+            )
+
+        # 2) contradicted 封堵“全部成功 + 顺带提失败”同句矛盾绕过，放行诚实否定“未全部成功”
+        for client in ("antigravity", "codex", "claude"):
+            sid = f"contra-{client}"
+            ledger = self.completion(sid)
+            with self.subTest(contradicted_client=client):
+                bypass_reply = "S1、S2 全部成功。S2 失败记录另附。Token 26。回执 receipt.json"
+                blocked = self.stop(client, sid, bypass_reply)
+                self.assertEqual(blocked["decision"], "continue" if client == "antigravity" else "block")
+                self.assertFalse(json.loads(ledger.read_text(encoding="utf-8"))[0]["reported_to_user"])
+                honest_reply = "S1 成功，S2 超时，未全部成功。Token 26。回执 receipt.json"
+                allowed = self.stop(client, sid, honest_reply, active=True)
+                self.assertNotIn("reason", allowed)
+                self.assertTrue(json.loads(ledger.read_text(encoding="utf-8"))[0]["reported_to_user"])
+
+        # 3) 同名裸回执文件（两次运行均写入 batch.json）须凭 run_id / 对账表名 / 上级目录消歧
+        dup_sid = "dup-receipt-sid"
+        hc_dir = self.state / "heavy_completions"
+        hc_dir.mkdir(parents=True, exist_ok=True)
+        dup_ledger = hc_dir / f"{dup_sid}.json"
+        dup_ledger.write_text(json.dumps([
+            {
+                "run_id": "aaaa1111bbbb2222", "reported_to_user": False, "subcommand": "batch",
+                "receipt_file": str(self.root / "r1" / "batch.json"), "all_succeeded": True,
+                "token_usage_summary": {"total_tokens": 10},
+                "streams": [{"stream_id": "S1", "engine": "codex", "model": "m1", "succeeded": True, "status": "ok", "token_usage": {"total_tokens": 10}}],
+            },
+            {
+                "run_id": "cccc3333dddd4444", "reported_to_user": False, "subcommand": "batch",
+                "receipt_file": str(self.root / "r2" / "batch.json"), "all_succeeded": True,
+                "token_usage_summary": {"total_tokens": 15},
+                "streams": [{"stream_id": "S2", "engine": "codex", "model": "m2", "succeeded": True, "status": "ok", "token_usage": {"total_tokens": 15}}],
+            },
+        ]), encoding="utf-8")
+        ambiguous = self.stop("codex", dup_sid, "S1、S2 成功；Token 25；回执 batch.json")
+        self.assertEqual(ambiguous.get("decision"), "block")
+        self.assertFalse(json.loads(dup_ledger.read_text(encoding="utf-8"))[0]["reported_to_user"])
+        disambiguated = self.stop("codex", dup_sid, "S1(aaaa1111) 与 S2(cccc3333) 成功；Token 25；回执 batch.json", active=True)
+        self.assertEqual(disambiguated, {})
+        self.assertTrue(all(item["reported_to_user"] for item in json.loads(dup_ledger.read_text(encoding="utf-8"))))
+
+        # 4) reconcile_file 机械对账表链接在 Antigravity / Codex / Claude 三端通用硬校验
+        for client in ("antigravity", "codex", "claude"):
+            sid = f"reconcile-link-{client}"
+            rec_ledger = hc_dir / f"{sid}.json"
+            rec_name = f"{sid}_reconcile.md"
+            rec_ledger.write_text(json.dumps([{
+                "run_id": f"run-{client}", "reported_to_user": False, "subcommand": "batch",
+                "receipt_file": str(self.root / f"{sid}_receipt.json"),
+                "reconcile_file": str(self.root / "reconcile" / rec_name),
+                "reconcile_summary": "实改 1 文件（源码 1、测试 0、文档 0、配置 0）；强关联未更新文档 1 份",
+                "all_succeeded": True,
+                "token_usage_summary": {"total_tokens": 42},
+                "streams": [{"stream_id": "S1", "engine": "codex", "model": "m1", "succeeded": True, "status": "ok", "token_usage": {"total_tokens": 42}}],
+            }]), encoding="utf-8")
+            with self.subTest(reconcile_client=client):
+                missing = self.stop(client, sid, f"S1 成功；Token 42；回执 {sid}_receipt.json")
+                self.assertEqual(missing["decision"], "continue" if client == "antigravity" else "block")
+                self.assertIn(rec_name, missing["reason"])
+                self.assertIn("机械对账表", missing["reason"])
+                self.assertFalse(json.loads(rec_ledger.read_text(encoding="utf-8"))[0]["reported_to_user"])
+                with_link = self.stop(client, sid, f"S1 成功；Token 42；回执 {sid}_receipt.json；对账 [{rec_name}](file:///tmp/{rec_name})", active=True)
+                self.assertNotIn("reason", with_link)
+                self.assertTrue(json.loads(rec_ledger.read_text(encoding="utf-8"))[0]["reported_to_user"])
 
 
 if __name__ == "__main__":

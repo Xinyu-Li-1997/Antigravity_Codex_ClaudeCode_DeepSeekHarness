@@ -201,7 +201,13 @@ flowchart TD
      --resume-ticket "<票据标识>" --plan-dir "<授权票据目录>" --user-prompt "<用户点名原话>"
    ```
 3. **持久化续接、双层超时抢救与完工核验**：外部无头会话默认持久化（`--ephemeral` 关闭）。到达软时限时先自动降挡向独立 `result_wrapup.json` 紧凑收口（`agy` 遇后台活跃回合直接短路防死锁）；硬超时仍保留总超时、部分 Token（`cli_partial_on_timeout`）与 `timeout_salvage`。后续可用 `followup --receipt <回执路径> [--stream <流号>] [--effort <挡位>] --task "<追问>"` 沿原会话边界追问（续接超时回执未指定挡位时自动按 `followup_default_effort` 降挡；原回执标记 `resumable: false` 则直接拦截提醒分片重开）。
-   任务结束后，`reply_repeat_guard.py` 在 `Stop` 拦截把局部补测冒充全过、把含失败或超时的账单写成“全部成功”的表述，并核对回复是否覆盖成败词、Token 用量（兼容 Markdown 表格账单与“无法统计”说明）、外部流标识（单路 `task` 或单路 `gate` 省略默认流号 `S1` 时须匹配具体模型名，仅在未记录具体模型名时可用任务状态词替代）与回执文件名（原生任务对应完成数量、流标识或角色名及轨迹说明）。主会话仍须亲自核对状态、`citation_audit` 原文行号与汇总算术。
+   任务结束后，重负载派单自动生成确定性机械对账表落盘至 `<plan_dir>/reconcile/<run_id>_reconcile.md`，并在回执 `reconciliation.chat_line` 提供单行可点击链接（不挤占聊天上下文），列出已更新/未更新源码与文档、AST/Markdown 强逻辑依赖、只读交付覆盖及显式义务结算结果。在准备读取大型仓库或长文档前，可先运行 `read-plan` 做读前尺寸评估与保守层级分片（自动按双口径防爆窗、切分超大单文件行段并导出可供 `plan --spec-file` 审批的多端分波清单），多端回执完工后用 `cross-check` 做确定性覆盖矩阵与分歧回源核对，并一键并入总机械对账表：
+   ```powershell
+   python -B -X utf8 "$HARNESS" read-plan --target "<项目根目录>" --shared-files "AGENTS.md" --cross-client-mode risk-tiered --emit-spec "<分片工作流.json>"
+   python -B -X utf8 "$HARNESS" cross-check --target "<项目根目录>" --receipt "<回执路径>" --read-plan "<阅读计划JSON>"
+   python -B -X utf8 "$HARNESS" reconcile --target "<项目根目录>" --base-ref HEAD --cross-check "<跨端核对JSON>"
+   ```
+   `reply_repeat_guard.py` 在 Antigravity、Codex、Claude Code 三端 `Stop` 钩子中统一拦截把未全量复跑的局部补测冒充全过、把含失败或超时的账单写成“全部成功”的表述，并按 `run_id` 核对回复是否覆盖成败词、Token 用量（兼容 Markdown 表格账单与“无法统计”说明）、外部流标识（单路 `task` 或单路 `gate` 省略默认流号 `S1` 时须匹配具体模型名，仅在未记录具体模型名时可用任务状态词替代）、同名回执消歧、回执文件名以及机械对账表链接（原生任务对应完成数量、流标识或角色名及轨迹说明）。主会话仍须亲自核对状态、`citation_audit` 原文行号与汇总算术。
 
 ---
 

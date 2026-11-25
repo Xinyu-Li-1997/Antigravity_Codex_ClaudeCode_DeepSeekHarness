@@ -805,6 +805,11 @@ def _render_heavy_bill(entries):
                 str(row.get("engine") or "未提供 agent") + " / " + str(row.get("model") or "未提供模型"),
                 outcome, usage_text(row.get("token_usage")) + "；" + str(row.get("receipt_file") or entry.get("receipt_file") or "未提供回执路径"))) + " |")
         lines.append("Token 汇总：" + usage_text(entry.get("token_usage_summary")) + "；回执：" + str(entry.get("receipt_file") or "未提供").replace("\r\n", "\n").replace("\r", " ").replace("\n", " "))
+        rec_file = str(entry.get("reconcile_file") or "").strip()
+        if rec_file:
+            rec_sum = str(entry.get("reconcile_summary") or "").strip()
+            suffix = f"（{rec_sum}）" if rec_sum else ""
+            lines.append("机械对账表：" + rec_file.replace("\r\n", "\n").replace("\r", " ").replace("\n", " ") + suffix)
     return "\n".join(lines)
 
 
@@ -883,7 +888,14 @@ def _check_heavy_report_locked(payload, state_dir, sid, turn_key, reply, decisio
         # 允许词项后紧跟英文句末句点（只要句点后非标识符字符），同时大小写不敏感。
         return bool(re.search(rf"(?<![A-Za-z0-9_.-]){re.escape(token)}(?!(?:[A-Za-z0-9_-]|\.[A-Za-z0-9_-]))", reply, re.I))
 
+    ext_receipt_counts: Dict[str, int] = {}
+    for entry in entries:
+        if not entry.get("native") and entry.get("receipt_file"):
+            fname_key = str(entry["receipt_file"]).replace(chr(92), "/").rsplit("/", 1)[-1].casefold()
+            ext_receipt_counts[fname_key] = ext_receipt_counts.get(fname_key, 0) + 1
+
     bound = True
+    missing_reconcile = False
     for entry in entries:
         rows = entry.get("streams", [])
         if entry.get("native"):
@@ -910,11 +922,48 @@ def _check_heavy_report_locked(payload, state_dir, sid, turn_key, reply, decisio
                     status_bound = (not has_concrete_model) and has_token(task_status)
                     bound &= single_task and (model_bound or status_bound)
             if entry.get("receipt_file"):
-                filename = str(entry["receipt_file"]).replace(chr(92), "/").rsplit("/", 1)[-1]
-                bound &= has_token(filename)
-    contradicted = (any(entry.get("all_succeeded") is False for entry in entries)
-                    and re.search(r"(?:全部|全数)(?:成功|完成|通过)|\ball\s+(?:succeeded|completed|passed)\b", reply, re.I)
-                    and not failure)
+                norm_receipt = str(entry["receipt_file"]).replace(chr(92), "/")
+                filename = norm_receipt.rsplit("/", 1)[-1]
+                file_ok = has_token(filename)
+                if ext_receipt_counts.get(filename.casefold(), 0) > 1:
+                    # 多个未汇报运行共用同一裸文件名时，须以 run_id（前 8 位或完整）、唯一对账表文件名或完整路径区分。
+                    rid = str(entry.get("run_id") or "")
+                    rec_name = str(entry.get("reconcile_file") or "").replace(chr(92), "/").rsplit("/", 1)[-1]
+                    parent_pair = "/".join(norm_receipt.rsplit("/", 2)[-2:]) if "/" in norm_receipt else ""
+                    file_ok &= bool(
+                        (rid and (has_token(rid) or has_token(rid[:8])))
+                        or (rec_name and has_token(rec_name))
+                        or (parent_pair and parent_pair.casefold() in reply.replace(chr(92), "/").casefold())
+                    )
+                bound &= file_ok
+            if entry.get("reconcile_file"):
+                rec_name = str(entry["reconcile_file"]).replace(chr(92), "/").rsplit("/", 1)[-1]
+                if rec_name and not has_token(rec_name):
+                    bound = False
+                    missing_reconcile = True
+    unquoted_reply = "\n".join(user_words.markdown_unquoted_lines(reply))
+    non_neg_claims = re.sub(
+        r"(?:未|没有|并未|并非|非|不(?:能|可|应|要|得|宣称)?|勿|切勿)\s*(?:全部|全数)(?:成功|完成|通过)"
+        r"|(?:全部|全数)(?:成功|完成|通过)\s*[:：]\s*(?:false|否|0)\b"
+        r"|\bnot\s+all\s+(?:succeeded|completed|passed)\b"
+        r"|\ball_succeeded\s*[:=]\s*false\b",
+        "",
+        unquoted_reply,
+        flags=re.I,
+    )
+    has_incomplete_entry = any(entry.get("all_succeeded") is False for entry in entries)
+    has_failed_stream = any(
+        (not entry.get("native")) and (
+            any(
+                row.get("succeeded") is False or str(row.get("status") or "").lower() not in ("", "ok")
+                for row in (entry.get("streams") or [])
+            )
+            or (not entry.get("streams") and entry.get("all_succeeded") is False)
+        )
+        for entry in entries
+    )
+    claims_all_ok = bool(re.search(r"(?:全部|全数)(?:成功|完成|通过)|\ball\s+(?:succeeded|completed|passed)\b", non_neg_claims, re.I))
+    contradicted = (has_incomplete_entry and claims_all_ok) or (has_failed_stream and not failure)
     if status and tokens and receipt and bound and not contradicted:
         verified_ids = [str(entry["run_id"]) for entry in entries if not entry.get("native") and entry.get("run_id")]
         user_words.mark_heavy_completions_reported(sid, state_dir, run_ids=verified_ids or None)
@@ -948,8 +997,9 @@ def _check_heavy_report_locked(payload, state_dir, sid, turn_key, reply, decisio
             return None
     state["blocked"] = True
     user_words.atomic_write_json(state_file, state)
-    correction = "磁盘账单含未成功的任务，请如实说明失败、超时或部分完成情况。" if contradicted else ""
-    return {"decision": decision, "reason": "【user-guard 重负载完工核验】" + correction + "请在本轮回复补齐各路成败、Token 明细与汇总、回执或子代理日志位置。磁盘账单如下：\n" + _render_heavy_bill(entries)}
+    correction = "磁盘账单含未成功的任务，请如实说明失败、超时或部分完成情况，勿写成全部成功。" if contradicted else ""
+    reconcile_hint = "、机械对账表查看链接" if missing_reconcile else ""
+    return {"decision": decision, "reason": "【user-guard 重负载完工核验】" + correction + f"请在本轮回复补齐各路成败、Token 明细与汇总、回执或子代理日志位置{reconcile_hint}。磁盘账单如下：\n" + _render_heavy_bill(entries)}
 
 
 _SUITE_RESULTS = re.compile(
@@ -1006,12 +1056,19 @@ def _check_test_suite_locked(payload, reply, state_file, state, sid, turn_key, d
             passes_since_failure[size] = 0
     for total, largest in passes_since_failure.items():
         subject = rf"(?:全套测试|全量(?:单测|测试|回归测试)|(?<![\d.]){total}(?!\d)\s*(?:项|个|条)?\s*(?:测试(?:用例)?|用例|tests?|cases?)?)"
-        if 0 < 2 * largest < total and re.search(subject + rf"\s*[:：]?\s*(?:均已|已|均|都)?\s*{green}|\bpassed\s+{total}\s+tests?\b", reply, re.I):
+        neg_prefix = r"(?<!未)(?<!没)(?<!非)(?<!勿)(?<!不宣称)(?<!不构成)"
+        claim_re = rf"{neg_prefix}{subject}\s*[:：]?\s*(?:均已|已|均|都)?\s*{green}|\bpassed\s+{total}\s+tests?\b"
+        if 2 * largest < total and re.search(claim_re, reply, re.I):
             if _heavy_report_blocked(state_file.parent, sid, turn_key, payload):
                 return None
             record["blockedSignatures"].append("test-suite")
             _save_repeat_state(state_file, state, sid)
-            return {"decision": decision, "reason": f"【user-guard 测试结果核验】{total} 项测试的运行有失败。请按 R3.6 分别报告已通过的局部补测和待复跑的全量回归。"}
+            reason = (
+                f"【user-guard 测试结果核验】{total} 项测试的运行有失败。请按 R3.6 分别报告已通过的局部补测和待复跑的全量回归。"
+                if largest > 0
+                else f"【user-guard 测试结果核验】{total} 项测试的运行有失败，且之后尚未有全量复跑通过记录。请按 R3.6 如实报告失败项，勿宣称全套测试通过。"
+            )
+            return {"decision": decision, "reason": reason}
     return None
 
 

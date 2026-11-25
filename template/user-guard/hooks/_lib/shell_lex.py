@@ -313,10 +313,19 @@ def split_shell_clauses(cmd_str: str, *, backslash_escape: bool = True) -> List[
             i += 1
             continue
 
-        if backslash_escape and ch == "\\" and i + 1 < n and cmd_str[i + 1] in ";&|{}()\n\"'#":
-            buf.extend((ch, cmd_str[i + 1]))
-            i += 2
-            continue
+        if backslash_escape and ch == "\\" and i + 1 < n:
+            if cmd_str[i + 1] == "\r" and i + 2 < n and cmd_str[i + 2] == "\n":
+                buf.append(" ")
+                i += 3
+                continue
+            if cmd_str[i + 1] == "\n":
+                buf.append(" ")
+                i += 2
+                continue
+            if cmd_str[i + 1] in ";&|{}()\"'#":
+                buf.extend((ch, cmd_str[i + 1]))
+                i += 2
+                continue
 
         if not embedded_braces and ch == "#" and (i == 0 or cmd_str[i - 1] in " \t\r\n;|&({"):
             nl = cmd_str.find("\n", i)
@@ -390,6 +399,85 @@ def split_shell_clauses(cmd_str: str, *, backslash_escape: bool = True) -> List[
     if tail:
         clauses.append(tail)
     return clauses
+
+
+def join_powershell_line_continuations(cmd_str: str) -> str:
+    """安全合并 PowerShell 引号外行尾反引号续行（` + 可选空白 + 换行）。
+
+    仅当引号外所有反引号均严格处于同行非空内容之后的行尾续行位置时才合并，
+    避免吞掉 POSIX 多行反引号命令替换（例如 `echo `\nrm -rf /outside\n``）。
+    """
+    if "`" not in cmd_str or ("\n" not in cmd_str and "\r" not in cmd_str):
+        return cmd_str
+    spans: List[Tuple[int, int]] = []
+    quote_ch: Optional[str] = None
+    line_has_non_ws = False
+    i = 0
+    n = len(cmd_str)
+    while i < n:
+        ch = cmd_str[i]
+        if quote_ch:
+            if quote_ch == "'" and ch == "'" and i + 1 < n and cmd_str[i + 1] == "'":
+                i += 2
+                continue
+            if ch == "\\" and quote_ch == "$'" and i + 1 < n:
+                i += 2
+                continue
+            if ch == "`" and quote_ch == '"' and i + 1 < n:
+                i += 2
+                continue
+            if ch == ("'" if quote_ch == "$'" else quote_ch):
+                quote_ch = None
+            if ch in ("\n", "\r"):
+                line_has_non_ws = False
+            else:
+                line_has_non_ws = True
+            i += 1
+            continue
+        if ch == "$" and i + 1 < n and cmd_str[i + 1] == "'":
+            quote_ch = "$'"
+            line_has_non_ws = True
+            i += 2
+            continue
+        if ch in ("'", '"'):
+            quote_ch = ch
+            line_has_non_ws = True
+            i += 1
+            continue
+        if ch == "#" and (i == 0 or cmd_str[i - 1] in " \t\r\n;|&({"):
+            nl = cmd_str.find("\n", i)
+            if nl == -1:
+                break
+            line_has_non_ws = False
+            i = nl + 1
+            continue
+        if ch == "`":
+            j = i + 1
+            while j < n and cmd_str[j] in " \t":
+                j += 1
+            if line_has_non_ws and j < n and cmd_str[j] in ("\r", "\n"):
+                end_j = j + 2 if (cmd_str[j] == "\r" and j + 1 < n and cmd_str[j + 1] == "\n") else j + 1
+                spans.append((i, end_j))
+                line_has_non_ws = False
+                i = end_j
+                continue
+            # 存在非行尾续行的反引号（如 POSIX 命令替换或 PowerShell 字符转义），保守不合并。
+            return cmd_str
+        if ch in ("\n", "\r"):
+            line_has_non_ws = False
+        elif ch not in " \t":
+            line_has_non_ws = True
+        i += 1
+    if not spans:
+        return cmd_str
+    parts: List[str] = []
+    pos = 0
+    for start, end in spans:
+        parts.append(cmd_str[pos:start])
+        parts.append(" ")
+        pos = end
+    parts.append(cmd_str[pos:])
+    return "".join(parts)
 
 
 def strip_quoted_segments(clause: str, *, backslash_escape: bool = True) -> str:

@@ -24,6 +24,9 @@ description: >
 | 独立审查 | `task --kind review` 或 `audit` | 前者用 `--engine role:review`；后者用 `--left`、`--right` 指定双源，`--single` 为单源。 |
 | 文字润色 | `task --kind polish` | 可用 `--engine role:review`；只读返回改写稿和 `grounding_audit`，不得改源码。 |
 | 按回执增量追问 | `followup --receipt <文件>` | 续接原无头会话 `provider_session_id` 追问或补查，继承原读写与快照边界。 |
+| 读前尺寸评估与分片 | `read-plan --target <目录>` | 纯离线零模型调用：按安全预算与内联字节双口径评估大目录/大文件，自动切分超大文件行段并输出保守波次清单与可选 `--emit-spec`。 |
+| 跨端分片汇总核对 | `cross-check --receipt <回执>` | 纯离线零模型调用：核对计划分母 × 客户端覆盖矩阵、共同盲区、多端同位并列/分歧、跨片边与 R6 待回源原文件行号清单。 |
+| 确定性机械对账 | `reconcile --target <目录>` | 纯离线零模型调用：核对已更新与未更新代码/文档、强显式依赖、义务结算及可选 `--cross-check` 并轨，写出可点击 Markdown 账表。 |
 | 省额度快检 | 按实际工作选择 `--kind` | 用 `--engine role:fast`；不存在 `--kind fast`。 |
 
 五个槽位的候选、声明窗口与推荐挡位读取 [fleet_profile.json](fleet_profile.json)，默认跳过自动委派 `ultra`。常规协作按四条原则编排：
@@ -45,7 +48,7 @@ description: >
 
 轻任务按 `runtime_tunables.dispatch_confirmation` 静默执行（单路只读带 `--files` 时按声明文件数计量）。外部无头调用及内部 `invoke_subagent`、`run_workflow`、`spawn_agent`、`Agent`、`swarm` 等多路或可写委派，均须经 `plan` 落盘 `<ticket_id>.json` 与 `<ticket_id>_card.md`（含 4 列总览表与 14 项明细：流号、子任务与范围、通道、客户端及子代理类型、模型名字、挡位、上下文窗口、是否无头、是否净室与隔离级别、访问模式/写入范围/验收命令、内联与超时、当前是否可用、额度类型与状态、回执或日志位置）。日常对话仅展示 3 句话 `chat_brief` 与 `<ticket_id>_card.md` 链接（本地交互勿传 `--redact` 以保留可点击链接），不在聊天框贴表刷屏。
 
-获批后以 `plan --approve-ticket` 登记（`--override-json` 外部无头仅可微调 `engine`/`tier`/`timeout`，原生通道仅可微调 `tier`/`timeout`、禁止微调 `engine`），执行绑定 `--ticket` 并由 `status_guard.py` 核验门禁（持票执行还会校验 `--write-scope`（须为获批范围子集）与 `--verify-cmd` 一致性）。`batch` 仅执行 `cae_harness_headless` 通道并按整数 `wave` 升序运行：前波次同目录可写流失败默认阻断后续波次为 `upstream_wave_failed`（仅声明 `run_on_upstream_failure: true` 的只读流放行）；同波次互不重叠 `write_scope` 可安全并发。压缩恢复、交接门禁与完工回执核验由 `session_context_loader.py`、`handoff_gate.py` 与 `reply_repeat_guard.py` 机械守卫（单路 `task` 或 `gate` 省略默认流号 `S1` 时须匹配具体模型名，仅在未记录具体模型名时可用任务状态词替代），主会话仍须逐路复核状态、Token 明细与汇总算术。
+获批后以 `plan --approve-ticket` 登记（`--override-json` 外部无头仅可微调 `engine`/`tier`/`timeout`，原生通道仅可微调 `tier`/`timeout`、禁止微调 `engine`；规划阶段可选 `--obligations-file` 附带显式义务清单随票据落盘），执行绑定 `--ticket` 并由 `status_guard.py` 核验门禁（持票执行还会校验 `--write-scope`（须为获批范围子集）与 `--verify-cmd` 一致性）。`batch` 仅执行 `cae_harness_headless` 通道并按整数 `wave` 升序运行：前波次同目录可写流失败默认阻断后续波次为 `upstream_wave_failed`（仅声明 `run_on_upstream_failure: true` 的只读流放行）；同波次互不重叠 `write_scope` 可安全并发。重负载派单完工硬触发生成机械对账表落盘至 `<plan_dir>/reconcile/<run_id>_reconcile.md`（不污染目标业务仓库），回执仅附精简 `reconciliation` 摘要与 `chat_line` 链接；压缩恢复、交接门禁与完工回执核验由 `session_context_loader.py`、`handoff_gate.py` 与 `reply_repeat_guard.py` 在三端钩子通用守卫（按 `run_id` 核验回执与 `reconcile_file` 查看链接；单路 `task` 或 `gate` 省略默认流号 `S1` 时须匹配具体模型名，仅在未记录具体模型名时可用任务状态词替代），主会话仍须逐路复核状态、Token 明细与汇总算术。
 
 ## 命令示例
 
@@ -63,6 +66,9 @@ $HARNESS = "$HOME\.gemini\config\plugins\user-guard\skills\cae-harness\scripts\c
 python -B -X utf8 "$HARNESS" probe --caller auto --redact
 python -B -X utf8 "$HARNESS" assess --caller auto --redact
 python -B -X utf8 "$HARNESS" check-grounding --target "<项目根目录>" --strict
+python -B -X utf8 "$HARNESS" read-plan --target "<项目根目录>" --cross-client-mode risk-tiered --emit-spec "<分片工作流.json>"
+python -B -X utf8 "$HARNESS" cross-check --target "<项目根目录>" --receipt "<回执路径>" --read-plan "<阅读计划JSON>"
+python -B -X utf8 "$HARNESS" reconcile --target "<项目根目录>" --base-ref HEAD --cross-check "<跨端核对JSON>"
 ```
 
 多波次与多文件 `--spec-file` 示例（双源审查应显式分端或直接用 `audit`）：

@@ -3939,9 +3939,10 @@ def _native_turn_snapshot(payload: Dict[str, Any], *, all_turns=False) -> Tuple[
 def _dispatch_commands(command: str, depth: int = 0):
     if depth > MAX_WRAPPER_DEPTH:
         return
-    clauses = _split_shell_clauses(command)
-    if r'\"' in command:
-        for extra_cl in _shell_lex.split_shell_clauses(command, backslash_escape=False):
+    normalized_cmd = _shell_lex.join_powershell_line_continuations(command)
+    clauses = _split_shell_clauses(normalized_cmd)
+    if r'\"' in normalized_cmd:
+        for extra_cl in _shell_lex.split_shell_clauses(normalized_cmd, backslash_escape=False):
             if extra_cl not in clauses:
                 clauses.append(extra_cl)
     for raw_clause in clauses:

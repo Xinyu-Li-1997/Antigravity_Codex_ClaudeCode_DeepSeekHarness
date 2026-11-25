@@ -7704,6 +7704,390 @@ else:
                 ('high', 'role_profile_orchestrator_high'),
             )
 
+    def test_stage1_reconcile_baseline_dependencies_obligations_and_cli(self):
+        repo = self.root / 'reconcile_repo'
+        (repo / 'src').mkdir(parents=True)
+        (repo / 'tests').mkdir(parents=True)
+        (repo / 'docs').mkdir(parents=True)
+        (repo / 'src' / '__init__.py').write_text('', encoding='utf-8')
+        (repo / 'src' / 'solver.py').write_text('def compute_flux(u):\n    return u\n', encoding='utf-8')
+        (repo / 'src' / 'driver.py').write_text('from src.solver import compute_flux\n\ndef step(u):\n    return compute_flux(u)\n', encoding='utf-8')
+        (repo / 'tests' / 'test_solver.py').write_text('import src.solver\n\ndef test_ok():\n    assert src.solver.compute_flux(1) == 1\n', encoding='utf-8')
+        (repo / 'docs' / 'design.md').write_text('# 设计\n\n见 [求解器](../src/solver.py) 中的 `compute_flux` 函数。\n', encoding='utf-8')
+        (repo / 'docs' / 'notes.md').write_text('# 杂记\n\n今天讨论了 solver 性能想法，未引用具体符号或路径。\n', encoding='utf-8')
+        (repo / 'docs' / 'preexisting.md').write_text('# 旧脏文档\n初始内容\n', encoding='utf-8')
+
+        git_ok = False
+        try:
+            env = harness._clean_git_env()
+            subprocess.run(['git', '-C', str(repo), 'init'], env=env, check=True, capture_output=True)
+            subprocess.run(['git', '-C', str(repo), 'config', 'user.email', 'test@example.com'], env=env, check=True, capture_output=True)
+            subprocess.run(['git', '-C', str(repo), 'config', 'user.name', 'Test'], env=env, check=True, capture_output=True)
+            subprocess.run(['git', '-C', str(repo), 'add', 'src', 'tests', 'docs/design.md', 'docs/notes.md', 'docs/preexisting.md'], env=env, check=True, capture_output=True)
+            subprocess.run(['git', '-C', str(repo), 'commit', '-m', 'init'], env=env, check=True, capture_output=True)
+            # 制造开工前已脏但本轮不再改动的 preexisting.md
+            (repo / 'docs' / 'preexisting.md').write_text('# 旧脏文档\n开工前已脏\n', encoding='utf-8')
+            git_ok = True
+        except (OSError, subprocess.SubprocessError):
+            git_ok = False
+
+        baseline_file = self.root / 'frozen_baseline.json'
+        code_save, saved = self.capture(
+            harness.cmd_reconcile,
+            self.args('reconcile', '--target', str(repo), '--save-baseline', str(baseline_file)),
+        )
+        self.assertEqual(code_save, 0)
+        self.assertTrue(baseline_file.is_file())
+        if git_ok:
+            self.assertEqual(saved['preexisting_dirty_count'], 1)
+
+        # 修改 src/solver.py 并在任务窗口内直接 commit（验证不因已提交而漏检）
+        (repo / 'src' / 'solver.py').write_text('def compute_flux(u):\n    return u * 2\n', encoding='utf-8')
+        if git_ok:
+            subprocess.run(['git', '-C', str(repo), 'add', 'src/solver.py'], env=harness._clean_git_env(), check=True, capture_output=True)
+            subprocess.run(['git', '-C', str(repo), 'commit', '-m', 'update flux'], env=harness._clean_git_env(), check=True, capture_output=True)
+
+        receipt_file = self.root / 'sample_receipt.json'
+        receipt_file.write_text(json.dumps({
+            'status': 'ok',
+            'streams': [{
+                'stream_id': 'S1', 'engine': 'codex:default', 'model': 'm1', 'status': 'ok', 'succeeded': True,
+                'planned_files': ['src/solver.py', 'docs/design.md'],
+                'citation_audit': {
+                    'inlined_files': ['src/solver.py'],
+                    'actual_files_read': [],
+                    'missing_files': ['src/ghost.py'],
+                    'unopened_cited_files': [],
+                    'out_of_range_lines': [],
+                },
+                'verification_executed': True,
+                'verify_exit_code': 0,
+            }],
+        }), encoding='utf-8')
+        obligations_file = self.root / 'obligations.json'
+        obligations_file.write_text(json.dumps([
+            {'id': 'OB1', 'kind': 'modify', 'target': 'src/solver.py'},
+            {'id': 'OB2', 'kind': 'modify', 'target': 'docs/design.md'},
+            {'id': 'OB3', 'kind': 'read', 'target': 'src/solver.py'},
+            {'id': 'OB4', 'kind': 'read', 'target': 'docs/design.md'},
+            {'id': 'OB5', 'kind': 'test'},
+            {'id': 'OB6', 'kind': 'final_audit'},
+        ]), encoding='utf-8')
+
+        out_md = self.root / 'out_reconcile.md'
+        code_rec, out = self.capture(
+            harness.cmd_reconcile,
+            self.args(
+                'reconcile', '--target', str(repo),
+                '--baseline-file', str(baseline_file),
+                '--receipt', str(receipt_file),
+                '--obligations-file', str(obligations_file),
+                '--output-md', str(out_md),
+            ),
+        )
+        self.assertEqual(code_rec, 0)
+        self.assertEqual(out['changes_status'], 'verified')
+        self.assertEqual(out['counts']['changed_total'], 1)
+        self.assertEqual(out['counts']['changed_by_category']['code'], 1)
+        self.assertEqual(out['counts']['weak_mention_docs'], 1)
+        pending_targets = {item['target'] for item in out['pending_review_top']}
+        self.assertIn('docs/design.md', pending_targets)
+        self.assertIn('src/driver.py', pending_targets)
+        self.assertIn('tests/test_solver.py', pending_targets)
+        self.assertNotIn('docs/notes.md', pending_targets)
+        self.assertTrue(out_md.is_file())
+        md_text = out_md.read_text(encoding='utf-8')
+        self.assertIn('确定性边界', md_text)
+        self.assertIn('`src/solver.py`', md_text)
+        self.assertIn('`docs/design.md`', md_text)
+        self.assertIn('**已满足**', md_text)
+        self.assertIn('**未改·待复核**', md_text)
+        self.assertIn('**缺凭据**', md_text)
+        if git_ok:
+            self.assertIn('docs/preexisting.md', md_text)
+
+        # 非 Git 且无基线时诚实报告 changes_status == unknown
+        plain_dir = self.root / 'plain_no_git'
+        plain_dir.mkdir()
+        (plain_dir / 'a.py').write_text('x = 1\n', encoding='utf-8')
+        plain_md = self.root / 'plain_reconcile.md'
+        code_plain, out_plain = self.capture(
+            harness.cmd_reconcile,
+            self.args('reconcile', '--target', str(plain_dir), '--output-md', str(plain_md)),
+        )
+        self.assertEqual(code_plain, 0)
+        self.assertEqual(out_plain['changes_status'], 'unknown')
+        self.assertIn('未知', out_plain['summary_line'])
+
+    @patch.dict(os.environ, {'CAE_HARNESS_DEPTH': '', 'CAE_DISABLE_HEAVY_COMPLETIONS': ''})
+    def test_stage1_dispatch_completion_hard_triggers_reconcile_without_polluting_target(self):
+        engines = self.four_backends()
+        home = Path(engines['codex']['config_home'])
+        home.mkdir()
+        (home / 'config.toml').write_text('model = "fixture-code"\nmodel_context_window = 65536\n', encoding='utf-8')
+        proj = self.root / 'biz_proj'
+        (proj / 'src').mkdir(parents=True)
+        (proj / 'docs').mkdir(parents=True)
+        (proj / 'src' / 'core.py').write_text('def calc():\n    return 1\n', encoding='utf-8')
+        (proj / 'docs' / 'spec.md').write_text('# 规范\n详见 [core](../src/core.py) 的 `calc`。\n', encoding='utf-8')
+
+        ob_file = self.root / 'ticket_obs.json'
+        ob_file.write_text(json.dumps([
+            {'id': 'M1', 'kind': 'modify', 'target': 'src/core.py'},
+            {'id': 'M2', 'kind': 'modify', 'target': 'docs/spec.md'},
+        ]), encoding='utf-8')
+        spec = self.root / 'batch_reconcile_spec.json'
+        spec.write_text(json.dumps([{
+            'stream_id': 'S1', 'subtask': '修改 core.py', 'kind': 'code',
+            'engine': 'codex:default', 'target': str(proj),
+            'write_scope': ['src/core.py'], 'timeout': 60,
+        }]), encoding='utf-8')
+        plans = self.root / 'state_reconcile' / 'dispatch_plans'
+        common = ['--caller', 'antigravity', '--plan-dir', str(plans), '--session-id', 'rec-sess-1']
+
+        with patch.object(harness, '_args_backends', return_value=engines):
+            _, ticket = self.capture(
+                harness.cmd_plan,
+                self.args('plan', *common, '--spec-file', str(spec), '--obligations-file', str(ob_file), '--full-json'),
+            )
+            self.assertEqual(len(ticket.get('obligations') or []), 2)
+            tid = ticket['ticket_id']
+            _, approved = self.capture(harness.cmd_plan, self.args('plan', *common, '--approve-ticket', tid))
+            self.assertEqual(approved['status'], 'APPROVED')
+
+            def edit_worker(*_a, receipt, **_kw):
+                (proj / 'src' / 'core.py').write_text('def calc():\n    return 2\n', encoding='utf-8')
+                receipt['token_usage'] = harness.extract_cli_token_usage('codex', '{"usage":{"input_tokens":15,"output_tokens":5}}')
+                return dict(TASK)
+
+            with patch.object(harness, 'invoke_engine', side_effect=edit_worker):
+                code, res = self.capture(
+                    harness.cmd_batch,
+                    self.args('batch', *common, '--ticket', tid),
+                )
+        self.assertEqual(code, 0)
+        self.assertIn('reconciliation', res)
+        rec_info = res['reconciliation']
+        rec_path = Path(rec_info['report_file'])
+        self.assertTrue(rec_path.is_file())
+        self.assertTrue(rec_path.is_relative_to(plans / 'reconcile'))
+        # 绝不污染目标业务仓库目录
+        self.assertFalse((proj / 'reconcile').exists())
+        self.assertEqual(sorted(p.relative_to(proj).as_posix() for p in proj.rglob('*') if p.is_file()),
+                         ['docs/spec.md', 'src/core.py'])
+        md_body = rec_path.read_text(encoding='utf-8')
+        self.assertIn('`src/core.py`', md_body)
+        self.assertIn('`docs/spec.md`', md_body)
+        self.assertIn('M2', md_body)
+        self.assertIn('未改·待复核', md_body)
+        hc_rows = json.loads((plans.parent / 'heavy_completions' / 'rec-sess-1.json').read_text(encoding='utf-8'))
+        self.assertEqual(hc_rows[0]['reconcile_file'], str(rec_path))
+        self.assertTrue(hc_rows[0]['reconcile_summary'])
+
+    def test_stage2_read_plan_dual_budget_oversized_split_dependencies_and_waves(self):
+        engines = self.four_backends()
+        proj = self.root / 'read_plan_proj'
+        (proj / 'src').mkdir(parents=True)
+        (proj / 'docs').mkdir(parents=True)
+        (proj / '历史探索').mkdir(parents=True)
+        (proj / 'docs' / 'constitution.md').write_text('# 宪法\n- 物理守恒红线。\n', encoding='utf-8')
+        (proj / 'src' / 'flux.py').write_text('def hllc(u_l, u_r):\n    return 0.5 * (u_l + u_r)\n', encoding='utf-8')
+        (proj / 'src' / 'driver.py').write_text('from src.flux import hllc\n\ndef step(a, b):\n    return hllc(a, b)\n', encoding='utf-8')
+        (proj / 'docs' / 'flux_spec.md').write_text('# 通量规范\n详见 [flux](../src/flux.py)。\n', encoding='utf-8')
+        # 构造超过 150 KiB 的超大文档，带清晰章节边界（验证连续行段自动切分且 1..N 全覆盖无跳行）
+        long_sections = []
+        for sec in range(1, 26):
+            long_sections.append(f'## §{sec}. 数值实验记录与判据\n')
+            for ln in range(1, 120):
+                long_sections.append(f'- 第 {sec} 节第 {ln} 行：验证守恒残差与高阶通量离散稳定性指标 1.23456789e-14。\n')
+        (proj / 'docs' / 'long_record.md').write_text(''.join(long_sections), encoding='utf-8')
+        total_long_lines = len((proj / 'docs' / 'long_record.md').read_text(encoding='utf-8').splitlines())
+        (proj / '历史探索' / 'old_rejection.md').write_text('# 历史否决\n禁止全局 Krylov。\n', encoding='utf-8')
+
+        plans = self.root / 'rp_state' / 'dispatch_plans'
+        spec_out = self.root / 'rp_emitted_spec.json'
+        with patch.object(harness, '_args_backends', return_value=engines):
+            code, out = self.capture(
+                harness.cmd_read_plan,
+                self.args(
+                    'read-plan', '--target', str(proj),
+                    '--shared-files', 'docs/constitution.md',
+                    '--core-files', 'src/flux.py',
+                    '--engines', 'codex:default,agy:default',
+                    '--cross-client-mode', 'risk-tiered',
+                    '--max-concurrency', '2',
+                    '--plan-dir', str(plans),
+                    '--emit-spec', str(spec_out),
+                    '--session-id', 'rp-sess-1',
+                ),
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual(out['budget']['min_inline_cap_bytes'], 128 * 1024)
+        self.assertEqual(out['budget']['effective_concurrency'], 2)
+        self.assertGreaterEqual(out['counts']['oversized_split_count'], 1)
+        self.assertGreaterEqual(out['counts']['shard_count'], 2)
+        self.assertFalse(out['single_session_safe'])
+        self.assertTrue(Path(out['report_file']).is_file())
+        self.assertTrue(Path(out['plan_json_file']).is_file())
+        self.assertTrue(spec_out.is_file())
+        # 验证超大单文件切分的连续行段并集严格覆盖 1..total_long_lines（零跳行缺口）
+        full_plan = json.loads(Path(out['plan_json_file']).read_text(encoding='utf-8'))
+        long_ranges = [
+            lr for sh in full_plan['shards'] for lr in sh.get('line_ranges') or []
+            if lr['file'] == 'docs/long_record.md'
+        ]
+        self.assertGreaterEqual(len(long_ranges), 2)
+        covered_lines = set()
+        for lr in long_ranges:
+            covered_lines.update(range(lr['line_start'], lr['line_end'] + 1))
+        self.assertEqual(covered_lines, set(range(1, total_long_lines + 1)))
+        # 验证保守波次并发上限 <= 2 且导出 spec 无内部私有字段
+        emitted = json.loads(spec_out.read_text(encoding='utf-8'))
+        self.assertTrue(emitted)
+        by_wave = {}
+        for st in emitted:
+            self.assertFalse(any(k.startswith('_') for k in st))
+            by_wave.setdefault(st['wave'], []).append(st)
+        self.assertTrue(all(len(items) <= 2 for items in by_wave.values()))
+        # 验证归档/历史目录默认如实披露，且传 --include-dirs 后可显式纳入
+        self.assertTrue(any(d['dir'] == '历史探索' for d in out['excluded_archive_dirs']))
+        self.assertNotIn('历史探索/old_rejection.md', full_plan['planned_files'])
+        ptr = plans / 'read_plans' / 'session_rp-sess-1_latest.json'
+        self.assertTrue(ptr.is_file())
+
+        with patch.object(harness, '_args_backends', return_value=engines):
+            code_inc, out_inc = self.capture(
+                harness.cmd_read_plan,
+                self.args(
+                    'read-plan', '--target', str(proj),
+                    '--engines', 'codex:default,dsh:default',
+                    '--cross-client-mode', 'all-engines',
+                    '--include-dirs', '历史探索',
+                    '--plan-dir', str(plans),
+                ),
+            )
+        self.assertEqual(code_inc, 0)
+        inc_plan = json.loads(Path(out_inc['plan_json_file']).read_text(encoding='utf-8'))
+        self.assertIn('历史探索/old_rejection.md', inc_plan['planned_files'])
+        # all-engines 模式下每片都应分配给两个引擎
+        self.assertTrue(all(len(sh['assigned_engines']) == 2 for sh in inc_plan['shards']))
+
+        # 超大共享材料超内联上限时自动降级为 anchor_reference_only 并标红告警
+        with patch.object(harness, '_args_backends', return_value=engines):
+            _, out_heavy = self.capture(
+                harness.cmd_read_plan,
+                self.args(
+                    'read-plan', '--target', str(proj),
+                    '--shared-files', 'docs/long_record.md',
+                    '--engines', 'agy:default',
+                    '--plan-dir', str(plans),
+                ),
+            )
+        self.assertEqual(out_heavy['budget']['shared_mode'], 'anchor_reference_only')
+        self.assertTrue(any(a['kind'] == 'shared_context_exceeds_budget' for a in out_heavy['capacity_alerts']))
+
+    def test_stage3_cross_check_coverage_blind_spots_divergence_and_reconcile_merge(self):
+        proj = self.root / 'cross_proj'
+        (proj / 'src').mkdir(parents=True)
+        (proj / 'docs').mkdir(parents=True)
+        (proj / 'src' / 'flux.py').write_text('def hllc(u):\n    return u\n', encoding='utf-8')
+        (proj / 'src' / 'driver.py').write_text('from src.flux import hllc\n', encoding='utf-8')
+        (proj / 'docs' / 'flux_spec.md').write_text('# 规范\n见 [flux](../src/flux.py)\n', encoding='utf-8')
+        (proj / 'docs' / 'missing_core.md').write_text('# 必读核心\n', encoding='utf-8')
+
+        rp_json = self.root / 'sample_read_plan.json'
+        rp_json.write_text(json.dumps({
+            'plan_id': 'rp-cross-1',
+            'engines': [{'engine': 'codex:gpt-6.2-sol'}, {'engine': 'dsh:deepseek-v4-pro'}],
+            'planned_files': ['src/flux.py', 'src/driver.py', 'docs/flux_spec.md', 'docs/missing_core.md'],
+            'shared_files': [],
+            'budget': {'shared_mode': 'none'},
+            'shards': [
+                {'shard_id': 1, 'files': ['src/flux.py', 'docs/flux_spec.md'], 'assigned_engines': ['codex:gpt-6.2-sol', 'dsh:deepseek-v4-pro']},
+                {'shard_id': 2, 'files': ['src/driver.py', 'docs/missing_core.md'], 'assigned_engines': ['codex:gpt-6.2-sol', 'dsh:deepseek-v4-pro']},
+            ],
+            'cross_shard_edges': [
+                {'from_shard': 2, 'to_shard': 1, 'source': 'src/driver.py', 'target': 'src/flux.py', 'relation': 'py_import'},
+            ],
+        }), encoding='utf-8')
+
+        receipt_path = self.root / 'cross_batch_receipt.json'
+        receipt_path.write_text(json.dumps({
+            'status': 'partial',
+            'streams': [
+                {
+                    'stream_id': 'S1_CODEX', 'engine': 'codex:gpt-6.2-sol', 'model': 'gpt-6.2-sol',
+                    'status': 'ok', 'succeeded': True,
+                    'planned_files': ['src/flux.py', 'docs/flux_spec.md', 'src/driver.py'],
+                    'citation_audit': {'inlined_files': ['src/flux.py', 'docs/flux_spec.md', 'src/driver.py'], 'actual_files_read': []},
+                    'result': {'findings': [
+                        {'file': 'src/flux.py', 'line_start': 1, 'line_end': 2, 'severity': 'high', 'description': '界面法向方向错误，导致通量不守恒', 'evidence': 'hllc L1-2'},
+                        {'file': 'src/driver.py', 'line_start': 1, 'line_end': 1, 'severity': 'medium', 'description': '缺少边界条件检查', 'evidence': 'driver L1'},
+                    ]},
+                },
+                {
+                    'stream_id': 'S2_DSH_OK', 'engine': 'dsh:deepseek-v4-pro', 'model': 'deepseek-v4-pro',
+                    'status': 'ok', 'succeeded': True,
+                    'planned_files': ['src/flux.py'],
+                    'citation_audit': {'inlined_files': ['src/flux.py'], 'actual_files_read': []},
+                    'result': {'findings': [
+                        {'file': 'src/flux.py', 'line_start': 1, 'line_end': 2, 'severity': 'low', 'description': '法向符号已满足约定，无需修改', 'evidence': 'hllc L1-2'},
+                    ]},
+                },
+                {
+                    'stream_id': 'S3_DSH_TIMEOUT', 'engine': 'dsh:deepseek-v4-pro', 'model': 'deepseek-v4-pro',
+                    'status': 'timeout', 'succeeded': False,
+                    'planned_files': ['src/driver.py'],
+                    'citation_audit': {'inlined_files': [], 'actual_files_read': []},
+                    'result': {},
+                },
+            ],
+        }), encoding='utf-8')
+
+        plans = self.root / 'cross_state' / 'dispatch_plans'
+        code_cc, out_cc = self.capture(
+            harness.cmd_cross_check,
+            self.args(
+                'cross-check', '--target', str(proj),
+                '--receipt', str(receipt_path),
+                '--read-plan', str(rp_json),
+                '--plan-dir', str(plans),
+            ),
+        )
+        self.assertEqual(code_cc, 0)
+        self.assertEqual(out_cc['counts']['multi_client_delivered'], 1)  # src/flux.py
+        self.assertIn('docs/missing_core.md', out_cc['shared_blind_spots'])
+        self.assertGreaterEqual(out_cc['counts']['failed_or_timeout_cells'], 1)
+        self.assertEqual(out_cc['counts']['divergent_findings'], 1)
+        cc_full = json.loads(Path(out_cc['cross_check_json_file']).read_text(encoding='utf-8'))
+        co_item = cc_full['co_located_multi_engine'][0]
+        self.assertTrue(co_item['cross_client'])
+        self.assertTrue(co_item['severity_divergent'])
+        self.assertTrue(co_item['polarity_divergence_hint'])
+        self.assertTrue(co_item['r6_host_verification_required'])
+        self.assertEqual(len(co_item['items']), 2)
+        # 单端发现中必须如实暴露对端 dsh 为 failed_or_timeout 而非无异议
+        single_drv = next(x for x in cc_full['single_engine_findings'] if x['file'] == 'src/driver.py')
+        self.assertTrue(single_drv['other_engine_failed_or_missing'])
+        self.assertEqual(single_drv['other_engines_coverage']['dsh:deepseek-v4-pro'], 'failed_or_timeout')
+        # 并轨进阶段 1 机械对账表
+        merged_md = self.root / 'merged_reconcile.md'
+        code_rec, out_rec = self.capture(
+            harness.cmd_reconcile,
+            self.args(
+                'reconcile', '--target', str(proj),
+                '--receipt', str(receipt_path),
+                '--cross-check', str(out_cc['cross_check_json_file']),
+                '--output-md', str(merged_md),
+            ),
+        )
+        self.assertEqual(code_rec, 0)
+        merged_text = merged_md.read_text(encoding='utf-8')
+        self.assertIn('跨端汇总核对并轨', merged_text)
+        self.assertIn('docs/missing_core.md', merged_text)
+        self.assertIn('shared_blind_spot', merged_text)
+        self.assertIn('cross_client_finding_divergence', merged_text)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

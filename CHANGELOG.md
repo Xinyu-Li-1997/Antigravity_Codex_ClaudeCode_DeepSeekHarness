@@ -2,6 +2,27 @@
 
 本文件记录四客户端共用规则、会话钩子、后台验证工具与上游维护流程的版本演进。当前插件版本以 `template/user-guard/plugin.json` 为准；常驻使用文档只说明机制和配置键，不重复维护版本号与性能日期。
 
+## [1.18.13] - 2026-11-25
+
+面向四客户端通用架构补齐三阶段确定性防遗漏与防爆窗机制——确定性机械对账表（`reconcile`）、读前双口径尺寸评估与保守层级分片（`read-plan`）、跨端分片盲读汇总核对（`cross-check`），并根治三项既有生命周期门禁漏洞：
+
+- **阶段 1 · 确定性机械对账表与派单完工硬触发（`cae_harness.py`、`reply_repeat_guard.py`、`tests/test_harness_offline.py`、`tests/test_guards_offline.py`）**：
+  - 新增纯离线子命令 `cae_harness.py reconcile`（支持 `--save-baseline`、`--baseline-file`、`--base-ref`、`--receipt`、`--cross-check`、`--obligations-file`、`--output-md`、`--plan-dir`），由确定性静态代码核对已更新/未更新代码与文档、Python AST 直接导入、Markdown 显式相对链接及反引号精确符号引用（高置信项入 `pending_review` 首屏 Top 10，普通词法提及仅计 `weak_mention_docs` 防扇出），并支持 `plan --obligations-file` 显式义务逐项结算；
+  - `capture_reconcile_baseline` 冻结任务开工基线（有内容快照时优先起止比对，同时捕获任务窗口内已提交改动并隔离开工前已脏未改文件；缺少基线或快照未核验时如实标 `unknown`）；重负载派单完工在 `record_heavy_completion_for_stop_hook` 自动将对账表落盘至 `<plan_dir>/reconcile/<run_id>_reconcile.md`（绝不污染目标业务仓库），stdout 仅附单行 `reconciliation` 与 `chat_line` 链接；
+  - Antigravity、Codex、Claude Code 三端共用的 `reply_repeat_guard.py` 依据 `heavy_completions` 中的 `reconcile_file` 统一强制核验机械对账表查看链接，零私有字段依赖，DSH 通过同一 CLI 获得同等对账能力。
+- **阶段 2 · 读前双口径尺寸评估与保守层级分片（`cae_harness.py`、`tests/test_harness_offline.py`）**：
+  - 新增纯离线子命令 `cae_harness.py read-plan`（支持 `--files`、`--shared-files`、`--core-files`、`--engines`、`--cross-client-mode`、`--shard-tokens`、`--max-concurrency`、`--context-used-tokens`、`--include-dirs`、`--clean-room`、`--emit-spec`、`--session-id`），同步校验保守单片 Token 预算与真实 UTF-8 带行号内联字节上限（独立核扣共享核心材料，超限自动降级为 `anchor_reference_only`）；
+  - 超大单文件由 `_split_oversized_file_ranges` 按 Markdown 标题或 Python 顶层定义自动切分为带 20 行重叠的连续行段，按 AST/Markdown 依赖聚类分片并标记 `cross_shard_edges`，默认以保守总并发上限（`<= 2`）按 `risk-tiered` 或 `all-engines` 分波，输出 3 句话 `chat_brief` 与 `<plan_dir>/read_plans/<plan_id>_read_plan.md` 清单并如实披露被跳过的归档/历史目录。
+- **阶段 3 · 跨端分片汇总核对与机械对账并轨（`cae_harness.py`、`tests/test_harness_offline.py`）**：
+  - 新增纯离线子命令 `cae_harness.py cross-check`（支持多份 `--receipt` 与可选 `--read-plan`），确定性生成计划分母 × 执行端覆盖矩阵、全端共同盲区（`shared_blind_spots`）、失败/超时格（保留在分母绝不剔除）、多端同位并列/分歧（保留各端原文并检测 `severity_divergent` 与 `polarity_divergence_hint`，绝不把同位置冒充共识）、跨片接口联审缺口及 `r6_source_check_list` 待回源原文件精确行号清单；
+  - 增强 `merge_blind_findings` 与 `cmd_audit`（输出 `cross_client_coverage`），支持通过 `reconcile --cross-check` 无缝并轨至总机械对账表。
+- **四端钩子加固与既有门禁缺陷修复（`shell_lex.py`、`status_guard.py`、`reply_repeat_guard.py`、`session_context_loader.py`、`handoff_gate.py`、`tests/test_lifecycle_offline.py`）**：
+  - 在 `shell_lex.py` 新增 `join_powershell_line_continuations` 并在 `status_guard.py` `_dispatch_commands` 中归一化 PowerShell 尾部反引号续行（修复多行命令误拆 `--ticket`/`--plan-dir`，且严格不吞噬 POSIX 多行反引号命令替换）；
+  - 修复 `reply_repeat_guard.py` 三处绕过与碰撞：封堵含失败项却在同句同时写“全部成功”与“失败”的 `contradicted` 绕过、对共用同名裸回执文件的多次运行要求凭 `run_id`/对账表名/上级目录消歧、将 `_check_test_suite_locked` 收紧为 `2 * largest < total` 拦截全量测试失败后零复跑冒充全绿；
+  - 升级 `session_context_loader.py` `_workflow_recovery_blocks` 兼容三端目录路径，压缩恢复时完整保留 R9 待批票据并有界折叠完工账单（附 `reconcile_file` 链接）与活跃 `read-plan` 指针；`handoff_gate.py` 统一放行 `reconcile`、`read-plan`、`cross-check` 诊断检查；同步更新 `SKILL.md`、`docs/architecture-and-hooks.md` 与 `docs/workflow-guide.md`。
+
+---
+
 ## [1.18.12] - 2026-11-24
 
 围绕“防规则膨胀、降派工摩擦、控审查过拟合”完成常驻规则与公开文档整篇减负重写，并补齐审查阻断/建议分级、风险分层选挡与 2 轮门禁收敛：

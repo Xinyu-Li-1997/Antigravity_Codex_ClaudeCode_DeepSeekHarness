@@ -761,11 +761,21 @@ def _git_branch_is_readonly(subargs: List[str]) -> bool:
     return True
 
 
+_HARNESS_NON_DISPATCH_SUBCMDS = (
+    "check-grounding", "assess", "probe", "plan",
+    "reconcile", "read-plan", "cross-check",
+    "--help", "-h", "status",
+)
+
+
 def _is_readonly_harness_subcommand(sub_tokens: List[str]) -> bool:
-    if not sub_tokens or sub_tokens[0] not in ("check-grounding", "assess", "probe", "plan", "--help", "-h", "status"):
+    if not sub_tokens or sub_tokens[0] not in _HARNESS_NON_DISPATCH_SUBCMDS:
         return False
     mutating_flags = (
         "--output",
+        "--output-md",
+        "--save-baseline",
+        "--emit-spec",
         "--approve-ticket",
         "--save-ticket",
         "--mark-handed-off",
@@ -859,7 +869,7 @@ def _classify_run_command(cmd_str: str, is_daemon: bool = False, _depth: int = 0
             sub_tokens = [_strip_token_quotes(st) for st in tokens[1:]]
             if not has_redir and _is_readonly_harness_subcommand(sub_tokens):
                 continue
-            if sub_tokens and sub_tokens[0] in ("check-grounding", "assess", "probe", "plan", "--help", "-h", "status"):
+            if sub_tokens and sub_tokens[0] in _HARNESS_NON_DISPATCH_SUBCMDS:
                 has_mutating = True
                 continue
             return "blocked_always"
@@ -923,7 +933,7 @@ def _classify_run_command(cmd_str: str, is_daemon: bool = False, _depth: int = 0
                     sub_tokens = [_strip_token_quotes(st) for st in py_args[idx_arg + 1 :]]
                     if not has_redir and _is_readonly_harness_subcommand(sub_tokens):
                         continue
-                    if sub_tokens and sub_tokens[0] in ("check-grounding", "assess", "probe", "plan", "--help", "-h", "status"):
+                    if sub_tokens and sub_tokens[0] in _HARNESS_NON_DISPATCH_SUBCMDS:
                         has_mutating = True
                         continue
                     return "blocked_always"

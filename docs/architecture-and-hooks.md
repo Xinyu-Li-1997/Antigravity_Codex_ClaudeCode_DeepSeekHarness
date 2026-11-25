@@ -14,12 +14,12 @@
 | --- | --- | --- |
 | [rules/AGENTS.md](../template/user-guard/rules/AGENTS.md) | 通用 + 上游 | `R0–R11` 全局工程规则唯一来源；坚持“纠错优先下沉为机械守卫、已守住条文及时减薄”，零时期性模型名，安装时保留末尾用户自定义尾段 |
 | [fleet_profile.json](../template/user-guard/skills/cae-harness/fleet_profile.json) | 通用 + 上游 | 单点动态配置源：维护五角色 `roles`、四端 `native_agent_profiles`、定量阈值 `runtime_tunables`、启停开关 `subscription_matrix` 与离线刷新时间 `capability_ledger` |
-| [cae_harness.py](../template/user-guard/skills/cae-harness/scripts/cae_harness.py) | 通用 + 上游 | 识别工作区与调用方；执行 P0 点名锁定、五角色与风险分层选挡（`role:review` 常规走推荐挡、命中高危词升 `max`）、审查阻断/建议分级提示、`--isolation` 四级隔离、分后端只读内联上限与大目录对称元数据快快照（`stat:`）、默认持久化会话（`dsh` 独立 `headless-sessions`）与 `followup` 超时降挡续查、双层超时抢救（独立 `result_wrapup.json` 与 `agy` 后台活跃回合短路）、`--files`/`wave` 波次编排、`citation_audit` 行号核验、`<ticket_id>_card.md` 落盘与 `check-grounding` 事实锚定 |
+| [cae_harness.py](../template/user-guard/skills/cae-harness/scripts/cae_harness.py) | 通用 + 上游 | 识别工作区与调用方；执行 P0 点名锁定、五角色与风险分层选挡（`role:review` 常规走推荐挡、命中高危词升 `max`）、审查阻断/建议分级提示、`--isolation` 四级隔离、分后端只读内联上限与大目录对称元数据快快照（`stat:`）、默认持久化会话（`dsh` 独立 `headless-sessions`）与 `followup` 超时降挡续查、双层超时抢救（独立 `result_wrapup.json` 与 `agy` 后台活跃回合短路）、`--files`/`wave` 波次编排、`citation_audit` 行号核验、`<ticket_id>_card.md` 落盘、`check-grounding` 事实锚定、`read-plan` 读前双口径尺寸评估与保守层级分片、`cross-check` 跨端覆盖矩阵与确定性回源核对，以及 `reconcile` 确定性机械对账表（开工基线冻结、AST/Markdown 强显式依赖与派单完工硬触发落盘至 `<plan_dir>/reconcile/`） |
 | [user_words.py](../template/user-guard/hooks/user_words.py) | 通用 + 上游 | 四个钩子共用的基础库（底层委托 `hooks/_lib/`）：跨平台文件锁、原子写、配置读取、三端轨迹去噪与实质子代理摘要提取（含 `timeout_salvage`）、历史确认单折叠（`collapse_historical_cards`）及票据与回执账单存取 |
-| `hooks/_lib/`（`fs_safety.py`、`shell_lex.py`、`adaptive_policy.py`、`process_guard.py`） | 通用 + 上游 | 底层安全锁与重解析点防御原子写（`fs_safety.py`）、Shell 词法拆壳（`shell_lex.py`）、按 `(client, model, effort)` 派生恢复与交接阈值的自适应策略（`adaptive_policy.py`），以及钩子入口墙钟自毁护栏（Windows 仅墙钟，POSIX 按条件附加 `RLIMIT_AS` 虚拟地址空间上限）与防分页环境（`process_guard.py`） |
-| [session_context_loader.py](../template/user-guard/hooks/session_context_loader.py) | 通用 + 上游 | 压缩或恢复入口：普通回合零字节注入；压缩恢复时分块补回“历轮原话 + 实质子代理与抢救摘要”以及“磁盘未决票据精简总览与明细链接” |
+| `hooks/_lib/`（`fs_safety.py`、`shell_lex.py`、`adaptive_policy.py`、`process_guard.py`） | 通用 + 上游 | 底层安全锁与重解析点防御原子写（`fs_safety.py`）、Shell 词法拆壳与 PowerShell 续行归一化（`shell_lex.py`）、按 `(client, model, effort)` 派生恢复与交接阈值的自适应策略（`adaptive_policy.py`），以及钩子入口墙钟自毁护栏（Windows 仅墙钟，POSIX 按条件附加 `RLIMIT_AS` 虚拟地址空间上限）与防分页环境（`process_guard.py`） |
+| [session_context_loader.py](../template/user-guard/hooks/session_context_loader.py) | 通用 + 上游 | 压缩或恢复入口：普通回合零字节注入；压缩恢复时有界分块补回“历轮原话 + 实质子代理与抢救摘要”以及“磁盘未决票据精简总览、未报账单与机械对账链接、活跃阅读分片计划指针”（超上限自动折叠防膨胀） |
 | [status_guard.py](../template/user-guard/hooks/status_guard.py) | 通用 + 上游 | 工具执行前门禁：静态解析文件工具、Shell 包装与内联 Python AST，拦截项目外越界写删与外部 `git worktree`（支持同会话已批外部目录续租）、拦截空转读日志和绕过调度器裸调无头 CLI，核验 `APPROVED` 票据（含 `followup`、`--files` 计量、隔离一致性与 `swarm add` 并发流数） |
-| [reply_repeat_guard.py](../template/user-guard/hooks/reply_repeat_guard.py) | 通用 + 上游 | 回合结束门禁（无头子进程 `CAE_HARNESS_DEPTH` 自动跳过）：拦截空等刷屏、同回合重复贴票与局部补测冒充全过，核验重负载完工成败词、Token 用量（兼容 Markdown 表格账单与 `cli_partial_on_timeout`）及流标识、回执文件名或轨迹词项 |
+| [reply_repeat_guard.py](../template/user-guard/hooks/reply_repeat_guard.py) | 通用 + 上游 | 回合结束门禁（无头子进程 `CAE_HARNESS_DEPTH` 自动跳过）：拦截空等刷屏、同回合重复贴票与未全量复跑的局部补测冒充全过，按 `run_id` 核验重负载完工成败词（防同句矛盾绕过）、Token 用量（兼容 Markdown 表格账单与 `cli_partial_on_timeout`）、流标识、同名回执消歧及机械对账表链接（`reconcile_file`） |
 | [handoff_gate.py](../template/user-guard/hooks/handoff_gate.py) | 通用 + 上游 | 长会话分级交接门禁：追踪压缩次数、轨迹体积与读图字节数，在 `drain`/`freeze` 阶段限制新派工，核验【新对话提示词】内嵌精简总览卡、明细链接与 `plan --resume-ticket` 命令，防擅自将待拍板占位符填为已拍板 |
 | [install.py](../install.py)、`install.ps1`、`install.sh` | 上游专属 | 校验非符号链接与非重解析点后幂等分发四端配置；提供零写入配置漂移、Windows/WSL2 `cross_side_status` 双端体检、DSH `hook_protocol` 探测、订阅候选汇总与科学计算包 ABI 耦合审计（`--audit-upgrade`） |
 | [fleet_state.py](../template/user-guard/skills/fleet-evolve/scripts/fleet_state.py) | 上游专属 | 核验 `upstream_config_repo` 身份；维护提案审批锁（`propose`/`approve`）、主会话重启重入锁（`record-pass1`/`verify-pass2`）及终审 `clear --verified --readback-done` 事实锚定门禁 |
@@ -106,7 +106,18 @@
 
 `polish` 流自动附带 `grounding_audit`；上游 `fleet_state.py clear --verified --readback-done` 在状态锁内强制校验文档事实锚定，并对未过期活跃提案、活跃 `AWAITING_MASTER_RELOAD` Pass 2 重启锁及损坏状态文件默认拒绝清除（已认领 Pass 2 会话可显式传 `--session-id <sid>` 归位，其余覆盖须显式加 `--force`）。
 
-### 3. 单分片安全输入预算公式（`_execution_budget`）
+### 3. 确定性机械对账表（`reconcile`）与四端通用闭环
+
+为防止模型遗漏配套文档/测试或靠主观总结产生幻觉，`cae_harness.py` 提供纯离线零模型调用的确定性机械对账能力，双入口硬触发并落盘至 `<plan_dir>/reconcile/<run_id>_reconcile.md`（永不污染目标业务仓库，且校验父目录与目标文件非符号链接）：
+
+- **双入口硬触发**：（1）用户随时点名运行 `cae_harness.py reconcile --target <目录>`（支持 `--save-baseline`、`--baseline-file`、`--base-ref`、`--receipt`、`--obligations-file`、`--output-md`）；（2）重负载派单（`audit`、`gate`、`batch`、可写或超阈值 `task`、`followup`）在 `record_heavy_completion_for_stop_hook` 完工时自动复用开工冻结基线生成账表，仅向标准输出附精简 `reconciliation` 摘要与 `chat_line` 查看链接，零正文刷屏。
+- **诚实基线与强弱依赖防扇出**：改动清单按“开工冻结基线 / `--baseline-file` → `--base-ref` → 回执流 `changed_files` → `git diff HEAD` 兜底”依次定界，隔离任务前原本已脏但本轮未改文件，缺少基线时如实标为 `unknown`；结构依赖仅将 Python AST 直接导入、Markdown 相对路径链接与反引号精确路径/文件名/已变顶层符号列为高置信 `pending_review`（首屏仅列前 10 项阻断与高风险待核对项），普通文本提及仅汇总为 `weak_mention_docs` 计数防噪声扇出。
+- **只读交付覆盖、义务结算与四端通用门禁**：同步核对各流 `planned_files`、`inlined_files`/`actual_files_read` 与 `citation_audit` 缺口，并对票据或 `--obligations-file` 中的 `read`/`modify`/`review`/`test`/`final_audit` 显式义务逐项结算。Antigravity、Codex、Claude Code 三端 `Stop` 钩子（`reply_repeat_guard.py`）完全基于标准 `heavy_completions` JSON 中的 `reconcile_file` 通用核验，三端压缩恢复钩子（`session_context_loader.py`）对工作流附加块施加总长上限防膨胀并同步带回 `reconcile_file` 与活跃阅读计划指针，`handoff_gate.py` 在交接收口期同样放行 `reconcile`、`read-plan`、`cross-check` 诊断检查，不依赖任何客户端私有扩展字段；DSH 通过同一 CLI 获得完整对账、分片规划与跨端核对能力。
+- **读前保守层级分片（`read-plan`）与跨端汇总核对（`cross-check`）**：
+  - `cae_harness.py read-plan` 在大范围阅读前按**保守单片 Token 预算**（扣减 `--context-used-tokens` 与输出预留）和**真实 UTF-8 带行号内联字节上限**（独立核扣 `--shared-files` 共享核心材料）双口径评估尺寸；超大单文件按 Markdown 标题或 Python 顶层定义自动切分为带重叠的连续行段，按 AST/Markdown 依赖聚类分片并标记跨片边（`cross_shard_edges`），默认以保守并发（总并发 `<= 2` 且严守每端并发上限）按 `risk-tiered`（核心片多端盲读、其余分担）或 `all-engines`（指定每端全量独立读）排波，落盘 `<plan_dir>/read_plans/<plan_id>_read_plan.md` 与可选 `--emit-spec`，对话仅输出 3 句话 `chat_brief` 与清单链接，并如实披露被默认跳过的归档/历史目录（可传 `--include-dirs` 纳入）。
+  - `cae_harness.py cross-check` 消费一份或多份回执与可选 `--read-plan` 计划分母，纯确定性生成计划分母 × 客户端覆盖矩阵、全端共同盲区（`shared_blind_spots`）、失败/超时格（不从分母剔除）、多端同位并列/分歧（保留各端原文、检出 `severity_divergent` 与极性冲突线索，绝不把同位置冒充共识）、跨片接口联审缺口及 `r6_source_check_list` 原文件精确行号核对清单，落盘至 `<plan_dir>/reconcile/<run_id>_cross_check.md`，并可通过 `reconcile --cross-check`（及 `audit` 自动产出的 `cross_client_coverage`）直接并轨至总机械对账表。
+
+### 4. 单分片安全输入预算公式（`_execution_budget`）
 
 模型声明的可用上下文窗口（来自 `subscription_matrix.models` 或本地模型目录缓存）可能与底层原生 API 窗口或自动压缩触发上限（如 Claude 的 `client_catalog_rules.claude.auto_compact_window`）不同；当客户端在服务端或本地引擎侧限定更低活跃窗口时，`subscription_matrix.models` 按客户端实际生效的活跃窗口口径记录，避免分片与恢复缩放失真。
 

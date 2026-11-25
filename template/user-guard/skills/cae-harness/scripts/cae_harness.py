@@ -5,6 +5,7 @@
 
 
 import argparse
+import ast
 import base64
 import collections
 import concurrent.futures
@@ -6395,11 +6396,16 @@ def merge_blind_findings(left_findings, right_findings, left_engine, right_engin
         consensus.append({**item, 'line_start': min(item['line_start'], other['line_start']),
                           'line_end': max(item['line_end'], other['line_end']),
                           'severity': max((item['severity'], other['severity']), key=lambda level: ranks[level]),
+                          'severity_divergent': item['severity'] != other['severity'],
+                          'r6_verification_required': True,
                           'reported_by': [left_engine, right_engine], 'left_description': item['description'],
                           'right_description': other['description'], 'left_finding': item, 'right_finding': other,
                           'match_basis': 'location_overlap_only', 'independently_verified': False})
-    singles.extend({**item, 'reported_by': [right_engine], 'independently_verified': False}
+    singles.extend({**item, 'reported_by': [right_engine], 'independently_verified': False,
+                    'r6_verification_required': True}
                    for i, item in enumerate(right) if i not in matched)
+    for item in singles:
+        item.setdefault('r6_verification_required', True)
     key = lambda item: (-ranks[item['severity']], item['file'], item['line_start'])
     return {'consensus_findings': sorted(consensus, key=key), 'single_source_findings': sorted(singles, key=key)}
 
@@ -7550,6 +7556,2739 @@ def cmd_check_grounding(args):
     return _print({'status': status, 'workspace_mode': detect_workspace_mode(args.root or args.target), **report})
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# ⑦B 统一基线冻结、义务结算与确定性机械对账表引擎
+# ════════════════════════════════════════════════════════════════════════════
+
+_RECONCILE_CODE_EXTS = {
+    '.py', '.f90', '.f95', '.f03', '.f08', '.f', '.for', '.c', '.cpp', '.cc', '.cxx',
+    '.cu', '.cuh', '.h', '.hpp', '.hh', '.jl', '.m', '.rs', '.go', '.ts', '.js',
+    '.sh', '.bash', '.ps1', '.cmake', '.lean', '.inc',
+}
+_RECONCILE_DOC_EXTS = {'.md', '.rst', '.txt', '.tex'}
+_RECONCILE_CONFIG_EXTS = {'.json', '.toml', '.yaml', '.yml', '.ini', '.cfg'}
+_RECONCILE_GENERIC_SYMBOLS = frozenset({
+    'main', 'setup', 'teardown', 'helper', 'config', 'status', 'result', 'render',
+    'format', 'parse', 'load', 'save', 'read', 'write', 'check', 'build', 'update',
+    'create', 'delete', 'remove', 'handle', 'process', 'execute', 'validate',
+    'summary', 'report', 'record', 'state', 'client', 'server', 'worker', 'stream',
+})
+_RECONCILE_MD_LINK_RE = re.compile(r'(?<!!)\[[^\]]+\]\(([^)\s]+)(?:\s+"[^"]*")?\)')
+_RECONCILE_BACKTICK_RE = re.compile(r'`([^`\r\n]{2,160})`')
+_RECONCILE_MAX_ACTIVE_FILES = 4000
+_RECONCILE_TOP_SCREEN_ITEMS = 10
+
+
+def _reconcile_git_porcelain(root):
+    """只读读取 Git 工作树脏文件状态（含未跟踪文件）；非 Git 仓库或失败时返回 None。"""
+    try:
+        proc = subprocess.run(
+            ['git', '-C', str(root), 'status', '--porcelain=v1', '-uall'],
+            env=_clean_git_env(), capture_output=True, text=True,
+            encoding='utf-8', errors='replace', timeout=15,
+        )
+        if proc.returncode != 0:
+            return None
+    except (OSError, subprocess.SubprocessError):
+        return None
+    dirty = {}
+    for raw in (proc.stdout or '').splitlines():
+        if len(raw) < 4:
+            continue
+        code = raw[:2]
+        path_part = raw[3:].strip()
+        if ' -> ' in path_part:
+            path_part = path_part.split(' -> ', 1)[1].strip()
+        if path_part.startswith('"') and path_part.endswith('"'):
+            path_part = path_part[1:-1]
+        norm = path_part.replace('\\', '/').lstrip('./')
+        if norm:
+            dirty[norm] = code.strip() or code
+    return dirty
+
+
+def _reconcile_git_diff_names(root, base_ref):
+    """对比指定 Git 基线引用与当前工作树（覆盖已提交、暂存、未暂存与未跟踪文件）。"""
+    try:
+        resolved = subprocess.run(
+            ['git', '-C', str(root), 'rev-parse', '--verify', str(base_ref) + '^{commit}'],
+            env=_clean_git_env(), capture_output=True, text=True,
+            encoding='utf-8', errors='replace', timeout=15,
+        )
+        if resolved.returncode != 0:
+            return None
+        diff_proc = subprocess.run(
+            ['git', '-C', str(root), 'diff', '--name-status', '--no-renames', str(base_ref)],
+            env=_clean_git_env(), capture_output=True, text=True,
+            encoding='utf-8', errors='replace', timeout=20,
+        )
+        if diff_proc.returncode != 0:
+            return None
+    except (OSError, subprocess.SubprocessError):
+        return None
+    added, modified, deleted = set(), set(), set()
+    for raw in (diff_proc.stdout or '').splitlines():
+        parts = raw.split('\t', 1)
+        if len(parts) != 2:
+            continue
+        st_code = parts[0].strip()[:1].upper()
+        rel = parts[1].strip().replace('\\', '/').lstrip('./')
+        if not rel:
+            continue
+        if st_code == 'A':
+            added.add(rel)
+        elif st_code == 'D':
+            deleted.add(rel)
+        else:
+            modified.add(rel)
+    porcelain = _reconcile_git_porcelain(root) or {}
+    for rel, code in porcelain.items():
+        if code == '??' and rel not in modified and rel not in deleted:
+            added.add(rel)
+    return {
+        'base_commit': (resolved.stdout or '').strip(),
+        'added': sorted(added),
+        'modified': sorted(modified - added - deleted),
+        'deleted': sorted(deleted),
+    }
+
+
+def capture_reconcile_baseline(root, *, ignore_dirs=None, ignore_patterns=None, pre_snapshot=None, capture_snapshot=True):
+    """冻结任务开工时刻的授权目录范围基线（覆盖 Git HEAD、开工前已脏文件与内容/元数据快照）。"""
+    root_path = Path(root).expanduser().resolve()
+    if root_path.is_file():
+        root_path = root_path.parent
+    snap = pre_snapshot
+    if snap is None and capture_snapshot and root_path.is_dir():
+        try:
+            snap = snapshot_files(root_path, ignore_dirs=ignore_dirs, ignore_patterns=ignore_patterns)
+        except (HarnessError, OSError):
+            snap = None
+    file_snap = {}
+    uses_stat = False
+    if isinstance(snap, dict):
+        for key, val in snap.items():
+            if key == '.' or key.endswith('/'):
+                continue
+            file_snap[key] = val
+            if isinstance(val, str) and val.startswith('stat:'):
+                uses_stat = True
+    dirty_map = _reconcile_git_porcelain(root_path) if root_path.is_dir() else None
+    return {
+        'schema_version': 1,
+        'root': str(root_path),
+        'captured_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        'git_head': _git_head(root_path) if root_path.is_dir() else None,
+        'git_dirty_files': sorted(dirty_map) if isinstance(dirty_map, dict) else [],
+        'snapshot_mode': ('stat_metadata' if uses_stat else 'content_sha256') if snap is not None else 'none',
+        'ignore_dirs': sorted(ignore_dirs) if ignore_dirs else None,
+        'snapshot': file_snap if snap is not None else None,
+    }
+
+
+def _classify_reconcile_file(rel_path):
+    norm = str(rel_path or '').replace('\\', '/').lstrip('./')
+    low = norm.lower()
+    name = low.rsplit('/', 1)[-1]
+    ext = Path(name).suffix.lower()
+    if (low.startswith('tests/') or '/tests/' in low
+            or name.startswith('test_') or name.endswith('_test.py')
+            or name.endswith('_test.rs') or name.endswith('_test.go')):
+        return 'test'
+    if ext in _RECONCILE_DOC_EXTS or name in ('readme', 'license', 'notice', 'changelog'):
+        return 'doc'
+    if ext in _RECONCILE_CONFIG_EXTS:
+        return 'config'
+    if ext in _RECONCILE_CODE_EXTS or name in ('makefile', 'cmakelists.txt', 'dockerfile'):
+        return 'code'
+    return 'other'
+
+
+def _reconcile_excluded_dirs():
+    hd = _headless_tunables()
+    return set(hd.get('grounding_excluded_dirs', ('.micromamba', '.toolchain', 'conda-meta', 'archive', 'archived', 'outdated')))
+
+
+def _collect_active_repo_files(root_dir):
+    """枚举项目内现役活动文件（跳过依赖/构建/归档与符号链接，带安全文件上限防卡死）。"""
+    root_path = Path(root_dir).expanduser().resolve()
+    if not root_path.is_dir():
+        return [], False, 0
+    excluded = _reconcile_excluded_dirs() | set(_snapshot_ignored_dirs()) | IGNORED_DIRS
+    active = []
+    truncated = False
+    skipped_archive_or_ignored = 0
+    for dirpath, dirs, files in os.walk(root_path, followlinks=False):
+        dpath = Path(dirpath)
+        kept = []
+        for dirname in sorted(dirs):
+            cand = dpath / dirname
+            low = dirname.lower()
+            if (dirname in excluded or low in excluded
+                    or low.startswith(('archive_', 'outdated_', '.')) and dirname != '.github'
+                    or _is_link(cand)):
+                skipped_archive_or_ignored += 1
+                continue
+            kept.append(dirname)
+        dirs[:] = kept
+        for fname in sorted(files):
+            fpath = dpath / fname
+            if _is_link(fpath):
+                continue
+            try:
+                resolved = fpath.resolve()
+                if not resolved.is_relative_to(root_path):
+                    continue
+                rel = resolved.relative_to(root_path).as_posix()
+            except (OSError, ValueError):
+                continue
+            if Path(fname).suffix.lower() not in SOURCE_EXTENSIONS and fname not in NAMED_TEXT_FILES:
+                continue
+            active.append(rel)
+            if len(active) >= _RECONCILE_MAX_ACTIVE_FILES:
+                truncated = True
+                return active, truncated, skipped_archive_or_ignored
+    return active, truncated, skipped_archive_or_ignored
+
+
+def _bounded_read_text(path, cap_bytes):
+    try:
+        st = path.lstat()
+        if not stat.S_ISREG(st.st_mode) or st.st_size > cap_bytes:
+            return ''
+        return path.read_text(encoding='utf-8-sig', errors='replace')
+    except OSError:
+        return ''
+
+
+def _extract_py_ast_metadata(root_path, rel_path, cap_bytes):
+    """用 Python AST 静态提取模块导入目标与顶层类/函数精确符号名。"""
+    text = _bounded_read_text(root_path / rel_path, cap_bytes)
+    if not text:
+        return {'imports': set(), 'symbols': set()}
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError, RecursionError):
+        return {'imports': set(), 'symbols': set()}
+    imports = set()
+    symbols = set()
+    rel_parts = Path(rel_path).with_suffix('').parts
+    pkg_parts = rel_parts[:-1]
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            name = node.name
+            if len(name) >= 6 and not name.startswith('__') and name.lower() not in _RECONCILE_GENERIC_SYMBOLS:
+                symbols.add(name)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name:
+                    imports.add(alias.name)
+                    imports.add(alias.name.rsplit('.', 1)[-1])
+        elif isinstance(node, ast.ImportFrom):
+            mod = node.module or ''
+            if node.level and node.level > 0:
+                up = node.level - 1
+                base = pkg_parts[:-up] if up > 0 and up <= len(pkg_parts) else (pkg_parts if up == 0 else ())
+                if mod:
+                    full_mod = '.'.join((*base, *mod.split('.')))
+                    imports.add(full_mod)
+                    imports.add(mod.rsplit('.', 1)[-1])
+                else:
+                    for alias in node.names:
+                        if alias.name and alias.name != '*':
+                            imports.add('.'.join((*base, alias.name)))
+                            imports.add(alias.name)
+            elif mod:
+                imports.add(mod)
+                imports.add(mod.rsplit('.', 1)[-1])
+                for alias in node.names:
+                    if alias.name and alias.name != '*':
+                        imports.add(f'{mod}.{alias.name}')
+                        imports.add(alias.name)
+    return {'imports': imports, 'symbols': symbols}
+
+
+def _extract_md_links_and_citations(root_path, rel_path, cap_bytes):
+    """跳过代码块围栏，提取 Markdown 显式相对链接、反引号代码引用与普通正文文本。"""
+    text = _bounded_read_text(root_path / rel_path, cap_bytes)
+    if not text:
+        return {'links': [], 'backticks': set(), 'visible_text': ''}
+    doc_dir = (root_path / rel_path).parent
+    links = []
+    backticks = set()
+    visible_lines = []
+    for line_no, line in _iter_visible_doc_lines(rel_path, text):
+        visible_lines.append(line)
+        for m in _RECONCILE_MD_LINK_RE.finditer(line):
+            raw_target = m.group(1).strip().strip('<>')
+            if (not raw_target or raw_target.startswith(('#', 'http://', 'https://', 'mailto:', 'file:', 'conversation:'))
+                    or '://' in raw_target):
+                continue
+            clean = raw_target.split('#', 1)[0].split('?', 1)[0].strip()
+            if not clean:
+                continue
+            try:
+                cand = (doc_dir / clean).resolve()
+                if cand.is_relative_to(root_path):
+                    norm = cand.relative_to(root_path).as_posix()
+                    links.append((norm, line_no))
+            except (OSError, ValueError):
+                continue
+        for m in _RECONCILE_BACKTICK_RE.finditer(line):
+            tok = m.group(1).strip()
+            if tok:
+                backticks.add(tok)
+    return {'links': links, 'backticks': backticks, 'visible_text': '\n'.join(visible_lines)}
+
+
+def _normalize_obligations(raw_obligations):
+    items = []
+    if not isinstance(raw_obligations, list):
+        return items
+    for idx, item in enumerate(raw_obligations, 1):
+        if not isinstance(item, dict):
+            continue
+        oid = str(item.get('id') or f'OBL-{idx}').strip()
+        kind = str(item.get('kind') or 'review').strip().lower()
+        target = str(item.get('target') or '').strip().replace('\\', '/').lstrip('./')
+        items.append({
+            'id': oid,
+            'kind': kind,
+            'target': target,
+            'line_range': item.get('line_range'),
+            'required_clients': list(item.get('required_clients') or []),
+            'source': str(item.get('source') or 'plan').strip(),
+            'description': str(item.get('description') or '').strip(),
+        })
+    return items
+
+
+def _normalize_reconcile_paths(raw_list, root_path):
+    out = []
+    for item in (raw_list or ()):
+        if isinstance(item, str) and item.strip():
+            norm = _normalize_rel_file(item, root_path) if root_path else item.strip().replace('\\', '/').lstrip('./')
+            out.append(norm)
+    return sorted(set(out))
+
+
+def build_reconciliation_report(
+    target_root,
+    *,
+    run_id='',
+    subcommand='reconcile',
+    payload=None,
+    baseline=None,
+    base_ref='',
+    obligations=None,
+    ticket=None,
+    cross_check=None,
+):
+    """构建确定性机械对账结构化报告（纯静态代码事实，绝不冒充深层语义证明）。"""
+    root_path = Path(target_root).expanduser().resolve() if target_root else Path.cwd().resolve()
+    if root_path.is_file():
+        root_path = root_path.parent
+    run_id = run_id or uuid.uuid4().hex
+    hd = _headless_tunables()
+    cap_bytes = (_positive_int(hd.get('grounding_max_anchor_file_mib')) or 2) * 1024 ** 2
+
+    # 1. 确定性变更集计算（优先使用冻结基线快照，避免漏掉阶段内提交或误归属开工前已脏文件）
+    baseline_source = 'unverified_no_baseline'
+    snapshot_mode = 'none'
+    changes_status = 'unknown'
+    added_files, modified_files, deleted_files = [], [], []
+    preexisting_dirty_unchanged = []
+    base_git_head = None
+    current_git_head = _git_head(root_path) if root_path.is_dir() else None
+
+    payload_scope_unverified = (
+        isinstance(payload, dict) and payload.get('scope_verified') is False
+    )
+    payload_has_verified_changes = (
+        isinstance(payload, dict)
+        and isinstance(payload.get('changed_files'), list)
+        and payload.get('scope_verified', True) is True
+    )
+    payload_stream_changes = None
+    if isinstance(payload, dict) and isinstance(payload.get('streams'), list):
+        _st_changed = set()
+        _st_any_verified = False
+        _st_any_unverified = False
+        for _st in payload['streams']:
+            if not isinstance(_st, dict):
+                continue
+            if _st.get('scope_verified') is False:
+                _st_any_unverified = True
+            elif isinstance(_st.get('changed_files'), list) and _st.get('scope_verified', True):
+                _st_any_verified = True
+                _st_changed.update(_normalize_reconcile_paths(_st.get('changed_files'), root_path))
+        if _st_any_unverified and not _st_any_verified:
+            payload_scope_unverified = True
+        elif _st_any_verified:
+            payload_stream_changes = sorted(_st_changed)
+
+    base_head_hint = baseline.get('git_head') if isinstance(baseline, dict) else None
+    has_frozen_snapshot = isinstance(baseline, dict) and isinstance(baseline.get('snapshot'), dict)
+    committed_during_run = bool(base_head_hint and current_git_head and base_head_hint != current_git_head)
+
+    if payload_scope_unverified and not base_ref:
+        baseline_source = 'payload_scope_unverified'
+        snapshot_mode = 'none'
+        changes_status = 'unknown'
+        base_git_head = base_head_hint or (payload.get('base_commit') if isinstance(payload, dict) else None)
+    elif payload_has_verified_changes and not base_ref and not committed_during_run:
+        raw_changed = _normalize_reconcile_paths(payload.get('changed_files'), root_path)
+        before_snap = baseline.get('snapshot') if has_frozen_snapshot else None
+        for rel in raw_changed:
+            if root_path.is_dir() and not (root_path / rel).exists():
+                deleted_files.append(rel)
+            elif before_snap is not None and rel not in before_snap:
+                added_files.append(rel)
+            else:
+                modified_files.append(rel)
+        changed_union = set(added_files) | set(modified_files) | set(deleted_files)
+        if isinstance(baseline, dict):
+            preexisting_dirty_unchanged = sorted(
+                p for p in (baseline.get('git_dirty_files') or ()) if p not in changed_union
+            )
+        baseline_source = 'frozen_receipt_snapshot' if isinstance(baseline, dict) else 'receipt_snapshot_diff'
+        snapshot_mode = str(baseline.get('snapshot_mode') or 'receipt_snapshot') if isinstance(baseline, dict) else 'receipt_snapshot'
+        changes_status = 'verified'
+        base_git_head = base_head_hint or payload.get('base_commit')
+    elif payload_stream_changes is not None and not base_ref and not committed_during_run:
+        before_snap = baseline.get('snapshot') if has_frozen_snapshot else None
+        for rel in payload_stream_changes:
+            if root_path.is_dir() and not (root_path / rel).exists():
+                deleted_files.append(rel)
+            elif before_snap is not None and rel not in before_snap:
+                added_files.append(rel)
+            else:
+                modified_files.append(rel)
+        changed_union = set(added_files) | set(modified_files) | set(deleted_files)
+        if isinstance(baseline, dict):
+            preexisting_dirty_unchanged = sorted(
+                p for p in (baseline.get('git_dirty_files') or ()) if p not in changed_union
+            )
+        baseline_source = 'batch_stream_snapshots'
+        snapshot_mode = 'receipt_snapshot'
+        changes_status = 'verified'
+        base_git_head = base_head_hint
+    elif has_frozen_snapshot and root_path.is_dir():
+        # 有冻结内容/元数据快照时优先按起止快照比对：既可捕获任务内 git commit，又能精准隔离任务前已脏但未再改动的文件
+        before_snap = baseline['snapshot']
+        snapshot_mode = str(baseline.get('snapshot_mode') or 'content_sha256')
+        uses_stat = snapshot_mode == 'stat_metadata'
+        ignore_dirs = set(baseline['ignore_dirs']) if baseline.get('ignore_dirs') else None
+        snap_patterns = read_agentignore_patterns(root_path)
+        try:
+            raw_after = snapshot_files(root_path, ignore_dirs=ignore_dirs, ignore_patterns=snap_patterns, fast_stat=uses_stat)
+            after_snap = {k: v for k, v in raw_after.items() if k != '.' and not k.endswith('/')}
+            before_keys = set(before_snap)
+            after_keys = set(after_snap)
+            added_files = sorted(after_keys - before_keys)
+            deleted_files = sorted(before_keys - after_keys)
+            modified_files = sorted(k for k in (before_keys & after_keys) if before_snap[k] != after_snap[k])
+            changed_union = set(added_files) | set(modified_files) | set(deleted_files)
+            preexisting_dirty_unchanged = sorted(
+                p for p in (baseline.get('git_dirty_files') or ()) if p not in changed_union
+            )
+            baseline_source = 'frozen_snapshot_baseline'
+            changes_status = 'verified'
+            base_git_head = baseline.get('git_head')
+        except (HarnessError, OSError):
+            changes_status = 'unknown'
+    elif committed_during_run and root_path.is_dir():
+        git_diff = _reconcile_git_diff_names(root_path, base_head_hint)
+        if git_diff is not None:
+            added_files = git_diff['added']
+            modified_files = git_diff['modified']
+            deleted_files = git_diff['deleted']
+            base_git_head = git_diff['base_commit']
+            changed_union = set(added_files) | set(modified_files) | set(deleted_files)
+            preexisting_dirty_unchanged = sorted(
+                p for p in (baseline.get('git_dirty_files') or ()) if p not in changed_union
+            )
+            baseline_source = 'frozen_git_head_diff'
+            snapshot_mode = 'git_diff_working_tree'
+            changes_status = 'verified'
+    elif base_ref and root_path.is_dir():
+        git_diff = _reconcile_git_diff_names(root_path, base_ref)
+        if git_diff is not None:
+            added_files = git_diff['added']
+            modified_files = git_diff['modified']
+            deleted_files = git_diff['deleted']
+            base_git_head = git_diff['base_commit']
+            baseline_source = f'git_ref:{base_ref}'
+            snapshot_mode = 'git_diff_working_tree'
+            changes_status = 'verified'
+    elif root_path.is_dir() and current_git_head:
+        git_diff = _reconcile_git_diff_names(root_path, 'HEAD')
+        if git_diff is not None:
+            added_files = git_diff['added']
+            modified_files = git_diff['modified']
+            deleted_files = git_diff['deleted']
+            base_git_head = git_diff['base_commit']
+            baseline_source = 'git_head_working_tree'
+            snapshot_mode = 'git_diff_working_tree'
+            changes_status = 'verified'
+
+    changed_all = sorted(set(added_files) | set(modified_files) | set(deleted_files))
+    changed_set = set(changed_all)
+    change_kind_map = {}
+    for rel in added_files:
+        change_kind_map[rel] = '新增'
+    for rel in modified_files:
+        change_kind_map[rel] = '已更新'
+    for rel in deleted_files:
+        change_kind_map[rel] = '已删除'
+
+    # 2. 枚举现役活动文件并按类型分组
+    active_files, scan_truncated, skipped_dirs_count = _collect_active_repo_files(root_path)
+    by_category = {'code': [], 'test': [], 'doc': [], 'config': [], 'other': []}
+    changed_by_category = {'code': [], 'test': [], 'doc': [], 'config': [], 'other': []}
+    unchanged_docs = []
+    for rel in active_files:
+        cat = _classify_reconcile_file(rel)
+        by_category[cat].append(rel)
+        if rel in changed_set:
+            changed_by_category[cat].append(rel)
+        elif cat == 'doc':
+            unchanged_docs.append(rel)
+    for rel in deleted_files:
+        cat = _classify_reconcile_file(rel)
+        if rel not in changed_by_category[cat]:
+            changed_by_category[cat].append(rel)
+
+    # 3. 派单流与只读覆盖对账（区分计划文件、可证实交付、引用缺口与测试验收）
+    stream_rows = []
+    all_planned_files = set()
+    all_delivered_files = set()
+    all_unverified_planned = set()
+    all_citation_gaps = []
+    if isinstance(payload, dict):
+        raw_streams = _result_streams(payload)
+        for idx, st in enumerate(raw_streams, 1):
+            if not isinstance(st, dict):
+                continue
+            inv = st.get('invocation') if isinstance(st.get('invocation'), dict) else {}
+            sid = str(
+                st.get('stream_id')
+                or (f"{st['side']}-S{st['shard_id']}" if st.get('side') and st.get('shard_id') is not None
+                    else f"S{st['shard_id']}" if st.get('shard_id') is not None else f'S{idx}')
+            )
+            planned = _normalize_reconcile_paths(
+                st.get('planned_files') or st.get('files') or inv.get('files') or [], root_path,
+            )
+            ca = st.get('citation_audit') or inv.get('citation_audit') or {}
+            inlined = _normalize_reconcile_paths(ca.get('inlined_files') or [], root_path)
+            actual_read = _normalize_reconcile_paths(ca.get('actual_files_read') or [], root_path)
+            delivered = sorted(set(inlined) | set(actual_read))
+            unverified_planned = sorted(set(planned) - set(delivered))
+            missing_cited = _normalize_reconcile_paths(ca.get('missing_files') or [], root_path)
+            unopened_cited = _normalize_reconcile_paths(ca.get('unopened_cited_files') or [], root_path)
+            out_of_range = list(ca.get('out_of_range_lines') or [])
+            all_planned_files.update(planned)
+            all_delivered_files.update(delivered)
+            all_unverified_planned.update(unverified_planned)
+            for mf in missing_cited:
+                all_citation_gaps.append({'stream_id': sid, 'kind': 'missing_cited_file', 'file': mf})
+            for uf in unopened_cited:
+                all_citation_gaps.append({'stream_id': sid, 'kind': 'unopened_cited_file', 'file': uf})
+            for oor in out_of_range:
+                all_citation_gaps.append({'stream_id': sid, 'kind': 'out_of_range_line', 'detail': oor})
+            stream_rows.append({
+                'stream_id': sid,
+                'engine': str(st.get('engine') or payload.get('engine') or ''),
+                'model': str(st.get('model') or payload.get('model') or ''),
+                'status': str(st.get('status') or ('ok' if st.get('succeeded', payload.get('status') == 'ok') else 'failed')),
+                'succeeded': bool(st.get('succeeded', st.get('status', payload.get('status')) == 'ok')),
+                'planned_count': len(planned),
+                'delivered_count': len(delivered),
+                'unverified_planned': unverified_planned,
+                'citation_gap_count': len(missing_cited) + len(unopened_cited) + len(out_of_range),
+                'verification_executed': bool(st.get('verification_executed', payload.get('verification_executed', False))),
+                'verify_exit_code': st.get('verify_exit_code', payload.get('verify_exit_code')),
+            })
+
+    # 4. 确定性结构逻辑关系图（AST 直接导入 + Markdown 显式相对链接 + 强反引号引用 vs 普通词法提及计数）
+    relations = []
+    pending_review_targets = {}  # target_file -> {'target', 'category', 'reasons': [...], 'weight': int}
+    weak_mention_docs = set()
+
+    if changed_set and root_path.is_dir():
+        changed_py = [rel for rel in changed_all if rel.endswith('.py') and (root_path / rel).is_file()]
+        changed_py_mod_keys = {}  # module_key -> changed_rel
+        changed_symbols = {}  # symbol_name -> changed_rel
+        changed_basename_map = {}  # exact filename (e.g. reply_repeat_guard.py) -> set of rels
+        changed_stem_map = {}  # stem (e.g. reply_repeat_guard) -> set of rels
+        for rel in changed_all:
+            fname = rel.rsplit('/', 1)[-1]
+            stem = Path(fname).stem
+            changed_basename_map.setdefault(fname, set()).add(rel)
+            if len(stem) >= 5:
+                changed_stem_map.setdefault(stem.lower(), set()).add(rel)
+        for rel in changed_py:
+            no_ext = rel[:-3]
+            dotted = no_ext.replace('/', '.')
+            mod_name = no_ext.rsplit('/', 1)[-1]
+            changed_py_mod_keys[dotted] = rel
+            if mod_name != '__init__':
+                changed_py_mod_keys[mod_name] = rel
+            # 同时登记从最末两段起的后缀模块路径（兼容 template/user-guard/hooks/_lib/shell_lex.py）
+            parts = dotted.split('.')
+            for tail_len in (2, 3):
+                if len(parts) >= tail_len:
+                    changed_py_mod_keys['.'.join(parts[-tail_len:])] = rel
+            meta = _extract_py_ast_metadata(root_path, rel, cap_bytes)
+            for sym in meta['symbols']:
+                changed_symbols[sym] = rel
+
+        # 4a. Python AST 直接导入边（下游源码与测试 -> 变更 .py）
+        if changed_py_mod_keys:
+            for rel in active_files:
+                if not rel.endswith('.py') or rel in changed_set:
+                    continue
+                meta = _extract_py_ast_metadata(root_path, rel, cap_bytes)
+                hit_sources = sorted({changed_py_mod_keys[m] for m in meta['imports'] if m in changed_py_mod_keys})
+                for src_rel in hit_sources:
+                    cat = _classify_reconcile_file(rel)
+                    rel_type = 'test_imports_changed_code' if cat == 'test' else 'code_imports_changed_code'
+                    relations.append({
+                        'source': src_rel,
+                        'target': rel,
+                        'relation': rel_type,
+                        'strength': 'strong',
+                        'target_status': '未更新',
+                    })
+                    entry = pending_review_targets.setdefault(rel, {'target': rel, 'category': cat, 'reasons': [], 'weight': 0})
+                    entry['reasons'].append(f'AST 直接导入已变模块 `{src_rel}`')
+                    entry['weight'] += 3 if cat == 'test' else 2
+
+        # 4b. Markdown 显式相对链接 & 强反引号引用 vs 普通词法提及
+        for doc_rel in by_category['doc']:
+            if doc_rel in changed_set:
+                continue
+            md_info = _extract_md_links_and_citations(root_path, doc_rel, cap_bytes)
+            strong_reasons = []
+            linked_sources = set()
+            for link_target, line_no in md_info['links']:
+                if link_target in changed_set:
+                    linked_sources.add(link_target)
+                    relations.append({
+                        'source': link_target,
+                        'target': doc_rel,
+                        'relation': 'doc_links_changed_file',
+                        'strength': 'strong',
+                        'line': line_no,
+                        'target_status': '未更新',
+                    })
+                    strong_reasons.append(f'L{line_no} 显式链接已变文件 `{link_target}`')
+            # 反引号强路径/强文件名/强符号引用
+            cited_sources = set()
+            for bt in md_info['backticks']:
+                bt_norm = bt.replace('\\', '/').lstrip('./')
+                if bt_norm in changed_set and bt_norm not in linked_sources:
+                    cited_sources.add(bt_norm)
+                    relations.append({
+                        'source': bt_norm,
+                        'target': doc_rel,
+                        'relation': 'doc_cites_changed_path',
+                        'strength': 'strong',
+                        'target_status': '未更新',
+                    })
+                    strong_reasons.append(f'反引号精确引用已变路径 `{bt_norm}`')
+                elif bt_norm in changed_basename_map:
+                    for src_rel in sorted(changed_basename_map[bt_norm]):
+                        if src_rel not in linked_sources and src_rel not in cited_sources:
+                            cited_sources.add(src_rel)
+                            relations.append({
+                                'source': src_rel,
+                                'target': doc_rel,
+                                'relation': 'doc_cites_changed_filename',
+                                'strength': 'strong',
+                                'target_status': '未更新',
+                            })
+                            strong_reasons.append(f'反引号精确引用已变文件名 `{bt_norm}`')
+                elif bt in changed_symbols:
+                    src_rel = changed_symbols[bt]
+                    if src_rel not in linked_sources and src_rel not in cited_sources:
+                        cited_sources.add(src_rel)
+                        relations.append({
+                            'source': src_rel,
+                            'target': doc_rel,
+                            'relation': 'doc_cites_changed_symbol',
+                            'strength': 'strong',
+                            'symbol': bt,
+                            'target_status': '未更新',
+                        })
+                        strong_reasons.append(f'反引号精确引用已变符号 `{bt}`（来自 `{src_rel}`）')
+            if strong_reasons:
+                dedup_reasons = list(dict.fromkeys(strong_reasons))
+                entry = pending_review_targets.setdefault(doc_rel, {'target': doc_rel, 'category': 'doc', 'reasons': [], 'weight': 0})
+                entry['reasons'].extend(dedup_reasons)
+                entry['weight'] += 4 * len(linked_sources) + 2 * len(cited_sources)
+            else:
+                low_vis = md_info['visible_text'].lower()
+                if any(stem in low_vis for stem in changed_stem_map):
+                    weak_mention_docs.add(doc_rel)
+
+    pending_review_list = sorted(
+        pending_review_targets.values(),
+        key=lambda item: (-item['weight'], item['category'] != 'doc', item['target']),
+    )
+
+    # 5. 义务结算（显式义务 + 派单派生义务）
+    combined_obligations = _normalize_obligations(obligations)
+    if isinstance(ticket, dict) and isinstance(ticket.get('obligations'), list):
+        seen_ids = {item['id'] for item in combined_obligations}
+        for item in _normalize_obligations(ticket.get('obligations')):
+            if item['id'] not in seen_ids:
+                combined_obligations.append(item)
+                seen_ids.add(item['id'])
+    obligation_results = []
+    for ob in combined_obligations:
+        kind = ob['kind']
+        tgt = ob['target']
+        if kind == 'read':
+            if not tgt:
+                st_label, detail = '未知', '未指定目标路径'
+            elif tgt in all_delivered_files:
+                st_label, detail = '已满足', '已证实交付（内联或回执读取记录命中）'
+            else:
+                st_label, detail = '缺凭据', '未在已证实交付集合中观测到该文件'
+        elif kind == 'modify':
+            if not tgt:
+                st_label, detail = '未知', '未指定目标路径'
+            elif tgt in changed_set:
+                st_label, detail = '已满足', f'本轮{change_kind_map.get(tgt, "已变更")}'
+            elif changes_status != 'verified':
+                st_label, detail = '未知', '缺少基线，无法证实是否修改'
+            else:
+                st_label, detail = '未改·待复核', '要求修改但起止内容未变'
+        elif kind == 'review':
+            if tgt and tgt in all_delivered_files:
+                st_label, detail = '已满足', '目标已证实交付审查'
+            elif tgt and tgt in changed_set:
+                st_label, detail = '已满足', '本轮已修改覆盖'
+            else:
+                st_label, detail = '未改·待复核', '缺少本版复核交付凭据'
+        elif kind == 'test':
+            executed = any(row['verification_executed'] for row in stream_rows)
+            passed = executed and all(
+                (row['verify_exit_code'] == 0) for row in stream_rows if row['verification_executed']
+            )
+            if passed:
+                st_label, detail = '已满足', '受管验收命令已运行且退出码为 0'
+            elif executed:
+                st_label, detail = '已失败', '受管验收命令退出码非零'
+            else:
+                st_label, detail = '缺凭据', '本回执中未观测到受管测试执行记录'
+        elif kind == 'final_audit':
+            if stream_rows and all(row['succeeded'] for row in stream_rows):
+                st_label, detail = '已满足', '全部派单流成功终态'
+            elif stream_rows:
+                st_label, detail = '已失败', '存在未成功的派单流'
+            else:
+                st_label, detail = '缺凭据', '缺少跨端终校回执'
+        else:
+            st_label, detail = '未知', f'未识别的义务类型: {kind}'
+        obligation_results.append({**ob, 'status': st_label, 'detail': detail})
+
+    # 派单自动派生核验项（越界写、测试失败、流失败）
+    derived_alerts = []
+    if isinstance(payload, dict):
+        violations = list(payload.get('scope_violations') or [])
+        for st in _result_streams(payload):
+            if isinstance(st, dict) and st.get('scope_violations'):
+                violations.extend(st['scope_violations'])
+        if violations:
+            derived_alerts.append({
+                'severity': 'red',
+                'kind': 'scope_violation',
+                'target': ', '.join(sorted(set(str(v) for v in violations))[:5]),
+                'detail': f'检测到 {len(set(violations))} 处写入越界',
+            })
+        failed_streams = [row['stream_id'] for row in stream_rows if not row['succeeded']]
+        if failed_streams:
+            derived_alerts.append({
+                'severity': 'red',
+                'kind': 'stream_not_ok',
+                'target': ', '.join(failed_streams),
+                'detail': f'存在 {len(failed_streams)} 路未成功流（不可宣称全部成功）',
+            })
+    for ob in obligation_results:
+        if ob['status'] in ('已失败', '缺凭据', '未改·待复核'):
+            derived_alerts.append({
+                'severity': 'red' if ob['status'] in ('已失败', '缺凭据') else 'yellow',
+                'kind': f"obligation:{ob['kind']}",
+                'target': ob['target'] or ob['id'],
+                'detail': f"{ob['id']} [{ob['status']}]：{ob['detail']}",
+            })
+    if all_unverified_planned:
+        derived_alerts.append({
+            'severity': 'yellow',
+            'kind': 'readonly_delivery_gap',
+            'target': ', '.join(sorted(all_unverified_planned)[:5]),
+            'detail': f'{len(all_unverified_planned)} 份计划必读文件未在可证实交付集合中出现',
+        })
+    if all_citation_gaps:
+        derived_alerts.append({
+            'severity': 'red',
+            'kind': 'citation_audit_gap',
+            'target': f'{len(all_citation_gaps)} 处引用核验缺口',
+            'detail': '回执引用含缺失文件、未打开文件或越界行号',
+        })
+
+    # 并轨阶段 3 跨端汇总核对结论（来自显式 --cross-check 或 audit 载荷中的 cross_client_coverage）
+    cross_summary = None
+    if isinstance(cross_check, dict):
+        cc_counts = cross_check.get('counts') if isinstance(cross_check.get('counts'), dict) else {}
+        cross_summary = {
+            'summary_line': str(cross_check.get('summary_line') or ''),
+            'shared_blind_spots': list(cross_check.get('shared_blind_spots') or [])[:20],
+            'failed_or_timeout_cells_count': int(cc_counts.get('failed_or_timeout_cells', len(cross_check.get('failed_or_timeout_cells') or []))),
+            'divergent_findings_count': int(cc_counts.get('divergent_findings', len(cross_check.get('divergent_findings') or []))),
+            'cross_shard_unverified_count': int(cc_counts.get('cross_shard_unverified', 0)),
+            'multi_client_delivered_count': int(cc_counts.get('multi_client_delivered', 0)),
+        }
+        for cc_alert in (cross_check.get('alerts') or []):
+            if isinstance(cc_alert, dict):
+                derived_alerts.append(cc_alert)
+    elif isinstance(payload, dict) and isinstance(payload.get('cross_client_coverage'), dict):
+        cov = payload['cross_client_coverage']
+        blind = list(cov.get('shared_blind_spots') or [])
+        cross_summary = {
+            'summary_line': str(cov.get('summary_line') or ''),
+            'shared_blind_spots': blind[:20],
+            'failed_or_timeout_cells_count': int(cov.get('failed_units_count', 0)),
+            'divergent_findings_count': int(cov.get('divergent_findings_count', 0)),
+            'cross_shard_unverified_count': 0,
+            'multi_client_delivered_count': int(cov.get('dual_delivered_count', 0)),
+        }
+        if blind:
+            derived_alerts.append({
+                'severity': 'red',
+                'kind': 'shared_blind_spot',
+                'target': ', '.join(blind[:5]),
+                'detail': f'{len(blind)} 份审计文件在参与端均缺少可证实交付凭据',
+            })
+        if int(cov.get('divergent_findings_count', 0)) > 0:
+            derived_alerts.append({
+                'severity': 'yellow',
+                'kind': 'cross_client_finding_divergence',
+                'target': f"{cov['divergent_findings_count']} 处双端严重度分歧",
+                'detail': '双端同位置发现严重度不一致，须主会话按 R6 回源核对原文',
+            })
+
+    pending_doc_count = sum(1 for item in pending_review_list if item['category'] == 'doc')
+    pending_test_count = sum(1 for item in pending_review_list if item['category'] == 'test')
+    obligation_gap_count = sum(1 for ob in obligation_results if ob['status'] not in ('已满足',))
+    readonly_gap_count = len(all_unverified_planned) + len(all_citation_gaps)
+    cross_gap_count = (
+        len(cross_summary['shared_blind_spots']) + cross_summary['divergent_findings_count'] + cross_summary['cross_shard_unverified_count']
+        if isinstance(cross_summary, dict) else 0
+    )
+    summary_parts = [
+        f"实改 {len(changed_all)} 文件（源码 {len(changed_by_category['code'])}、测试 {len(changed_by_category['test'])}、文档 {len(changed_by_category['doc'])}、配置 {len(changed_by_category['config'])}）"
+        if changes_status == 'verified' else '改动状态未知（缺基线）',
+        f'强关联未更新文档 {pending_doc_count} 份',
+    ]
+    if pending_test_count:
+        summary_parts.append(f'强关联未更新测试 {pending_test_count} 份')
+    if all_planned_files or all_delivered_files:
+        summary_parts.append(f'只读交付 {len(all_delivered_files)}/{max(len(all_planned_files), len(all_delivered_files))}')
+    if obligation_gap_count or readonly_gap_count or cross_gap_count:
+        summary_parts.append(f'缺口 {obligation_gap_count + readonly_gap_count + cross_gap_count} 项')
+    summary_line = '；'.join(summary_parts)
+
+    return {
+        'schema_version': 1,
+        'run_id': run_id,
+        'subcommand': subcommand,
+        'generated_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        'target_root': str(root_path),
+        'baseline_source': baseline_source,
+        'snapshot_mode': snapshot_mode,
+        'changes_status': changes_status,
+        'base_git_head': base_git_head,
+        'current_git_head': current_git_head,
+        'preexisting_dirty_unchanged': preexisting_dirty_unchanged,
+        'scan_truncated': scan_truncated,
+        'skipped_dirs_count': skipped_dirs_count,
+        'summary_line': summary_line,
+        'counts': {
+            'active_total': len(active_files),
+            'active_by_category': {k: len(v) for k, v in by_category.items()},
+            'changed_total': len(changed_all),
+            'added': len(added_files),
+            'modified': len(modified_files),
+            'deleted': len(deleted_files),
+            'changed_by_category': {k: len(v) for k, v in changed_by_category.items()},
+            'unchanged_active_docs': len(unchanged_docs),
+            'pending_review_total': len(pending_review_list),
+            'pending_review_docs': pending_doc_count,
+            'pending_review_tests': pending_test_count,
+            'weak_mention_docs': len(weak_mention_docs),
+            'planned_files': len(all_planned_files),
+            'delivered_files': len(all_delivered_files),
+            'unverified_planned_files': len(all_unverified_planned),
+            'citation_gaps': len(all_citation_gaps),
+            'obligations_total': len(obligation_results),
+            'obligation_gaps': obligation_gap_count,
+        },
+        'changes': {
+            'added': added_files,
+            'modified': modified_files,
+            'deleted': deleted_files,
+            'by_category': changed_by_category,
+        },
+        'unchanged_active_docs_sample': unchanged_docs[:30],
+        'pending_review': pending_review_list,
+        'relations': relations,
+        'streams': stream_rows,
+        'readonly_coverage': {
+            'planned_files': sorted(all_planned_files),
+            'verified_delivered_files': sorted(all_delivered_files),
+            'unverified_planned_files': sorted(all_unverified_planned),
+            'citation_gaps': all_citation_gaps,
+        },
+        'obligations': obligation_results,
+        'cross_check_summary': cross_summary,
+        'alerts': derived_alerts,
+        'honesty_boundary': (
+            '本表由纯 Python 静态代码基于文件版本快照、Git 差异、Python AST 导入、Markdown 显式相对链接、反引号精确符号引用及派单回执确定性生成；'
+            '仅证明文件版本状态、静态引用关系与回执交付事实，不证明动态调用、深层数理公式或语义逻辑等价性。'
+        ),
+    }
+
+
+def render_reconciliation_markdown(report):
+    """将机械对账结构化报告渲染为首屏降噪、零幻觉的可查阅 Markdown 表。"""
+    c = report.get('counts', {})
+    lines = [
+        f"# 机械对账表（`{report.get('run_id', '')[:12]}` · `{report.get('subcommand', 'reconcile')}`）",
+        '',
+        f"- **生成时间**：`{report.get('generated_at', '')}`",
+        f"- **目标根目录**：`{report.get('target_root', '')}`",
+        f"- **基线口径**：`{report.get('baseline_source', '')}`（快照模式：`{report.get('snapshot_mode', '')}`；改动核验：`{report.get('changes_status', '')}`）",
+        f"- **Git 版本**：基线 `{report.get('base_git_head') or '无'}` → 当前 `{report.get('current_git_head') or '无'}`",
+        f"- **一句话摘要**：{report.get('summary_line', '')}",
+        f"- **确定性边界**：{report.get('honesty_boundary', '')}",
+        '',
+        '---',
+        '',
+        '## 一、首屏重点关注（缺口与强显式依赖未更新 Top 10）',
+        '',
+    ]
+    alerts = report.get('alerts') or []
+    pending = report.get('pending_review') or []
+    if not alerts and not pending:
+        lines.append('> 当前未检出硬缺口或一跳强显式依赖未更新项。')
+    else:
+        lines.append('| 级别 | 类型 | 目标对象 | 确定性依据 |')
+        lines.append('| --- | --- | --- | --- |')
+        shown = 0
+        for item in alerts:
+            if shown >= _RECONCILE_TOP_SCREEN_ITEMS:
+                break
+            icon = '🔴 阻断/缺口' if item.get('severity') == 'red' else '🟡 待核对'
+            lines.append(f"| {icon} | `{item.get('kind', '')}` | `{item.get('target', '')}` | {item.get('detail', '')} |")
+            shown += 1
+        for item in pending:
+            if shown >= _RECONCILE_TOP_SCREEN_ITEMS:
+                break
+            reason = '；'.join(item.get('reasons', [])[:3])
+            lines.append(f"| 🟡 未改·待核对 | `{item.get('category', '')}` | `{item.get('target', '')}` | {reason} |")
+            shown += 1
+        total_focus = len(alerts) + len(pending)
+        if total_focus > shown:
+            lines.append(f'\n> 首屏已展示前 {shown} 项，其余 {total_focus - shown} 项见下方完整分表。')
+
+    lines.extend([
+        '',
+        '---',
+        '',
+        '## 二、代码与文档更新 vs 未更新对账',
+        '',
+        '| 分类 | 现役总数 | 本轮实改（增/改/删汇总） | 本轮未更新数 |',
+        '| --- | ---: | ---: | ---: |',
+    ])
+    cat_labels = {'code': '源码 (`code`)', 'test': '测试 (`test`)', 'doc': '活动文档 (`doc`)', 'config': '配置 (`config`)', 'other': '其他 (`other`)'}
+    for key in ('code', 'test', 'doc', 'config', 'other'):
+        tot = c.get('active_by_category', {}).get(key, 0)
+        chg = c.get('changed_by_category', {}).get(key, 0)
+        lines.append(f'| {cat_labels[key]} | {tot} | {chg} | {max(0, tot - chg)} |')
+    if c.get('weak_mention_docs', 0):
+        lines.append(f"\n> 另检出 `{c['weak_mention_docs']}` 份活动文档仅含普通词法提及（无显式链接或反引号精确符号引用），为防扇出噪声未标红。")
+    if report.get('preexisting_dirty_unchanged'):
+        lines.append(f"\n> 开工前原本已脏但本轮内容未变的文件（已隔离，未归属本轮改动，共 `{len(report['preexisting_dirty_unchanged'])}` 份）：`{'`, `'.join(report['preexisting_dirty_unchanged'][:10])}`")
+
+    lines.extend(['', '### 本轮已变更文件清单', ''])
+    changes = report.get('changes', {})
+    changed_rows = (
+        [(p, '新增') for p in changes.get('added', [])]
+        + [(p, '已更新') for p in changes.get('modified', [])]
+        + [(p, '已删除') for p in changes.get('deleted', [])]
+    )
+    if not changed_rows:
+        lines.append('（本轮零文件变更，或缺少基线未能计算变更。）')
+    else:
+        lines.append('| 变更状态 | 分类 | 文件路径 |')
+        lines.append('| --- | --- | --- |')
+        for rel, st_lbl in changed_rows[:200]:
+            lines.append(f'| {st_lbl} | `{_classify_reconcile_file(rel)}` | `{rel}` |')
+        if len(changed_rows) > 200:
+            lines.append(f'\n> 共 {len(changed_rows)} 份变更文件，表内展示前 200 项。')
+
+    lines.extend(['', '---', '', '## 三、确定性结构逻辑关系（变更源 → 未更新受影响对象）', ''])
+    if not pending:
+        lines.append('（无一跳强显式依赖的未更新对象。）')
+    else:
+        lines.append('| 受影响未更新对象 | 分类 | 状态 | 确定性结构依据 |')
+        lines.append('| --- | --- | --- | --- |')
+        for item in pending[:80]:
+            lines.append(f"| `{item['target']}` | `{item['category']}` | 未改·待核对 | {'；'.join(item['reasons'][:4])} |")
+        if len(pending) > 80:
+            lines.append(f'\n> 共 {len(pending)} 份受影响未更新对象，表内展示前 80 项。')
+
+    lines.extend(['', '---', '', '## 四、派单流状态、只读交付覆盖与义务结算', ''])
+    streams = report.get('streams') or []
+    if streams:
+        lines.append('| 流号 | 引擎 / 模型 | 终态 | 计划文件 | 可证实交付 | 引用缺口 | 验收命令 |')
+        lines.append('| --- | --- | --- | ---: | ---: | ---: | --- |')
+        for row in streams:
+            v_str = (
+                f"exit={row['verify_exit_code']}" if row.get('verification_executed')
+                else '未执行'
+            )
+            lines.append(
+                f"| `{row['stream_id']}` | `{row['engine']}` / `{row['model'] or '未声明'}` | `{row['status']}` | "
+                f"{row['planned_count']} | {row['delivered_count']} | {row['citation_gap_count']} | {v_str} |"
+            )
+        rc = report.get('readonly_coverage', {})
+        if rc.get('unverified_planned_files'):
+            lines.append(f"\n- **未证实交付的计划文件**：`{'`, `'.join(rc['unverified_planned_files'][:20])}`")
+        if rc.get('citation_gaps'):
+            lines.append(f"- **引用核验缺口数**：`{len(rc['citation_gaps'])}` 处")
+    else:
+        lines.append('（本次为独立点名对账，未绑定派单回执流。）')
+
+    obs = report.get('obligations') or []
+    if obs:
+        lines.extend(['', '### 显式义务结算', '', '| 义务 ID | 类型 | 目标对象 | 结算状态 | 依据 |', '| --- | --- | --- | --- | --- |'])
+        for ob in obs:
+            lines.append(f"| `{ob['id']}` | `{ob['kind']}` | `{ob['target'] or '-'}` | **{ob['status']}** | {ob['detail']} |")
+
+    ccs = report.get('cross_check_summary')
+    if isinstance(ccs, dict):
+        lines.extend([
+            '',
+            '### 跨端汇总核对并轨',
+            '',
+            f"- **跨端核对摘要**：{ccs.get('summary_line') or '已并轨跨端覆盖核验'}",
+            f"- **跨客户端实证文件数**：`{ccs.get('multi_client_delivered_count', 0)}`；**失败/超时格数**：`{ccs.get('failed_or_timeout_cells_count', 0)}`；**跨端分歧发现数**：`{ccs.get('divergent_findings_count', 0)}`；**跨片缺联审边数**：`{ccs.get('cross_shard_unverified_count', 0)}`",
+        ])
+        if ccs.get('shared_blind_spots'):
+            lines.append(f"- **全端共同盲区**：`{'`, `'.join(ccs['shared_blind_spots'][:20])}`")
+
+    return '\n'.join(lines).rstrip() + '\n'
+
+
+def _write_reconciliation_artifact(report, md_path, *, json_path=None, redact=False):
+    """安全校验非符号链接后原子写出机械对账 Markdown（及可选 JSON）。"""
+    md_target = Path(md_path).expanduser()
+    for anc in (md_target.parent, md_target):
+        if os.path.lexists(anc) and _is_link(anc):
+            raise HarnessError(f'拒绝通过符号链接写入机械对账表: {anc}')
+    md_text = render_reconciliation_markdown(report)
+    if redact:
+        md_text = _redact_public(md_text)
+    _atomic_text(md_target, md_text)
+    if json_path is not None:
+        jt = Path(json_path).expanduser()
+        for anc in (jt.parent, jt):
+            if os.path.lexists(anc) and _is_link(anc):
+                raise HarnessError(f'拒绝通过符号链接写入机械对账 JSON: {anc}')
+        _atomic_json(jt, _redact_public(report) if redact else report)
+    return str(md_target.resolve())
+
+
+def cmd_reconcile(args):
+    """用户点名离线硬触发：生成纯确定性机械对账表并返回单行摘要与查看链接。"""
+    target, root = _target(args)
+    if getattr(args, 'save_baseline', ''):
+        snap_patterns = read_agentignore_patterns(root) if root.is_dir() else None
+        base_obj = capture_reconcile_baseline(root, ignore_patterns=snap_patterns)
+        out_base = Path(args.save_baseline).expanduser()
+        if os.path.lexists(out_base) and _is_link(out_base):
+            raise HarnessError(f'拒绝通过符号链接写入基线文件: {out_base}')
+        _atomic_json(out_base, base_obj)
+        res = {
+            'status': 'ok',
+            'baseline_file': str(out_base.resolve()),
+            'root': base_obj['root'],
+            'git_head': base_obj['git_head'],
+            'snapshot_mode': base_obj['snapshot_mode'],
+            'tracked_file_count': len(base_obj.get('snapshot') or {}),
+            'preexisting_dirty_count': len(base_obj.get('git_dirty_files') or []),
+        }
+        return _inspection_print(args, res)
+
+    baseline = None
+    if getattr(args, 'baseline_file', ''):
+        baseline = _read_json(Path(args.baseline_file).expanduser())
+    receipt_payload = None
+    if getattr(args, 'receipt', ''):
+        receipt_payload = _read_json(Path(args.receipt).expanduser())
+    obligations = None
+    if getattr(args, 'obligations_file', ''):
+        raw_ob = _read_json(Path(args.obligations_file).expanduser())
+        obligations = raw_ob.get('obligations') if isinstance(raw_ob, dict) else raw_ob
+    cross_check_obj = None
+    if getattr(args, 'cross_check', ''):
+        cross_check_obj = _read_json(Path(args.cross_check).expanduser())
+
+    run_id = uuid.uuid4().hex
+    report = build_reconciliation_report(
+        root,
+        run_id=run_id,
+        subcommand='reconcile',
+        payload=receipt_payload,
+        baseline=baseline,
+        base_ref=getattr(args, 'base_ref', '') or '',
+        obligations=obligations,
+        cross_check=cross_check_obj,
+    )
+    if getattr(args, 'output_md', ''):
+        md_path = Path(args.output_md).expanduser()
+    else:
+        plan_dir = resolve_dispatch_plan_dir(getattr(args, 'plan_dir', None))
+        md_path = plan_dir / 'reconcile' / f'{run_id}_reconcile.md'
+    saved_md = _write_reconciliation_artifact(report, md_path, redact=bool(getattr(args, 'redact', False)))
+    md_uri = Path(saved_md).as_uri()
+    chat_line = f"机械对账（{report['summary_line']}）：[{Path(saved_md).name}]({md_uri})"
+    out = {
+        'status': 'ok',
+        'run_id': run_id,
+        'report_file': saved_md,
+        'chat_line': chat_line,
+        'summary_line': report['summary_line'],
+        'counts': report['counts'],
+        'baseline_source': report['baseline_source'],
+        'changes_status': report['changes_status'],
+        'alerts': report['alerts'][:_RECONCILE_TOP_SCREEN_ITEMS],
+        'pending_review_top': report['pending_review'][:_RECONCILE_TOP_SCREEN_ITEMS],
+        'honesty_boundary': report['honesty_boundary'],
+    }
+    return _inspection_print(args, out)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# ⑦C 阶段 2：读前尺寸评估、超大单文件行段切分与保守层级分片规划（read-plan）
+# ════════════════════════════════════════════════════════════════════════════
+
+_READ_PLAN_LINE_OVERHEAD_BYTES = 10
+_READ_PLAN_FILE_HEADER_BYTES = 128
+_READ_PLAN_SECTION_OVERLAP_LINES = 20
+_READ_PLAN_DEFAULT_CONSERVATIVE_RATIO = 0.25
+_READ_PLAN_DEFAULT_CONCURRENCY = 2
+_READ_PLAN_MD_HEADING_RE = re.compile(r'^(#{1,6})\s+(.+?)\s*$')
+_READ_PLAN_PY_BOUNDARY_RE = re.compile(r'^(?:async\s+def|def|class)\s+([A-Za-z_][A-Za-z0-9_]*)')
+_READ_PLAN_CORE_FILENAME_HINTS = frozenset({
+    'agents.md', 'claude.md', 'readme.md', 'constitution.md', 'spec.md', 'design.md',
+    'fleet_profile.json', 'pyproject.toml', 'cargo.toml', 'cmakelists.txt',
+})
+
+
+def _estimate_inlined_file_bytes(raw_bytes, line_count):
+    """估算带精确行号内联传输时的真实 UTF-8 字节数（正文 + 行号前缀 + 文件头）。"""
+    return int(raw_bytes) + max(1, int(line_count)) * _READ_PLAN_LINE_OVERHEAD_BYTES + _READ_PLAN_FILE_HEADER_BYTES
+
+
+def _read_plan_collect_files(root_path, *, explicit_files=None, include_dirs=None, max_files=None):
+    """独立枚举授权范围内的可读文本文件，并如实记录被默认排除的归档目录与不可读跳过项。"""
+    cap = _positive_int(max_files) or _RECONCILE_MAX_ACTIVE_FILES
+    excluded_cfg = _reconcile_excluded_dirs() | set(_snapshot_ignored_dirs()) | IGNORED_DIRS
+    extra_inc = {
+        str(d).strip().replace('\\', '/').strip('/')
+        for d in (include_dirs or ())
+        if isinstance(d, str) and str(d).strip()
+    }
+    extra_inc_low = {d.lower() for d in extra_inc}
+    records, skipped, excluded_archive_dirs = [], [], []
+    truncated = False
+
+    def _inspect_rel(rel_posix):
+        full = (root_path / rel_posix)
+        if not os.path.lexists(full) or _is_link(full):
+            skipped.append({'file': rel_posix, 'reason': 'missing_or_symlink'})
+            return
+        try:
+            resolved = full.resolve()
+            if not resolved.is_relative_to(root_path) or not resolved.is_file():
+                skipped.append({'file': rel_posix, 'reason': 'outside_root_or_not_file'})
+                return
+            st = resolved.stat()
+            raw_bytes = int(st.st_size)
+            with open(resolved, 'rb') as fh:
+                sample = fh.read(min(raw_bytes, 8192))
+            if b'\x00' in sample:
+                skipped.append({'file': rel_posix, 'reason': 'binary_file'})
+                return
+            line_count = 0
+            with open(resolved, 'rb') as fh:
+                for chunk in iter(lambda: fh.read(65536), b''):
+                    line_count += chunk.count(b'\n')
+            if raw_bytes > 0:
+                line_count = max(1, line_count + (0 if sample.endswith(b'\n') and raw_bytes <= 8192 else 1))
+            records.append({
+                'rel_path': rel_posix,
+                'bytes': raw_bytes,
+                'line_count': line_count,
+                'tokens': estimate_tokens_from_bytes(raw_bytes),
+                'inlined_bytes': _estimate_inlined_file_bytes(raw_bytes, line_count),
+                'category': _classify_reconcile_file(rel_posix),
+            })
+        except OSError as exc:
+            skipped.append({'file': rel_posix, 'reason': f'read_error:{exc.__class__.__name__}'})
+
+    if explicit_files:
+        seen = set()
+        for raw in explicit_files:
+            rel = _normalize_rel_file(raw, root_path)
+            if rel in seen:
+                continue
+            seen.add(rel)
+            _inspect_rel(rel)
+        return records, skipped, excluded_archive_dirs, False
+
+    for dirpath, dirs, files in os.walk(root_path, followlinks=False):
+        dpath = Path(dirpath)
+        rel_dir = '' if dpath == root_path else dpath.relative_to(root_path).as_posix()
+        kept = []
+        for dirname in sorted(dirs):
+            cand = dpath / dirname
+            sub_rel = f'{rel_dir}/{dirname}' if rel_dir else dirname
+            low = dirname.lower()
+            explicitly_included = (
+                sub_rel in extra_inc or sub_rel.lower() in extra_inc_low
+                or dirname in extra_inc or low in extra_inc_low
+            )
+            if _is_link(cand):
+                skipped.append({'file': sub_rel + '/', 'reason': 'symlink_dir'})
+                continue
+            is_archive_like = (
+                low in ('archive', 'archived', 'outdated')
+                or low.startswith(('archive_', 'outdated_'))
+                or '历史' in dirname or '归档' in dirname
+            )
+            is_excluded = (
+                dirname in excluded_cfg or low in excluded_cfg
+                or (low.startswith('.') and dirname != '.github')
+                or is_archive_like
+            )
+            if is_excluded and not explicitly_included:
+                if is_archive_like:
+                    try:
+                        approx_cnt = sum(1 for _ in cand.rglob('*') if _.is_file())
+                    except OSError:
+                        approx_cnt = 0
+                    excluded_archive_dirs.append({'dir': sub_rel, 'file_count': approx_cnt})
+                continue
+            kept.append(dirname)
+        dirs[:] = kept
+        for fname in sorted(files):
+            if len(records) >= cap:
+                truncated = True
+                break
+            rel_posix = f'{rel_dir}/{fname}' if rel_dir else fname
+            _inspect_rel(rel_posix)
+        if truncated:
+            break
+    return records, skipped, excluded_archive_dirs, truncated
+
+
+def _split_oversized_file_ranges(root_path, rec, max_inlined_bytes, max_tokens, *, overlap_lines=_READ_PLAN_SECTION_OVERLAP_LINES):
+    """将超出单分片内联字节或 Token 预算的大文件按章节/顶层定义边界切分为连续带重叠的行段。"""
+    rel = rec['rel_path']
+    full = root_path / rel
+    text = full.read_text(encoding='utf-8', errors='replace')
+    raw_lines = text.splitlines(keepends=True)
+    total_lines = len(raw_lines)
+    if total_lines == 0:
+        return [{
+            'kind': 'file_range', 'file': rel, 'line_start': 1, 'line_end': 1, 'total_lines': 0,
+            'heading': '', 'bytes': 0, 'inlined_bytes': _READ_PLAN_FILE_HEADER_BYTES,
+            'tokens': 0, 'single_line_over_cap': False, 'category': rec['category'],
+        }]
+    line_byte_sizes = [len(ln.encode('utf-8')) for ln in raw_lines]
+    is_md = Path(rel).suffix.lower() in ('.md', '.rst', '.txt')
+    is_py = Path(rel).suffix.lower() == '.py'
+    boundaries = {}
+    for idx, ln in enumerate(raw_lines):
+        stripped = ln.strip()
+        if is_md:
+            m = _READ_PLAN_MD_HEADING_RE.match(stripped)
+            if m:
+                boundaries[idx] = f'{m.group(1)} {m.group(2)[:64]}'
+        elif is_py:
+            m = _READ_PLAN_PY_BOUNDARY_RE.match(ln)
+            if m:
+                boundaries[idx] = m.group(0)[:64]
+
+    eff_max_bytes = max(4096, int(max_inlined_bytes))
+    eff_max_tokens = max(1000, int(max_tokens))
+    ranges = []
+    start_idx = 0
+    last_heading = ''
+    while start_idx < total_lines:
+        cur_raw = 0
+        cur_inlined = _READ_PLAN_FILE_HEADER_BYTES
+        end_idx = start_idx
+        single_over = False
+        while end_idx < total_lines:
+            add_raw = line_byte_sizes[end_idx]
+            next_raw = cur_raw + add_raw
+            next_inlined = cur_inlined + add_raw + _READ_PLAN_LINE_OVERHEAD_BYTES
+            next_tokens = estimate_tokens_from_bytes(next_raw)
+            if end_idx > start_idx and (next_inlined > eff_max_bytes or next_tokens > eff_max_tokens):
+                break
+            cur_raw = next_raw
+            cur_inlined = next_inlined
+            if end_idx == start_idx and (cur_inlined > eff_max_bytes or next_tokens > eff_max_tokens):
+                single_over = True
+                end_idx += 1
+                break
+            end_idx += 1
+        end_inclusive = max(start_idx, end_idx - 1)
+        # 非末段时优先在后 28% 区间内的结构边界（标题或顶层 def/class）整齐切分
+        if end_inclusive < total_lines - 1 and end_inclusive - start_idx >= 12:
+            search_lo = start_idx + max(1, int((end_inclusive - start_idx + 1) * 0.72))
+            chosen_cut = None
+            for cand in range(end_inclusive, search_lo - 1, -1):
+                if cand in boundaries and cand > start_idx:
+                    chosen_cut = cand - 1
+                    break
+            if chosen_cut is not None and chosen_cut >= start_idx:
+                end_inclusive = chosen_cut
+        seg_raw = sum(line_byte_sizes[start_idx:end_inclusive + 1])
+        seg_lines = end_inclusive - start_idx + 1
+        seg_inlined = _estimate_inlined_file_bytes(seg_raw, seg_lines)
+        seg_heading = ''
+        for b_idx in range(start_idx, end_inclusive + 1):
+            if b_idx in boundaries:
+                seg_heading = boundaries[b_idx]
+                break
+        if not seg_heading:
+            for b_idx in range(start_idx - 1, -1, -1):
+                if b_idx in boundaries:
+                    seg_heading = boundaries[b_idx]
+                    break
+        if seg_heading:
+            last_heading = seg_heading
+        ranges.append({
+            'kind': 'file_range',
+            'file': rel,
+            'line_start': start_idx + 1,
+            'line_end': end_inclusive + 1,
+            'total_lines': total_lines,
+            'heading': seg_heading or last_heading,
+            'bytes': seg_raw,
+            'inlined_bytes': seg_inlined,
+            'tokens': estimate_tokens_from_bytes(seg_raw),
+            'single_line_over_cap': single_over,
+            'category': rec['category'],
+        })
+        if end_inclusive >= total_lines - 1:
+            break
+        eff_overlap = min(max(0, int(overlap_lines)), max(0, (end_inclusive - start_idx) // 3))
+        start_idx = max(start_idx + 1, end_inclusive + 1 - eff_overlap)
+    return ranges
+
+
+def _build_read_plan_dependency_order(root_path, records):
+    """基于 Python AST 直接导入与 Markdown 显式相对链接对文件聚组排序，并返回有向显式依赖边。"""
+    rel_set = {rec['rel_path'] for rec in records}
+    by_rel = {rec['rel_path']: rec for rec in records}
+    py_mod_to_rel = {}
+    for rel in rel_set:
+        if rel.endswith('.py'):
+            mod = rel[:-3].replace('/', '.')
+            py_mod_to_rel[mod] = rel
+            if mod.endswith('.__init__'):
+                py_mod_to_rel[mod[:-9]] = rel
+            py_mod_to_rel.setdefault(Path(rel).stem, rel)
+
+    hd = _headless_tunables()
+    cap_bytes = (_positive_int(hd.get('grounding_max_anchor_file_mib')) or 2) * 1024 ** 2
+    edges = []
+    adj = {rel: set() for rel in rel_set}
+    for rec in records:
+        rel = rec['rel_path']
+        full = root_path / rel
+        if rel.endswith('.py'):
+            meta = _extract_py_ast_metadata(root_path, rel, cap_bytes)
+            for mod in sorted(meta['imports']):
+                target_rel = py_mod_to_rel.get(mod)
+                if not target_rel and '.' in mod:
+                    target_rel = py_mod_to_rel.get(mod.rsplit('.', 1)[0])
+                if not target_rel:
+                    target_rel = py_mod_to_rel.get(mod.rsplit('.', 1)[-1])
+                if target_rel and target_rel != rel and target_rel in rel_set:
+                    edges.append({'source': rel, 'target': target_rel, 'relation': 'py_import'})
+                    adj[rel].add(target_rel)
+                    adj[target_rel].add(rel)
+        elif Path(rel).suffix.lower() in ('.md', '.rst'):
+            md_info = _extract_md_links_and_citations(root_path, rel, cap_bytes)
+            seen_targets = set()
+            for target_rel, _lineno in md_info['links']:
+                if target_rel in rel_set and target_rel != rel and target_rel not in seen_targets:
+                    seen_targets.add(target_rel)
+                    edges.append({'source': rel, 'target': target_rel, 'relation': 'md_link'})
+                    adj[rel].add(target_rel)
+                    adj[target_rel].add(rel)
+
+    # 连通强依赖组件优先按目录聚合，组件内部按 BFS 邻接排序，确保源码与配套文档/测试尽量同片
+    visited = set()
+    components = []
+    for rel in sorted(rel_set, key=lambda r: (r.split('/')[0] if '/' in r else '', r)):
+        if rel in visited:
+            continue
+        comp, queue = [], [rel]
+        visited.add(rel)
+        while queue:
+            cur = queue.pop(0)
+            comp.append(cur)
+            for nxt in sorted(adj.get(cur, ())):
+                if nxt not in visited:
+                    visited.add(nxt)
+                    queue.append(nxt)
+        components.append(comp)
+    components.sort(key=lambda c: (-len(c), c[0]))
+    ordered_records = [by_rel[rel] for comp in components for rel in comp]
+    return ordered_records, edges
+
+
+def _resolve_read_plan_engines(backends, caller, raw_engines, cross_client_mode):
+    """离线解析读前评估的目标执行引擎与各自安全窗口、内联上限和单端并发上限。"""
+    hd = _headless_tunables()
+    fallback_budget = _positive_int(hd.get('unlisted_window_fallback_tokens')) or 120_000
+    worker_caps = hd.get('batch_max_workers_per_backend') or {}
+    specs = []
+    if raw_engines:
+        for item in raw_engines:
+            for part in str(item or '').split(','):
+                s = part.strip()
+                if s and s not in specs:
+                    specs.append(s)
+    else:
+        ready = [p for p in ('codex', 'dsh', 'agy', 'claude') if _peer_auto_ready(backends, p)]
+        if cross_client_mode in ('risk-tiered', 'all-engines') and len(ready) >= 2:
+            specs = [f'{ready[0]}:@review', f'{ready[1]}:@review']
+        elif ready:
+            specs = [f'{ready[0]}:@review']
+        else:
+            specs = ['codex:default']
+
+    resolved = []
+    seen_specs = set()
+    for raw_spec in specs:
+        try:
+            chosen = choose_engine(backends, caller, raw_spec) if raw_spec.startswith('role:') else raw_spec
+        except HarnessError:
+            chosen = raw_spec
+        prefix, _ = _engine_parts(chosen)
+        if prefix not in backends:
+            raise HarnessError(f'read-plan 遇到未知后端引擎规格: {raw_spec}')
+        try:
+            prof = resolve_execution_profile(backends, chosen, 'high', kind='review')
+            cap = prof.get('capacity') or {}
+            win = cap.get('selected_window_tokens')
+            budget = cap.get('input_budget_tokens') or fallback_budget
+            model_name = prof.get('model') or chosen
+            spec_str = prof.get('spec') or chosen
+            ready_flag = bool(_peer_auto_ready(backends, prefix)) and not prof.get('execution_blocked_reason')
+        except HarnessError:
+            win = None
+            budget = fallback_budget
+            model_name = chosen
+            spec_str = chosen
+            ready_flag = False
+        if spec_str in seen_specs:
+            continue
+        seen_specs.add(spec_str)
+        resolved.append({
+            'engine': spec_str,
+            'requested': raw_spec,
+            'prefix': prefix,
+            'model': model_name,
+            'ready': ready_flag,
+            'context_window_tokens': win,
+            'input_budget_tokens': int(budget),
+            'inline_cap_bytes': _inline_readonly_cap_bytes(prefix),
+            'max_workers': _positive_int(worker_caps.get(prefix)) or 2,
+            'clean_room_supported': prefix in ('codex', 'claude', 'dsh'),
+        })
+    return resolved
+
+
+def build_read_plan(
+    target_root,
+    *,
+    plan_id='',
+    files=None,
+    shared_files=None,
+    core_files=None,
+    engines=None,
+    backends=None,
+    caller='caller',
+    shard_tokens=None,
+    max_concurrency=None,
+    context_used_tokens=0,
+    cross_client_mode='risk-tiered',
+    include_dirs=None,
+    focus='',
+    clean_room=False,
+):
+    """纯离线读前尺寸评估与保守层级分片规划（双口径硬约束 + 超大单文件行段切分 + 跨端波次编排）。"""
+    root_path = Path(target_root).expanduser().resolve()
+    if root_path.is_file():
+        explicit_from_target = [root_path.name]
+        root_path = root_path.parent
+    else:
+        explicit_from_target = None
+    if not root_path.is_dir():
+        raise HarnessError(f'read-plan 目标目录不存在: {target_root}')
+
+    plan_id = plan_id or uuid.uuid4().hex
+    hd = _headless_tunables()
+    default_shard = _positive_int(hd.get('default_shard_tokens')) or 120_000
+    audit_max_workers = _positive_int(hd.get('audit_max_workers')) or 4
+    raw_ratio = hd.get('read_plan_shard_budget_ratio', _READ_PLAN_DEFAULT_CONSERVATIVE_RATIO)
+    try:
+        conservative_ratio = min(0.5, max(0.1, float(raw_ratio)))
+    except (TypeError, ValueError):
+        conservative_ratio = _READ_PLAN_DEFAULT_CONSERVATIVE_RATIO
+
+    resolved_backends = backends if backends is not None else discover_backends(refresh_model_cache=False)
+    engine_profiles = _resolve_read_plan_engines(resolved_backends, caller, engines, cross_client_mode)
+
+    min_input_budget = min(ep['input_budget_tokens'] for ep in engine_profiles)
+    min_inline_cap = min(ep['inline_cap_bytes'] for ep in engine_profiles)
+    reserve_tokens = max(8000, int(min_input_budget * 0.10))
+    used_tokens = max(0, int(context_used_tokens or 0))
+    remaining_tokens = max(4000, min_input_budget - used_tokens - reserve_tokens)
+    conservative_target = min(default_shard, max(8000, int(min_input_budget * conservative_ratio)), remaining_tokens)
+    if shard_tokens is not None and int(shard_tokens) > 0:
+        conservative_target = min(conservative_target, int(shard_tokens))
+
+    # 1. 收集共享核心材料与目标读取范围
+    norm_shared = _normalize_reconcile_paths(shared_files or [], root_path)
+    norm_core = set(_normalize_reconcile_paths(core_files or [], root_path)) | set(norm_shared)
+    explicit_list = list(files or []) if files else explicit_from_target
+    if explicit_list is not None:
+        all_explicit = list(dict.fromkeys(list(norm_shared) + list(explicit_list)))
+        all_records, skipped, excluded_archives, scan_truncated = _read_plan_collect_files(
+            root_path, explicit_files=all_explicit, include_dirs=include_dirs,
+        )
+    else:
+        all_records, skipped, excluded_archives, scan_truncated = _read_plan_collect_files(
+            root_path, include_dirs=include_dirs,
+        )
+        present_rels = {r['rel_path'] for r in all_records}
+        missing_shared = [s for s in norm_shared if s not in present_rels]
+        if missing_shared:
+            extra_recs, extra_skip, _, _ = _read_plan_collect_files(root_path, explicit_files=missing_shared)
+            all_records.extend(extra_recs)
+            skipped.extend(extra_skip)
+
+    shared_set = set(norm_shared)
+    shared_records = [r for r in all_records if r['rel_path'] in shared_set]
+    target_records = [r for r in all_records if r['rel_path'] not in shared_set]
+    shared_bytes = sum(r['bytes'] for r in shared_records)
+    shared_inlined_bytes = sum(r['inlined_bytes'] for r in shared_records)
+    shared_tokens = sum(r['tokens'] for r in shared_records)
+
+    capacity_alerts = []
+    shared_mode = 'inlined_per_shard' if shared_records else 'none'
+    avail_inlined_bytes = min_inline_cap - shared_inlined_bytes - 4096
+    avail_tokens = conservative_target - shared_tokens - 2000
+    if shared_records and (avail_inlined_bytes < 16384 or avail_tokens < 4000):
+        shared_mode = 'anchor_reference_only'
+        capacity_alerts.append({
+            'severity': 'red',
+            'kind': 'shared_context_exceeds_budget',
+            'detail': (
+                f'共享核心材料（{len(shared_records)} 份，内联 {shared_inlined_bytes / 1024:.1f} KiB / {shared_tokens} tokens）'
+                f'超出最严格单片内联上限（{min_inline_cap // 1024} KiB）或保守预算（{conservative_target} tokens），'
+                '已自动降级为锚点引用模式，防止每片超窗。'
+            ),
+        })
+        avail_inlined_bytes = max(16384, min_inline_cap - 4096)
+        avail_tokens = max(4000, conservative_target - 2000)
+    elif shared_records and (shared_inlined_bytes > int(min_inline_cap * 0.5) or shared_tokens > int(conservative_target * 0.45)):
+        capacity_alerts.append({
+            'severity': 'yellow',
+            'kind': 'shared_context_heavy',
+            'detail': (
+                f'共享核心材料占用了内联上限的 {shared_inlined_bytes / max(1, min_inline_cap) * 100:.0f}%，'
+                '建议仅保留关键裁定章节或拆分子锚点。'
+            ),
+        })
+    if used_tokens > 0 and remaining_tokens <= 12000:
+        capacity_alerts.append({
+            'severity': 'red',
+            'kind': 'context_remaining_low',
+            'detail': f'当前上下文已占约 {used_tokens} tokens，剩余安全预算仅约 {remaining_tokens} tokens，建议新开会话或交后台无头分片执行。',
+        })
+
+    # 2. 依赖感知聚类排序 + 超大单文件行段切分
+    ordered_records, dep_edges = _build_read_plan_dependency_order(root_path, target_records)
+    units = []
+    oversized_splits = []
+    for rec in ordered_records:
+        if rec['inlined_bytes'] > avail_inlined_bytes or rec['tokens'] > avail_tokens:
+            ranges = _split_oversized_file_ranges(root_path, rec, avail_inlined_bytes, avail_tokens)
+            oversized_splits.append({
+                'file': rec['rel_path'],
+                'total_lines': rec['line_count'],
+                'bytes': rec['bytes'],
+                'inlined_bytes': rec['inlined_bytes'],
+                'range_count': len(ranges),
+            })
+            units.extend(ranges)
+        else:
+            units.append({
+                'kind': 'file',
+                'file': rec['rel_path'],
+                'line_start': 1,
+                'line_end': rec['line_count'],
+                'total_lines': rec['line_count'],
+                'heading': '',
+                'bytes': rec['bytes'],
+                'inlined_bytes': rec['inlined_bytes'],
+                'tokens': rec['tokens'],
+                'single_line_over_cap': False,
+                'category': rec['category'],
+            })
+
+    # 3. 双口径（内联 UTF-8 字节 + 保守 Token 预算）严格装箱
+    shards = []
+    cur_units, cur_bytes, cur_inlined, cur_tokens = [], 0, 0, 0
+    for unit in units:
+        exceeds_bytes = bool(cur_units) and (cur_inlined + unit['inlined_bytes'] > avail_inlined_bytes)
+        exceeds_tokens = bool(cur_units) and (cur_tokens + unit['tokens'] > avail_tokens)
+        if exceeds_bytes or exceeds_tokens:
+            shards.append({
+                'shard_id': len(shards) + 1,
+                'units': cur_units,
+                'files': list(dict.fromkeys(u['file'] for u in cur_units)),
+                'line_ranges': [
+                    {'file': u['file'], 'line_start': u['line_start'], 'line_end': u['line_end'], 'heading': u['heading']}
+                    for u in cur_units if u['kind'] == 'file_range'
+                ],
+                'raw_bytes': cur_bytes,
+                'inlined_bytes': cur_inlined + (shared_inlined_bytes if shared_mode == 'inlined_per_shard' else 0),
+                'estimated_tokens': cur_tokens + (shared_tokens if shared_mode == 'inlined_per_shard' else 0),
+                'over_inline_cap': (cur_inlined + (shared_inlined_bytes if shared_mode == 'inlined_per_shard' else 0)) > min_inline_cap,
+            })
+            cur_units, cur_bytes, cur_inlined, cur_tokens = [], 0, 0, 0
+        cur_units.append(unit)
+        cur_bytes += unit['bytes']
+        cur_inlined += unit['inlined_bytes']
+        cur_tokens += unit['tokens']
+    if cur_units:
+        shards.append({
+            'shard_id': len(shards) + 1,
+            'units': cur_units,
+            'files': list(dict.fromkeys(u['file'] for u in cur_units)),
+            'line_ranges': [
+                {'file': u['file'], 'line_start': u['line_start'], 'line_end': u['line_end'], 'heading': u['heading']}
+                for u in cur_units if u['kind'] == 'file_range'
+            ],
+            'raw_bytes': cur_bytes,
+            'inlined_bytes': cur_inlined + (shared_inlined_bytes if shared_mode == 'inlined_per_shard' else 0),
+            'estimated_tokens': cur_tokens + (shared_tokens if shared_mode == 'inlined_per_shard' else 0),
+            'over_inline_cap': (cur_inlined + (shared_inlined_bytes if shared_mode == 'inlined_per_shard' else 0)) > min_inline_cap,
+        })
+
+    # 4. 计算跨片显式依赖边并标注高风险/核心分片
+    file_to_shards = {}
+    for sh in shards:
+        for rel in sh['files']:
+            file_to_shards.setdefault(rel, []).append(sh['shard_id'])
+    cross_shard_edges = []
+    seen_cross = set()
+    for edge in dep_edges:
+        s_ids = file_to_shards.get(edge['source']) or []
+        t_ids = file_to_shards.get(edge['target']) or []
+        if not s_ids or not t_ids or (set(s_ids) & set(t_ids)):
+            continue
+        key = (edge['source'], edge['target'], edge['relation'])
+        if key in seen_cross:
+            continue
+        seen_cross.add(key)
+        cross_shard_edges.append({
+            'from_shard': s_ids[0],
+            'to_shard': t_ids[0],
+            'source': edge['source'],
+            'target': edge['target'],
+            'relation': edge['relation'],
+        })
+
+    cross_shard_ids = {e['from_shard'] for e in cross_shard_edges} | {e['to_shard'] for e in cross_shard_edges}
+    for sh in shards:
+        is_core = bool(
+            any(f in norm_core for f in sh['files'])
+            or any(Path(f).name.lower() in _READ_PLAN_CORE_FILENAME_HINTS for f in sh['files'])
+            or bool(sh['line_ranges'])
+            or sh['shard_id'] in cross_shard_ids
+        )
+        sh['is_core_shard'] = is_core
+
+    # 5. 保守并发分层波次与可直接送入 plan --spec-file 的多端工作流清单
+    sum_caps = sum(ep['max_workers'] for ep in engine_profiles)
+    req_conc = _positive_int(max_concurrency) or _READ_PLAN_DEFAULT_CONCURRENCY
+    eff_concurrency = max(1, min(req_conc, audit_max_workers, max(1, sum_caps)))
+
+    mode_norm = str(cross_client_mode or 'risk-tiered').strip().lower()
+    if mode_norm not in ('single', 'risk-tiered', 'all-engines'):
+        mode_norm = 'risk-tiered'
+    if mode_norm in ('risk-tiered', 'all-engines') and len(engine_profiles) < 2:
+        capacity_alerts.append({
+            'severity': 'yellow',
+            'kind': 'single_engine_available',
+            'detail': '当前仅解析到 1 个可用执行端，无法形成跨客户端双盲覆盖；可显式传入多个 --engines 或补齐对等端后重试。',
+        })
+
+    planned_assignments = []
+    rr_idx = 0
+    for sh in shards:
+        if mode_norm == 'all-engines':
+            assigned = list(engine_profiles)
+        elif mode_norm == 'risk-tiered' and sh['is_core_shard'] and len(engine_profiles) >= 2:
+            assigned = list(engine_profiles)
+        elif mode_norm == 'single':
+            assigned = [engine_profiles[0]]
+        else:
+            assigned = [engine_profiles[rr_idx % len(engine_profiles)]]
+            rr_idx += 1
+        sh['assigned_engines'] = [ep['engine'] for ep in assigned]
+        for ep in assigned:
+            planned_assignments.append((sh, ep))
+
+    # 贪心按波次装箱：每波次同时严守总并发 <= eff_concurrency 与每端并发 <= ep['max_workers']
+    spec_streams = []
+    remaining_items = list(planned_assignments)
+    wave_num = 1
+    stream_seq = 1
+    while remaining_items:
+        next_remaining = []
+        wave_total = 0
+        per_prefix = {}
+        placed_any = False
+        for sh, ep in remaining_items:
+            pfx = ep['prefix']
+            if wave_total < eff_concurrency and per_prefix.get(pfx, 0) < ep['max_workers']:
+                wave_total += 1
+                per_prefix[pfx] = per_prefix.get(pfx, 0) + 1
+                placed_any = True
+                stream_files = list(dict.fromkeys(
+                    (list(norm_shared) if shared_mode == 'inlined_per_shard' else []) + list(sh['files'])
+                ))
+                range_note = ''
+                if sh['line_ranges']:
+                    parts = [
+                        f"{lr['file']}:L{lr['line_start']}-L{lr['line_end']}"
+                        + (f"({lr['heading']})" if lr.get('heading') else '')
+                        for lr in sh['line_ranges']
+                    ]
+                    range_note = '；超大文件必读行段：' + '、'.join(parts)
+                anchor_note = ''
+                if shared_mode == 'anchor_reference_only' and norm_shared:
+                    anchor_note = '；共享核心锚点（按需定向查行号）：' + ', '.join(norm_shared)
+                subtask_text = (
+                    f"分片 P{sh['shard_id']} 只读核对（共 {len(sh['files'])} 份目标文件）"
+                    + (f"；关注焦点：{focus}" if focus else '')
+                    + range_note
+                    + anchor_note
+                    + '。严禁改文件，每条结论必须附带精确文件路径与行号。'
+                )
+                stream_entry = {
+                    'stream_id': f'R{wave_num}_S{stream_seq}',
+                    'wave': wave_num,
+                    'channel': 'cae_harness_headless',
+                    'kind': 'review',
+                    'engine': ep['engine'],
+                    'target': str(root_path),
+                    'files': stream_files,
+                    'subtask': subtask_text,
+                    '_read_plan_shard_id': sh['shard_id'],
+                    '_read_plan_line_ranges': sh['line_ranges'],
+                }
+                if clean_room and ep['clean_room_supported']:
+                    stream_entry['isolation'] = 'clean_room'
+                spec_streams.append(stream_entry)
+                stream_seq += 1
+            else:
+                next_remaining.append((sh, ep))
+        if not placed_any:
+            # 极端保底：强行放置一条防死循环
+            sh, ep = next_remaining.pop(0)
+            spec_streams.append({
+                'stream_id': f'R{wave_num}_S{stream_seq}',
+                'wave': wave_num,
+                'channel': 'cae_harness_headless',
+                'kind': 'review',
+                'engine': ep['engine'],
+                'target': str(root_path),
+                'files': list(sh['files']),
+                'subtask': f"分片 P{sh['shard_id']} 只读核对。",
+                '_read_plan_shard_id': sh['shard_id'],
+                '_read_plan_line_ranges': sh['line_ranges'],
+            })
+            stream_seq += 1
+        remaining_items = next_remaining
+        wave_num += 1
+
+    total_waves = max((s['wave'] for s in spec_streams), default=0)
+    total_raw_bytes = sum(r['bytes'] for r in all_records)
+    total_inlined_bytes = sum(r['inlined_bytes'] for r in all_records)
+    total_tokens = sum(r['tokens'] for r in all_records)
+
+    # 配套显式义务列表（每个计划文件一条 read 义务 + 存在跨端或跨片边时补一条 final_audit 义务）
+    planned_obligations = [
+        {'id': f'READ-{idx}', 'kind': 'read', 'target': r['rel_path']}
+        for idx, r in enumerate(all_records, 1)
+    ]
+    if len(engine_profiles) >= 2 or cross_shard_edges:
+        planned_obligations.append({'id': 'AUDIT-CROSS', 'kind': 'final_audit', 'target': ''})
+
+    single_session_safe = bool(
+        len(shards) <= 1
+        and not oversized_splits
+        and total_tokens <= conservative_target
+        and total_inlined_bytes <= min_inline_cap
+        and not capacity_alerts
+    )
+    recommended_layers = 1 if single_session_safe else (3 if (cross_shard_edges or len(engine_profiles) >= 2) else 2)
+    summary_line = (
+        f"共 {len(all_records)} 文件（{total_raw_bytes / 1024:.1f} KiB / 约 {total_tokens} tokens）；"
+        f"按最严内联 {min_inline_cap // 1024} KiB 与保守单片 {conservative_target} tokens 拆为 {len(shards)} 片、"
+        f"{total_waves} 波次（总并发 ≤ {eff_concurrency}，模式 {mode_norm}，{len(spec_streams)} 流）"
+        + (f"；超大单文件行段切分 {len(oversized_splits)} 份" if oversized_splits else '')
+        + (f"；跨片显式依赖 {len(cross_shard_edges)} 条" if cross_shard_edges else '')
+    )
+
+    return {
+        'schema_version': 1,
+        'plan_id': plan_id,
+        'generated_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        'target_root': str(root_path),
+        'cross_client_mode': mode_norm,
+        'focus': focus,
+        'recommended_layers': recommended_layers,
+        'single_session_safe': single_session_safe,
+        'summary_line': summary_line,
+        'budget': {
+            'min_input_budget_tokens': min_input_budget,
+            'reserve_tokens': reserve_tokens,
+            'context_used_tokens': used_tokens,
+            'remaining_tokens': remaining_tokens,
+            'conservative_shard_tokens': conservative_target,
+            'conservative_ratio': conservative_ratio,
+            'min_inline_cap_bytes': min_inline_cap,
+            'effective_concurrency': eff_concurrency,
+            'shared_mode': shared_mode,
+            'shared_file_count': len(shared_records),
+            'shared_inlined_bytes': shared_inlined_bytes,
+            'shared_tokens': shared_tokens,
+        },
+        'engines': engine_profiles,
+        'counts': {
+            'total_files': len(all_records),
+            'shared_files': len(shared_records),
+            'target_files': len(target_records),
+            'total_raw_bytes': total_raw_bytes,
+            'total_inlined_bytes': total_inlined_bytes,
+            'total_estimated_tokens': total_tokens,
+            'shard_count': len(shards),
+            'core_shard_count': sum(1 for sh in shards if sh['is_core_shard']),
+            'oversized_split_count': len(oversized_splits),
+            'cross_shard_edge_count': len(cross_shard_edges),
+            'stream_count': len(spec_streams),
+            'wave_count': total_waves,
+            'skipped_count': len(skipped),
+            'excluded_archive_dir_count': len(excluded_archives),
+            'scan_truncated': scan_truncated,
+        },
+        'shared_files': [r['rel_path'] for r in shared_records],
+        'planned_files': [r['rel_path'] for r in all_records],
+        'oversized_splits': oversized_splits,
+        'shards': [
+            {k: v for k, v in sh.items() if k != 'units'}
+            for sh in shards
+        ],
+        'cross_shard_edges': cross_shard_edges,
+        'spec_streams': spec_streams,
+        'obligations': planned_obligations,
+        'excluded_archive_dirs': excluded_archives,
+        'skipped_files': skipped[:100],
+        'capacity_alerts': capacity_alerts,
+        'honesty_boundary': (
+            '本阅读计划按每 3 字节约 1 token 与真实 UTF-8 行号内联字节双口径离线估算，'
+            '不代表底层分词器精确计数；被默认排除的归档/历史目录已单列，如需排查历史否决依据请显式传 --include-dirs。'
+        ),
+    }
+
+
+def render_read_plan_markdown(plan_report):
+    """将读前预算与保守层级分片计划渲染为结构化 Markdown 清单。"""
+    b = plan_report['budget']
+    c = plan_report['counts']
+    lines = [
+        f"# 读前尺寸评估与保守层级分片计划（`{plan_report['plan_id'][:12]}`）",
+        '',
+        f"- **生成时间**：`{plan_report['generated_at']}`",
+        f"- **目标根目录**：`{plan_report['target_root']}`",
+        f"- **跨端阅读模式**：`{plan_report['cross_client_mode']}`（推荐层级：`{plan_report['recommended_layers']}` 层；单会话直读安全：`{'是' if plan_report['single_session_safe'] else '否'}`）",
+        f"- **一句话摘要**：{plan_report['summary_line']}",
+        f"- **估算边界声明**：{plan_report['honesty_boundary']}",
+        '',
+        '---',
+        '',
+        '## 一、双口径容量预算与参与执行端',
+        '',
+        '| 引擎规格 | 模型 | 状态 | 声明窗口 (tokens) | 安全预算 (tokens) | 内联上限 (KiB) | 单端并发上限 |',
+        '| --- | --- | --- | ---: | ---: | ---: | ---: |',
+    ]
+    for ep in plan_report.get('engines') or []:
+        lines.append(
+            f"| `{ep['engine']}` | `{ep['model']}` | `{'ready' if ep['ready'] else 'unready'}` | "
+            f"{ep['context_window_tokens'] or '未知'} | {ep['input_budget_tokens']} | "
+            f"{ep['inline_cap_bytes'] // 1024} | {ep['max_workers']} |"
+        )
+    lines.extend([
+        '',
+        f"- **生效双口径上限**：单片保守 Token ≤ `{b['conservative_shard_tokens']}`（占比 `{b['conservative_ratio']:.0%}`，已扣减预留 `{b['reserve_tokens']}` 与当前占用 `{b['context_used_tokens']}`）；最严内联载荷 ≤ `{b['min_inline_cap_bytes'] // 1024} KiB`；总并发上限 ≤ `{b['effective_concurrency']}`。",
+        f"- **共享核心材料（L0）**：共 `{b['shared_file_count']}` 份（模式 `{b['shared_mode']}`，内联 `{b['shared_inlined_bytes'] / 1024:.1f} KiB` / 约 `{b['shared_tokens']}` tokens）"
+        + (f"：`{'`, `'.join(plan_report['shared_files'])}`" if plan_report.get('shared_files') else '。'),
+    ])
+
+    alerts = plan_report.get('capacity_alerts') or []
+    if alerts:
+        lines.extend(['', '### 容量预警', ''])
+        for al in alerts:
+            icon = '🔴' if al.get('severity') == 'red' else '🟡'
+            lines.append(f"- {icon} **`{al.get('kind')}`**：{al.get('detail')}")
+
+    archives = plan_report.get('excluded_archive_dirs') or []
+    if archives:
+        desc = '、'.join(f"`{a['dir']}/`（约 {a['file_count']} 份）" for a in archives[:12])
+        lines.extend([
+            '',
+            f"> **历史与归档目录分母披露**：默认跳过 {len(archives)} 个归档/历史目录（{desc}）。"
+            '若需核查历史否决依据，请显式传入 `--include-dirs` 或将裁定文档加入 `--shared-files`。',
+        ])
+
+    lines.extend([
+        '',
+        '---',
+        '',
+        '## 二、分层分片清单（L1）',
+        '',
+        '| 分片 | 核心片 | 文件数 | 原始体积 (KiB) | 内联载荷 (KiB) | 估算 Tokens | 分配执行端 | 包含文件 / 行段 |',
+        '| --- | --- | ---: | ---: | ---: | ---: | --- | --- |',
+    ])
+    for sh in plan_report.get('shards') or []:
+        range_map = {}
+        for lr in sh.get('line_ranges') or []:
+            range_map.setdefault(lr['file'], []).append(f"L{lr['line_start']}-L{lr['line_end']}")
+        file_desc_parts = []
+        for f in sh['files'][:8]:
+            if f in range_map:
+                file_desc_parts.append(f"`{f}`({', '.join(range_map[f])})")
+            else:
+                file_desc_parts.append(f"`{f}`")
+        if len(sh['files']) > 8:
+            file_desc_parts.append(f"…共 {len(sh['files'])} 份")
+        lines.append(
+            f"| `P{sh['shard_id']}` | {'是' if sh['is_core_shard'] else '否'} | {len(sh['files'])} | "
+            f"{sh['raw_bytes'] / 1024:.1f} | {sh['inlined_bytes'] / 1024:.1f} | {sh['estimated_tokens']} | "
+            f"`{', '.join(sh.get('assigned_engines') or [])}` | {'；'.join(file_desc_parts)} |"
+        )
+
+    if plan_report.get('oversized_splits'):
+        lines.extend(['', '### 超大单文件连续行段切分明细', '', '| 文件 | 总行数 | 内联字节 (KiB) | 切分段数 |', '| --- | ---: | ---: | ---: |'])
+        for sp in plan_report['oversized_splits']:
+            lines.append(f"| `{sp['file']}` | {sp['total_lines']} | {sp['inlined_bytes'] / 1024:.1f} | {sp['range_count']} |")
+
+    cross_edges = plan_report.get('cross_shard_edges') or []
+    lines.extend(['', '---', '', '## 三、跨片显式依赖边（供 L2 / `cross-check` 重点回源核对）', ''])
+    if not cross_edges:
+        lines.append('（无跨分片显式静态导入或 Markdown 链接边。）')
+    else:
+        lines.append('| 源分片 → 目标分片 | 关系类型 | 源文件 | 目标文件 |')
+        lines.append('| --- | --- | --- | --- |')
+        for e in cross_edges[:80]:
+            lines.append(f"| `P{e['from_shard']}` → `P{e['to_shard']}` | `{e['relation']}` | `{e['source']}` | `{e['target']}` |")
+
+    lines.extend(['', '---', '', '## 四、保守并发波次流排程（可直接送入 `plan --spec-file` 审批）', ''])
+    streams = plan_report.get('spec_streams') or []
+    if not streams:
+        lines.append('（目标目录为空，无待执行流。）')
+    else:
+        lines.append('| 波次 | 流号 | 执行端 | 隔离 | 目标文件数 | 任务范围 |')
+        lines.append('| ---: | --- | --- | --- | ---: | --- |')
+        for st in streams[:120]:
+            lines.append(
+                f"| Wave {st['wave']} | `{st['stream_id']}` | `{st['engine']}` | `{st.get('isolation') or 'default'}` | "
+                f"{len(st.get('files') or [])} | {st.get('subtask', '')[:120]} |"
+            )
+    return '\n'.join(lines).rstrip() + '\n'
+
+
+def cmd_read_plan(args):
+    """纯离线读前尺寸评估与保守层级分片规划入口：输出 3 句话简报并落盘完整清单与可选 spec.json。"""
+    target, _root = _target(args)
+    caller = resolve_caller(args.caller)
+    backends = _args_backends(args, refresh_model_cache=False)
+    plan_id = uuid.uuid4().hex
+    report = build_read_plan(
+        target,
+        plan_id=plan_id,
+        files=getattr(args, 'files', None) or None,
+        shared_files=getattr(args, 'shared_files', None) or None,
+        core_files=getattr(args, 'core_files', None) or None,
+        engines=getattr(args, 'engines', None) or None,
+        backends=backends,
+        caller=caller,
+        shard_tokens=getattr(args, 'shard_tokens', None),
+        max_concurrency=getattr(args, 'max_concurrency', None),
+        context_used_tokens=getattr(args, 'context_used_tokens', 0) or 0,
+        cross_client_mode=getattr(args, 'cross_client_mode', 'risk-tiered') or 'risk-tiered',
+        include_dirs=getattr(args, 'include_dirs', None) or None,
+        focus=getattr(args, 'focus', '') or '',
+        clean_room=bool(getattr(args, 'clean_room', False)),
+    )
+    plan_dir = resolve_dispatch_plan_dir(getattr(args, 'plan_dir', None))
+    rp_dir = plan_dir / 'read_plans'
+    if os.path.lexists(rp_dir) and _is_link(rp_dir):
+        raise HarnessError(f'拒绝通过符号链接目录写入阅读计划: {rp_dir}')
+    md_path = Path(args.output_md).expanduser() if getattr(args, 'output_md', '') else (rp_dir / f'{plan_id}_read_plan.md')
+    json_path = rp_dir / f'{plan_id}_read_plan.json'
+    redact = bool(getattr(args, 'redact', False))
+    for anc in (md_path.parent, md_path, json_path.parent, json_path):
+        if os.path.lexists(anc) and _is_link(anc):
+            raise HarnessError(f'拒绝通过符号链接写入阅读计划文件: {anc}')
+    md_text = render_read_plan_markdown(report)
+    if redact:
+        md_text = _redact_public(md_text)
+    _atomic_text(md_path, md_text)
+    _atomic_json(json_path, _redact_public(report) if redact else report)
+    saved_md = str(md_path.resolve())
+    saved_json = str(json_path.resolve())
+
+    emitted_spec = ''
+    if getattr(args, 'emit_spec', ''):
+        spec_out = Path(args.emit_spec).expanduser()
+        for anc in (spec_out.parent, spec_out):
+            if os.path.lexists(anc) and _is_link(anc):
+                raise HarnessError(f'拒绝通过符号链接写入工作流配置: {spec_out}')
+        clean_streams = [
+            {k: v for k, v in st.items() if not k.startswith('_')}
+            for st in report['spec_streams']
+        ]
+        _atomic_json(spec_out, _redact_public(clean_streams) if redact else clean_streams)
+        emitted_spec = str(spec_out.resolve())
+
+    sid = _session_id(args)
+    if sid:
+        ptr_path = rp_dir / f'session_{_safe_state_id(sid)}_latest.json'
+        if not (os.path.lexists(ptr_path) and _is_link(ptr_path)):
+            _atomic_json(ptr_path, {
+                'plan_id': plan_id,
+                'session_id': sid,
+                'report_file': saved_md,
+                'plan_json_file': saved_json,
+                'summary_line': report['summary_line'],
+                'shard_count': report['counts']['shard_count'],
+                'wave_count': report['counts']['wave_count'],
+                'created_at': report['generated_at'],
+            })
+
+    md_uri = Path(saved_md).as_uri()
+    chat_brief = (
+        f"**【读前尺寸评估 · {report['recommended_layers']} 层保守分片】** {report['summary_line']}。\n"
+        f"- 完整分片、行段切分与波次清单：[{Path(saved_md).name}]({md_uri})\n"
+        f"- 计划 JSON：`{Path(saved_json).name}`"
+        + (f"；已导出可执行工作流配置：`{Path(emitted_spec).name}`" if emitted_spec else '')
+        + '。'
+    )
+    out = {
+        'status': 'ok',
+        'plan_id': plan_id,
+        'report_file': saved_md,
+        'plan_json_file': saved_json,
+        'emitted_spec_file': emitted_spec or None,
+        'chat_brief': chat_brief,
+        'summary_line': report['summary_line'],
+        'recommended_layers': report['recommended_layers'],
+        'single_session_safe': report['single_session_safe'],
+        'budget': report['budget'],
+        'counts': report['counts'],
+        'capacity_alerts': report['capacity_alerts'],
+        'excluded_archive_dirs': report['excluded_archive_dirs'],
+        'honesty_boundary': report['honesty_boundary'],
+    }
+    return _inspection_print(args, out)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# ⑦D 阶段 3：跨端分片盲读覆盖矩阵与确定性回源汇总核对（cross-check）
+# ════════════════════════════════════════════════════════════════════════════
+
+_CROSS_CHECK_OK_POLARITY_RE = re.compile(
+    r'无需修改|无问题|已满足|一致通过|未发现缺陷|\b(?:no\s+issue|no\s+defect|consistent|looks\s+good)\b',
+    re.I,
+)
+_CROSS_CHECK_BAD_POLARITY_RE = re.compile(
+    r'错误|缺失|遗漏|越界|不守恒|违规|失效|崩溃|死锁|相反|冲突|阻断|漏改|'
+    r'\b(?:bug|error|missing|violation|incorrect|contradict|fail(?:ed|ure)?|mismatch|deadlock)\b',
+    re.I,
+)
+
+
+def _extract_cross_check_streams(receipt_obj, root_path):
+    """将 batch / audit / task 回执统一标准化为跨端核对流列表，保留原始终态、交付凭据与发现项。"""
+    if not isinstance(receipt_obj, dict):
+        return []
+    out = []
+    # audit 顶层按引擎提取原始发现（避免仅按行合并丢掉各端原话）
+    audit_findings_by_engine = {}
+    if 'completed_units' in receipt_obj or 'consensus_findings' in receipt_obj:
+        for cf in receipt_obj.get('consensus_findings') or []:
+            if not isinstance(cf, dict):
+                continue
+            rby = cf.get('reported_by') or []
+            if isinstance(cf.get('left_finding'), dict) and len(rby) >= 1:
+                audit_findings_by_engine.setdefault(str(rby[0]), []).append(cf['left_finding'])
+            if isinstance(cf.get('right_finding'), dict) and len(rby) >= 2:
+                audit_findings_by_engine.setdefault(str(rby[1]), []).append(cf['right_finding'])
+        for sf in receipt_obj.get('single_source_findings') or []:
+            if not isinstance(sf, dict):
+                continue
+            rby = sf.get('reported_by') or []
+            eng = str(rby[0]) if rby else str(receipt_obj.get('left_engine') or '')
+            if eng:
+                audit_findings_by_engine.setdefault(eng, []).append(sf)
+
+    raw_streams = _result_streams(receipt_obj)
+    attached_audit_engines = set()
+    for idx, st in enumerate(raw_streams, 1):
+        if not isinstance(st, dict):
+            continue
+        inv = st.get('invocation') if isinstance(st.get('invocation'), dict) else {}
+        eng = str(st.get('engine') or receipt_obj.get('engine') or '').strip()
+        if not eng:
+            eng = f'unknown:{idx}'
+        prefix, _ = _engine_parts(eng) if ':' in eng else (eng.lower(), '')
+        sid = str(
+            st.get('stream_id')
+            or (f"{st['side']}-S{st['shard_id']}" if st.get('side') and st.get('shard_id') is not None
+                else f"S{st['shard_id']}" if st.get('shard_id') is not None else f'S{idx}')
+        )
+        st_status = str(st.get('status') or ('ok' if st.get('succeeded', receipt_obj.get('status') == 'ok') else 'failed'))
+        succeeded = bool(st.get('succeeded', st_status == 'ok'))
+        planned = _normalize_reconcile_paths(
+            st.get('planned_files') or st.get('files') or inv.get('files') or [], root_path,
+        )
+        ca = st.get('citation_audit') or inv.get('citation_audit') or {}
+        inlined = _normalize_reconcile_paths(ca.get('inlined_files') or [], root_path)
+        actual_read = _normalize_reconcile_paths(ca.get('actual_files_read') or [], root_path)
+        delivered = sorted(set(inlined) | set(actual_read))
+        self_read = _normalize_reconcile_paths(st.get('read_files') or [], root_path)
+        missing_cited = _normalize_reconcile_paths(ca.get('missing_files') or [], root_path)
+        unopened_cited = _normalize_reconcile_paths(ca.get('unopened_cited_files') or [], root_path)
+        out_of_range = list(ca.get('out_of_range_lines') or [])
+
+        raw_findings = []
+        res_obj = st.get('result')
+        if isinstance(res_obj, dict) and isinstance(res_obj.get('findings'), list):
+            raw_findings.extend(res_obj['findings'])
+        if isinstance(st.get('findings'), list):
+            raw_findings.extend(st['findings'])
+        if eng in audit_findings_by_engine and eng not in attached_audit_engines:
+            attached_audit_engines.add(eng)
+            raw_findings.extend(audit_findings_by_engine[eng])
+
+        norm_findings = []
+        for fitem in raw_findings:
+            if not isinstance(fitem, dict):
+                continue
+            fpath = str(fitem.get('file') or '').strip()
+            if not fpath:
+                continue
+            try:
+                frel = _normalize_rel_file(fpath, root_path)
+            except HarnessError:
+                frel = fpath.replace('\\', '/').lstrip('./')
+            ls = fitem.get('line_start')
+            le = fitem.get('line_end')
+            line_start = int(ls) if isinstance(ls, int) and not isinstance(ls, bool) and ls > 0 else 1
+            line_end = int(le) if isinstance(le, int) and not isinstance(le, bool) and le >= line_start else line_start
+            sev = str(fitem.get('severity') or 'medium').strip().lower()
+            if sev not in ('critical', 'high', 'medium', 'low'):
+                sev = 'medium'
+            norm_findings.append({
+                'file': frel,
+                'line_start': line_start,
+                'line_end': line_end,
+                'severity': sev,
+                'description': str(fitem.get('description') or fitem.get('summary') or '').strip(),
+                'evidence': str(fitem.get('evidence') or '').strip(),
+                'engine': eng,
+                'client_prefix': prefix,
+                'stream_id': sid,
+                'stream_status': st_status,
+            })
+
+        out.append({
+            'stream_id': sid,
+            'engine': eng,
+            'client_prefix': prefix,
+            'model': str(st.get('model') or receipt_obj.get('model') or ''),
+            'status': st_status,
+            'succeeded': succeeded,
+            'planned_files': planned,
+            'delivered_files': delivered,
+            'self_reported_read_files': self_read,
+            'citation_gap_count': len(missing_cited) + len(unopened_cited) + len(out_of_range),
+            'findings': norm_findings,
+        })
+    return out
+
+
+def build_cross_check_report(
+    target_root,
+    *,
+    run_id='',
+    receipts=None,
+    read_plan=None,
+    obligations=None,
+    line_tolerance=None,
+):
+    """纯确定性跨端汇总核对：覆盖矩阵、共同盲区、多端同位并列/分歧、跨片接口核对与 R6 回源清单。"""
+    root_path = Path(target_root).expanduser().resolve() if target_root else Path.cwd().resolve()
+    if root_path.is_file():
+        root_path = root_path.parent
+    run_id = run_id or uuid.uuid4().hex
+    if line_tolerance is None:
+        line_tolerance = _positive_int(_headless_tunables().get('consensus_line_tolerance')) or 8
+    ranks = {'critical': 4, 'high': 3, 'medium': 2, 'low': 1}
+
+    all_streams = []
+    for rec in (receipts or []):
+        all_streams.extend(_extract_cross_check_streams(rec, root_path))
+
+    # 1. 构建分母（计划文件 × 期望执行端）
+    expected_engines = []
+    engine_prefix_map = {}
+    planned_file_engines = {}  # file -> set(expected_engines) from read_plan
+    denominator_files = []
+
+    def _add_eng(eng_str):
+        if eng_str and eng_str not in expected_engines:
+            expected_engines.append(eng_str)
+            engine_prefix_map[eng_str] = _engine_parts(eng_str)[0] if ':' in eng_str else eng_str.lower()
+
+    def _add_file(rel):
+        if rel and rel not in denominator_files:
+            denominator_files.append(rel)
+
+    if isinstance(read_plan, dict):
+        for ep in read_plan.get('engines') or []:
+            if isinstance(ep, dict) and ep.get('engine'):
+                _add_eng(str(ep['engine']))
+        for rel in _normalize_reconcile_paths(read_plan.get('planned_files') or [], root_path):
+            _add_file(rel)
+        for sh in read_plan.get('shards') or []:
+            if not isinstance(sh, dict):
+                continue
+            sh_engs = [str(e) for e in (sh.get('assigned_engines') or []) if e]
+            for e in sh_engs:
+                _add_eng(e)
+            for rel in _normalize_reconcile_paths(sh.get('files') or [], root_path):
+                _add_file(rel)
+                planned_file_engines.setdefault(rel, set()).update(sh_engs)
+        shared_rels = _normalize_reconcile_paths(read_plan.get('shared_files') or [], root_path)
+        if shared_rels and (read_plan.get('budget') or {}).get('shared_mode') == 'inlined_per_shard':
+            for rel in shared_rels:
+                _add_file(rel)
+                planned_file_engines.setdefault(rel, set()).update(expected_engines)
+
+    for st in all_streams:
+        _add_eng(st['engine'])
+        for rel in st['planned_files']:
+            _add_file(rel)
+        for rel in st['delivered_files']:
+            _add_file(rel)
+        for fitem in st['findings']:
+            _add_file(fitem['file'])
+
+    norm_obs = _normalize_obligations(obligations)
+    if isinstance(read_plan, dict) and isinstance(read_plan.get('obligations'), list):
+        seen_ob_ids = {item['id'] for item in norm_obs}
+        for item in _normalize_obligations(read_plan.get('obligations')):
+            if item['id'] not in seen_ob_ids:
+                norm_obs.append(item)
+                seen_ob_ids.add(item['id'])
+    for ob in norm_obs:
+        if ob['kind'] in ('read', 'review') and ob['target']:
+            _add_file(ob['target'])
+
+    denominator_files = sorted(denominator_files)
+
+    # 2. 按 (file, engine) 逐格计算覆盖矩阵
+    coverage_matrix = {}  # file -> {engine: status}
+    multi_client_delivered = []
+    multi_engine_delivered = []
+    single_engine_only_delivered = []
+    shared_blind_spots = []
+    failed_or_timeout_cells = []
+    missing_envelope_cells = []
+    reported_only_cells = []
+
+    for rel in denominator_files:
+        row_map = {}
+        delivered_engs = []
+        delivered_clients = set()
+        for eng in expected_engines:
+            eng_streams = [st for st in all_streams if st['engine'] == eng]
+            assigned_streams = [st for st in eng_streams if rel in st['planned_files'] or rel in st['delivered_files'] or rel in st['self_reported_read_files']]
+            ok_delivered = any(st['succeeded'] and rel in st['delivered_files'] for st in eng_streams)
+            ok_reported = any(st['succeeded'] and rel in st['self_reported_read_files'] for st in eng_streams)
+            any_failed = any((not st['succeeded']) and (rel in st['planned_files']) for st in eng_streams)
+            if ok_delivered:
+                cell = 'delivered'
+                delivered_engs.append(eng)
+                delivered_clients.add(engine_prefix_map.get(eng, eng))
+            elif any_failed:
+                cell = 'failed_or_timeout'
+                failed_or_timeout_cells.append({'file': rel, 'engine': eng})
+            elif ok_reported:
+                cell = 'reported_only'
+                reported_only_cells.append({'file': rel, 'engine': eng})
+            elif assigned_streams:
+                cell = 'unverified_delivery'
+            elif eng in planned_file_engines.get(rel, ()):
+                cell = 'missing_from_envelope'
+                missing_envelope_cells.append({'file': rel, 'engine': eng})
+            else:
+                cell = 'not_assigned'
+            row_map[eng] = cell
+        coverage_matrix[rel] = row_map
+        if len(delivered_clients) >= 2:
+            multi_client_delivered.append(rel)
+        if len(delivered_engs) >= 2:
+            multi_engine_delivered.append(rel)
+        elif len(delivered_engs) == 1:
+            single_engine_only_delivered.append(rel)
+        else:
+            shared_blind_spots.append(rel)
+
+    # 3. 发现项跨端对齐与分歧保全（绝不以同位置覆盖相反观点，绝不免除 R6 回源核对）
+    all_findings = [fitem for st in all_streams for fitem in st['findings']]
+    clusters = []
+    for fitem in sorted(all_findings, key=lambda x: (x['file'], x['line_start'], -ranks[x['severity']], x['engine'])):
+        placed = False
+        for cl in clusters:
+            if (
+                cl['file'] == fitem['file']
+                and fitem['line_start'] - line_tolerance <= cl['line_end']
+                and cl['line_start'] - line_tolerance <= fitem['line_end']
+            ):
+                cl['items'].append(fitem)
+                cl['line_start'] = min(cl['line_start'], fitem['line_start'])
+                cl['line_end'] = max(cl['line_end'], fitem['line_end'])
+                placed = True
+                break
+        if not placed:
+            clusters.append({
+                'file': fitem['file'],
+                'line_start': fitem['line_start'],
+                'line_end': fitem['line_end'],
+                'items': [fitem],
+            })
+
+    co_located_multi_engine = []
+    single_engine_findings = []
+    divergent_findings = []
+    for cl in clusters:
+        engines_in_cl = list(dict.fromkeys(it['engine'] for it in cl['items']))
+        clients_in_cl = list(dict.fromkeys(it['client_prefix'] for it in cl['items']))
+        max_sev = max((it['severity'] for it in cl['items']), key=lambda s: ranks[s])
+        min_sev = min((it['severity'] for it in cl['items']), key=lambda s: ranks[s])
+        if len(engines_in_cl) >= 2:
+            sev_div = (ranks[max_sev] - ranks[min_sev]) >= 1
+            descs = [it['description'] for it in cl['items']]
+            has_ok = any(_CROSS_CHECK_OK_POLARITY_RE.search(d) for d in descs)
+            has_bad = any(_CROSS_CHECK_BAD_POLARITY_RE.search(d) for d in descs)
+            pol_div = bool(has_ok and has_bad)
+            entry = {
+                'file': cl['file'],
+                'line_start': cl['line_start'],
+                'line_end': cl['line_end'],
+                'max_severity': max_sev,
+                'engines': engines_in_cl,
+                'cross_client': len(clients_in_cl) >= 2,
+                'severity_divergent': sev_div,
+                'polarity_divergence_hint': pol_div,
+                'match_basis': 'location_overlap_only',
+                'r6_host_verification_required': True,
+                'items': cl['items'],
+            }
+            co_located_multi_engine.append(entry)
+            if sev_div or pol_div:
+                divergent_findings.append(entry)
+        else:
+            only_eng = engines_in_cl[0]
+            other_status = {
+                eng: ('delivered_no_finding' if st_val == 'delivered' else st_val)
+                for eng, st_val in (coverage_matrix.get(cl['file']) or {}).items()
+                if eng != only_eng
+            }
+            single_engine_findings.append({
+                'file': cl['file'],
+                'line_start': cl['line_start'],
+                'line_end': cl['line_end'],
+                'max_severity': max_sev,
+                'engine': only_eng,
+                'client_prefix': clients_in_cl[0],
+                'other_engines_coverage': other_status,
+                'other_engine_failed_or_missing': any(
+                    v in ('failed_or_timeout', 'missing_from_envelope', 'unverified_delivery')
+                    for v in other_status.values()
+                ),
+                'r6_host_verification_required': True,
+                'items': cl['items'],
+            })
+
+    co_located_multi_engine.sort(key=lambda x: (-ranks[x['max_severity']], not (x['severity_divergent'] or x['polarity_divergence_hint']), x['file'], x['line_start']))
+    single_engine_findings.sort(key=lambda x: (-ranks[x['max_severity']], x['file'], x['line_start']))
+
+    # 4. 跨片接口核对清单（检测是否存在无公共复核端的跨片显式依赖边）
+    cross_shard_verification = []
+    if isinstance(read_plan, dict):
+        for edge in read_plan.get('cross_shard_edges') or []:
+            src = edge.get('source', '')
+            tgt = edge.get('target', '')
+            src_map = coverage_matrix.get(src) or {}
+            tgt_map = coverage_matrix.get(tgt) or {}
+            joint = [e for e in expected_engines if src_map.get(e) == 'delivered' and tgt_map.get(e) == 'delivered']
+            src_deliv = [e for e in expected_engines if src_map.get(e) == 'delivered']
+            tgt_deliv = [e for e in expected_engines if tgt_map.get(e) == 'delivered']
+            needs_w2 = not joint
+            cross_shard_verification.append({
+                'from_shard': edge.get('from_shard'),
+                'to_shard': edge.get('to_shard'),
+                'source': src,
+                'target': tgt,
+                'relation': edge.get('relation', ''),
+                'source_delivered_by': src_deliv,
+                'target_delivered_by': tgt_deliv,
+                'joint_delivered_by': joint,
+                'needs_wave2_cross_check': needs_w2,
+            })
+
+    # 5. R6 主会话回源原文件精确行号核对清单与顶层告警
+    r6_source_check_list = []
+    for item in co_located_multi_engine:
+        r6_source_check_list.append({
+            'file': item['file'],
+            'line_start': item['line_start'],
+            'line_end': item['line_end'],
+            'severity': item['max_severity'],
+            'kind': 'divergent_multi_engine' if (item['severity_divergent'] or item['polarity_divergence_hint']) else 'co_located_multi_engine',
+            'engines': item['engines'],
+        })
+    for item in single_engine_findings:
+        r6_source_check_list.append({
+            'file': item['file'],
+            'line_start': item['line_start'],
+            'line_end': item['line_end'],
+            'severity': item['max_severity'],
+            'kind': 'single_engine_with_peer_gap' if item['other_engine_failed_or_missing'] else 'single_engine_finding',
+            'engines': [item['engine']],
+        })
+    r6_source_check_list.sort(key=lambda x: (-ranks[x['severity']], x['file'], x['line_start']))
+
+    alerts = []
+    if shared_blind_spots:
+        alerts.append({
+            'severity': 'red',
+            'kind': 'shared_blind_spot',
+            'target': ', '.join(shared_blind_spots[:5]),
+            'detail': f'{len(shared_blind_spots)} 份分母文件在全部参与端均无可证实交付凭据（可能存在共同信封缺口或全端失败）',
+        })
+    if failed_or_timeout_cells:
+        alerts.append({
+            'severity': 'red',
+            'kind': 'cross_client_stream_failure',
+            'target': ', '.join(sorted({f"{c['engine']}:{c['file']}" for c in failed_or_timeout_cells})[:5]),
+            'detail': f'{len(failed_or_timeout_cells)} 个（文件 × 引擎）格子因流失败或超时缺证，仍保留在验收分母中',
+        })
+    if missing_envelope_cells:
+        alerts.append({
+            'severity': 'red',
+            'kind': 'missing_from_envelope',
+            'target': ', '.join(sorted({f"{c['engine']}:{c['file']}" for c in missing_envelope_cells})[:5]),
+            'detail': f'{len(missing_envelope_cells)} 个计划分配项未出现在任何派单流输入信封中',
+        })
+    if divergent_findings:
+        alerts.append({
+            'severity': 'yellow',
+            'kind': 'cross_client_finding_divergence',
+            'target': ', '.join(f"{d['file']}:L{d['line_start']}" for d in divergent_findings[:5]),
+            'detail': f'{len(divergent_findings)} 处多端同位置发现存在严重度或极性分歧，须主会话按 R6 亲自回源核对',
+        })
+    cross_gaps = [c for c in cross_shard_verification if c['needs_wave2_cross_check']]
+    if cross_gaps:
+        alerts.append({
+            'severity': 'yellow',
+            'kind': 'cross_shard_unverified_interface',
+            'target': ', '.join(f"{c['source']}->{c['target']}" for c in cross_gaps[:5]),
+            'detail': f'{len(cross_gaps)} 条跨片显式依赖边缺乏同时阅读两端的公共执行端，建议安排 L2 联合回源复核',
+        })
+
+    summary_line = (
+        f"分母 {len(denominator_files)} 文件 × {len(expected_engines)} 引擎（多端实证 {len(multi_engine_delivered)}、"
+        f"跨客户端实证 {len(multi_client_delivered)}、共同盲区 {len(shared_blind_spots)}、失败/超时格 {len(failed_or_timeout_cells)}）；"
+        f"多端同位发现 {len(co_located_multi_engine)} 处（含分歧 {len(divergent_findings)} 处）、单端发现 {len(single_engine_findings)} 处"
+        + (f"；跨片缺联审边 {len(cross_gaps)} 条" if cross_gaps else '')
+    )
+
+    return {
+        'schema_version': 1,
+        'run_id': run_id,
+        'generated_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        'target_root': str(root_path),
+        'summary_line': summary_line,
+        'engines': expected_engines,
+        'counts': {
+            'denominator_files': len(denominator_files),
+            'engines_count': len(expected_engines),
+            'streams_count': len(all_streams),
+            'failed_streams_count': sum(1 for st in all_streams if not st['succeeded']),
+            'multi_client_delivered': len(multi_client_delivered),
+            'multi_engine_delivered': len(multi_engine_delivered),
+            'single_engine_only_delivered': len(single_engine_only_delivered),
+            'shared_blind_spots': len(shared_blind_spots),
+            'failed_or_timeout_cells': len(failed_or_timeout_cells),
+            'missing_envelope_cells': len(missing_envelope_cells),
+            'reported_only_cells': len(reported_only_cells),
+            'co_located_multi_engine': len(co_located_multi_engine),
+            'divergent_findings': len(divergent_findings),
+            'single_engine_findings': len(single_engine_findings),
+            'cross_shard_edges_total': len(cross_shard_verification),
+            'cross_shard_unverified': len(cross_gaps),
+            'r6_items_total': len(r6_source_check_list),
+        },
+        'alerts': alerts,
+        'streams': [{k: v for k, v in st.items() if k != 'findings'} for st in all_streams],
+        'coverage_matrix': coverage_matrix,
+        'shared_blind_spots': shared_blind_spots,
+        'failed_or_timeout_cells': failed_or_timeout_cells,
+        'missing_envelope_cells': missing_envelope_cells,
+        'co_located_multi_engine': co_located_multi_engine,
+        'divergent_findings': divergent_findings,
+        'single_engine_findings': single_engine_findings,
+        'cross_shard_verification': cross_shard_verification,
+        'r6_source_check_list': r6_source_check_list,
+        'honesty_boundary': (
+            '本跨端汇总核对表由纯确定性代码基于回执终态、citation_audit 可证实交付记录与原始发现并列生成；'
+            '多端同位置检出绝不等同于共识已证实，且超时/失败端仍计入验收分母；所有拟采纳发现须由主会话按 R6 亲自打开原文件核对行号与上下文。'
+        ),
+    }
+
+
+def render_cross_check_markdown(report):
+    """将跨端覆盖矩阵、共同盲区、多端并列/分歧发现与 R6 待回源清单渲染为 Markdown。"""
+    c = report['counts']
+    engines = report.get('engines') or []
+    lines = [
+        f"# 跨端分片读取与独立汇总核对表（`{report['run_id'][:12]}`）",
+        '',
+        f"- **生成时间**：`{report['generated_at']}`",
+        f"- **目标根目录**：`{report['target_root']}`",
+        f"- **一句话摘要**：{report['summary_line']}",
+        f"- **核对边界声明**：{report['honesty_boundary']}",
+        '',
+        '---',
+        '',
+        '## 一、首屏重点告警（共同盲区、超时缺口、跨端分歧与跨片边）',
+        '',
+    ]
+    alerts = report.get('alerts') or []
+    if not alerts:
+        lines.append('（无共同盲区、失败缺口或显式分歧告警；拟采纳发现仍须按 R6 回源核对原文。）')
+    else:
+        lines.append('| 级别 | 类型 | 涉及对象 | 确定性说明 |')
+        lines.append('| --- | --- | --- | --- |')
+        for al in alerts[:_RECONCILE_TOP_SCREEN_ITEMS]:
+            icon = '🔴 阻断/缺口' if al.get('severity') == 'red' else '🟡 待回源核对'
+            lines.append(f"| {icon} | `{al.get('kind', '')}` | `{al.get('target', '')}` | {al.get('detail', '')} |")
+
+    lines.extend(['', '---', '', '## 二、计划分母 × 客户端覆盖矩阵', ''])
+    if not report.get('coverage_matrix'):
+        lines.append('（无计划或已交付文件记录。）')
+    else:
+        cell_labels = {
+            'delivered': '已实证',
+            'reported_only': '仅自报',
+            'failed_or_timeout': '失败/超时',
+            'missing_from_envelope': '漏入信封',
+            'unverified_delivery': '未证实交付',
+            'not_assigned': '未分配',
+        }
+        header = '| 目标文件 | ' + ' | '.join(f'`{e}`' for e in engines) + ' |'
+        sep = '| --- | ' + ' | '.join('---' for _ in engines) + ' |'
+        lines.extend([header, sep])
+        for rel, row_map in list(report['coverage_matrix'].items())[:150]:
+            vals = ' | '.join(cell_labels.get(row_map.get(e, 'not_assigned'), row_map.get(e, '')) for e in engines)
+            lines.append(f'| `{rel}` | {vals} |')
+        if len(report['coverage_matrix']) > 150:
+            lines.append(f"\n> 分母共 {len(report['coverage_matrix'])} 份文件，表内展示前 150 项。")
+
+    lines.extend(['', '---', '', '## 三、多端同位置发现并列核对（含分歧标出，均需 R6 回源）', ''])
+    co_list = report.get('co_located_multi_engine') or []
+    if not co_list:
+        lines.append('（无多端同位置发现。）')
+    else:
+        lines.append('| 文件与行段 | 最高级别 | 跨客户端 | 分歧标记 | 各端原始意见并列 |')
+        lines.append('| --- | --- | --- | --- | --- |')
+        for item in co_list[:80]:
+            div_tags = []
+            if item['severity_divergent']:
+                div_tags.append('严重度分歧')
+            if item['polarity_divergence_hint']:
+                div_tags.append('极性冲突线索')
+            div_str = '、'.join(div_tags) if div_tags else '同位待 R6 核实'
+            opinions = '；'.join(
+                f"`{sub['engine']}`[{sub['severity']}]: {sub['description'][:90]}"
+                for sub in item['items']
+            )
+            lines.append(
+                f"| `{item['file']}:L{item['line_start']}-L{item['line_end']}` | `{item['max_severity']}` | "
+                f"{'是' if item['cross_client'] else '否'} | {div_str} | {opinions} |"
+            )
+
+    lines.extend(['', '---', '', '## 四、单端发现与对端覆盖状态', ''])
+    single_list = report.get('single_engine_findings') or []
+    if not single_list:
+        lines.append('（无单端独有发现。）')
+    else:
+        lines.append('| 文件与行段 | 级别 | 报告端 | 对端覆盖状态 | 原始描述 |')
+        lines.append('| --- | --- | --- | --- | --- |')
+        for item in single_list[:80]:
+            peer_str = '；'.join(f"`{e}`={st}" for e, st in item['other_engines_coverage'].items()) or '无对端'
+            desc = item['items'][0]['description'][:110] if item['items'] else ''
+            lines.append(
+                f"| `{item['file']}:L{item['line_start']}-L{item['line_end']}` | `{item['max_severity']}` | "
+                f"`{item['engine']}` | {peer_str} | {desc} |"
+            )
+
+    lines.extend(['', '---', '', '## 五、跨片显式接口边联审核对', ''])
+    if report.get('cross_shard_verification'):
+        lines.append('| 源分片 → 目标分片 | 关系 | 源文件 | 目标文件 | 共同实证端 | 需 L2 联合回源 |')
+        lines.append('| --- | --- | --- | --- | --- | --- |')
+        for edge in report['cross_shard_verification'][:80]:
+            joint = ', '.join(edge['joint_delivered_by']) or '无'
+            lines.append(
+                f"| `P{edge['from_shard']}` → `P{edge['to_shard']}` | `{edge['relation']}` | "
+                f"`{edge['source']}` | `{edge['target']}` | `{joint}` | {'**是**' if edge['needs_wave2_cross_check'] else '否'} |"
+            )
+    else:
+        lines.append('（本次核对未绑定含跨片显式依赖边的阅读计划。）')
+
+    lines.extend(['', '---', '', '## 六、R6 主会话待回源原文件精确行号清单', ''])
+    r6_list = report.get('r6_source_check_list') or []
+    if not r6_list:
+        lines.append('（本次无待回源发现项。）')
+    else:
+        for idx, item in enumerate(r6_list[:80], 1):
+            lines.append(
+                f"{idx}. `{item['file']}:L{item['line_start']}-L{item['line_end']}` "
+                f"(`{item['severity']}` · `{item['kind']}` · 来源 `{', '.join(item['engines'])}`)"
+            )
+    return '\n'.join(lines).rstrip() + '\n'
+
+
+def cmd_cross_check(args):
+    """纯离线跨端分片读取汇总核对入口：对比多份回执与阅读计划分母并落盘 Markdown/JSON。"""
+    target, root = _target(args)
+    raw_receipts = getattr(args, 'receipt', None) or []
+    if not raw_receipts:
+        raise HarnessError('cross-check 至少需要一份 --receipt 回执 JSON 路径')
+    receipts = []
+    for rp in raw_receipts:
+        obj = _read_json(Path(rp).expanduser())
+        if not isinstance(obj, dict):
+            raise HarnessError(f'无效的回执 JSON: {rp}')
+        receipts.append(obj)
+    read_plan = None
+    if getattr(args, 'read_plan', ''):
+        read_plan = _read_json(Path(args.read_plan).expanduser())
+    obligations = None
+    if getattr(args, 'obligations_file', ''):
+        raw_ob = _read_json(Path(args.obligations_file).expanduser())
+        obligations = raw_ob.get('obligations') if isinstance(raw_ob, dict) else raw_ob
+
+    run_id = uuid.uuid4().hex
+    report = build_cross_check_report(
+        root,
+        run_id=run_id,
+        receipts=receipts,
+        read_plan=read_plan,
+        obligations=obligations,
+    )
+    plan_dir = resolve_dispatch_plan_dir(getattr(args, 'plan_dir', None))
+    rec_dir = plan_dir / 'reconcile'
+    if os.path.lexists(rec_dir) and _is_link(rec_dir):
+        raise HarnessError(f'拒绝通过符号链接目录写入跨端核对表: {rec_dir}')
+    md_path = Path(args.output_md).expanduser() if getattr(args, 'output_md', '') else (rec_dir / f'{run_id}_cross_check.md')
+    json_path = rec_dir / f'{run_id}_cross_check.json'
+    redact = bool(getattr(args, 'redact', False))
+    for anc in (md_path.parent, md_path, json_path.parent, json_path):
+        if os.path.lexists(anc) and _is_link(anc):
+            raise HarnessError(f'拒绝通过符号链接写入跨端核对文件: {anc}')
+    md_text = render_cross_check_markdown(report)
+    if redact:
+        md_text = _redact_public(md_text)
+    _atomic_text(md_path, md_text)
+    _atomic_json(json_path, _redact_public(report) if redact else report)
+    saved_md = str(md_path.resolve())
+    saved_json = str(json_path.resolve())
+
+    md_uri = Path(saved_md).as_uri()
+    chat_line = f"跨端汇总核对（{report['summary_line']}）：[{Path(saved_md).name}]({md_uri})"
+    out = {
+        'status': 'ok',
+        'run_id': run_id,
+        'report_file': saved_md,
+        'cross_check_json_file': saved_json,
+        'chat_line': chat_line,
+        'summary_line': report['summary_line'],
+        'counts': report['counts'],
+        'alerts': report['alerts'][:_RECONCILE_TOP_SCREEN_ITEMS],
+        'shared_blind_spots': report['shared_blind_spots'][:20],
+        'r6_source_check_top': report['r6_source_check_list'][:_RECONCILE_TOP_SCREEN_ITEMS],
+        'honesty_boundary': report['honesty_boundary'],
+    }
+    return _inspection_print(args, out)
+
+
 def _inspection_print(args, payload):
     if getattr(args, 'output', ''):
         _atomic_json(args.output, payload if getattr(args, 'no_redact_output', False) else _redact_public(payload))
@@ -7755,6 +10494,8 @@ def cmd_audit(args):
         _require_execution_profile(profile)
     base = _git_head(root)
     before = snapshot_files(root, ignore_patterns=snap_patterns)
+    args._reconcile_target_root = root
+    args._reconcile_baseline = capture_reconcile_baseline(root, ignore_patterns=snap_patterns, pre_snapshot=before)
     tasks = [(side, unit) for side in ('left', 'right') for unit in plan[side + '_units']]
     findings = {'left': [], 'right': []}
     errors, completed = [], []
@@ -7837,10 +10578,39 @@ def cmd_audit(args):
     completed.sort(key=lambda unit: (unit['side'], unit['shard_id']))
     errors.sort(key=lambda unit: (unit['side'], unit['shard_id']))
     merged = merge_blind_findings(findings['left'], findings['right'], plan['left_engine'], plan['right_engine'], root)
+    side_delivered = {'left': set(), 'right': set()}
+    has_delivery_telemetry = False
+    for unit in completed:
+        ca = (unit.get('invocation') or {}).get('citation_audit')
+        if isinstance(ca, dict) and (ca.get('inlined_files') or ca.get('actual_files_read')):
+            has_delivery_telemetry = True
+            side_delivered[unit['side']].update(
+                _normalize_reconcile_paths(list(ca.get('inlined_files') or []) + list(ca.get('actual_files_read') or []), root)
+            )
+    all_audit_files = sorted({f for u in (*completed, *errors) for f in (u.get('planned_files') or [])})
+    dual_delivered = sorted(side_delivered['left'] & side_delivered['right'])
+    single_side = sorted(side_delivered['left'] ^ side_delivered['right'])
+    shared_blind = sorted(set(all_audit_files) - (side_delivered['left'] | side_delivered['right'])) if has_delivery_telemetry else []
+    divergent_cnt = sum(1 for item in merged['consensus_findings'] if item.get('severity_divergent'))
+    cross_coverage = {
+        'delivery_telemetry_present': has_delivery_telemetry,
+        'planned_files_count': len(all_audit_files),
+        'dual_delivered_count': len(dual_delivered),
+        'single_side_delivered_count': len(single_side),
+        'shared_blind_spots': shared_blind,
+        'failed_units_count': len(errors),
+        'divergent_findings_count': divergent_cnt,
+        'summary_line': (
+            f"双端实证 {len(dual_delivered)}/{len(all_audit_files)} 份，单端 {len(single_side)} 份，"
+            f"失败单元 {len(errors)} 个，双端严重度分歧 {divergent_cnt} 处"
+            if has_delivery_telemetry else
+            f"计划 {len(all_audit_files)} 份（无底层交付遥测，失败单元 {len(errors)} 个，双端严重度分歧 {divergent_cnt} 处）"
+        ),
+    }
     return _dispatch_print(args, {'status': status, **meta, 'plan': plan, 'base_commit': base,
                    'completed_units': completed, 'completed_count': sum(unit['status'] == 'ok' for unit in completed),
                    'received_count': len(completed), 'total_units': len(tasks), 'errors': errors,
-                   'reading_coverage_verified': False,
+                   'reading_coverage_verified': False, 'cross_client_coverage': cross_coverage,
                    'consensus_count': len(merged['consensus_findings']), 'single_source_count': len(merged['single_source_findings']),
                    **merged, **scope, **scope_error, **quota_meta,
                    'verification_notice': '当前总控需核实原始文件与证据后采纳发现。'})
@@ -7907,6 +10677,11 @@ def cmd_gate(args):
                        'work_dir': str(root), 'verify_cmd': args.verify_cmd, 'write_scope': scopes, 'max_rounds': args.max_rounds})
     _require_execution_profile(profile)
     base = _git_head(root)
+    args._reconcile_target_root = root
+    args._reconcile_baseline = capture_reconcile_baseline(
+        root, ignore_dirs=snap_ignored, ignore_patterns=snap_patterns,
+        pre_snapshot=fallback_before, capture_snapshot=False,
+    )
     try:
         result = _run_gate_with_fallback(
             args, root, requested_target, text, caller, engine, backends,
@@ -8004,7 +10779,14 @@ def cmd_task(args):
     if args.dry_run:
         return _dispatch_print(args, {'status': 'ok', 'dry_run': True, 'quota_cooldown': backends.get(prefix, {}).get('quota_cooldown'), **payload})
     _require_execution_profile(profile)
+    if files:
+        payload['planned_files'] = list(files)
+    args._reconcile_target_root = root
     if args.kind == 'code' and args.verify_cmd:
+        args._reconcile_baseline = capture_reconcile_baseline(
+            root, ignore_dirs=snap_ignored, ignore_patterns=snap_patterns,
+            pre_snapshot=fallback_before, capture_snapshot=False,
+        )
         try:
             result = _run_gate_with_fallback(
                 args, root, requested_target, text + boundary, caller, engine, backends,
@@ -8018,6 +10800,9 @@ def cmd_task(args):
     if not readonly:
         payload['verification_notice'] = '未提供 --verify-cmd，本次代码修改未经宿主机命令实测验证，请总控运行验证后再验收。'
     before = snapshot_files(root, ignore_dirs=snap_ignored, ignore_patterns=snap_patterns)
+    args._reconcile_baseline = capture_reconcile_baseline(
+        root, ignore_dirs=snap_ignored, ignore_patterns=snap_patterns, pre_snapshot=before,
+    )
     prompt = _task_prompt(args.kind, caller, requested_target, readonly, scopes, text, boundary)
     result, error, status, invocation = {}, {}, 'ok', {}
     try:
@@ -8534,6 +11319,42 @@ def _is_heavy_streams(streams, switched=False):
         or stream.get('timeout', 0) > cfg.get('heavy_max_light_timeout_sec', 600) for stream in streams))
 
 
+def _resolve_reconcile_target_root(args, payload):
+    """为派单完工自动机械对账安全定位目标根目录；纯 mock 无目标 batch 不盲扫宿主 CWD。"""
+    candidates = []
+    explicit_root = getattr(args, '_reconcile_target_root', None)
+    if explicit_root:
+        candidates.append(explicit_root)
+    base_obj = getattr(args, '_reconcile_baseline', None)
+    if isinstance(base_obj, dict) and base_obj.get('root'):
+        candidates.append(base_obj['root'])
+    if isinstance(payload, dict) and payload.get('target'):
+        candidates.append(payload['target'])
+    if isinstance(payload, dict):
+        for st in _result_streams(payload):
+            if not isinstance(st, dict):
+                continue
+            if st.get('target'):
+                candidates.append(st['target'])
+            inv = st.get('invocation')
+            if isinstance(inv, dict) and inv.get('target_dir'):
+                candidates.append(inv['target_dir'])
+    raw_arg_target = getattr(args, 'target', None)
+    cmd = getattr(args, 'subcommand', '')
+    if raw_arg_target and not (cmd == 'batch' and str(raw_arg_target).strip() == '.' and not candidates):
+        candidates.append(raw_arg_target)
+    for raw in candidates:
+        try:
+            p = Path(str(raw)).expanduser().resolve()
+            if p.is_file():
+                p = p.parent
+            if p.is_dir():
+                return p
+        except OSError:
+            continue
+    return None
+
+
 def record_heavy_completion_for_stop_hook(args, payload):
     if (getattr(args, 'dry_run', False) or os.environ.get('CAE_HARNESS_DEPTH')
             or os.environ.get('CAE_DISABLE_HEAVY_COMPLETIONS') == '1'):
@@ -8575,6 +11396,40 @@ def record_heavy_completion_for_stop_hook(args, payload):
         raise HarnessError(f'拒绝通过符号链接写入回执文件: {raw_receipt}')
     receipt_path = raw_receipt.resolve()
     payload['receipt_file'] = str(receipt_path)
+    # 派单完工硬触发：生成纯确定性机械对账表落盘至 plan_dir/reconcile/，不污染目标业务仓库
+    reconcile_saved_md = ''
+    reconcile_summary = ''
+    rec_root = _resolve_reconcile_target_root(args, payload)
+    if rec_root is not None:
+        rec_dir = plan_dir / 'reconcile'
+        if os.path.lexists(rec_dir) and _is_link(rec_dir):
+            raise HarnessError(f'拒绝通过符号链接目录写入机械对账表: {rec_dir}')
+        rec_ticket = getattr(args, '_approved_ticket', None)
+        rec_report = build_reconciliation_report(
+            rec_root,
+            run_id=run_id,
+            subcommand=command or 'dispatch',
+            payload=payload,
+            baseline=getattr(args, '_reconcile_baseline', None),
+            obligations=getattr(args, '_reconcile_obligations', None),
+            ticket=rec_ticket if isinstance(rec_ticket, dict) else None,
+        )
+        rec_md_path = rec_dir / f'{run_id}_reconcile.md'
+        reconcile_saved_md = _write_reconciliation_artifact(
+            rec_report, rec_md_path, redact=bool(getattr(args, 'redact', False)),
+        )
+        reconcile_summary = rec_report['summary_line']
+        payload['reconciliation'] = {
+            'run_id': run_id,
+            'report_file': reconcile_saved_md,
+            'chat_line': f"机械对账（{reconcile_summary}）：[{Path(reconcile_saved_md).name}]({Path(reconcile_saved_md).as_uri()})",
+            'summary_line': reconcile_summary,
+            'counts': rec_report['counts'],
+            'baseline_source': rec_report['baseline_source'],
+            'changes_status': rec_report['changes_status'],
+            'alert_count': len(rec_report['alerts']),
+            'pending_review_count': len(rec_report['pending_review']),
+        }
     # Explicit --output is written by _dispatch_print after all metadata is attached.
     if not raw_out:
         _atomic_json(raw_receipt, _redact_public(payload))
@@ -8604,6 +11459,9 @@ def record_heavy_completion_for_stop_hook(args, payload):
                                              or extract_cli_token_usage('', '')}
                              for i, stream in enumerate(_result_streams(payload), 1)],
                  'token_usage_summary': payload['token_usage_summary'], 'reported_to_user': False}
+        if reconcile_saved_md:
+            entry['reconcile_file'] = reconcile_saved_md
+            entry['reconcile_summary'] = reconcile_summary
         with _COMPLETION_LOCK, _heavy_completion_file_lock(hc_dir, session_id):
             if os.path.lexists(path) and _is_link(path):
                 raise HarnessError(f'拒绝通过符号链接写入重负载完工记录: {path}')
@@ -9965,6 +12823,23 @@ def cmd_plan(args):
                   'workflow_goal': args.workflow_goal, 'workflow_impact': args.workflow_impact,
                   'streams': streams, 'is_heavy': _is_heavy_streams(streams, switched),
                   'capability_ledger': _fleet_profile().get('capability_ledger', {})}
+        if getattr(args, 'obligations_file', ''):
+            raw_ob = _read_json(Path(args.obligations_file).expanduser())
+            raw_ob_list = raw_ob.get('obligations') if isinstance(raw_ob, dict) else raw_ob
+            ticket['obligations'] = _normalize_obligations(raw_ob_list)
+        baseline_heads = {}
+        for _st in streams:
+            try:
+                _tp = Path(str(_st.get('target') or '')).expanduser().resolve()
+                _rt = _tp if _tp.is_dir() else _tp.parent
+                if _rt.is_dir() and str(_rt) not in baseline_heads:
+                    _hd = _git_head(_rt)
+                    if _hd:
+                        baseline_heads[str(_rt)] = _hd
+            except OSError:
+                continue
+        if baseline_heads:
+            ticket['baseline_heads'] = baseline_heads
         ticket['plan_hash'] = _plan_hash(ticket)
         _render_plan(ticket)
         if ticket['is_heavy'] or args.save_ticket:
@@ -10114,6 +12989,8 @@ def cmd_batch(args):
             if not readonly and not scopes:
                 raise HarnessError('批处理编码任务必须声明 write_scope')
             files, negative, contract = _input_envelope(args, target, stream)
+            if files:
+                result['planned_files'] = list(files)
             with _workspace_guard(root, None if readonly else scopes) as peer_scopes:
                 snap_ignored = None if readonly else _snapshot_ignore_dirs_for(
                     scopes, include_build=bool((stream.get('verify_cmd') or '').strip())
@@ -10197,6 +13074,22 @@ def cmd_batch(args):
             result['elapsed_sec'] = round(time.monotonic() - started, 6)
             result['token_usage'] = invocation.get('token_usage') or extract_cli_token_usage(prefix, '')
         return result
+    if not args.dry_run:
+        primary_root = None
+        for _st in streams:
+            try:
+                _tp = Path(str(_st.get('target') or '')).expanduser().resolve()
+                if _tp.exists():
+                    primary_root = _tp if _tp.is_dir() else _tp.parent
+                    break
+            except OSError:
+                continue
+        if primary_root is not None:
+            args._reconcile_target_root = primary_root
+            args._reconcile_baseline = capture_reconcile_baseline(
+                primary_root, ignore_patterns=read_agentignore_patterns(primary_root),
+                capture_snapshot=False,
+            )
     waves = {}
     for index, stream in enumerate(streams):
         groups = waves.setdefault(stream.get('wave', 1), {})
@@ -10330,6 +13223,10 @@ def cmd_followup(args):
     ignored = None if readonly else _snapshot_ignore_dirs_for(scopes)
     patterns = read_agentignore_patterns(root)
     before = snapshot_files(root, ignore_dirs=ignored, ignore_patterns=patterns)
+    args._reconcile_target_root = root
+    args._reconcile_baseline = capture_reconcile_baseline(
+        root, ignore_dirs=ignored, ignore_patterns=patterns, pre_snapshot=before,
+    )
     raw_session_plan_dir = str(previous.get('session_plan_dir') or '').strip()
     state = args.plan_dir or (str(_unredact_local_path(raw_session_plan_dir)) if raw_session_plan_dir else '')
     try:
@@ -10368,6 +13265,41 @@ def build_arg_parser():
     grounding.add_argument('--base-ref', default='', help='可选 Git 基线引用（如 HEAD），额外拦截改写期间新增的无依据领域短语')
     grounding.add_argument('--allow-from-file', action='append', default=[], help='额外纳入允许锚点语料的说明或需求文件路径')
     grounding.add_argument('--strict', action='store_true', help='检出任何无依据标识符、缩写、定量数字或举例词干时返回非零退出码')
+    reconcile = sub.add_parser('reconcile', help='纯确定性离线机械对账表：核对实改与未更新代码/文档、强显式依赖与义务结算')
+    reconcile.add_argument('--target', default='.', help='待对账的仓库或目录路径')
+    reconcile.add_argument('--base-ref', default='', help='可选 Git 基线引用（如 HEAD 或提交哈希），用于独立点名核对工作区改动')
+    reconcile.add_argument('--baseline-file', default='', help='由 --save-baseline 冻结的开工基线 JSON 路径')
+    reconcile.add_argument('--save-baseline', default='', help='仅冻结当前工作区基线并写出至指定 JSON 路径，随后退出')
+    reconcile.add_argument('--receipt', default='', help='可选派单回执 JSON 路径，将流终态、只读交付覆盖与引用核验并入对账表')
+    reconcile.add_argument('--cross-check', default='', help='可选 cross-check 跨端汇总核对 JSON 路径，将共同盲区与分歧并入机械对账表')
+    reconcile.add_argument('--obligations-file', default='', help='可选显式义务清单 JSON 文件路径（逐项核验 read/modify/review/test/final_audit）')
+    reconcile.add_argument('--output-md', default='', help='显式指定机械对账 Markdown 输出路径（默认落盘至 plan-dir/reconcile/）')
+    reconcile.add_argument('--plan-dir', default='', help='未传 --output-md 时用于存放机械对账表的状态目录路径')
+    read_plan = sub.add_parser('read-plan', help='读前尺寸评估与保守层级分片规划：双口径防爆窗、超大单文件行段切分与多端波次编排')
+    read_plan.add_argument('--target', default='.', help='待评估读取的目录或文件路径')
+    read_plan.add_argument('--files', action='append', default=[], help='可选显式目标读取文件相对路径（可重复传入）')
+    read_plan.add_argument('--shared-files', action='append', default=[], help='每片共享的核心裁定或接口规范文件相对路径（单独核扣内联与 Token 预算）')
+    read_plan.add_argument('--core-files', action='append', default=[], help='高风险核心文件相对路径（在 risk-tiered 模式下优先安排跨端独立盲读）')
+    read_plan.add_argument('--engines', action='append', default=[], help='参与评估与分片的引擎规格（可逗号分隔或重复传入，如 codex:@review,dsh:@review）')
+    read_plan.add_argument('--cross-client-mode', choices=['single', 'risk-tiered', 'all-engines'], default='risk-tiered',
+                           help='跨端读取策略：risk-tiered 核心片多端盲读其余分担（默认）；all-engines 全量每端独立读；single 单端分片')
+    read_plan.add_argument('--shard-tokens', type=_positive_arg, help='可选覆写单片保守 Token 上限')
+    read_plan.add_argument('--max-concurrency', type=_positive_arg, help='可选覆写单波次总并发上限（默认保守为 2 且受每端并发上限约束）')
+    read_plan.add_argument('--context-used-tokens', type=int, default=0, help='当前主会话已占用的估算 Token 数，用于核算剩余安全预算')
+    read_plan.add_argument('--include-dirs', action='append', default=[], help='显式纳入默认排除的归档或历史目录（如 历史探索）')
+    read_plan.add_argument('--focus', default='', help='本轮只读评估关注焦点说明')
+    read_plan.add_argument('--clean-room', action='store_true', help='为支持净室的后端在导出工作流中启用 clean_room 隔离')
+    read_plan.add_argument('--emit-spec', default='', help='可选导出可直接交 plan --spec-file 审批的纯流数组 JSON 路径')
+    read_plan.add_argument('--output-md', default='', help='显式指定阅读计划 Markdown 输出路径（默认落盘至 plan-dir/read_plans/）')
+    read_plan.add_argument('--plan-dir', default='', help='阅读计划落盘状态目录路径')
+    read_plan.add_argument('--session-id', default='', help='可选绑定当前会话标识以在压缩恢复时保留轻量阅读计划指针')
+    cross_check = sub.add_parser('cross-check', help='跨端分片读取与独立汇总核对：覆盖矩阵、共同盲区、分歧保全与 R6 回源行号清单')
+    cross_check.add_argument('--target', default='.', help='目标仓库根目录路径')
+    cross_check.add_argument('--receipt', action='append', default=[], required=True, help='待汇总核对的派单回执 JSON 路径（支持重复传入多份）')
+    cross_check.add_argument('--read-plan', default='', help='可选由 read-plan 生成的计划 JSON 路径，提供分母与跨片依赖边')
+    cross_check.add_argument('--obligations-file', default='', help='可选显式义务清单 JSON 路径')
+    cross_check.add_argument('--output-md', default='', help='显式指定跨端核对 Markdown 输出路径（默认落盘至 plan-dir/reconcile/）')
+    cross_check.add_argument('--plan-dir', default='', help='跨端核对表落盘状态目录路径')
     plan = sub.add_parser('plan', help='纯离线生成工作流确认票据与交接提示')
     plan.add_argument('--target', default='.')
     plan.add_argument('--kind', default='review', choices=['review', 'math', 'code', 'gate', 'direction', 'polish'])
@@ -10380,6 +13312,7 @@ def build_arg_parser():
     plan.add_argument('--verify-cmd', default='')
     plan.add_argument('--receipt-location', default='')
     plan.add_argument('--spec-file', default='', help='多流工作流配置 JSON 文件路径')
+    plan.add_argument('--obligations-file', default='', help='可选显式义务清单 JSON 文件路径（随票据落盘并在完工机械对账中逐项结算）')
     plan.add_argument('--workflow-bg', default='', help='工作流背景说明')
     plan.add_argument('--workflow-goal', default='', help='工作流目标说明')
     plan.add_argument('--workflow-impact', default='', help='预计后果与影响范围说明')
@@ -10436,9 +13369,9 @@ def build_arg_parser():
     for command in (gate, task):
         command.add_argument('--write-scope', action='append', default=[])
         command.add_argument('--max-rounds', type=_positive_arg, default=default_rounds)
-    for command in (probe, assess, grounding, audit, gate, task, plan, batch, followup):
+    for command in (probe, assess, grounding, reconcile, read_plan, cross_check, audit, gate, task, plan, batch, followup):
         command.add_argument('--caller', choices=['auto', 'codex', 'antigravity', 'claude', 'cc', 'dsh'], default='auto')
-        if command is not grounding:
+        if command not in (grounding, reconcile, cross_check):
             command.add_argument('--codex-input-budget', type=_positive_arg)
             command.add_argument('--agy-input-budget', type=_positive_arg)
             command.add_argument('--claude-input-budget', type=_positive_arg)
@@ -10454,7 +13387,7 @@ def build_arg_parser():
                              help='用户确认已充值或额度恢复后，忽略本地额度冷却记录重试发起')
         command.add_argument('--timeout', type=_positive_arg, default=default_timeout)
         command.add_argument('--dry-run', action='store_true')
-    for command in (probe, assess, audit, gate, task, plan, batch, followup):
+    for command in (probe, assess, reconcile, read_plan, cross_check, audit, gate, task, plan, batch, followup):
         command.add_argument('--output', default='', help='将结构化结果写入指定 JSON 文件路径（默认自动脱敏）')
         command.add_argument('--no-redact-output', action='store_true', help='写入 --output 文件时保留未脱敏原始路径与统计字段')
         command.add_argument('--redact', action='store_true', help='对标准输出 JSON 启用路径、私网地址、用量比例与敏感键值脱敏')
@@ -10485,7 +13418,7 @@ def main():
     with QUOTA_LOCK:
         _SESSION_QUOTA_BLOCKED.clear()
     args = build_arg_parser().parse_args()
-    if os.environ.get('CAE_HARNESS_DEPTH') and args.subcommand not in ('probe', 'assess', 'check-grounding'):
+    if os.environ.get('CAE_HARNESS_DEPTH') and args.subcommand not in ('probe', 'assess', 'check-grounding', 'reconcile', 'read-plan', 'cross-check'):
         sys.exit(_print({'status': 'failed', 'error': '子任务再次调用本编排器会形成递归派工，已拒绝'}))
     for signum in (signal.SIGINT, signal.SIGTERM):
         signal.signal(signum, _cancel_signal)
@@ -10494,6 +13427,9 @@ def main():
             'probe': cmd_probe,
             'assess': cmd_assess,
             'check-grounding': cmd_check_grounding,
+            'reconcile': cmd_reconcile,
+            'read-plan': cmd_read_plan,
+            'cross-check': cmd_cross_check,
             'audit': cmd_audit,
             'gate': cmd_gate,
             'task': cmd_task,
