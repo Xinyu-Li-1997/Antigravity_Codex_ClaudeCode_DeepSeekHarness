@@ -16,7 +16,7 @@
   <path class="link" d="M 1161 802 L 1161 842"/>
   <g><rect x="32" y="112" width="850" height="164" rx="14" fill="#ffffff" stroke="#b5c8e5"/>
     <text x="54" y="144" class="heading">准备与计划：先明确契约，再离线复查可用性</text>
-    <text x="54" y="173" class="body">界定控制方程或软件接口、目标路径、行号范围与定量验收判据。</text>
+    <text x="54" y="173" class="body">界定接口与验收判据；大仓库先用 read-plan 双口径分片与超大文件连续行段切分。</text>
     <text x="54" y="198" class="body">外部调用按 P0 锁定点名并由 role:* 补齐；原生代理按当前配置解析 inherit。</text>
     <text x="54" y="223" class="body">plan 离线复查启停、路由、可读额度与冷却；日常派工不联网查榜单。</text>
     <text x="54" y="248" class="body">轻重任务分流阈值统一读取 runtime_tunables.dispatch_confirmation。</text>
@@ -36,8 +36,8 @@
   </g>
   <g><rect x="32" y="652" width="850" height="150" rx="14" fill="#eefaf4" stroke="#81bfa0"/>
     <text x="54" y="686" class="heading">完成核验与主会话 R6 终审：按验证深度如实披露</text>
-    <text x="54" y="717" class="body">reply_repeat_guard.py 在 Stop 按外部与原生规则检查成败词、Token 说明及回执或轨迹标识。</text>
-    <text x="54" y="743" class="body">通道未暴露整数 Token 时须明确写无法统计；漏报时单次阻断并附结果汇总。</text>
+    <text x="54" y="717" class="body">派单完工硬出机械对账表（&lt;run_id&gt;_reconcile.md）；多端回执用 cross-check 查覆盖矩阵与分歧。</text>
+    <text x="54" y="743" class="body">Stop 核验成败、Token、同名回执消歧与 reconcile_file 链接，拦截零复跑与矛盾宣称全过。</text>
     <text x="54" y="769" class="body">主会话亲自核对原文件行号与算术汇总，区分配置就位、离线单测与实际环境实测。</text>
   </g>
   <g><rect x="914" y="112" width="494" height="248" rx="14" fill="#f3efff" stroke="#b8a7dc"/>
@@ -46,7 +46,7 @@
     <text x="936" y="203" class="body">collapse_historical_cards 折叠历史明细；</text>
     <text x="936" y="229" class="body">常规用户原话与关键子代理返回摘要；</text>
     <text x="936" y="255" class="body">独立读票据恢复总览，对话仅补展 chat_brief；</text>
-    <text x="936" y="281" class="body">保留背景、目标、后果与三选项（禁刷屏）；</text>
+    <text x="936" y="281" class="body">保留待批总览与三选项，有界带回对账指针；</text>
     <text x="936" y="307" class="body">缺项如实报缺口，无明细文件才回退长表；</text>
     <text x="936" y="333" class="body">压缩与恢复均不构成用户批准。</text>
   </g>
@@ -68,9 +68,9 @@
     <text x="54" y="876" class="heading">共有钩子模块分工与各客户端宿主事件适配</text>
     <text x="54" y="907" class="body">恢复与调用前：session_context_loader.py 与 handoff_gate.py 还原原话、关键返回与未决确认单并评估交接阶段。</text>
     <text x="54" y="933" class="body">工具执行前：status_guard.py 与 handoff_gate.py 检查写边界、重复读日志、直接调 CLI、批准票据与收尾限制。</text>
-    <text x="54" y="959" class="body">回合结束时：reply_repeat_guard.py 与 handoff_gate.py 检查重复等待短句、重复刷票、完成回执与交接提示词。</text>
+    <text x="54" y="959" class="body">回合结束时：reply_repeat_guard.py 与 handoff_gate.py 检查刷屏、零复跑/矛盾宣称、完成回执、reconcile_file 与交接词。</text>
     <text x="54" y="985" class="body">协议映射：Antigravity 挂 4 类事件；Codex/Claude 挂 5 类事件；DSH 为 soft_rules_only 并由 install.py 探测 hook_protocol。</text>
     <text x="54" y="1011" class="body">共享基础库：user_words.py 与 hooks/_lib/ 承载跨平台锁、自适应阈值、轨迹解析与完成回执记录持久化。</text>
-    <text x="54" y="1037" class="body">事实核验：check-grounding --strict 零黑名单拦截无依据标识符、缩写与数字（不替代数学证明与运行验证）。</text>
+    <text x="54" y="1037" class="body">离线确定性核验：check-grounding、read-plan、cross-check 与 reconcile 零模型调用，四端通用且不替代运行验证。</text>
   </g>
 </svg>

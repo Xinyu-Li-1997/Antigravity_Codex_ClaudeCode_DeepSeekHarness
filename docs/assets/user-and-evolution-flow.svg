@@ -60,7 +60,7 @@
   <g>
     <rect x="50" y="508" width="624" height="142" rx="12" fill="#ffffff" stroke="#b8cde8"/>
     <text x="72" y="540" class="heading">3. 轻任务静默执行 · 重负载发 3 句话确认条与明细链接</text>
-    <text x="72" y="568" class="body">小范围单路检查静默执行；内部原生与外部无头重负载统一先运行 plan。</text>
+    <text x="72" y="568" class="body">大仓库先用 read-plan 双口径分片；重负载委派统一先运行 plan。</text>
     <text x="72" y="594" class="body">4 列总览与 14 项明细写入 &lt;ticket_id&gt;_card.md，日常对话仅展 chat_brief。</text>
     <text x="72" y="620" class="body">压缩时按窗口缩放预算并折叠历史明细；获批后凭 --ticket 放行。</text>
   </g>
@@ -72,7 +72,7 @@
     <text x="72" y="712" class="heading">4. 定量验证、完成回执检查与主会话原文终审</text>
     <text x="72" y="740" class="body">只读任务比对自适应快照；可写 gate 锁范围并强制跑通 --verify-cmd。</text>
     <text x="72" y="766" class="body">严禁放宽容差与守恒判据；文档盲读支持 --isolation 四级隔离与事实锚定。</text>
-    <text x="72" y="792" class="body">Stop 检查成败词、Token 说明与回执标识；主会话亲自核对行号与算术。</text>
+    <text x="72" y="792" class="body">完工硬出 reconcile 机械对账表；多端经 cross-check 查盲区与分歧。</text>
   </g>
 
   <!-- Center Workspace Mode Isolation Divider -->

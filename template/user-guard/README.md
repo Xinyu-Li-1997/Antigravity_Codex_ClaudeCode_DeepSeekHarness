@@ -9,8 +9,8 @@
 | [plugin.json](plugin.json)、[hooks.json](hooks.json)、[assets/logo.svg](assets/logo.svg) | 插件清单、Antigravity 原生插件事件绑定与图标 |
 | [rules/AGENTS.md](rules/AGENTS.md) | 四端共用的全局工程规则唯一模板（`R0–R11`），坚持“纠错优先下沉机械守卫、已守住条文及时减薄”；安装时保留完整标准章节与用户自定义尾段 |
 | [agents/](agents/) | `readonly-reader`、`readonly-auditor`、`readonly-collaborator`；默认 `inherit` 跟随主会话（优先识别显式 `model`），禁写文件、禁跑构建与测试 |
-| [hooks/](hooks/) | 五个共用钩子脚本与 `hooks/_lib/` 公共库：提供进程墙钟/内存自毁护栏、自适应压缩恢复、无头子进程非写钩子隔离、工具前写边界与票据门禁（含同会话外部目录续租与 `swarm` 流数统计）、重复刷屏与局部补测拦截、完工回执核验与长会话交接保护 |
-| [skills/cae-harness/](skills/cae-harness/) | 跨端无头派工与门禁验证：双门可用性复查、审查阻断/建议分级与风险分层选挡、分后端只读内联与自适应快照、默认持久化会话（`dsh` 独立 `headless-sessions`）与 `followup` 超时降挡续查、双层超时抢救、`--files`/`wave` 波次编排、`--isolation` 四级隔离、`<ticket_id>_card.md` 明细落盘与 `check-grounding` 事实锚定 |
+| [hooks/](hooks/) | 五个共用钩子脚本与 `hooks/_lib/` 公共库：提供进程墙钟/内存自毁护栏、PowerShell 续行归一化、三端有界压缩恢复（带回 `reconcile_file` 与活跃阅读计划指针）、无头子进程非写钩子隔离、工具前写边界与票据门禁（含同会话外部目录续租与 `swarm` 流数统计）、重复刷屏与零复跑/局部补测冒充全过拦截、完工回执与机械对账表链接核验及长会话交接保护 |
+| [skills/cae-harness/](skills/cae-harness/) | 跨端无头派工与确定性核验：双门可用性复查、审查阻断/建议分级与风险分层选挡、分后端只读内联与自适应快照、默认持久化会话（`dsh` 独立 `headless-sessions`）与 `followup` 超时降挡续查、双层超时抢救、`--files`/`wave` 波次编排、`--isolation` 四级隔离、`<ticket_id>_card.md` 明细落盘、`check-grounding` 事实锚定、`read-plan` 读前双口径保守分片、`cross-check` 跨端覆盖与分歧核对及 `reconcile` 机械对账表 |
 | [skills/cae-harness/fleet_profile.json](skills/cae-harness/fleet_profile.json) | 五角色（`roles`）、四端内生代理档案（`native_agent_profiles`）、运行期定量阈值（`runtime_tunables`）、启停矩阵（`subscription_matrix`）与离线更新时间（`capability_ledger`）的唯一动态配置源 |
 | [skills/fleet-evolve/](skills/fleet-evolve/) | 上游配置仓专属的四维工具链评估、审批提案、双端同步与重启重入验收 |
 
@@ -20,7 +20,7 @@
 
 - **点名优先与动态角色并列**：用户点名按 P0 锁定客户端、模型、挡位、隔离级别或省额度意图（经 `--user-prompt` 保留原话）；`role:*` 按职责动态选路，零碎小修直接主会话闭环，接口清晰的成块模块与独立审查再经 `cae-harness` 派工。
 - **两道门禁与极简确认单**：第一道门由 `fleet-evolve` 评估并经用户审定 `subscription_matrix`；第二道门由 `plan` 纯离线核查本机程序、凭据、路由与可读额度（只读 `capability_ledger` 时间戳，不联网刷新）。多路或可写任务先落盘 `<ticket_id>.json` 与含 4 列总览及 14 项明细的 `<ticket_id>_card.md`，日常对话只展示 3 句话确认条 `chat_brief` 与明细链接，获批登记后由 `PreToolUse` 核验票据并拦截裸调底层无头 CLI。
-- **压缩恢复与完工核验**：压缩后钩子自动折叠历史长表，分两块还原历轮原话与未决票据总览；强制交接时 `Stop` 核验【新对话提示词】内的精简总览、明细链接、离线更新时间、选项卡与 `plan --resume-ticket` 命令。重负载完工后，`Stop` 检查成败词、Token 用量或无法统计说明及回执或日志词项（单路 `task`/`gate` 省略默认流号 `S1` 时须匹配具体模型名，仅在未记录具体模型名时可用任务状态词替代），主会话仍须逐路核实状态与汇总算术。
+- **压缩恢复与完工机械对账**：压缩后钩子自动折叠历史长表，完整还原磁盘未决票据总览并有界带回未报账单的机械对账链接与活跃 `read-plan` 指针；强制交接期放行 `check-grounding`/`reconcile`/`read-plan`/`cross-check` 诊断检查，并在 `Stop` 核验【新对话提示词】要素。重负载派单完工硬触发写出 `<plan_dir>/reconcile/<run_id>_reconcile.md`，三端 `Stop` 钩子按 `run_id` 核验成败词（封堵同句矛盾宣称全过）、Token 用量或无法统计说明、同名回执消歧、回执或日志词项及 `reconcile_file` 链接（单路 `task`/`gate` 省略默认流号 `S1` 时须匹配具体模型名，仅在未记录具体模型名时可用任务状态词替代），主会话仍须按 R6 逐路核实原文行号与汇总算术。
 
 ## 本地校验
 

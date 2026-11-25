@@ -23,8 +23,8 @@
 
 2. **打开自己的仓库直接对话**：日常工作不需要背命令，系统按任务规模自动分流：
    - **零碎小修与高频对齐**：主窗口直接改完闭环，不走派工流程，省掉沟通和建票摩擦。后台钩子自动放行系统临时目录与包缓存，只拦未授权的项目外越界写删、外部 `git worktree` 和重复读取未变化的日志；你在本会话批准过的已有外部目录，后续同目录常规编辑会自动续租。
-   - **成块实现、多路并发与跨端审查**：委派多路任务、可写无头任务或超轻任务阈值前，脚本先把 4 列总览和 14 项明细落盘到本地 `<ticket_id>_card.md`，聊天框里只给你看 **3 句话确认条（`chat_brief`）+ 明细链接**，绝不贴长表刷屏。你回复确认并登记批准后才放行执行；`gate --verify-cmd` 会自动跑验收命令，不通过则带真实报错迭代修正。
-   - **长对话自动压缩**：触发压缩时，钩子自动补回历轮关键原话、重要子任务结论和未决确认单，避免写到一半忘了物理符号约定或数值容差。
+   - **成块实现、大仓库阅读与跨端审查**：面对大型仓库或超长文档，可先运行 `cae_harness.py read-plan` 按安全预算与内联字节双口径评估尺寸并切分保守波次和超大单文件连续行段（对话只出 3 句话简报 + 清单链接）；委派多路任务、可写无头任务或超轻任务阈值前，脚本先把 4 列总览和 14 项明细落盘到本地 `<ticket_id>_card.md`，聊天框里只给你看 **3 句话确认条（`chat_brief`）+ 明细链接**，绝不贴长表刷屏。你回复确认并登记批准后才放行执行；`gate --verify-cmd` 会自动跑验收命令，不通过则带真实报错迭代修正。派单完工自动落盘确定性机械对账表（`<run_id>_reconcile.md`），也可随时运行 `reconcile` 或 `cross-check` 核对变更与多端覆盖。
+   - **长对话自动压缩**：触发压缩时，钩子自动补回历轮关键原话、重要子任务结论、完整未决确认单、未报账单的机械对账链接与活跃阅读计划指针，避免写到一半忘了物理符号约定或数值容差。
 
 3. **随时点名模型或检查配置漂移**：想指定哪一端干活，直接在对话里说即可（例如“用 Codex 高强度查 `src/flux/`”）。客户端升级或调整订阅后，回到本仓库执行 `python -B -X utf8 install.py --audit-upgrade`，即可一次核查配置漂移、Windows/WSL2 双端对齐状态和编译型科学计算包的二进制接口（ABI）风险。
 
@@ -47,9 +47,11 @@
 
 | 常见工程痛点 | 裸用客户端时容易出什么事 | 本仓库怎么兜底 |
 | --- | --- | --- |
-| **长对话压缩后失忆** | 自动摘要丢掉早期法向约定、符号定义或容差；大量短回执把关键审查行号挤出窗口 | 压缩恢复分两块独立还原：一块按模型窗口动态缩放，补回历轮用户原话与实质子任务结论；另一块直接从磁盘读取未决票据总览与 `<ticket_id>_card.md` 链接 |
+| **长对话压缩后失忆** | 自动摘要丢掉早期法向约定、符号定义或容差；大量短回执把关键审查行号挤出窗口 | 压缩恢复分块还原：原话与实质子任务结论按模型窗口动态缩放；磁盘未决票据总览与 `<ticket_id>_card.md` 链接完整保留；完工账单（含 `reconcile_file`）与活跃 `read-plan` 指针有界带回防膨胀 |
+| **大仓库塞爆上下文或跳行漏读** | 一股脑全读大仓库或几百 KB 长文档引发频繁压缩、中途跳行丢关键条款；跨端全量重复读烧穿额度 | 读前运行 `read-plan` 按保守单片 Token 与真实 UTF-8 带行号内联字节双口径切分保守波次，超大单文件按标题或顶层定义切成带重叠连续行段，核心片多端盲读、其余分担，并如实披露被跳过的归档/历史目录 |
+| **多端共同盲区与改漏配套文档** | 多路审查收到同一残缺信封形成共同盲区，或按行合并掩盖相反观点；改完源码忘了同步配套文档与测试，靠 AI 总结报喜不报忧 | `cross-check` 确定性生成计划分母 × 执行端覆盖矩阵、全端共同盲区（`shared_blind_spots`）、失败/超时格与分歧并列清单；`reconcile` 与派单完工硬触发确定性机械对账表（基于冻结基线、Python AST 导入、Markdown 显式链接与反引号符号引用），零上下文刷屏 |
 | **派工成本失控或超时白干** | 小修改硬派后台浪费沟通成本；点名模型被静默换掉；长任务一超时所有中间推演和账单全丢 | 小修直接主控闭环，接口清晰的成块模块再跨端派工；点名按 P0 锁定绝不静默降级；无头会话默认持久化、到软时限先降挡紧凑收口、硬超时回收 `timeout_salvage` 并支持 `followup` 续查 |
-| **过度挑刺或放宽验收底线** | 审查靠极端假想反复打回拖垮节奏；或为了过测试擅自放宽 `rtol`、拿局部补测冒充全套通过 | 审查区分**阻断级**（有明确触发或复现链路的实质缺陷）与**建议级**（仅记录），常规审查用 `high` 挡、高危核心自动升 `max` 挡，门禁默认 2 轮封顶；`R3.6` 禁止放宽容差，`Stop` 钩子拦局部补测冒充全过与翻案汇报 |
+| **过度挑刺或放宽验收底线** | 审查靠极端假想反复打回拖垮节奏；或为了过测试擅自放宽 `rtol`、拿局部补测或零复跑冒充全套通过 | 审查区分**阻断级**（有明确触发或复现链路的实质缺陷）与**建议级**（仅记录），常规审查用 `high` 挡、高危核心自动升 `max` 挡，门禁默认 2 轮封顶；`R3.6` 禁止放宽容差，`Stop` 钩子拦零复跑/局部补测冒充全过、同句矛盾宣称全过与漏报对账链接 |
 | **只读审查顺手改代码或越界** | 让模型读代码却顺手改了文件、写到项目外目录，或死循环轮询未变化的日志 | `readonly-*` 代理禁写禁测；外部只读任务前后比对自适应文件快照（中小目录逐字节 SHA-256，大目录切对称元数据快快照）；`PreToolUse` 静态拦截项目外越界写删与空转轮询 |
 | **文档越堆越重、越改越失真** | 每次踩坑都往规则文件叠补丁，上下文越来越重；润色文档时编出源码不存在的参数或缩写 | `R0` 要求纠错优先下沉为单测和钩子守卫，已被守住的文字及时减薄；`check-grounding --strict` 扫描源码与配置核对参数和术语依据，配合 `--isolation clean_room` 盲读检查可读性 |
 | **模型换代或升级把环境弄坏** | 模型名写死在脚本里很快过期；系统级 Python 跨次版本升级弄崩编译好的科学计算扩展 | 固定代码与 `fleet_profile.json` 动态配置完全分离；`install.py --audit-upgrade` 统一检查四端漂移、双端同步缺口及科学计算包 ABI 兼容风险 |
@@ -104,16 +106,17 @@ python -B -X utf8 install.py --audit-upgrade     # 4. 体检配置对齐（summa
 | **零碎小修与高频对齐** | 主窗口直接闭环（`role:orchestrator`） | 几十行改动和来回对接口不值得花派工沟通成本 |
 | **重大架构与建模路线抉择** | `batch` 或 `clean_room` **无草稿盲出独立双方案** | 只喂用户原话与必要背景，不给主控草稿，避免第二个模型被先入为主带偏 |
 | **文献摘录与大源码定位** | 同端 `readonly-*` 子代理并行读原文 | 禁写禁测、只带回原文摘录与精确行号，不替代跨端审查 |
+| **大仓库与超长文档防爆窗阅读** | `read-plan` 读前双口径分片 + 多端 `batch` + `cross-check` 汇总核对 | 先核算保守单片预算与带行号内联字节，超大文件自动切带重叠连续行段；核心片跨端盲读，完工由确定性代码查覆盖矩阵、共同盲区与分歧 |
 | **公式推导与高风险命题攻坚** | `role:math` 单模型高强度推导，或正反双流对抗 | 缺乏现成单测时，由审慎模型正向立论 + 高算力模型找反例和奇点边界 |
 | **成块核心模块实现与验证** | `role:code` 配合 `cae_harness.py gate` | 写清接口与验收标准，锁定 `--write-scope` 白名单并强制跑通 `--verify-cmd`，默认最多 2 轮不过交人拍板 |
 | **独立代码与文档审查** | 跨端 `role:review` 或双源 `audit`（文档可读性加 `clean_room`） | 区分阻断级与建议级发现；常规审查默认 `high` 挡，涉及守恒律、离散算子、边界条件或权限安全自动升 `max` 挡 |
 | **表面格式初筛与润色核验** | `role:fast` 快检；`polish` 润色后跑 `check-grounding --strict` | 低成本扫表面问题，不冒充核心审查；润色结果经词法锚定防编造参数 |
 
-### 3. 执行前精简确认与完成后核验
+### 3. 读前评估、执行前确认与完成后机械对账
 
-- **确认单不刷屏**：多路并发、可写任务或超轻任务阈值前，`plan` 把完整 4 列总览和分路 14 项明细写进 `<ticket_id>_card.md`，聊天框里只显示 3 句话确认条 `chat_brief` 和可点击链接；批准并执行 `plan --approve-ticket` 后，钩子才放行启动。
-- **压缩与交接不断链**：等审批时遇到自动压缩，钩子直接从磁盘加载未决票据总览与明细链接，只向你补展 1 次 `chat_brief`；进入强制交接时，【新对话提示词】自动附带总览、明细链接和 `plan --resume-ticket` 复核命令。
-- **完工必核账**：任务完成后，`Stop` 钩子自动核对是否写清成败结论、Token 用量（兼容 Markdown 表格账单，无法统计须如实写明）与回执文件名或原生轨迹说明，漏写或把失败写成全过时拦截补正。
+- **大读先量尺寸、确认单不刷屏**：面对大目录或超长文档，先跑 `read-plan` 评估体积、自动切分超大文件行段与保守并发波次，并落盘完整清单与可选 `--emit-spec` 工作流配置；多路并发、可写任务或超轻任务阈值前，`plan` 把完整 4 列总览和分路 14 项明细写进 `<ticket_id>_card.md`（可选 `--obligations-file` 绑定显式义务），聊天框里只显示 3 句话确认条 `chat_brief` 和可点击链接；批准并执行 `plan --approve-ticket` 后，钩子才放行启动。
+- **压缩与交接不断链**：等审批时遇到自动压缩，钩子直接从磁盘完整加载未决票据总览与明细链接，并有界带回未报账单的对账表链接与活跃阅读计划指针，只向你补展 1 次 `chat_brief`；进入强制交接时，【新对话提示词】自动附带总览、明细链接和 `plan --resume-ticket` 复核命令，同时放行 `reconcile`/`read-plan`/`cross-check` 等纯诊断核对。
+- **完工硬出机械对账表与三端核账**：重负载派单完工硬触发生成确定性机械对账表落盘至 `<plan_dir>/reconcile/<run_id>_reconcile.md`（不污染目标业务仓库），你也可随时点名运行 `reconcile` 或 `cross-check` 核对实改与未更新文件、强显式依赖、跨端覆盖矩阵、共同盲区与分歧。Antigravity、Codex、Claude Code 三端 `Stop` 钩子统一核对成败结论（拦截含失败项却同句宣称“全部成功”）、Token 用量（兼容 Markdown 表格账单，无法统计须如实写明）、同名回执消歧与 `reconcile_file` 查看链接，漏报或把未全量复跑的测试写成全绿时拦截补正。
 
 ## 四、配置仓库维护与演进
 
@@ -154,12 +157,12 @@ python -B -X utf8 install.py --audit-upgrade     # 4. 体检配置对齐（summa
 
 `template/user-guard/hooks/` 包含共用基础库 `user_words.py`（底层调用 `hooks/_lib/` 中的跨平台文件锁、Shell 词法拆解、自适应策略与进程墙钟/内存自毁护栏）以及四个事件阶段门禁：
 
-1. **压缩恢复**（`session_context_loader.py` + `handoff_gate.py`）：普通回合零字节注入不扰动前缀缓存；压缩后按窗口缩放还原原话与关键子任务结论，折叠历史长表并从磁盘独立加载未决票据总览。
-2. **工具执行前**（`status_guard.py` + `handoff_gate.py`）：静态解析文件工具、Shell 包装与内联 Python AST，拦截未授权项目外写删、外部 `git worktree`、空转读日志和绕过调度器裸调无头 CLI，核验已批票据、隔离一致性和原生通道容量（含 `swarm add` 按 `tasks` 长度或 `n` 计流数）。
-3. **长会话交接**（`handoff_gate.py`）：达到 `drain`/`freeze` 阶段限制新派工，在收尾时核验【新对话提示词】内嵌的精简总览、明细链接、恢复命令与待拍板占位符保护。
-4. **回合结束**（`reply_repeat_guard.py` + `handoff_gate.py`）：拦截空等刷屏、同回合重复贴票和局部补测冒充全过，核验完工成败词、Token 用量与回执标识。外部无头子进程（`CAE_HARNESS_DEPTH`）自动跳过恢复、交接和停顿钩子，仅保留越界写硬阻断。
+1. **压缩恢复**（`session_context_loader.py` + `handoff_gate.py`）：普通回合零字节注入不扰动前缀缓存；压缩后按窗口缩放还原原话与关键子任务结论，折叠历史长表，完整加载磁盘未决票据总览，并有界带回未报账单的 `reconcile_file` 链接与活跃 `read-plan` 指针。
+2. **工具执行前**（`status_guard.py` + `handoff_gate.py`）：静态解析文件工具、Shell 包装（含 PowerShell 尾部反引号续行归一化）与内联 Python AST，拦截未授权项目外写删、外部 `git worktree`、空转读日志和绕过调度器裸调无头 CLI，核验已批票据、隔离一致性和原生通道容量（含 `swarm add` 按 `tasks` 长度或 `n` 计流数）。
+3. **长会话交接**（`handoff_gate.py`）：达到 `drain`/`freeze` 阶段限制新派工（放行 `check-grounding`、`reconcile`、`read-plan`、`cross-check` 等纯诊断核对），在收尾时核验【新对话提示词】内嵌的精简总览、明细链接、恢复命令与待拍板占位符保护。
+4. **回合结束**（`reply_repeat_guard.py` + `handoff_gate.py`）：拦截空等刷屏、同回合重复贴票、全量测试失败后零复跑或局部补测冒充全过，以及含失败项却宣称“全部成功”的矛盾表述，按 `run_id` 核验完工成败词、Token 用量、同名回执消歧与 `reconcile_file` 机械对账表链接。外部无头子进程（`CAE_HARNESS_DEPTH`）自动跳过恢复、交接和停顿钩子，仅保留越界写硬阻断。
 
-独立于事件钩子之外，`cae_harness.py check-grounding --strict` 扫描仓库源码与配置（跳过 `tests/` 与代理契约正文）做零黑名单词法核验，专门抓文档中编造的参数、不存在的文件名和失步缩写。
+独立于事件钩子之外，`cae_harness.py` 提供四项纯离线零模型调用的确定性诊断与对账子命令，四客户端完全通用：`check-grounding --strict` 扫描仓库源码与配置做零黑名单词法核验；`read-plan` 做读前双口径预算评估与超大单文件保守层级分片；`cross-check` 核对多端覆盖矩阵、共同盲区与发现分歧；`reconcile` 生成实改与未更新文件、强显式依赖及义务结算机械对账表。
 
 四个客户端接入同一套机制的适配方式如下：
 
@@ -207,7 +210,7 @@ Antigravity_Codex_ClaudeCode_DeepSeekHarness/
 
 `Antigravity_Codex_ClaudeCode_DeepSeekHarness` brings shared engineering rules (`R0–R11`), deterministic session lifecycle hooks, read-only review subagents, lexical grounding checks, and cross-client headless verification workflows to **Google Antigravity** (`agy`), **OpenAI Codex** (`codex`), **Claude Code** (`claude` / `cc`), and **DeepSeek Harness** (`dsh`). Built solely on the Python 3.11+ standard library for Windows, WSL2, and Linux, it is tailored for scientific computing, CAE, CFD, FEA, numerical PDE solvers, HPC, and high-reliability software engineering.
 
-Instead of piling ever-longer prose onto system prompts, the repository pushes recurring failure modes into deterministic hooks, unit tests, and verification gates while keeping permanent rules lean. Small local edits stay in the main session; well-scoped modules, independent dual proposals (blind of host drafts to prevent anchoring), and cross-client reviews run through `cae_harness.py` with P0 user-override locking, severity-separated findings (blocking vs. advisory), risk-tiered review effort, bounded gate rounds, and post-compaction recovery.
+Instead of piling ever-longer prose onto system prompts, the repository pushes recurring failure modes into deterministic hooks, unit tests, and verification gates while keeping permanent rules lean. Small local edits stay in the main session; well-scoped modules, independent dual proposals (blind of host drafts to prevent anchoring), and cross-client reviews run through `cae_harness.py` with P0 user-override locking, severity-separated findings (blocking vs. advisory), risk-tiered review effort, bounded gate rounds, and bounded post-compaction recovery. Offline deterministic tools—`read-plan` (dual-budget pre-read sizing, oversized file section splitting, and conservative wave sharding), `cross-check` (multi-client coverage matrix, shared blind-spot detection, and divergence preservation), and `reconcile` (dispatch-triggered and on-demand mechanical reconciliation tables verified across hooks)—guard against context overflow, blind spots, and stale documentation across all four clients.
 
 Run `install.py` once (separately on Windows and WSL2 when both are used) to install globally so any project repository (`general_project`) works immediately without copying config files. Opening this repository (`upstream_config_repo`) enables `fleet-evolve` (`full`, `hygiene`, `audit`) with explicit user approval checkpoints. Users provide their own network access, official client installations, and official OAuth sign-in or vendor API keys (avoid external OAuth credential switchers; use `ccswitch_admin.py switch-card` or re-run `install.py` after Claude Code card changes to preserve lifecycle hooks). Supported solely by the China Scholarship Council (CSC), CSC No. `202506280162`, Approval No. `留金选[2025]37号`. Licensed under [Apache License 2.0](LICENSE); retain attribution notices in [NOTICE](NOTICE) (`Copyright 2026 Xinyu Li (Xinyu-Li-1997)`).
 

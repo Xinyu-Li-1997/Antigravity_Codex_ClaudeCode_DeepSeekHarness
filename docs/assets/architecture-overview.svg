@@ -17,7 +17,7 @@
   <g><rect x="32" y="112" width="670" height="162" rx="14" fill="#ffffff" stroke="#b5c8e5"/>
     <text x="54" y="146" class="heading">常驻机制层：共用规则、钩子与验证入口</text>
     <text x="54" y="177" class="body">全局规则 R0–R11、5 个钩子模块、hooks/_lib/ 公共库与 readonly-* 约束边界。</text>
-    <text x="54" y="203" class="body">install.py 按客户端协议分发；cae_harness.py 组织后台验证与事实锚定。</text>
+    <text x="54" y="203" class="body">install.py 按协议分发；cae_harness.py 承接验证、分片、核对与对账。</text>
     <text x="54" y="229" class="body">交互主会话保留用户自选客户端、模型与推理强度，零时期性模型名硬编码。</text>
   </g>
   <g><rect x="738" y="112" width="670" height="162" rx="14" fill="#ffffff" stroke="#b5c8e5"/>
@@ -59,7 +59,7 @@
   <g><rect x="32" y="998" width="1376" height="132" rx="14" fill="#eefaf4" stroke="#81bfa0"/>
     <text x="54" y="1032" class="heading">共有会话生命周期门禁与四客户端协议适配</text>
     <text x="54" y="1063" class="body">Antigravity、Codex、Claude Code 接入 5 个共用钩子模块；DSH 为 soft_rules_only 并由 install.py 探测 hook_protocol。</text>
-    <text x="54" y="1089" class="body">压缩后经 collapse_historical_cards 折叠历史明细并与未决确认单分块恢复；强制交接阶段由 Stop 校验提示词。</text>
-    <text x="54" y="1115" class="body">重负载完工后由 Stop 按外部与原生规则核验成败词、Token 说明及回执或轨迹标识，主会话逐路复核原文与算术。</text>
+    <text x="54" y="1089" class="body">压缩后折叠历史明细，完整还原未决确认单并有界带回对账与 read-plan 指针；交接期放行只读诊断。</text>
+    <text x="54" y="1115" class="body">派单完工硬出机械对账表；Stop 核验成败、Token、同名回执消歧与 reconcile_file 链接，主会话按 R6 复核。</text>
   </g>
 </svg>

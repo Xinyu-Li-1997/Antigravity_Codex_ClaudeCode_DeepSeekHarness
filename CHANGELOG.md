@@ -19,7 +19,7 @@
 - **四端钩子加固与既有门禁缺陷修复（`shell_lex.py`、`status_guard.py`、`reply_repeat_guard.py`、`session_context_loader.py`、`handoff_gate.py`、`tests/test_lifecycle_offline.py`）**：
   - 在 `shell_lex.py` 新增 `join_powershell_line_continuations` 并在 `status_guard.py` `_dispatch_commands` 中归一化 PowerShell 尾部反引号续行（修复多行命令误拆 `--ticket`/`--plan-dir`，且严格不吞噬 POSIX 多行反引号命令替换）；
   - 修复 `reply_repeat_guard.py` 三处绕过与碰撞：封堵含失败项却在同句同时写“全部成功”与“失败”的 `contradicted` 绕过、对共用同名裸回执文件的多次运行要求凭 `run_id`/对账表名/上级目录消歧、将 `_check_test_suite_locked` 收紧为 `2 * largest < total` 拦截全量测试失败后零复跑冒充全绿；
-  - 升级 `session_context_loader.py` `_workflow_recovery_blocks` 兼容三端目录路径，压缩恢复时完整保留 R9 待批票据并有界折叠完工账单（附 `reconcile_file` 链接）与活跃 `read-plan` 指针；`handoff_gate.py` 统一放行 `reconcile`、`read-plan`、`cross-check` 诊断检查；同步更新 `SKILL.md`、`docs/architecture-and-hooks.md` 与 `docs/workflow-guide.md`。
+  - 升级 `session_context_loader.py` `_workflow_recovery_blocks` 兼容三端目录路径，压缩恢复时完整保留 R9 待批票据并有界折叠完工账单（附 `reconcile_file` 链接）与活跃 `read-plan` 指针；`handoff_gate.py` 统一放行 `reconcile`、`read-plan`、`cross-check` 诊断检查；同步更新并润色脱敏 `README.md`、`AGENTS.md`、`CITATION.cff`、`SKILL.md`、`template/user-guard/README.md`、`docs/architecture-and-hooks.md`、`docs/workflow-guide.md` 与三张 `docs/assets/*.svg` 流程图。
 
 ---
 

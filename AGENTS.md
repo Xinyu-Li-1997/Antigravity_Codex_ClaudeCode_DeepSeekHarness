@@ -37,10 +37,10 @@
 
 | 共有防护阶段 | 对应共用脚本与宿主事件映射 |
 | --- | --- |
-| 恢复与调用前 | `session_context_loader.py`（联动 `handoff_gate.py`；Antigravity 挂 `SessionStart`、`PreInvocation`；Codex 与 Claude Code 挂 `SessionStart`、`PostCompact`）去噪恢复原话、实质子代理与超时抢救摘要、未决票据总览，并评估交接阶段。 |
+| 恢复与调用前 | `session_context_loader.py`（联动 `handoff_gate.py`；Antigravity 挂 `SessionStart`、`PreInvocation`；Codex 与 Claude Code 挂 `SessionStart`、`PostCompact`）去噪恢复原话、实质子代理与超时抢救摘要、完整未决票据总览及有界完工对账链接与活跃 `read-plan` 指针，并评估交接阶段。 |
 | 新指令提交时 | `handoff_gate.py`（Codex 与 Claude Code 挂 `UserPromptSubmit`；Antigravity 在 `PreInvocation` 对账轨迹步）更新交接判断或宽限期。 |
-| 工具执行前 | `status_guard.py`（联动 `handoff_gate.py`；三端挂 `PreToolUse`）守卫写边界与同会话外部目录批准租约、拦截日志轮询与裸调 CLI、核验重负载与 `followup` 票据及交接限制。 |
-| 回合结束时 | `reply_repeat_guard.py`（联动 `handoff_gate.py`；三端挂 `Stop`）拦截空等刷屏、同回合重复贴票、局部补测冒充全过，核验重负载完工回执（按 `run_id` 销账；单路省略默认流号 `S1` 时须匹配具体模型名，仅在未记录具体模型名时可用任务状态词替代）与强制交接提示词及待拍板占位符保护。 |
+| 工具执行前 | `status_guard.py`（联动 `handoff_gate.py`；三端挂 `PreToolUse`）守卫写边界与同会话外部目录批准租约、归一化 PowerShell 续行、拦截日志轮询与裸调 CLI、核验重负载与 `followup` 票据及交接限制（收口期放行 `check-grounding`/`reconcile`/`read-plan`/`cross-check` 诊断）。 |
+| 回合结束时 | `reply_repeat_guard.py`（联动 `handoff_gate.py`；三端挂 `Stop`）拦截空等刷屏、同回合重复贴票、全量测试失败后零复跑或局部补测冒充全过及含失败项宣称全过，核验重负载完工回执（按 `run_id` 销账、同名回执消歧并核验 `reconcile_file` 链接；单路省略默认流号 `S1` 时须匹配具体模型名，仅在未记录具体模型名时可用任务状态词替代）与强制交接提示词及待拍板占位符保护。 |
 
 Antigravity 默认启用长会话分段收口；Codex 与 Claude Code 默认交接模式为 `advisory`。Claude 默认随钩子同步 `~/.claude/hooks/ccswitch_admin.py`（`--no-claude-hooks` 跳过，`--with-cc-router` 另行分发 `~/.claude/router/`）；仅在获授权并传 `--disable-ccswitch-prompts` 或 `--purge-ccswitch-legacy` 时，先在线备份 `cc-switch.db` 再处理旧记录。
 
