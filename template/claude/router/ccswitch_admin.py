@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright 2026 Xinyu Li (Xinyu-Li-1997)
+# SPDX-License-Identifier: Apache-2.0
 """ccswitch_admin.py - CC Switch 供应商卡片配置、settings.json 同步与旧提示词清理工具（仅依赖 Python 标准库）。
 
 子命令：

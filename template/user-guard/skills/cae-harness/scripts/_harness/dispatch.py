@@ -1,3 +1,5 @@
+# Copyright 2026 Xinyu Li (Xinyu-Li-1997)
+# SPDX-License-Identifier: Apache-2.0
 """_harness.dispatch - 物理门禁循环、全通道确认票据、批处理编排与 CLI 主入口。"""
 
 # ════════════════════════════════════════════════════════════════════════════

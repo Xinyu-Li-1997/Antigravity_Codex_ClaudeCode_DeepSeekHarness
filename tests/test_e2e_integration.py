@@ -1,3 +1,5 @@
+# Copyright 2026 Xinyu Li (Xinyu-Li-1997)
+# SPDX-License-Identifier: Apache-2.0
 """
 test_e2e_integration.py - 全系统端到端集成验证、隐私脱敏审计与沙箱安装测试套件
 
@@ -3356,6 +3358,56 @@ raise SystemExit(module.main(sys.argv[3:]))
         hyg_rep = json.loads(hyg_proc.stdout)
         self.assertTrue(hyg_rep.get("ok"), hyg_rep)
         self.assertEqual(hyg_rep.get("finding_count"), 0, hyg_rep)
+
+    def test_52_legal_governance_and_spdx_headers(self) -> None:
+        """机械守卫开源法律治理文件完整度与全仓脚本 SPDX Apache-2.0 版权头。"""
+        required_docs = (
+            "LICENSE",
+            "NOTICE",
+            "LEGAL.md",
+            "SECURITY.md",
+            "CONTRIBUTING.md",
+            "CODE_OF_CONDUCT.md",
+            ".github/PULL_REQUEST_TEMPLATE.md",
+            ".github/ISSUE_TEMPLATE/config.yml",
+            ".github/ISSUE_TEMPLATE/bug_report.yml",
+            ".github/ISSUE_TEMPLATE/compliance_and_ip_notice.md",
+        )
+        for rel in required_docs:
+            doc_path = REPO_ROOT / rel
+            self.assertTrue(doc_path.is_file(), f"缺少法律与开源治理文件: {rel}")
+            self.assertGreater(doc_path.stat().st_size, 0, f"治理文件不能为空: {rel}")
+
+        notice_text = (REPO_ROOT / "NOTICE").read_text(encoding="utf-8")
+        self.assertIn("Antigravity_Codex_ClaudeCode_DeepSeekHarness", notice_text)
+        self.assertIn("Xinyu Li (Xinyu-Li-1997)", notice_text)
+        self.assertNotIn("LEGAL.md", notice_text)
+        legal_text = (REPO_ROOT / "LEGAL.md").read_text(encoding="utf-8")
+        self.assertIn("Apache License 2.0", legal_text)
+        self.assertIn("无官方关联", legal_text)
+        self.assertIn("not affiliated with", legal_text)
+        self.assertIn("按现状", legal_text)
+        self.assertIn("第五百零六条", legal_text)
+        self.assertIn("第一千一百九十五条", legal_text)
+        self.assertIn("submitting-content-removal-requests", legal_text)
+        citation_text = (REPO_ROOT / "CITATION.cff").read_text(encoding="utf-8")
+        self.assertNotIn("未接受任何其他单位或个人任何形式的资助", citation_text)
+        readme_text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn("LEGAL.md", readme_text)
+        self.assertIn("SECURITY.md", readme_text)
+        self.assertIn("CONTRIBUTING.md", readme_text)
+        self.assertIn("CODE_OF_CONDUCT.md", readme_text)
+        self.assertLessEqual(len((REPO_ROOT / "README.md").read_bytes()), 18000)
+
+        script_files = [
+            rel for rel in self._managed_repo_files()
+            if rel.endswith((".py", ".sh", ".ps1"))
+        ]
+        self.assertGreaterEqual(len(script_files), 30)
+        for rel in script_files:
+            head = "\n".join((REPO_ROOT / rel).read_text(encoding="utf-8-sig").splitlines()[:6])
+            self.assertIn("SPDX-License-Identifier: Apache-2.0", head, f"{rel} 缺少 SPDX Apache-2.0 许可头")
+            self.assertRegex(head, r"Copyright\s+20\d\d", f"{rel} 缺少版权年份声明头")
 
 
 if __name__ == "__main__":

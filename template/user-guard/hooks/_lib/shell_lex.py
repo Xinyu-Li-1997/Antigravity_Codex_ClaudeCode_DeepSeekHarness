@@ -1,3 +1,5 @@
+# Copyright 2026 Xinyu Li (Xinyu-Li-1997)
+# SPDX-License-Identifier: Apache-2.0
 """
 shell_lex.py - Shared shell lexing, quoting, ANSI-C $'...' decoding, and substitution extraction.
 Pure Python standard library only.

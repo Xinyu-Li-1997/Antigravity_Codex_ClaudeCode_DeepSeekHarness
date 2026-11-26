@@ -1,3 +1,5 @@
+# Copyright 2026 Xinyu Li (Xinyu-Li-1997)
+# SPDX-License-Identifier: Apache-2.0
 """
 fs_safety.py - Shared filesystem safety, atomic I/O, bounded JSONL reading, and session lock primitives.
 Pure Python standard library only.

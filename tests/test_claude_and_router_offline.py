@@ -1,3 +1,5 @@
+# Copyright 2026 Xinyu Li (Xinyu-Li-1997)
+# SPDX-License-Identifier: Apache-2.0
 """Claude 生命周期、模型路由与 CC Switch 管理的纯离线回归。
 
 临时文件优先使用系统临时目录（受限或与仓库重叠时回退至 .pytest_cache/claude_offline）；HTTP、DNS、代理和上游响应均使用本地夹具。

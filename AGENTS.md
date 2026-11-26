@@ -25,7 +25,7 @@
 | T0 入口页 | `README.md` | 首次接触的 CAE/科学计算用户；严控精简体积，不堆砌内部私有符号、钩子实现细节或上游维护步骤。 |
 | T1 实战手册 | `docs/workflow-guide.md` | 已安装工具的日常研发工程师；聚焦派工分工、分片阅读、算例闭环与 L1–L4 验收，不复读架构细节。 |
 | T2 架构与运维 | `docs/architecture-and-hooks.md`、`template/user-guard/README.md` | 维护者与安全审计人员；独占模块表、配置键、钩子细节、预算公式、体检建议码与精确卸载。 |
-| T3 契约与日志 | `AGENTS.md`、`rules/AGENTS.md`、`SKILL.md`、`CHANGELOG.md` | 面向 Agent 执行的精简规则与参数契约；版本增量历史只记入 `CHANGELOG.md`。 |
+| T3 契约与日志 | `AGENTS.md`、`rules/AGENTS.md`、`SKILL.md`、`CHANGELOG.md`、`LEGAL.md`、`SECURITY.md`、`CONTRIBUTING.md`、`CODE_OF_CONDUCT.md` | 面向 Agent 执行的精简规则、参数契约与开源法律合规治理文件；版本增量历史只记入 `CHANGELOG.md`。 |
 
 `workspace_mode` 区分通用课题项目（`general_project`）与上游配置仓库（`upstream_config_repo`，同时包含 `install.py` 与 `template/user-guard/plugin.json`）。独立安装的 `fleet_state.py` 在非上游目录未传 `--repo` 时返回 `not_upstream_config_repo`（退出码 `2`）。修改前核对本轮授权与 Git 状态，保留其他任务改动；全局写入、推荐矩阵与 `runtime_tunables` 调整、ABI 强耦合升级及 `git push` 均须取得相应批准。
 
@@ -77,7 +77,7 @@ python -B -X utf8 install.py --dry-run --yes
 
 ```powershell
 python -B -X utf8 template/user-guard/skills/cae-harness/scripts/cae_harness.py check-grounding --target . --strict --doc-hygiene
-python -B -X utf8 -m unittest tests.test_e2e_integration
+python -B -X utf8 -m unittest discover -s tests -p "test_*.py"
 ```
 
 涉及审批节点用 `fleet_state.py propose` 登记具体方案；全局同步附 `install.py --dry-run --yes` 清单，获批后执行 `approve` 与同步，最后经 `clear --verified --readback-done` 通过事实锚定门禁归位。未经明确批准不执行 `git push`。

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright 2026 Xinyu Li (Xinyu-Li-1997)
+# SPDX-License-Identifier: Apache-2.0
 """Claude Code 本地模型分流代理（配合 CC Switch 供应商卡片使用，仅依赖 Python 标准库）。
 
 Claude Code 每次请求固定发往单一 ANTHROPIC_BASE_URL。将激活卡片指向本服务后，代理按请求体中的

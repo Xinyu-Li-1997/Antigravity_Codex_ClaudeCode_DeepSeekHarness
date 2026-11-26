@@ -1,3 +1,5 @@
+# Copyright 2026 Xinyu Li (Xinyu-Li-1997)
+# SPDX-License-Identifier: Apache-2.0
 """
 test_guards_offline.py - 防空转门禁 (status_guard) 与防刷屏门禁 (reply_repeat_guard) 离线单元测试套件
 

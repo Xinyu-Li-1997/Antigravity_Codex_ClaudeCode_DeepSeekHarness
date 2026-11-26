@@ -1,3 +1,5 @@
+# Copyright 2026 Xinyu Li (Xinyu-Li-1997)
+# SPDX-License-Identifier: Apache-2.0
 """
 session_context_loader.py - Antigravity、Codex 与 Claude Code 压缩后原话及最近子代理返回恢复钩子 (user-guard)
 

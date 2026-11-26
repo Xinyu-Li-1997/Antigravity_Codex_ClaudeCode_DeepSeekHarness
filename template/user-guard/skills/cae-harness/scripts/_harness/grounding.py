@@ -1,3 +1,5 @@
+# Copyright 2026 Xinyu Li (Xinyu-Li-1997)
+# SPDX-License-Identifier: Apache-2.0
 """_harness.grounding - 零黑名单确定性事实锚定与通用文档卫生校验引擎。"""
 
 _GROUNDING_GENERIC_ACRONYMS = frozenset({

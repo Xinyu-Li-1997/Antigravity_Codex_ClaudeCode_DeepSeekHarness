@@ -1,3 +1,5 @@
+# Copyright 2026 Xinyu Li (Xinyu-Li-1997)
+# SPDX-License-Identifier: Apache-2.0
 """_harness.config - 全局常量、回执 Schema、动态配置与跨平台路径/WSL 互操作工具。"""
 
 # ════════════════════════════════════════════════════════════════════════════

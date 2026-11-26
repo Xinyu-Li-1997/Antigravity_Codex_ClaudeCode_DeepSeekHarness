@@ -1,3 +1,5 @@
+# Copyright 2026 Xinyu Li (Xinyu-Li-1997)
+# SPDX-License-Identifier: Apache-2.0
 """
 status_guard.py - PreToolUse 项目目录写边界、长会话收尾限制与重复读取日志拦截钩子 (user-guard)
 

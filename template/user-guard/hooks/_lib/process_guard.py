@@ -1,3 +1,5 @@
+# Copyright 2026 Xinyu Li (Xinyu-Li-1997)
+# SPDX-License-Identifier: Apache-2.0
 """CLI hook resource limits and noninteractive subprocess defaults."""
 
 import math

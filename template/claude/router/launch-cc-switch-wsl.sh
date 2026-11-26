@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Copyright 2026 Xinyu Li (Xinyu-Li-1997)
+# SPDX-License-Identifier: Apache-2.0
 # WSLg launcher for CC Switch using system WebKitGTK, X11 backend, software rendering, and 100% scale.
 # Checks Windows RAIL window visibility after launch and restores/restarts once if hidden at 0x0.
 set -euo pipefail

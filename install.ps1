@@ -1,7 +1,7 @@
-﻿# Antigravity, Codex, Claude Code & DeepSeek Harness Windows 安装入口。
+﻿# Copyright 2026 Xinyu Li (Xinyu-Li-1997) | SPDX-License-Identifier: Apache-2.0
+# Antigravity, Codex, Claude Code & DeepSeek Harness Windows 安装入口。
 $ErrorActionPreference = "Stop"
 $PSNativeCommandUseErrorActionPreference = $false
-
 try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch [System.IO.IOException] {} catch [System.Security.SecurityException] {}
 $env:PYTHONDONTWRITEBYTECODE = "1"
 

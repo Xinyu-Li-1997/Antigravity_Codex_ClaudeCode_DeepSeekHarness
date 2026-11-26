@@ -8,13 +8,17 @@
 
 本仓库为 **Google Antigravity**（`agy`）、**OpenAI Codex**（`codex`）、**Claude Code**（`claude`）与 **DeepSeek Harness**（`dsh`）提供共用的工程规范、会话生命周期钩子、只读审查代理与跨客户端验证脚本。适用领域包括 **CAE、计算流体力学（CFD）、有限元分析（FEA）、偏微分方程（PDE）数值求解器、高性能计算（HPC）及高可靠系统软件工程**。
 
-核心设计思路是将研发中反复出现的易错环节固化为确定性钩子、离线核验脚本与自动化测试，而非不断拉长系统提示词。安装任意单个客户端即可独立使用；同时配置多个客户端时，可按任务分工跨客户端协同。全仓仅依赖 Python 3.11+ 标准库，支持 Windows、WSL2 与 Linux。
+> **独立开源提示**：**本项目为个人独立开源适配工具，与上述各厂商无官方关联或背书，全部内容按现状提供；使用前请查阅 [LEGAL.md](LEGAL.md)。**
+
+核心设计思路是将研发中反复出现的易错环节固化为确定性钩子、离线核验脚本与自动化测试，而非不断拉长系统提示词。安装任意单个客户端即可独立使用；同时配置多个客户端时，可按任务分工跨客户端协同。核心脚本与校验仅依赖 Python 3.11+ 标准库，支持 Windows、WSL2 与 Linux。
 
 快速跳转：[安装与上手](#一安装与快速上手) · [核心风险防护](#二核心工程风险防护) · [日常课题使用示例](#三日常课题使用方式与示例) · [配置仓库维护示例](#四配置仓库维护与常用选项) · [文档导航](#五文档分层导航与目录结构) · [致谢与许可](#六致谢english-overview-与开源许可)
 
 ---
 
 ## 一、安装与快速上手
+
+> **执行前提示**：**安装与切换脚本会写入用户配置目录或本机数据库，按现状提供且无担保；执行前请先预览并备份，详见 [LEGAL.md](LEGAL.md)。**
 
 1. **准备官方客户端**：安装上述至少一个官方客户端，并完成官方 OAuth 登录或配置厂商 API Key。本仓库不内置第三方反向代理，也不创建或修改账号凭据。
 2. **同步至用户级配置目录**：克隆本仓库后，在仓库根目录运行安装脚本；Windows 使用 `python -B -X utf8`，WSL2 与 Linux 使用 `python3 -B -X utf8`：
@@ -110,13 +114,15 @@
 | **按需学术写作与改稿指南（论文、专著、科研报告与审稿回复）** | [cae-writing 写作规范](template/user-guard/skills/cae-writing/SKILL.md) |
 | **上游维护流程：四维评估、审批门禁与多客户端及跨环境同步** | [fleet-evolve 维护规程](template/user-guard/skills/fleet-evolve/SKILL.md) · [仓库维护说明](AGENTS.md) |
 | **插件目录索引、版本演进与时间戳凭证** | [插件模板索引](template/user-guard/README.md) · [更新日志](CHANGELOG.md) · [时间戳与 DOI 说明](.timestamps/README.md) |
+| **法律合规、安全披露与社区贡献规范** | [法律与合规说明](LEGAL.md) · [安全政策](SECURITY.md) · [贡献指南](CONTRIBUTING.md) · [行为准则](CODE_OF_CONDUCT.md) |
 
 ```text
 Antigravity_Codex_ClaudeCode_DeepSeekHarness/
 ├── README.md                              # 入口总览：安装上手、风险防护、使用示例与文档导航
 ├── AGENTS.md, CHANGELOG.md                # 上游配置仓库维护说明与版本更新日志
 ├── LICENSE, NOTICE, CITATION.cff          # Apache License 2.0、原创归属声明与学术引用元数据
-├── .github/workflows/ci.yml               # 跨平台离线回归、事实锚定与文档卫生流水线
+├── LEGAL.md, SECURITY.md, CONTRIBUTING.md # 商标与免责边界、私密漏洞披露、DCO 贡献与行为准则（含 CODE_OF_CONDUCT.md）
+├── .github/                               # 跨平台离线 CI 流水线、Issue 与 Pull Request 合规模板
 ├── .timestamps/                           # RFC 3161 时间戳凭证与 DOI 发版说明
 ├── install.py, install.ps1, install.sh    # 跨平台安装同步、配置体检、Windows 与 WSL2 对齐及 ABI 检查
 ├── docs/                                  # 日常工作流指南、架构与钩子说明及 3 张 SVG 流程图
@@ -133,7 +139,7 @@ Antigravity_Codex_ClaudeCode_DeepSeekHarness/
 
 ### 1. 资助致谢
 
-本项目获**国家留学基金管理委员会**（简称**国家留学基金委**，**China Scholarship Council, CSC**）资助，学号为 `202506280162`，批准文号为 `留金选[2025]37号`；该项资助为本项目目前的唯一资助来源。
+作者在**国家留学基金管理委员会**（简称**国家留学基金委**，**China Scholarship Council, CSC**）资助的留学期间完成本项目（学号 `202506280162`，批准文号 `留金选[2025]37号`）；截至本版本，未获得其他专项经费资助。
 
 ### 2. English Overview
 
@@ -141,8 +147,12 @@ Antigravity_Codex_ClaudeCode_DeepSeekHarness/
 
 Rather than expanding system prompts indefinitely, the repository addresses recurring engineering failure modes through deterministic hooks, automated tests, and verification gates. Routine local edits remain in the main session, while self-contained derivations, solver modules, and independent reviews run in isolated workers with explicit confirmation and bounded write scopes. Offline tools—`read-plan`, `cross-check`, `reconcile`, and `check-grounding --doc-hygiene`—mitigate context overflow, review blind spots, stale documentation, and unverified claims.
 
-Run `install.py` to sync configurations into user-level client directories without modifying project repositories. When developing across Windows and WSL2, run it in both environments. Users supply their own official client installations alongside official OAuth sign-in or vendor API keys. This project is supported solely by the China Scholarship Council (CSC), CSC No. `202506280162`, Approval No. `留金选[2025]37号`. Licensed under [Apache License 2.0](LICENSE), `Copyright 2026 Xinyu Li (Xinyu-Li-1997)`; retain attribution notices in [NOTICE](NOTICE).
+Run `install.py` to sync configurations into user-level client directories without modifying project repositories (run on both Windows and WSL2 if developing across both). Users supply official client installations and sign-in/API keys. Developed by the author while studying under China Scholarship Council (CSC) funding (CSC No. `202506280162`, Approval No. `留金选[2025]37号`), with no other dedicated funding. Independent open-source project unaffiliated with any listed vendor; provided **"AS IS"** without warranty and not for unverified safety-critical use. Licensed under [Apache License 2.0](LICENSE) (`Copyright 2026 Xinyu Li (Xinyu-Li-1997)`); see [NOTICE](NOTICE), [LEGAL.md](LEGAL.md), and [SECURITY.md](SECURITY.md).
 
-### 3. 开源许可
+### 3. 开源许可、商标声明与重要免责提示
 
-本项目采用 [Apache License 2.0](LICENSE) 开源许可，版权归属 `Copyright 2026 Xinyu Li (Xinyu-Li-1997)`。复制或分发本仓库及其衍生作品时，须遵守协议第 4 条及第 4(d) 条，附带许可证副本并保留 [NOTICE](NOTICE) 中的完整原创归属声明。
+本项目采用 [Apache License 2.0](LICENSE)（`Copyright 2026 Xinyu Li (Xinyu-Li-1997)`）；再分发须遵守第 4 条并依第 4(d) 条保留 [NOTICE](NOTICE) 相关归属声明。
+
+- **独立项目与商标**：**本项目为个人独立开源工具，与文中涉及厂商及开源项目均无官方关联或背书；相关名称与商标归各自权利人所有，详见 [LEGAL.md](LEGAL.md) 第一节。**
+- **免责与安全关键警示**：**在法定最大范围内，本仓库按现状提供且无任何担保，维护者不承担直接或间接使用损失（法定不得免除的除外）。未经独立人工验证与法定审定，不应直接用于高风险安全关键生产决策，风险由用户自担。**
+- **运行方式与合规边界**：**核心校验与钩子本地运行且无遥测；调度、路由与可选更新脚本按用户指令联网，传输与合规责任由用户自担。本仓库不提供代理绕过，写入前请先预览备份。** 详见 [LEGAL.md](LEGAL.md)、[SECURITY.md](SECURITY.md)、[CONTRIBUTING.md](CONTRIBUTING.md) 与 [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)。

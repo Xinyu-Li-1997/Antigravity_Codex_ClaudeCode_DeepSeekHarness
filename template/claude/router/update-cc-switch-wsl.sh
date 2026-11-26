@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
+# Copyright 2026 Xinyu Li (Xinyu-Li-1997)
+# SPDX-License-Identifier: Apache-2.0
 # Upgrade CC Switch inside WSL using official GitHub release .deb with SHA-256 verification.
+# Third-party notice: downloads user-requested releases from the independent open-source project
+# farion1231/cc-switch; users are responsible for verifying upstream integrity and license terms.
 # Usage:
 #   update-cc-switch-wsl.sh 4.0.31             Download official .deb, verify SHA-256, install via sudo apt
 #   update-cc-switch-wsl.sh /path/to/pkg.deb   Install from local .deb

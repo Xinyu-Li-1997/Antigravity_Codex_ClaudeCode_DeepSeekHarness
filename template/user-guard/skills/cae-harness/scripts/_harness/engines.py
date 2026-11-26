@@ -1,3 +1,5 @@
+# Copyright 2026 Xinyu Li (Xinyu-Li-1997)
+# SPDX-License-Identifier: Apache-2.0
 """_harness.engines - 进程树监督、JSON 流解析、轨迹与引用审计、无头执行与工作区快照。"""
 
 # ════════════════════════════════════════════════════════════════════════════

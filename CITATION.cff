@@ -19,7 +19,7 @@ abstract: >-
   OpenAI Codex, Claude Code, and DeepSeek Harness for scientific computing,
   CAE, CFD, FEA, numerical PDE solvers, HPC, and high-reliability software
   engineering, implemented purely on the Python 3.11+ standard library across
-  Windows, WSL2, and Linux. 本仓库所载研究成果由作者独立完成，仅接受国家留学基金管理委员会（CSC，学号 202506280162，批准文号 留金选[2025]37号）资助，未接受任何其他单位或个人任何形式的资助、项目、资源、设施、行政或机构性支持。
+  Windows, WSL2, and Linux.
 keywords:
   - scientific-computing
   - computer-aided-engineering

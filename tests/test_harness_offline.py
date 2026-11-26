@@ -1,3 +1,5 @@
+# Copyright 2026 Xinyu Li (Xinyu-Li-1997)
+# SPDX-License-Identifier: Apache-2.0
 """双向编排的离线回归，所有模型调用均使用替身。"""
 import contextlib
 import base64

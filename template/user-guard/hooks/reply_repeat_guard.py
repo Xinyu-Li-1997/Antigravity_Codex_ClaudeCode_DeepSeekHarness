@@ -1,3 +1,5 @@
+# Copyright 2026 Xinyu Li (Xinyu-Li-1997)
+# SPDX-License-Identifier: Apache-2.0
 """
 reply_repeat_guard.py - Stop 阶段长会话交接核查与重复等待回复拦截钩子 (user-guard)
 

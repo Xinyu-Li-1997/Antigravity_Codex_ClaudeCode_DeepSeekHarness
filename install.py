@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright 2026 Xinyu Li (Xinyu-Li-1997)
+# SPDX-License-Identifier: Apache-2.0
 """
 Antigravity、Codex、Claude Code 与 DeepSeek Harness 全局配置安装脚本（仅依赖 Python 3.11+ 标准库）。
 

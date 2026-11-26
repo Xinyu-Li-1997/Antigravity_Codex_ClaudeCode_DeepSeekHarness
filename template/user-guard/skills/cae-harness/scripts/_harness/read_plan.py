@@ -1,3 +1,5 @@
+# Copyright 2026 Xinyu Li (Xinyu-Li-1997)
+# SPDX-License-Identifier: Apache-2.0
 """_harness.read_plan - 读前尺寸评估、保守层级分片规划与跨端盲读汇总核对。"""
 
 # ════════════════════════════════════════════════════════════════════════════

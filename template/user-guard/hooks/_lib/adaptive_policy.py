@@ -1,3 +1,5 @@
+# Copyright 2026 Xinyu Li (Xinyu-Li-1997)
+# SPDX-License-Identifier: Apache-2.0
 """
 adaptive_policy.py - Per-(agent, model) adaptive parameter resolution for hooks, context windows, and proxy cards.
 Pure Python standard library only.

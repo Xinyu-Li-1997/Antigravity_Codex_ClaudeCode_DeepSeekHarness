@@ -1,3 +1,5 @@
+# Copyright 2026 Xinyu Li (Xinyu-Li-1997)
+# SPDX-License-Identifier: Apache-2.0
 """
 user_words.py - Antigravity、Codex 与 Claude Code 会话原话及最近子代理返回归档模块 (user-guard)
 

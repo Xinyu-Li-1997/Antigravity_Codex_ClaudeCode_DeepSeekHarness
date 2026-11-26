@@ -1,3 +1,5 @@
+# Copyright 2026 Xinyu Li (Xinyu-Li-1997)
+# SPDX-License-Identifier: Apache-2.0
 """_harness.reconcile - 统一基线冻结、义务结算与确定性机械对账表引擎。"""
 
 # ════════════════════════════════════════════════════════════════════════════

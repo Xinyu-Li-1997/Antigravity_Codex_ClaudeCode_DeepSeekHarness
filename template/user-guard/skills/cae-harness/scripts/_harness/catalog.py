@@ -1,3 +1,5 @@
+# Copyright 2026 Xinyu Li (Xinyu-Li-1997)
+# SPDX-License-Identifier: Apache-2.0
 """_harness.catalog - 模型目录、语义线索、挡位策略、执行画像与额度冷却门禁。"""
 
 # ════════════════════════════════════════════════════════════════════════════

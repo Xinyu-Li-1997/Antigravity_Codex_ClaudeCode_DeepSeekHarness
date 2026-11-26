@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Copyright 2026 Xinyu Li (Xinyu-Li-1997)
+# SPDX-License-Identifier: Apache-2.0
 # Antigravity, Codex, Claude Code & DeepSeek Harness 统一安装脚本 (Linux / WSL2)
 set -euo pipefail
 

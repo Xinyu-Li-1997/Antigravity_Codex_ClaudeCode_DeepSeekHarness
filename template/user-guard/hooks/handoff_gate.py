@@ -1,3 +1,5 @@
+# Copyright 2026 Xinyu Li (Xinyu-Li-1997)
+# SPDX-License-Identifier: Apache-2.0
 """
 handoff_gate.py - 长会话交接策略与 Antigravity / Codex / Claude Code 宿主适配 (user-guard)
 

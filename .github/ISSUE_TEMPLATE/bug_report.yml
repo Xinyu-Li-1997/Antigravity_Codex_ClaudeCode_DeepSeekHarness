@@ -1,0 +1,52 @@
+name: 缺陷反馈与功能建议（Bug Report / Feature Request）
+description: 反馈脚本缺陷、跨平台兼容问题或提出工程改进建议
+labels: ["triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈！提交前请先阅读 [LEGAL.md](https://github.com/Xinyu-Li-1997/Antigravity_Codex_ClaudeCode_DeepSeekHarness/blob/main/LEGAL.md) 与 [SECURITY.md](https://github.com/Xinyu-Li-1997/Antigravity_Codex_ClaudeCode_DeepSeekHarness/blob/main/SECURITY.md)。
+        如涉及安全漏洞，请勿在此公开提交，请改用仓库 Security 页面的私密报告通道。
+        严禁在 Issue 中粘贴真实 API Key、账号凭据、真实用户名路径、内网 IP 或未公开涉密课题数据。
+  - type: dropdown
+    id: kind
+    attributes:
+      label: 反馈类型
+      options:
+        - 缺陷反馈（Bug）
+        - 功能或机制改进建议（Enhancement）
+        - 文档勘误（Documentation）
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: 仓库版本或提交哈希（选填）
+      description: 可填写 Release 版本号或 git rev-parse --short HEAD 输出
+      placeholder: V2.0.5 / main
+    validations:
+      required: false
+  - type: input
+    id: env
+    attributes:
+      label: 运行环境
+      description: 操作系统、Python 版本与涉及客户端（勿填真实用户名或主机名）
+      placeholder: Windows 11 / WSL2 Ubuntu 24.04 / Python 3.12 / Codex
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: 问题描述或需求说明（缺陷类请附复现步骤）
+      description: 请提供脱敏后的命令、预期结果与实际输出
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 提交前脱敏确认
+      options:
+        - label: 我已确认上述内容不含真实密钥、凭据、个人隐私路径、内网地址或涉密科研数据。
+          required: true
+        - label: 我已确认本反馈不涉及尚未修复的安全漏洞（安全漏洞请走私密安全报告通道）。
+          required: true

@@ -1,3 +1,5 @@
+# Copyright 2026 Xinyu Li (Xinyu-Li-1997)
+# SPDX-License-Identifier: Apache-2.0
 """
 test_lifecycle_offline.py - 上下文压缩原话回溯引擎离线单元测试套件
 

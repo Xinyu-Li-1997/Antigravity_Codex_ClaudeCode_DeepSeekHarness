@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright 2026 Xinyu Li (Xinyu-Li-1997)
+# SPDX-License-Identifier: Apache-2.0
 """fleet_state.py - fleet-evolve 维护流程的本机审批与重启验证状态锁（仅依赖 Python 标准库）。"""
 
 from __future__ import annotations
