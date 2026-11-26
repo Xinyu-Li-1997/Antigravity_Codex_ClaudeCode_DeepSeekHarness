@@ -2,6 +2,21 @@
 
 本文件记录四客户端共用规则、会话钩子、后台验证工具与上游维护流程的版本演进。当前插件版本以 `template/user-guard/plugin.json` 为准；常驻使用文档只说明机制和配置键，不重复维护版本号与性能日期。
 
+## [2.0.6] - 2026-11-26
+
+补齐开源法律治理体系、全仓脚本许可证与版权头、GitHub 合规交互模板及自动化回归守卫，并对公开文档的许可条款、数据流向与权属表述完成跨端核校：
+
+- **开源法律与社区治理文档（`LEGAL.md`、`SECURITY.md`、`CONTRIBUTING.md`、`CODE_OF_CONDUCT.md`、`README.md`、`NOTICE`、`CITATION.cff`、`.timestamps/README.md`、`AGENTS.md`）**：
+  - 新增 `LEGAL.md`，集中说明独立开源定位、第三方商标权属与 Apache License 2.0 第 6 条非授权边界、再分发条件与专利终止条款（第 3 条与第 4 条）、按现状免责与责任限制（第 7 条与第 8 条及《中华人民共和国民法典》第五百零六条法定边界）、安全关键领域设计边界提示、本地与联网数据流向、非生成式人工智能服务声明，以及依 GitHub 官方内容移除流程与脱敏模板分流处理的异议沟通机制（含善意处理不构成自认与防范不实通知条款）；
+  - 新增 `SECURITY.md`、`CONTRIBUTING.md` 与 `CODE_OF_CONDUCT.md`，明确支持版本与私密漏洞报告渠道、无漏洞赏金与非商业响应边界、Apache License 2.0 第 5 条贡献许可、`Signed-off-by`（Developer Certificate of Origin 1.1）原创来源声明、双平台本地验证命令及社区违规处置原则；
+  - 在 `README.md` 首屏与安装命令前增设显著风险与备份提示，修正“纯本地离线”口径并保持入口页体积预算；恢复 `NOTICE` 为纯净第 4(d) 条归属声明；移除 `CITATION.cff` 摘要中绝对化的中文否认句；精确限定 `.timestamps/README.md` 时间戳证明边界，并同步对齐 `AGENTS.md` 的四级文档清单与全量单测命令。
+- **GitHub 合规交互模板、全仓脚本版权头与回归测试（`.github/`、全仓 `.py`/`.sh`/`.ps1`、`tests/`）**：
+  - 新增 `.github/PULL_REQUEST_TEMPLATE.md` 与 `.github/ISSUE_TEMPLATE/{config.yml,bug_report.yml,compliance_and_ip_notice.md}`，关闭公开空白 Issue，规范脱敏确认与通知人真实性声明；
+  - 为仓库受管的全部 32 份 `.py`、`.sh` 与 `.ps1` 脚本补齐版权声明与 `SPDX-License-Identifier: Apache-2.0` 标识，并在 `template/claude/router/update-cc-switch-wsl.sh` 中注明第三方安装包独立来源；
+  - 在 `tests/test_e2e_integration.py` 新增 `test_52_legal_governance_and_spdx_headers` 机械守卫法律治理文件完整度、`README.md` 体积上限与全仓脚本版权许可头；同时将 `tests/test_harness_offline.py` 与 `tests/test_claude_and_router_offline.py` 中的脱敏测试伪密钥字面量改为字符串拼接，避免触发推送扫描误报。
+
+---
+
 ## [2.0.5] - 2026-11-26
 
 修复真实跨端科研会话中暴露的三处 `status_guard.py` Python AST 静态边界误报，并为同波次并发 `agy` 无头子进程增加轻量错峰启动：

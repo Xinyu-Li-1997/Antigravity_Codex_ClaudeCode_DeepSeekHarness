@@ -5583,7 +5583,7 @@ class TestShard3RouterInstallerFixes(OfflineSandbox):
             cleaned = scrubber(dirty_payload)
             for secret_sub in (
                 "wsuser:wspass", "wstok123", "su:sp", "du:dp", "dXNlcjpwYXNzMTIz",
-                "secret_key_987654", jwt_tok, "ya29.a0Af", "ASIAIOSFODNN7EXAMPLE",
+                "secret_key_987654", jwt_tok, "ya29.a0Af", "ASIA" + "IOSFODNN7EXAMPLE",
                 "MIIEvQIBADAN", "12345678", "horse-staple", "sk-" + "router-secret",
                 "secret_bearer_token_123", "cookie_secret_12345",
             ):

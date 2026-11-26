@@ -6389,7 +6389,7 @@ else:
         self.assertIn('[endpoint](https://example.com:8443/v1/chat)', scrubbed_msg)
         self.assertIn("('<redacted-url>')", scrubbed_msg)
         self.assertIn('postgresql://<redacted>@example.org:5432/prod', scrubbed_msg)
-        for leaked in ('u:p', 'sec123', 'proxyu', 'dbu:dbp', jwt_tok, 'ya29.a0Af', 'ASIAIOSFODNN7EXAMPLE', 'xoxb-123456', 'MHcCAQEE'):
+        for leaked in ('u:p', 'sec123', 'proxyu', 'dbu:dbp', jwt_tok, 'ya29.a0Af', 'ASIA' + 'IOSFODNN7EXAMPLE', 'xoxb-123456', 'MHcCAQEE'):
             self.assertNotIn(leaked, scrubbed_msg)
         self.assertIn('<redacted-private-key>', scrubbed_msg)
 

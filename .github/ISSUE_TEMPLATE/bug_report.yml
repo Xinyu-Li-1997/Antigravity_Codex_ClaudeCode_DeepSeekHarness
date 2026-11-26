@@ -23,7 +23,7 @@ body:
     attributes:
       label: 仓库版本或提交哈希（选填）
       description: 可填写 Release 版本号或 git rev-parse --short HEAD 输出
-      placeholder: V2.0.5 / main
+      placeholder: V2.0.6 / main
     validations:
       required: false
   - type: input
