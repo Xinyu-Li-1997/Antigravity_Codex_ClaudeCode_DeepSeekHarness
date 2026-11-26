@@ -6,7 +6,241 @@ Pure Python standard library only.
 import os
 import re
 import shlex
-from typing import List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+
+WRAPPER_VALUE_FLAGS: Dict[str, Tuple[str, ...]] = {
+    "wsl": ("-d", "--distribution", "-u", "--user", "--cd"),
+    "sudo": (
+        "-u", "--user", "-g", "--group", "-h", "--host", "-p", "--prompt",
+        "-r", "--role", "-t", "--type", "-C", "--close-from",
+        "-T", "--command-timeout", "-D", "--chdir", "-R", "--chroot",
+    ),
+    "timeout": ("-k", "--kill-after", "-s", "--signal"),
+    "nice": ("-n", "--adjustment"),
+    "nohup": (),
+    "env": ("-u", "--unset", "-C", "--chdir"),
+    "uv_global": ("--directory", "--project", "--config-file"),
+    "uv_run": (
+        "--python", "-p", "--with", "--with-editable", "--with-requirements",
+        "--directory", "--project", "--env-file", "--package",
+    ),
+    "exec": ("-a",),
+    "systemd-run": (
+        "-p", "--property", "--unit", "-u", "--slice", "--working-directory",
+        "-E", "--setenv", "--uid", "--gid", "--service-type", "--description",
+    ),
+}
+SUBSYSTEM_WRAPPER_NAMES = frozenset({"wsl", "wsl.exe", "ssh", "ssh.exe", "docker", "docker.exe", "podman"})
+
+
+def unquote_split_string_payload(inner: str) -> str:
+    """剥离 Windows shlex(posix=False) 拆解 --split-string="..." 后残留的开头或成对引号。"""
+    s = inner.strip()
+    if not s or s[0] not in ("'", '"'):
+        return s
+    q = s[0]
+    if len(s) >= 2 and s[-1] == q:
+        body = s[1:-1]
+        return body.replace('\\"', '"') if q == '"' else body.replace("''", "'")
+    end = s.find(q, 1)
+    if end != -1:
+        head = s[1:end]
+        head = head.replace('\\"', '"') if q == '"' else head.replace("''", "'")
+        return head + s[end + 1 :]
+    return s[1:]
+
+
+def consume_leading_wrapper(
+    tokens: List[str],
+    idx: int,
+    *,
+    unquote: Optional[Callable[[str], str]] = None,
+    allow_subsystem: bool = True,
+    allow_wsl_only: bool = False,
+    allow_exec: bool = False,
+    allow_systemd_run: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """统一剥离单个前导命令包装器（command/nohup/nice/uv run/sudo/timeout/wsl/exec/systemd-run）。
+
+    返回 dict:
+      - next_idx: int
+      - wrapper: str
+      - lookup_only: bool (command -v / -V)
+      - chdir: Optional[str] (由 sudo -D / wsl --cd 捕获的未展开目录参数)
+      - used_subsystem: bool
+      - saw_no_pager_env: bool (systemd-run -E GIT_PAGER=...)
+    若 tokens[idx] 不是支持的包装器则返回 None。
+    """
+    n = len(tokens)
+    if idx >= n:
+        return None
+    norm = unquote if unquote is not None else (lambda s: s)
+    raw = norm(tokens[idx])
+    head = Path(raw.replace("\\", "/")).name.lower()
+    head_stem = head[:-4] if head.endswith(".exe") else head
+
+    if head_stem == "command":
+        j = idx + 1
+        lookup_only = False
+        while j < n and norm(tokens[j]).startswith("-"):
+            fl = norm(tokens[j])
+            j += 1
+            if fl == "--":
+                break
+            if fl in ("-v", "-V") or (not fl.startswith("--") and any(c in fl[1:] for c in ("v", "V"))):
+                lookup_only = True
+                break
+        return {
+            "next_idx": j, "wrapper": "command", "lookup_only": lookup_only,
+            "chdir": None, "used_subsystem": False, "saw_no_pager_env": False,
+        }
+
+    if head_stem == "nohup":
+        j = idx + 1
+        if j < n and norm(tokens[j]) == "--":
+            j += 1
+        return {
+            "next_idx": j, "wrapper": "nohup", "lookup_only": False,
+            "chdir": None, "used_subsystem": False, "saw_no_pager_env": False,
+        }
+
+    if head_stem == "nice":
+        j = idx + 1
+        while j < n and norm(tokens[j]).startswith("-"):
+            fl = norm(tokens[j])
+            j += 1
+            if fl == "--":
+                break
+            if fl in WRAPPER_VALUE_FLAGS["nice"] and j < n:
+                j += 1
+        return {
+            "next_idx": j, "wrapper": "nice", "lookup_only": False,
+            "chdir": None, "used_subsystem": False, "saw_no_pager_env": False,
+        }
+
+    if head_stem == "uv" and idx + 1 < n:
+        j = idx + 1
+        chdir_val: Optional[str] = None
+        while j < n and norm(tokens[j]).startswith("-"):
+            fl = norm(tokens[j])
+            j += 1
+            if fl.startswith("--directory="):
+                chdir_val = fl.split("=", 1)[1]
+            elif fl in WRAPPER_VALUE_FLAGS["uv_global"] and j < n:
+                if fl == "--directory":
+                    chdir_val = tokens[j]
+                j += 1
+        if j < n and norm(tokens[j]).lower() == "run":
+            j += 1
+            while j < n and norm(tokens[j]).startswith("-"):
+                fl = norm(tokens[j])
+                j += 1
+                if fl == "--":
+                    break
+                if fl.startswith("--directory="):
+                    chdir_val = fl.split("=", 1)[1]
+                elif fl in WRAPPER_VALUE_FLAGS["uv_run"] and j < n:
+                    if fl == "--directory":
+                        chdir_val = tokens[j]
+                    j += 1
+            return {
+                "next_idx": j, "wrapper": "uv", "lookup_only": False,
+                "chdir": chdir_val, "used_subsystem": False, "saw_no_pager_env": False,
+            }
+        return None
+
+    if head_stem == "sudo":
+        j = idx + 1
+        chdir_val = None
+        while j < n and norm(tokens[j]).startswith("-"):
+            fl = norm(tokens[j])
+            j += 1
+            if fl == "--":
+                break
+            if fl.startswith("--chdir="):
+                chdir_val = fl.split("=", 1)[1]
+            elif fl in WRAPPER_VALUE_FLAGS["sudo"] and j < n:
+                if fl in ("-D", "--chdir"):
+                    chdir_val = tokens[j]
+                j += 1
+        return {
+            "next_idx": j, "wrapper": "sudo", "lookup_only": False,
+            "chdir": chdir_val, "used_subsystem": False, "saw_no_pager_env": False,
+        }
+
+    if head_stem == "timeout":
+        j = idx + 1
+        while j < n and norm(tokens[j]).startswith("-"):
+            fl = norm(tokens[j]).lower()
+            j += 1
+            if fl == "--":
+                break
+            if fl in WRAPPER_VALUE_FLAGS["timeout"] and j < n:
+                j += 1
+        if j < n:
+            j += 1  # 跳过时长参数
+        return {
+            "next_idx": j, "wrapper": "timeout", "lookup_only": False,
+            "chdir": None, "used_subsystem": False, "saw_no_pager_env": False,
+        }
+
+    is_sub = (head in ("wsl", "wsl.exe")) if allow_wsl_only else (allow_subsystem and head in SUBSYSTEM_WRAPPER_NAMES)
+    if is_sub:
+        j = idx + 1
+        chdir_val = None
+        while j < n and norm(tokens[j]).startswith("-"):
+            fl = norm(tokens[j])
+            fl_low = fl.lower()
+            j += 1
+            if fl_low in ("--", "-e", "--exec"):
+                break
+            if fl_low.startswith("--cd="):
+                chdir_val = fl.split("=", 1)[1]
+            elif fl_low in WRAPPER_VALUE_FLAGS["wsl"] and j < n:
+                if fl_low == "--cd":
+                    chdir_val = tokens[j]
+                j += 1
+        return {
+            "next_idx": j, "wrapper": head_stem, "lookup_only": False,
+            "chdir": chdir_val, "used_subsystem": True, "saw_no_pager_env": False,
+        }
+
+    if allow_exec and head_stem == "exec":
+        j = idx + 1
+        while j < n and norm(tokens[j]).startswith("-"):
+            fl = norm(tokens[j])
+            j += 1
+            if fl == "--":
+                break
+            if fl in WRAPPER_VALUE_FLAGS["exec"] and j < n:
+                j += 1
+        return {
+            "next_idx": j, "wrapper": "exec", "lookup_only": False,
+            "chdir": None, "used_subsystem": False, "saw_no_pager_env": False,
+        }
+
+    if allow_systemd_run and head_stem == "systemd-run":
+        j = idx + 1
+        saw_no_pager = False
+        while j < n and norm(tokens[j]).startswith("-"):
+            fl = norm(tokens[j])
+            j += 1
+            if fl == "--":
+                break
+            if re.search(r"(?:^|=)(?:GIT_PAGER|PAGER)=", fl, re.I):
+                saw_no_pager = True
+            if fl in WRAPPER_VALUE_FLAGS["systemd-run"] and j < n:
+                if fl in ("-E", "--setenv") and re.match(r"^(?:GIT_PAGER|PAGER)=", norm(tokens[j]), re.I):
+                    saw_no_pager = True
+                j += 1
+        return {
+            "next_idx": j, "wrapper": "systemd-run", "lookup_only": False,
+            "chdir": None, "used_subsystem": False, "saw_no_pager_env": saw_no_pager,
+        }
+
+    return None
 
 
 def safe_split_tokens(segment: str) -> List[str]:

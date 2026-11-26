@@ -369,6 +369,7 @@
     },
     "handoff_thresholds": {
       "antigravity": {
+        "default_mode": "enforce",
         "default_drain_invocations": 4,
         "default_drain_actions": 8,
         "advisory_cp_threshold": 3,

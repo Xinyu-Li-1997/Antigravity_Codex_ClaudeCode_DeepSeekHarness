@@ -958,7 +958,7 @@ assert sys.stdin.readline() == ''
             self.assertNotIn(prompt, command)
             self.assertEqual(json.loads(input_text)['message']['content'], prompt)
             self.assertEqual(command[command.index('--agent') + 1], 'readonly-collaborator')
-            self.assertEqual(command[command.index('--print-timeout') + 1], '510s')
+            self.assertEqual(command[command.index('--print-timeout') + 1], '600s')
             self.assertNotIn('--dangerously-skip-permissions', command)
             self.assertEqual(kwargs['env']['CAE_HARNESS_DEPTH'], '1')
             stream = '\n'.join([
@@ -6590,10 +6590,20 @@ else:
                             self.assertEqual(caught.exception.status, 'timeout')
                             self.assertIsNone(receipt['provider_session_id'])
                             self.assertFalse(receipt['timeout_salvage']['resumable'])
+                            self.assertEqual(process.call_count, 1)
+                        elif provider == 'agy':
+                            # agy 不再按 soft_timeout_ratio 倒扣主回合预算，也不自动同会话 wrapup；
+                            # 但非 ephemeral 时仍持久化 provider_session_id 供非锁定场景显式 followup。
+                            with self.assertRaises(harness.HarnessError) as caught:
+                                invoke()
+                            self.assertEqual(caught.exception.status, 'timeout')
+                            self.assertEqual(receipt['provider_session_id'], 'agy-s1')
+                            self.assertTrue(receipt['timeout_salvage']['resumable'])
+                            self.assertEqual(process.call_count, 1)
                         else:
                             self.assertEqual(invoke(), TASK)
                             self.assertEqual(receipt['provider_session_id'], provider + '-s1')
-                        self.assertEqual(process.call_count, 1 if ephemeral else 2)
+                            self.assertEqual(process.call_count, 2)
 
     def test_v118_hard_timeout_archives_rollout_and_followup_restores_it(self):
         root = self.root / 'work'
@@ -7144,8 +7154,8 @@ else:
         self.assertNotIn('.julia', harness._snapshot_ignore_dirs_for(['.julia/config.toml']))
 
     def test_v11810_agy_wrapup_downgrade_grace_stalled_guard_and_plan_budget_gates(self):
-        # 1. agy tier-suffixed slug downgrades to sibling '-low' model on soft-timeout wrapup,
-        #    and proc_timeout stays strictly above --print-timeout in both primary & wrapup turns
+        # 1. agy 不再被 soft_timeout_ratio 倒扣 15% 主预算：timeout=600 完整传入 --print-timeout 600s，
+        #    且外层 proc_timeout 仍严格大于 --print-timeout（600 + grace=15 -> 615s）
         agy_engines = self.four_backends()
         agy_engines['agy']['models'] = [
             {'slug': 'gemini-4-carbon-high', 'context_window': 512000, 'priority': 1},
@@ -7157,7 +7167,7 @@ else:
         seen_calls = []
         receipt = {}
 
-        def run_agy_wrapup(argv, cwd, prompt, timeout, **kwargs):
+        def run_agy_full_budget(argv, cwd, prompt, timeout, **kwargs):
             seen_calls.append({
                 'argv': list(argv),
                 'print_timeout': argv[argv.index('--print-timeout') + 1],
@@ -7166,61 +7176,44 @@ else:
                 'proc_timeout': timeout,
                 'is_resume': '--conversation' in argv,
             })
-            if '--conversation' not in argv:
-                now[0] = 510.0
-                init_out = json.dumps({'event': 'init', 'conversation_id': 'agy-wrap-s1', 'init': {'model': 'gemini-4-carbon-high'}})
-                return subprocess.CompletedProcess(
-                    argv, 3, init_out + '\n',
-                    '[agy] print timeout after 510s\nAGY_ERROR: {"reason":"print_timeout"}\n',
-                )
+            now[0] = 526.4
             final = json.dumps({'event': 'result', 'result': {'structured_output': TASK}})
             return subprocess.CompletedProcess(argv, 0, final, '')
 
         with patch.object(harness.time, 'monotonic', side_effect=lambda: now[0]), \
-             patch.object(harness, 'run_process', side_effect=run_agy_wrapup):
+             patch.object(harness, 'run_process', side_effect=run_agy_full_budget):
             out = harness.invoke_engine(
                 'agy:gemini-4-carbon-high', self.root, '复核双语文档', agy_engines,
                 harness.TASK_JSON_SCHEMA, readonly=True, timeout_sec=600, receipt=receipt,
             )
         self.assertEqual(out, TASK)
-        self.assertEqual(len(seen_calls), 2)
+        self.assertEqual(len(seen_calls), 1)
         self.assertEqual(seen_calls[0]['model'], 'gemini-4-carbon-high')
         self.assertFalse(seen_calls[0]['has_effort'])
-        self.assertEqual(seen_calls[0]['print_timeout'], '510s')
-        self.assertGreater(seen_calls[0]['proc_timeout'], 510)
-        self.assertEqual(seen_calls[0]['proc_timeout'], 525)
-        self.assertTrue(seen_calls[1]['is_resume'])
-        self.assertEqual(seen_calls[1]['model'], 'gemini-4-carbon-low')
-        self.assertFalse(seen_calls[1]['has_effort'])
-        self.assertEqual(seen_calls[1]['print_timeout'], '90s')
-        self.assertGreater(seen_calls[1]['proc_timeout'], 90)
-        self.assertEqual(receipt.get('wrapup_model'), 'gemini-4-carbon-low')
-        self.assertEqual(receipt.get('wrapup_effort'), 'low')
-        self.assertTrue(receipt.get('soft_timeout_wrapup'))
+        self.assertEqual(seen_calls[0]['print_timeout'], '600s')
+        self.assertGreater(seen_calls[0]['proc_timeout'], 600)
+        self.assertEqual(seen_calls[0]['proc_timeout'], 615)
+        self.assertFalse(receipt.get('soft_timeout_wrapup', False))
 
-        # 2. agy wrapup timeout with 0 model progress marks wrapup_stalled=True & resumable=False,
-        #    blocking cmd_followup with session_not_resumable; Codex double timeout remains resumable=True
+        # 2. agy 触发 --print-timeout with turn in progress 时标记 wrapup_stalled=True & resumable=False，
+        #    阻断 cmd_followup 返回 session_not_resumable；Codex 双超时保持 resumable=True
         stall_now = [0.0]
         stall_receipt = {}
 
-        def run_agy_stalled(argv, cwd, prompt, timeout, **kwargs):
-            if '--conversation' not in argv:
-                stall_now[0] = 510.0
-                out1 = '\n'.join((
-                    json.dumps({'event': 'init', 'conversation_id': 'agy-stall-s1'}),
-                    json.dumps({'event': 'agent_response', 'text': '已读取前 7 个文件'}),
-                ))
-                raise harness.HarnessError('子进程超时', 'timeout', timeout_sec=timeout, process_started=True, partial_stdout=out1)
+        def run_agy_bg_timeout(argv, cwd, prompt, timeout, **kwargs):
             stall_now[0] = 600.0
-            out2 = '\n'.join((
+            out1 = '\n'.join((
                 json.dumps({'event': 'init', 'conversation_id': 'agy-stall-s1'}),
-                json.dumps({'event': 'user_input', 'text': '立即停止工具调用'}),
-                json.dumps({'event': 'system_message', 'text': '[Notice] All your subagents and background tasks have been stopped due to server restart.'}),
+                json.dumps({'event': 'result', 'result': {'finished_reason': 'print_timeout', 'response': ''}}),
             ))
-            raise harness.HarnessError('子进程超时', 'timeout', timeout_sec=timeout, process_started=True, partial_stdout=out2)
+            return subprocess.CompletedProcess(
+                argv, 0, out1 + '\n',
+                '[agy] print timeout after 10m0s with turn in progress; returning partial output\n'
+                'AGY_ERROR: {"reason":"print_timeout"}\n',
+            )
 
         with patch.object(harness.time, 'monotonic', side_effect=lambda: stall_now[0]), \
-             patch.object(harness, 'run_process', side_effect=run_agy_stalled):
+             patch.object(harness, 'run_process', side_effect=run_agy_bg_timeout):
             with self.assertRaises(harness.HarnessError) as stall_exc:
                 harness.invoke_engine(
                     'agy:gemini-4-carbon-high', self.root, '复核', agy_engines,
@@ -7230,7 +7223,7 @@ else:
         self.assertTrue(stall_receipt.get('wrapup_stalled'))
         self.assertTrue(stall_exc.exception.details.get('wrapup_stalled'))
         self.assertFalse(stall_receipt['timeout_salvage']['resumable'])
-        self.assertEqual(stall_receipt['timeout_salvage']['resume_blocked_reason'], 'agy_wrapup_stalled_without_model_turn')
+        self.assertEqual(stall_receipt['timeout_salvage']['resume_blocked_reason'], 'agy_background_turn_in_progress')
 
         stall_receipt_path = self.root / 'agy_stalled_receipt.json'
         stall_receipt_path.write_text(json.dumps({
@@ -7244,7 +7237,7 @@ else:
                     'followup', '--receipt', str(stall_receipt_path), '--task', '继续收口', '--timeout', '120',
                 ))
         self.assertEqual(f_exc.exception.status, 'session_not_resumable')
-        self.assertEqual(f_exc.exception.details.get('resume_blocked_reason'), 'agy_wrapup_stalled_without_model_turn')
+        self.assertEqual(f_exc.exception.details.get('resume_blocked_reason'), 'agy_background_turn_in_progress')
 
         # Codex double timeout with empty wrapup stdout still preserves resumable=True (R5 scope guard)
         cx_now, cx_rec = [0.0], {}
@@ -7563,34 +7556,30 @@ else:
         self.assertEqual(norm_u['total_tokens'], 6200)
 
         agy_multi_calls = []
-        agy_now = [0.0]
 
-        def run_agy_multi(command, cwd, stdin_text, timeout, **kwargs):
-            agy_multi_calls.append(list(command))
-            if len(agy_multi_calls) == 1:
-                agy_now[0] = 520.0
-                out1 = (
-                    json.dumps({'event': 'init', 'init': {'conversation_id': 'conv-dedup-1'}}) + '\n'
-                    + json.dumps({'event': 'result', 'result': {
-                        'finished_reason': 'print_timeout', 'response': '',
-                        'usage': {'input_tokens': 1000, 'cache_read_tokens': 4000, 'output_tokens': 300, 'total_tokens': 1300},
-                    }}) + '\n'
-                )
-                return subprocess.CompletedProcess(command, 0, out1, '')
-            out2 = json.dumps({'event': 'result', 'result': {
-                'structured_output': TASK,
-                'usage': {'input_tokens': 1200, 'cache_read_tokens': 4500, 'output_tokens': 500, 'total_tokens': 1700},
-            }}) + '\n'
-            return subprocess.CompletedProcess(command, 0, out2, '')
+        def run_agy_single_full_budget(command, cwd, stdin_text, timeout, **kwargs):
+            agy_multi_calls.append((list(command), timeout))
+            out = (
+                json.dumps({'event': 'init', 'init': {'conversation_id': 'conv-dedup-1'}}) + '\n'
+                + json.dumps({'event': 'step_update', 'step_update': {
+                    'step_type': 'agent_response',
+                    'usage': {'input_tokens': 1000, 'cache_read_tokens': 4000, 'output_tokens': 300, 'total_tokens': 1300},
+                }}) + '\n'
+                + json.dumps({'event': 'result', 'result': {
+                    'structured_output': TASK,
+                    'usage': {'input_tokens': 1200, 'cache_read_tokens': 4500, 'output_tokens': 500, 'total_tokens': 1700},
+                }}) + '\n'
+            )
+            return subprocess.CompletedProcess(command, 0, out, '')
 
         dedup_rec = {}
-        with patch.object(harness.time, 'monotonic', side_effect=lambda: agy_now[0]), \
-             patch.object(harness, 'run_process', side_effect=run_agy_multi):
+        with patch.object(harness, 'run_process', side_effect=run_agy_single_full_budget):
             harness.invoke_engine(
                 'agy:gemini-4-carbon-high', self.root, '审查', cap_engines, harness.TASK_JSON_SCHEMA,
                 readonly=True, timeout_sec=600, receipt=dedup_rec,
             )
-        self.assertEqual(len(agy_multi_calls), 2)
+        self.assertEqual(len(agy_multi_calls), 1)
+        self.assertEqual(agy_multi_calls[0][0][agy_multi_calls[0][0].index('--print-timeout') + 1], '600s')
         self.assertEqual(dedup_rec['token_usage']['input_tokens'], 5700)
         self.assertEqual(dedup_rec['token_usage']['cached_input_tokens'], 4500)
         self.assertEqual(dedup_rec['token_usage']['output_tokens'], 500)
@@ -8311,6 +8300,204 @@ else:
         )
         rep_fixed = harness.audit_doc_grounding(proj, root_dir=proj, doc_hygiene=True)
         self.assertTrue(rep_fixed['ok'], rep_fixed['findings'])
+
+    def test_v204_codex_custom_exec_trace_citation_grounding_and_batch_concurrent(self):
+        """回归测试：Codex 0.171 custom_tool_call('exec') 读盘追踪、citation_audit 子路径消歧、
+        check-grounding 统一排除归档与去 fleet_profile.json 文案泄露及 --output/--hygiene-only、
+        cmd_batch OS 只读沙箱外部并发变动不误判 scope_violation。"""
+        proj = self.root / 'v204_proj'
+        (proj / 'src' / 'paper').mkdir(parents=True)
+        (proj / '归档').mkdir(parents=True)
+        (proj / '.runtime').mkdir(parents=True)
+        (proj / 'archive_old').mkdir(parents=True)
+        (proj / 'src' / 'paper' / 'manuscript.md').write_text(
+            '# 离散格式分析\n\n第 2 节给出了离散守恒形式。\n', encoding='utf-8',
+        )
+        (proj / 'src' / 'solver.py').write_text('CFL_MAX = 0.5\n', encoding='utf-8')
+        # 归档/.runtime/archive_old 里的旧草稿含坏链接与陌生缩写，应被统一排除
+        (proj / '归档' / 'old_draft.md').write_text('旧草稿含 BOGUSACR 与 ![坏图](missing.png)\n', encoding='utf-8')
+        (proj / '.runtime' / 'scratch.md').write_text('运行时临时文档含 BOGUSRUN\n', encoding='utf-8')
+        (proj / 'archive_old' / 'legacy.md').write_text('旧版含 BOGUSOLD\n', encoding='utf-8')
+
+        # 1) _session_trace 解析 Codex 0.171 custom_tool_call("exec") + custom_tool_call_output
+        events = [
+            {
+                'type': 'response_item',
+                'payload': {
+                    'type': 'custom_tool_call',
+                    'status': 'completed',
+                    'call_id': 'call_exec_1',
+                    'name': 'exec',
+                    'input': 'const r = await tools.exec_command({cmd: "Get-Content -LiteralPath \'src/paper/manuscript.md\'"});',
+                },
+            },
+            {
+                'type': 'response_item',
+                'payload': {
+                    'type': 'custom_tool_call_output',
+                    'call_id': 'call_exec_1',
+                    'output': [
+                        {'type': 'input_text', 'text': 'Script completed\nWall time 0.3 seconds\nOutput:\n'},
+                        {'type': 'input_text', 'text': '{"exit_code":0,"output":"ok"}'},
+                    ],
+                },
+            },
+            {
+                'type': 'response_item',
+                'payload': {
+                    'type': 'custom_tool_call',
+                    'status': 'completed',
+                    'call_id': 'call_exec_fail',
+                    'name': 'exec',
+                    'input': 'const r = await tools.exec_command({cmd: "cat src/solver.py"});',
+                },
+            },
+            {
+                'type': 'response_item',
+                'payload': {
+                    'type': 'custom_tool_call_output',
+                    'call_id': 'call_exec_fail',
+                    'output': [{'type': 'input_text', 'text': '{"exit_code":1,"output":"err"}'}],
+                },
+            },
+        ]
+        reads, _, _ = harness._session_trace(events, proj, None)
+        self.assertEqual(reads, ['src/paper/manuscript.md'])
+
+        # 2) _citation_audit 支持简写文件名/子路径唯一匹配已打开文件
+        cit = harness._citation_audit(
+            {'content': '参见 `manuscript.md#L1-L3` 与 `paper/manuscript.md:2`', 'evidence': [], 'findings': []},
+            proj,
+            reads=['src/paper/manuscript.md'],
+            inlined=[],
+        )
+        self.assertEqual(cit['missing_files'], [])
+        self.assertEqual(cit['unopened_cited_files'], [])
+        self.assertEqual(cit['out_of_range_lines'], [])
+
+        # 3) check-grounding 统一跳过 归档/.runtime/archive_old；通用项目报错不再提及 fleet_profile.json；支持 --output 与 --hygiene-only
+        (proj / 'report.md').write_text('# 汇报\n\n本轮测试共输出 999999 tokens。\n', encoding='utf-8')
+        out_json = self.root / 'grounding_out.json'
+        rc, rep = self.capture(
+            harness.cmd_check_grounding,
+            self.args('check-grounding', '--target', str(proj), '--root', str(proj), '--strict', '--doc-hygiene', '--output', str(out_json)),
+        )
+        self.assertEqual(rc, harness.EXIT_CODES['verification_failed'])
+        self.assertTrue(out_json.is_file())
+        checked = set(rep['checked_files'])
+        self.assertNotIn('归档/old_draft.md', checked)
+        self.assertNotIn('.runtime/scratch.md', checked)
+        self.assertNotIn('archive_old/legacy.md', checked)
+        num_findings = [f for f in rep['findings'] if f['category'] == 'ungrounded_number']
+        self.assertTrue(num_findings)
+        self.assertNotIn('fleet_profile.json', num_findings[0]['reason'])
+        # --hygiene-only 跳过源码词法锚定，保留卫生校验（无坏图/空壳/超长句时通过）
+        rc_hyg, rep_hyg = self.capture(
+            harness.cmd_check_grounding,
+            self.args('check-grounding', '--target', str(proj), '--root', str(proj), '--strict', '--hygiene-only'),
+        )
+        self.assertEqual(rc_hyg, 0, rep_hyg['findings'])
+
+        # 4) cmd_batch: OS 强制只读沙箱遇到外部并发改动记录 external_concurrent_changes，不误判 scope_violation
+        spec_file = self.root / 'v204_batch_spec.json'
+        spec_file.write_text(json.dumps([
+            {'stream_id': 'R1', 'wave': 1, 'kind': 'review', 'engine': 'codex:review',
+             'target': str(proj), 'subtask': '只读核查'},
+        ], ensure_ascii=False), encoding='utf-8')
+
+        def fake_invoke(*a, **kw):
+            receipt = kw.get('receipt')
+            if isinstance(receipt, dict):
+                receipt['os_readonly_enforced'] = True
+                receipt['launch_attempted'] = True
+            # 模拟外部进程并发写入工作区
+            (proj / 'external_edit.tmp').write_text('concurrent', encoding='utf-8')
+            return {'summary': 'ok', 'content': 'done', 'evidence': [], 'findings': []}
+
+        backends = self.four_backends()
+        with patch.object(harness, '_args_backends', return_value=backends), \
+             patch.object(harness, 'invoke_engine', side_effect=fake_invoke):
+            rc_b, rep_b = self.capture(
+                harness.cmd_batch,
+                self.args('batch', '--spec-file', str(spec_file), '--tier', 'high'),
+            )
+        self.assertEqual(rc_b, 0, rep_b)
+        st0 = rep_b['streams'][0]
+        self.assertEqual(st0['status'], 'ok')
+        self.assertEqual(st0['scope_violations'], [])
+        self.assertEqual(st0['scope_check'], 'external_concurrent_drift')
+        self.assertIn('external_edit.tmp', st0.get('external_concurrent_changes', []))
+
+    def test_v204_codex_adversarial_harness_hardening(self):
+        proj = self.root / 'proj_v204_adv'
+        (proj / 'src').mkdir(parents=True)
+        (proj / 'manuscript.md').write_text('root\nline2\n', encoding='utf-8')
+        (proj / 'src' / 'manuscript.md').write_text('src\nline2\n', encoding='utf-8')
+        (proj / 'diagram.svg').write_text('<svg/>', encoding='utf-8')
+
+        # 1) S2-2: _unescape_js_literal 单遍解码不破坏 Windows 路径 \\n；混合退出码判错；非工具字面量不计入读文件
+        self.assertEqual(harness._unescape_js_literal(r'C:\\notes\\a.py'), r'C:\notes\a.py')
+        self.assertTrue(harness._output_block_has_error({
+            'output': [{'type': 'input_text', 'text': '{"exit_code":0}\n{"exit_code":1}'}],
+        }))
+        self.assertEqual(harness._extract_js_exec_read_paths('const note = "cat src/manuscript.md";'), [])
+
+        # 2) S2-3: _citation_audit 对磁盘存在的未读文件绝不误别名；../ 绝不误剥成子路径
+        cit_real = harness._citation_audit(
+            {'content': '参见 `manuscript.md#L1-L2` 与 `../manuscript.md:1`', 'evidence': [], 'findings': []},
+            proj,
+            reads=['src/manuscript.md'],
+            inlined=[],
+        )
+        self.assertIn('manuscript.md', cit_real['unopened_cited_files'])
+        self.assertIn('../manuscript.md', cit_real['missing_files'])
+
+        # 3) S2-4 & S2-5: --output 禁止覆盖目标文档；--hygiene-only 拒绝对 .svg 空跑通过且拒绝与 --base-ref 混用
+        with self.assertRaises(harness.HarnessError):
+            harness.cmd_check_grounding(self.args(
+                'check-grounding', '--target', str(proj / 'manuscript.md'), '--root', str(proj),
+                '--output', str(proj / 'manuscript.md'),
+            ))
+        with self.assertRaises(harness.HarnessError):
+            harness.audit_doc_grounding(proj / 'manuscript.md', proj, base_ref='HEAD', hygiene_only=True)
+        rep_svg = harness.audit_doc_grounding(proj / 'diagram.svg', proj, hygiene_only=True)
+        self.assertFalse(rep_svg['ok'])
+        self.assertEqual(rep_svg['checked_files'], [])
+        self.assertEqual(rep_svg['findings'][0]['category'], 'no_applicable_hygiene_files')
+
+        # 4) S2-7: 同波次流 A 擅写兄弟流 B 的 write_scope 时（B 未改该文件），A 须报 scope_violation
+        (proj / 'a.txt').write_text('a0', encoding='utf-8')
+        (proj / 'b.txt').write_text('b0', encoding='utf-8')
+        spec_peer = self.root / 'v204_peer_spec.json'
+        spec_peer.write_text(json.dumps([
+            {'stream_id': 'A', 'wave': 1, 'kind': 'code', 'engine': 'codex:code',
+             'target': str(proj), 'write_scope': ['a.txt'], 'subtask': '改 a'},
+            {'stream_id': 'B', 'wave': 1, 'kind': 'code', 'engine': 'claude:code',
+             'target': str(proj), 'write_scope': ['b.txt'], 'subtask': '改 b'},
+        ], ensure_ascii=False), encoding='utf-8')
+
+        b_done = threading.Event()
+
+        def fake_peer_invoke(spec, *a, **kw):
+            rec = kw.get('receipt')
+            if isinstance(rec, dict):
+                rec['launch_attempted'] = True
+            if spec.startswith('claude'):
+                b_done.set()
+                return {'summary': 'ok', 'content': 'done', 'evidence': [], 'unverified': []}
+            # 等待兄弟流 B 完成快照退出（changed_files=[]）后，流 A 才越界篡改 B 的 write_scope
+            b_done.wait(timeout=5.0)
+            time.sleep(0.15)
+            (proj / 'b.txt').write_text('hijacked-by-A', encoding='utf-8')
+            return {'summary': 'ok', 'content': 'done', 'evidence': [], 'unverified': []}
+
+        with patch.object(harness, '_args_backends', return_value=self.four_backends()), \
+             patch.object(harness, 'invoke_engine', side_effect=fake_peer_invoke):
+            rc_p, rep_p = self.capture(harness.cmd_batch, self.args('batch', '--spec-file', str(spec_peer)))
+        self.assertNotEqual(rc_p, 0)
+        by_id = {s['stream_id']: s for s in rep_p['streams']}
+        self.assertEqual(by_id['A']['status'], 'scope_violation')
+        self.assertIn('b.txt', by_id['A']['scope_violations'])
 
 
 if __name__ == '__main__':

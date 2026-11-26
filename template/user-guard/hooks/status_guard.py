@@ -361,18 +361,7 @@ _split_shell_clauses = _shell_lex.split_shell_clauses
 _extract_cmd_substitutions = _shell_lex.extract_cmd_substitutions
 
 
-def _unquote_split_string_payload(inner: str) -> str:
-    """剥离 Windows shlex(posix=False) 拆解 --split-string="..." 后残留的开头或成对引号。"""
-    s = inner.strip()
-    if not s or s[0] not in ("'", '"'):
-        return s
-    q = s[0]
-    if len(s) >= 2 and s[-1] == q:
-        return s[1:-1]
-    end = s.find(q, 1)
-    if end != -1:
-        return s[1:end] + s[end + 1 :]
-    return s[1:]
+_unquote_split_string_payload = _shell_lex.unquote_split_string_payload
 
 
 def _unwrap_inner_command(tokens: List[str]) -> Tuple[List[str], bool]:
@@ -390,17 +379,6 @@ def _unwrap_inner_command(tokens: List[str]) -> Tuple[List[str], bool]:
 
         if head_raw == "&":
             idx += 1
-            continue
-
-        if head_name == "command":
-            idx += 1
-            while idx < n and tokens[idx].startswith("-"):
-                fl = tokens[idx]
-                idx += 1
-                if fl == "--":
-                    break
-                if fl in ("-v", "-V") or (not fl.startswith("--") and any(c in fl[1:] for c in ("v", "V"))):
-                    return [], used_subsystem
             continue
 
         if head_name == "env":
@@ -427,82 +405,17 @@ def _unwrap_inner_command(tokens: List[str]) -> Tuple[List[str], bool]:
                     idx += 1
             continue
 
-        if head_name == "nohup":
-            idx += 1
-            continue
-
-        if head_name == "nice":
-            idx += 1
-            while idx < n and tokens[idx].startswith("-"):
-                fl = tokens[idx]
-                idx += 1
-                if fl == "--":
-                    break
-                if fl in ("-n", "--adjustment") and idx < n:
-                    idx += 1
-            continue
-
-        if head_name == "uv" and idx + 1 < n:
-            j = idx + 1
-            while j < n and tokens[j].startswith("-"):
-                j += 2 if tokens[j] in ("--directory", "--project", "--config-file") and j + 1 < n else 1
-            if j < n and tokens[j].lower() == "run":
-                j += 1
-                uv_vals = ("--python", "-p", "--with", "--with-editable", "--with-requirements",
-                           "--directory", "--project", "--env-file", "--package")
-                while j < n and tokens[j].startswith("-"):
-                    fl = tokens[j]
-                    j += 1
-                    if fl == "--":
-                        break
-                    if fl in uv_vals and j < n:
-                        j += 1
-                idx = j
-                continue
-
-        if head_name == "sudo":
-            idx += 1
-            while idx < n and tokens[idx].startswith("-"):
-                fl = tokens[idx]
-                idx += 1
-                if fl == "--":
-                    break
-                if fl in (
-                    "-u", "--user", "-g", "--group", "-h", "--host", "-p", "--prompt",
-                    "-r", "--role", "-t", "--type", "-C", "--close-from",
-                    "-T", "--command-timeout", "-D", "--chdir", "-R", "--chroot",
-                ) and idx < n:
-                    idx += 1
-            continue
-
         # 跳过形如 KEY=VALUE 的环境变量前缀
         if "=" in head_raw and not head_raw.startswith("-") and "/" not in head_raw and "\\" not in head_raw:
             idx += 1
             continue
 
-        if head_name == "timeout":
-            idx += 1
-            while idx < n and tokens[idx].startswith("-"):
-                flag_low = tokens[idx].lower()
-                idx += 1
-                if flag_low == "--":
-                    break
-                if flag_low in ("-k", "--kill-after", "-s", "--signal") and idx < n:
-                    idx += 1
-            if idx < n:
-                idx += 1  # 跳过秒数参数
-            continue
-
-        if head_name in REMOTE_OR_SUBSYSTEM_WRAPPERS:
-            used_subsystem = True
-            idx += 1
-            while idx < n and tokens[idx].startswith("-"):
-                flag = tokens[idx]
-                idx += 1
-                if flag in ("--", "-e", "--exec"):
-                    break
-                if flag in ("-d", "--distribution", "-u", "--user", "--cd") and idx < n:
-                    idx += 1
+        wrapped = _shell_lex.consume_leading_wrapper(tokens, idx, allow_subsystem=True)
+        if wrapped is not None:
+            if wrapped["lookup_only"]:
+                return [], used_subsystem
+            used_subsystem = used_subsystem or wrapped["used_subsystem"]
+            idx = wrapped["next_idx"]
             continue
 
         if head_name in SHELL_WRAPPERS:
@@ -667,20 +580,59 @@ def _is_fingerprint_equal(rec: Dict[str, Any], fp: Dict[str, Any]) -> bool:
 
 
 def _locate_task_log_file(transcript_path_str: Optional[str], task_id: str) -> Optional[Path]:
-    """根据会话 transcriptPath 定位 Antigravity 后台任务日志 .system_generated/tasks/<TaskId>.log"""
-    if not transcript_path_str or not user_words.valid_session_id(task_id):
+    """根据会话 transcriptPath 定位 Antigravity 后台任务日志 .system_generated/tasks/<TaskId>.log。
+
+    兼容裸 task ID（如 `task-170`）及带会话前缀的复合 ID（如 `<convId>/task-170`）；
+    显式指定其他会话 ID 时绝不回退到当前会话同名日志，并拒绝符号链接或目录穿越。
+    """
+    if not transcript_path_str or not task_id:
         return None
+    raw_id = task_id.strip().replace("\\", "/")
+    task_conv_id = ""
+    bare_task_id = raw_id
+    if "/" in raw_id:
+        parts = raw_id.split("/")
+        if len(parts) != 2 or not all(user_words.valid_session_id(part) for part in parts):
+            return None
+        task_conv_id, bare_task_id = parts[0], parts[1]
+    elif not user_words.valid_session_id(bare_task_id):
+        return None
+
     tp = Path(transcript_path_str).expanduser()
     # 标准布局: <brain>/<convId>/.system_generated/logs/transcript.jsonl
     sg_dir = tp.parent.parent
+    current_conv_id = sg_dir.parent.name
+    if task_conv_id and task_conv_id != current_conv_id:
+        brain_root = sg_dir.parent.parent
+        tasks_dir = brain_root / task_conv_id / ".system_generated" / "tasks"
+    else:
+        tasks_dir = sg_dir / "tasks"
+
+    if user_words._is_reparse_or_link(tasks_dir) or user_words._is_reparse_or_link(tasks_dir.parent):
+        return None
+    try:
+        resolved_tasks_dir = tasks_dir.resolve()
+    except OSError:
+        return None
+
     candidates = [
-        sg_dir / "tasks" / f"{task_id}.log",
-        sg_dir / "tasks" / task_id,
+        tasks_dir / f"{bare_task_id}.log",
+        tasks_dir / bare_task_id,
     ]
+    safe_candidates: List[Path] = []
     for c in candidates:
+        if user_words._is_reparse_or_link(c):
+            continue
+        try:
+            res_c = c.resolve()
+            if not res_c.is_relative_to(resolved_tasks_dir):
+                continue
+        except (OSError, ValueError):
+            continue
+        safe_candidates.append(c)
         if c.exists() and c.is_file():
             return c
-    return candidates[0]
+    return safe_candidates[0] if safe_candidates else None
 
 
 def _check_polling_locked(tool_name: str, args: Dict[str, Any], conversation_id: str, cwd: Optional[str],
@@ -2278,6 +2230,7 @@ def _scan_inline_python_code(
     depth: int = 0,
     wsl_distribution: Optional[str] = None,
     tree: Optional[ast.AST] = None,
+    allow_dynamic_unresolved: bool = False,
 ) -> Optional[Tuple[str, str, str]]:
     """使用 AST 精确识别内联 Python 脚本中真正发生写/删/改的外部路径（忽略一切只读 open 与数组 .copy()）"""
     if py_code == _UNCLOSED_INLINE_PY_SENTINEL:
@@ -2320,6 +2273,11 @@ def _scan_inline_python_code(
         return _ast_bad_target(target, bindings, base_cwd, allowed_norm_keys, allowed_resolved_keys,
                                allow_os_temp, wsl_distribution)
 
+    def _accept_hit(act: str, tgt_str: str, snip: str) -> Optional[Tuple[str, str, str]]:
+        if allow_dynamic_unresolved and _is_dynamic_unresolved_hit(act, tgt_str):
+            return None
+        return act, tgt_str, snip
+
     if tree is not None:
         try:
             for node, bindings in _iter_ast_calls_in_order(tree, bindings):
@@ -2328,7 +2286,10 @@ def _scan_inline_python_code(
                 chdir_hit = _track_ast_chdir(node, bindings, base_cwd, allowed_norm_keys, allowed_resolved_keys,
                                             allow_os_temp, snippet, wsl_distribution)
                 if chdir_hit:
-                    return chdir_hit
+                    if allow_dynamic_unresolved and _is_dynamic_unresolved_hit(chdir_hit[0], chdir_hit[1]):
+                        bindings[_AST_CWD] = frozenset((_AST_DYNAMIC,))
+                    else:
+                        return chdir_hit
 
                 # 模块函数先于同名 Path 方法检查，模块与可调用标识不能作为路径字符串使用。
                 qualnames = _ast_call_qualnames(fn, bindings)
@@ -2339,33 +2300,45 @@ def _scan_inline_python_code(
                             tgt = _ast_call_arg_candidates(node, 0, ("file", "filename", "name"), bindings)
                             if _bad(tgt):
                                 label = "open" if qualname in ("builtins.open", "io.open") else qualname
-                                return f"Python 写入/修改文件 ({label} mode='{mode_s}')", _format_ast_candidates(tgt), snippet
+                                hit = _accept_hit(f"Python 写入/修改文件 ({label} mode='{mode_s}')", _format_ast_candidates(tgt), snippet)
+                                if hit:
+                                    return hit
                     elif qualname in ("tarfile.open", "tarfile.TarFile"):
                         is_mut, mode_s = _tarfile_open_mode_is_mutating(node, 1, bindings)
                         if is_mut:
                             tgt = _ast_call_arg_candidates(node, 0, ("name",), bindings)
                             if _bad(tgt):
-                                return f"Python 写入/修改归档 ({qualname} mode='{mode_s}')", _format_ast_candidates(tgt), snippet
+                                hit = _accept_hit(f"Python 写入/修改归档 ({qualname} mode='{mode_s}')", _format_ast_candidates(tgt), snippet)
+                                if hit:
+                                    return hit
                     elif qualname == "os.open":
                         flags = _ast_call_arg_candidates(node, 1, ("flags",), bindings)
                         if not all(type(value) is int and value == 0 for value in flags):
                             tgt = _ast_call_arg_candidates(node, 0, ("path",), bindings)
                             if _bad(tgt):
-                                return "Python 系统文件写入 (os.open)", _format_ast_candidates(tgt), snippet
+                                hit = _accept_hit("Python 系统文件写入 (os.open)", _format_ast_candidates(tgt), snippet)
+                                if hit:
+                                    return hit
                     elif qualname in _AST_WRITE_CALL_ARGS:
                         for index, keywords in _AST_WRITE_CALL_ARGS[qualname]:
                             default = "." if qualname == "shutil.unpack_archive" else _AST_DYNAMIC
                             tgt = _ast_call_arg_candidates(node, index, keywords, bindings, default)
                             if _bad(tgt):
-                                return f"Python 系统文件写删操作 ({qualname})", _format_ast_candidates(tgt), snippet
+                                hit = _accept_hit(f"Python 系统文件写删操作 ({qualname})", _format_ast_candidates(tgt), snippet)
+                                if hit:
+                                    return hit
                     elif qualname.startswith("tempfile.") and qualname.split(".")[1] in _AST_TEMP_DIR_INDEX:
                         tgt = _ast_temp_path_candidates(node, qualname.split(".")[1], bindings)
                         if _bad(tgt):
-                            return f"Python 创建临时目录或文件 ({qualname})", _format_ast_candidates(tgt), snippet
+                            hit = _accept_hit(f"Python 创建临时目录或文件 ({qualname})", _format_ast_candidates(tgt), snippet)
+                            if hit:
+                                return hit
                     elif qualname in {"numpy." + name for name in _AST_MODULE_CALLS["numpy"]}:
                         tgt = _ast_call_arg_candidates(node, 0, ("file", "fname"), bindings)
                         if _bad(tgt):
-                            return f"NumPy 数组落盘 ({qualname})", _format_ast_candidates(tgt), snippet
+                            hit = _accept_hit(f"NumPy 数组落盘 ({qualname})", _format_ast_candidates(tgt), snippet)
+                            if hit:
+                                return hit
                     elif qualname in {"os." + name for name in _AST_OS_EXEC_SPAWN}:
                         if _AST_DEFINITION not in bindings:
                             return f"Python 进程替换或派生执行 ({qualname})", "<EXEC_OR_SPAWN>", snippet
@@ -2383,9 +2356,13 @@ def _scan_inline_python_code(
                             ))
                             specified = raw_cwds - frozenset((None,))
                             if _bad(specified):
-                                return "Python 子进程指定项目外或动态 Cwd", _format_ast_candidates(specified), snippet
-                            resolved = _ast_product([cwds, specified], lambda parts: _ast_resolve_cwd(parts[1], parts[0])) if specified else frozenset()
-                            cwds = resolved | (cwds if None in raw_cwds else frozenset())
+                                hit = _accept_hit("Python 子进程指定项目外或动态 Cwd", _format_ast_candidates(specified), snippet)
+                                if hit:
+                                    return hit
+                                cwds = frozenset((_AST_DYNAMIC,))
+                            else:
+                                resolved = _ast_product([cwds, specified], lambda parts: _ast_resolve_cwd(parts[1], parts[0])) if specified else frozenset()
+                                cwds = resolved | (cwds if None in raw_cwds else frozenset())
                         commands = _ast_call_arg_candidates(node, 0, ("args", "command", "cmd"), bindings)
                         for command in commands:
                             direct_py_code: Optional[str] = None
@@ -2424,22 +2401,29 @@ def _scan_inline_python_code(
                                     node, bindings, cwds, allowed_norm_keys, allowed_resolved_keys, allow_os_temp, wsl_distribution
                                 ):
                                     continue
-                                return "Python 子进程命令无法静态确定", "<DYNAMIC_UNRESOLVED>", snippet
+                                hit = _accept_hit("Python 子进程命令无法静态确定", "<DYNAMIC_UNRESOLVED>", snippet)
+                                if hit:
+                                    return hit
+                                continue
                             for cwd in cwds:
+                                eff_sub_cwd: Optional[str] = cwd if isinstance(cwd, str) else None
                                 if not isinstance(cwd, (str, type(None))):
                                     if _AST_DEFINITION in bindings:
                                         continue
-                                    return "Python 子进程工作目录无法静态确定", "<DYNAMIC_UNRESOLVED>", snippet
+                                    hit = _accept_hit("Python 子进程工作目录无法静态确定", "<DYNAMIC_UNRESOLVED>", snippet)
+                                    if hit:
+                                        return hit
                                 if direct_py_code is not None:
                                     py_hit = _scan_inline_python_code(
-                                        direct_py_code, cwd, allowed_norm_keys, allowed_resolved_keys,
+                                        direct_py_code, eff_sub_cwd, allowed_norm_keys, allowed_resolved_keys,
                                         allow_os_temp, depth + 1, wsl_distribution,
+                                        allow_dynamic_unresolved=allow_dynamic_unresolved,
                                     )
                                     if py_hit:
                                         return py_hit
                                 sub_hit = _detect_command_external_mutation(
-                                    command, cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp,
-                                    depth + 1, wsl_distribution,
+                                    command, eff_sub_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp,
+                                    depth + 1, wsl_distribution, allow_dynamic_unresolved=allow_dynamic_unresolved,
                                 )
                                 if sub_hit:
                                     return sub_hit
@@ -2452,7 +2436,9 @@ def _scan_inline_python_code(
                     if is_mut:
                         tgt = _ast_call_arg_candidates(node, 0, ("file",), bindings)
                         if _bad(tgt):
-                            return f"Python 写入/修改文件 (open mode='{mode_s}')", _format_ast_candidates(tgt), snippet
+                            hit = _accept_hit(f"Python 写入/修改文件 (open mode='{mode_s}')", _format_ast_candidates(tgt), snippet)
+                            if hit:
+                                return hit
                 elif isinstance(fn, ast.Name) and fn.id in ("exec", "eval") and fn.id not in bindings:
                     if depth >= MAX_WRAPPER_DEPTH:
                         if _AST_DEFINITION not in bindings:
@@ -2463,16 +2449,23 @@ def _scan_inline_python_code(
                         for code_val in code_cands:
                             if not isinstance(code_val, str):
                                 if _AST_DEFINITION not in bindings:
-                                    return f"Python 动态代码执行无法静态确定边界 ({fn.id})", "<DYNAMIC_UNRESOLVED>", snippet
+                                    hit = _accept_hit(f"Python 动态代码执行无法静态确定边界 ({fn.id})", "<DYNAMIC_UNRESOLVED>", snippet)
+                                    if hit:
+                                        return hit
                                 continue
                             for cwd in cwds:
+                                eff_dyn_cwd: Optional[str] = cwd if isinstance(cwd, str) else None
                                 if not isinstance(cwd, (str, type(None))):
                                     if _AST_DEFINITION not in bindings:
-                                        return f"Python 动态代码工作目录无法静态确定 ({fn.id})", "<DYNAMIC_UNRESOLVED>", snippet
-                                    continue
+                                        hit = _accept_hit(f"Python 动态代码工作目录无法静态确定 ({fn.id})", "<DYNAMIC_UNRESOLVED>", snippet)
+                                        if hit:
+                                            return hit
+                                    else:
+                                        continue
                                 dyn_hit = _scan_inline_python_code(
-                                    code_val, cwd, allowed_norm_keys, allowed_resolved_keys,
+                                    code_val, eff_dyn_cwd, allowed_norm_keys, allowed_resolved_keys,
                                     allow_os_temp, depth + 1, wsl_distribution,
+                                    allow_dynamic_unresolved=allow_dynamic_unresolved,
                                 )
                                 if dyn_hit:
                                     return dyn_hit
@@ -2491,13 +2484,17 @@ def _scan_inline_python_code(
                         if is_mut:
                             tgt = _eval_ast_path_candidates(fn.value, bindings)
                             if _bad(tgt):
-                                return f"Python 写入/修改文件 (.open mode='{mode_s}')", _format_ast_candidates(tgt), snippet
+                                hit = _accept_hit(f"Python 写入/修改文件 (.open mode='{mode_s}')", _format_ast_candidates(tgt), snippet)
+                                if hit:
+                                    return hit
 
                     # 3) Path(p).write_text / write_bytes / unlink / rmdir / mkdir / touch / chmod / lchmod
                     elif attr in ("write_text", "write_bytes", "unlink", "rmdir", "mkdir", "touch", "symlink_to", "hardlink_to", "chmod", "lchmod"):
                         tgt = _eval_ast_path_candidates(fn.value, bindings)
                         if _bad(tgt):
-                            return f"Python 文件写删操作 (.{attr})", _format_ast_candidates(tgt), snippet
+                            hit = _accept_hit(f"Python 文件写删操作 (.{attr})", _format_ast_candidates(tgt), snippet)
+                            if hit:
+                                return hit
 
                     # 4) Path(p).rename(dst) / replace(dst)
                     elif attr in ("rename", "replace"):
@@ -2511,13 +2508,17 @@ def _scan_inline_python_code(
                             target |= frozenset((_AST_DYNAMIC,))
                         for tgt in (_eval_ast_path_candidates(fn.value, bindings), target):
                             if _bad(tgt):
-                                return f"Python 移动/替换文件 (.{attr})", _format_ast_candidates(tgt), snippet
+                                hit = _accept_hit(f"Python 移动/替换文件 (.{attr})", _format_ast_candidates(tgt), snippet)
+                                if hit:
+                                    return hit
 
                     elif attr in ("extractall", "extract"):
                         idx_ext = 0 if attr == "extractall" else 1
                         tgt = _ast_call_arg_candidates(node, idx_ext, ("path",), bindings, ".")
                         if _bad(tgt):
-                            return f"Python 归档解压写入 (.{attr})", _format_ast_candidates(tgt), snippet
+                            hit = _accept_hit(f"Python 归档解压写入 (.{attr})", _format_ast_candidates(tgt), snippet)
+                            if hit:
+                                return hit
 
                     elif attr in ("savefig", "to_csv", "to_parquet", "to_excel", "to_feather", "to_pickle"):
                         keywords = ("fname",) if attr == "savefig" else (("excel_writer",) if attr == "to_excel" else ("path_or_buf", "path"))
@@ -2526,7 +2527,9 @@ def _scan_inline_python_code(
                         if attr in ("to_csv", "to_parquet"):
                             tgt -= frozenset((None,))
                         if _bad(tgt):
-                            return f"Python 数据/图表导出 (.{attr})", _format_ast_candidates(tgt), snippet
+                            hit = _accept_hit(f"Python 数据/图表导出 (.{attr})", _format_ast_candidates(tgt), snippet)
+                            if hit:
+                                return hit
         except RecursionError:
             return "内联 Python 语法树嵌套深度超出静态审查上限", "<AST_RECURSION_LIMIT>", _compact_snippet(used_src)
         except _AstScanBudgetExceeded:
@@ -2540,7 +2543,9 @@ def _scan_inline_python_code(
         for m in pat.finditer(used_src):
             cand = m.group(1).strip("\"'")
             if _bad(cand):
-                return label, cand, _compact_snippet(m.group(0))
+                hit = _accept_hit(label, cand, _compact_snippet(m.group(0)))
+                if hit:
+                    return hit
     if has_raw_nul:
         return "内联 Python 含空字节无法静态确证安全", "<NUL_BYTE>", _compact_snippet(py_code.replace("\x00", "\\x00"))
     return None
@@ -3215,6 +3220,7 @@ def _detect_command_external_mutation(
     depth: int = 0,
     wsl_distribution: Optional[str] = None,
     msys_shell: bool = False,
+    allow_dynamic_unresolved: bool = False,
 ) -> Optional[Tuple[str, str, str]]:
     """
     精准检测命令行是否改动项目目录外的业务路径或全局配置。
@@ -3230,13 +3236,14 @@ def _detect_command_external_mutation(
         distribution, inner = wsl_prefix
         return _detect_command_external_mutation(
             inner, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp, depth + 1, distribution,
+            allow_dynamic_unresolved=allow_dynamic_unresolved,
         )
 
     # 必须先扫描原命令的命令替换（防止 git commit -m "$(rm -rf /outside)" 被 commit 掩码抹除）
     for raw_inner in _extract_cmd_substitutions(command_line):
         raw_hit = _detect_command_external_mutation(
             raw_inner, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp,
-            depth + 1, wsl_distribution,
+            depth + 1, wsl_distribution, allow_dynamic_unresolved=allow_dynamic_unresolved,
         )
         if raw_hit:
             return raw_hit
@@ -3244,7 +3251,7 @@ def _detect_command_external_mutation(
         for ps_inner in _shell_lex.extract_cmd_substitutions(command_line, backslash_escape=False):
             ps_hit = _detect_command_external_mutation(
                 ps_inner, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp,
-                depth + 1, wsl_distribution,
+                depth + 1, wsl_distribution, allow_dynamic_unresolved=allow_dynamic_unresolved,
             )
             if ps_hit:
                 return ps_hit
@@ -3265,14 +3272,14 @@ def _detect_command_external_mutation(
         )
         inner_hit = _detect_command_external_mutation(
             unwrapped, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp,
-            depth + 1, wsl_distribution, msys_shell=inner_msys,
+            depth + 1, wsl_distribution, msys_shell=inner_msys, allow_dynamic_unresolved=allow_dynamic_unresolved,
         )
         if inner_hit:
             return inner_hit
         if outer_tail:
             tail_hit = _detect_command_external_mutation(
                 "true " + outer_tail, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp,
-                depth + 1, wsl_distribution, msys_shell=msys_shell,
+                depth + 1, wsl_distribution, msys_shell=msys_shell, allow_dynamic_unresolved=allow_dynamic_unresolved,
             )
             if tail_hit:
                 return tail_hit
@@ -3282,7 +3289,7 @@ def _detect_command_external_mutation(
     for inner in _extract_cmd_substitutions(shell_masked):
         hit = _detect_command_external_mutation(
             inner, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp,
-            depth + 1, wsl_distribution,
+            depth + 1, wsl_distribution, allow_dynamic_unresolved=allow_dynamic_unresolved,
         )
         if hit:
             return hit
@@ -3410,19 +3417,6 @@ def _detect_command_external_mutation(
             if tl == "&":
                 idx += 1
                 continue
-            if tl == "command":
-                idx += 1
-                while idx < n_tok and tokens[idx].startswith("-"):
-                    fl = tokens[idx]
-                    idx += 1
-                    if fl == "--":
-                        break
-                    if fl in ("-v", "-V") or (not fl.startswith("--") and any(c in fl[1:] for c in ("v", "V"))):
-                        lookup_only = True
-                        break
-                if lookup_only:
-                    break
-                continue
             if tl == "env":
                 idx += 1
                 split_sub = None
@@ -3460,101 +3454,28 @@ def _detect_command_external_mutation(
                     sub_hit = _detect_command_external_mutation(
                         split_sub, effective_cwd, allowed_norm_keys, allowed_resolved_keys,
                         allow_os_temp, depth + 1, wsl_distribution,
+                        allow_dynamic_unresolved=allow_dynamic_unresolved,
                     )
                     if sub_hit:
                         return sub_hit
                     idx = n_tok
                     break
                 continue
-            if tl == "nohup":
-                idx += 1
-                continue
-            if tl == "nice":
-                idx += 1
-                while idx < n_tok and tokens[idx].startswith("-"):
-                    fl = tokens[idx]
-                    idx += 1
-                    if fl == "--":
-                        break
-                    if fl in ("-n", "--adjustment") and idx < n_tok:
-                        idx += 1
-                continue
-            if tl == "uv" and idx + 1 < n_tok:
-                j = idx + 1
-                while j < n_tok and tokens[j].startswith("-"):
-                    j += 2 if tokens[j] in ("--directory", "--project", "--config-file") and j + 1 < n_tok else 1
-                if j < n_tok and tokens[j].lower() == "run":
-                    j += 1
-                    uv_vals = ("--python", "-p", "--with", "--with-editable", "--with-requirements",
-                               "--directory", "--project", "--env-file", "--package")
-                    while j < n_tok and tokens[j].startswith("-"):
-                        fl = tokens[j]
-                        j += 1
-                        if fl == "--":
-                            break
-                        if fl in uv_vals and j < n_tok:
-                            j += 1
-                    idx = j
-                    continue
-            if tl == "sudo":
-                idx += 1
-                while idx < n_tok and tokens[idx].startswith("-"):
-                    fl = tokens[idx]
-                    idx += 1
-                    if fl == "--":
-                        break
-                    if fl in (
-                        "-u", "--user", "-g", "--group", "-h", "--host", "-p", "--prompt",
-                        "-r", "--role", "-t", "--type", "-C", "--close-from",
-                        "-T", "--command-timeout", "-D", "--chdir", "-R", "--chroot",
-                    ) and idx < n_tok:
-                        if fl in ("-D", "--chdir"):
-                            c_arg = _expand_host_vars(_unquote_shell_word(tokens[idx]), base_cwd=effective_cwd)
-                            effective_cwd = (
-                                None
-                                if _has_unexpanded_dynamic_var(c_arg) or (effective_cwd is None and not _is_anchored_path_str(c_arg))
-                                else _ast_resolve_cwd(c_arg, effective_cwd)
-                            )
-                        idx += 1
-                continue
-            if tl == "timeout":
-                idx += 1
-                while idx < n_tok and tokens[idx].startswith("-"):
-                    fl = tokens[idx].lower()
-                    idx += 1
-                    if fl == "--":
-                        break
-                    if fl in ("-k", "--kill-after", "-s", "--signal") and idx < n_tok:
-                        idx += 1
-                if idx < n_tok:
-                    idx += 1
-                continue
-            if tl in ("wsl", "wsl.exe"):
-                idx += 1
-                while idx < n_tok and tokens[idx].startswith("-"):
-                    fl = tokens[idx].lower()
-                    idx += 1
-                    if fl in ("--", "-e", "--exec"):
-                        break
-                    if fl in ("-d", "--distribution", "-u", "--user", "--cd") and idx < n_tok:
-                        if fl == "--cd":
-                            c_arg = _expand_host_vars(_unquote_shell_word(tokens[idx]), base_cwd=effective_cwd)
-                            effective_cwd = (
-                                None
-                                if _has_unexpanded_dynamic_var(c_arg) or (effective_cwd is None and not _is_anchored_path_str(c_arg))
-                                else _ast_resolve_cwd(c_arg, effective_cwd)
-                            )
-                        idx += 1
-                continue
-            if tl == "exec":
-                idx += 1
-                while idx < n_tok and tokens[idx].startswith("-"):
-                    fl = tokens[idx]
-                    idx += 1
-                    if fl == "--":
-                        break
-                    if fl == "-a" and idx < n_tok:
-                        idx += 1
+            wrapped = _shell_lex.consume_leading_wrapper(
+                tokens, idx, allow_subsystem=False, allow_wsl_only=True, allow_exec=True,
+            )
+            if wrapped is not None:
+                if wrapped["lookup_only"]:
+                    lookup_only = True
+                    break
+                if wrapped["chdir"]:
+                    c_arg = _expand_host_vars(_unquote_shell_word(wrapped["chdir"]), base_cwd=effective_cwd)
+                    effective_cwd = (
+                        None
+                        if _has_unexpanded_dynamic_var(c_arg) or (effective_cwd is None and not _is_anchored_path_str(c_arg))
+                        else _ast_resolve_cwd(c_arg, effective_cwd)
+                    )
+                idx = wrapped["next_idx"]
                 continue
             if tl == "eval":
                 idx += 1
@@ -3574,6 +3495,7 @@ def _detect_command_external_mutation(
                 py_hit = _scan_inline_python_code(
                     py_blocks[py_idx], effective_cwd, allowed_norm_keys, allowed_resolved_keys,
                     allow_os_temp, depth, wsl_distribution,
+                    allow_dynamic_unresolved=allow_dynamic_unresolved,
                 )
                 if py_hit:
                     return py_hit
@@ -3583,6 +3505,7 @@ def _detect_command_external_mutation(
                 sub_hit = _detect_command_external_mutation(
                     sub_expr, effective_cwd, allowed_norm_keys, allowed_resolved_keys,
                     allow_os_temp, depth + 1, wsl_distribution,
+                    allow_dynamic_unresolved=allow_dynamic_unresolved,
                 )
                 if sub_hit:
                     return sub_hit
@@ -3597,6 +3520,8 @@ def _detect_command_external_mutation(
             subbed_red = _substitute_shell_local_vars(red_tok, local_vars)
             expanded_red = _expand_host_vars(subbed_red, base_cwd=effective_cwd)
             if _has_unexpanded_dynamic_var(expanded_red, is_cmd_or_win=(wsl_distribution is not None)):
+                if allow_dynamic_unresolved:
+                    continue
                 return "Shell 输出重定向写入 [未解析动态变量路径]", red_tok, _compact_snippet(m_red.group(0))
             if not _is_write_target_allowed(
                 expanded_red, effective_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp, wsl_distribution, msys_shell=msys_shell
@@ -3608,6 +3533,7 @@ def _detect_command_external_mutation(
                 eval_hit = _detect_command_external_mutation(
                     eval_sub, effective_cwd, allowed_norm_keys, allowed_resolved_keys,
                     allow_os_temp, depth + 1, wsl_distribution,
+                    allow_dynamic_unresolved=allow_dynamic_unresolved,
                 )
                 if eval_hit:
                     return eval_hit
@@ -3623,6 +3549,7 @@ def _detect_command_external_mutation(
             sub_hit = _detect_command_external_mutation(
                 sub_unwrapped, effective_cwd, allowed_norm_keys, allowed_resolved_keys,
                 allow_os_temp, depth + 1, wsl_distribution,
+                allow_dynamic_unresolved=allow_dynamic_unresolved,
             )
             if sub_hit:
                 return sub_hit
@@ -3630,6 +3557,7 @@ def _detect_command_external_mutation(
                 tail_hit = _detect_command_external_mutation(
                     "true " + sub_tail, effective_cwd, allowed_norm_keys, allowed_resolved_keys,
                     allow_os_temp, depth + 1, wsl_distribution,
+                    allow_dynamic_unresolved=allow_dynamic_unresolved,
                 )
                 if tail_hit:
                     return tail_hit
@@ -3744,6 +3672,8 @@ def _detect_command_external_mutation(
                 if _has_unexpanded_dynamic_var(
                     expanded_cand, is_cmd_or_win=(is_win_verb or wsl_distribution is not None)
                 ):
+                    if allow_dynamic_unresolved:
+                        continue
                     return f"{action_label} [未解析动态变量路径]", cand, _compact_snippet(clause)
                 command_distribution = wsl_distribution
                 if wsl_distribution is not None and any(
@@ -3759,7 +3689,8 @@ def _detect_command_external_mutation(
     for py_idx, block in enumerate(py_blocks):
         if py_idx not in scanned_py_indices:
             py_hit = _scan_inline_python_code(
-                block, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp, depth, wsl_distribution
+                block, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp, depth, wsl_distribution,
+                allow_dynamic_unresolved=allow_dynamic_unresolved,
             )
             if py_hit:
                 return py_hit
@@ -3772,6 +3703,8 @@ def _detect_command_external_mutation(
                 continue
             expanded_red = _expand_host_vars(red_tok, base_cwd=base_cwd)
             if _has_unexpanded_dynamic_var(expanded_red, is_cmd_or_win=(wsl_distribution is not None)):
+                if allow_dynamic_unresolved:
+                    continue
                 return "Shell 输出重定向写入 [未解析动态变量路径]", red_tok, _compact_snippet(m_red.group(0))
             if not _is_write_target_allowed(
                 expanded_red, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp, wsl_distribution
@@ -3960,9 +3893,82 @@ def _native_turn_snapshot(payload: Dict[str, Any], *, all_turns=False) -> Tuple[
     return turn, calls
 
 
-def _dispatch_commands(command: str, depth: int = 0):
+def _split_tokens_preserve_quotes(segment: str) -> List[str]:
+    try:
+        return shlex.split(segment, posix=False)
+    except ValueError:
+        return segment.split()
+
+
+def _record_dispatch_local_var(clause: str, local_vars: Dict[str, Optional[str]]) -> bool:
+    """捕获多子句命令中的本地变量赋值：POSIX 区分大小写（posix:），PowerShell/CMD 大小写不敏感（ci:）。"""
+    s = clause.strip()
+    m_ps = re.match(r"^\$([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)$", s)
+    if m_ps:
+        var_name = m_ps.group(1).lower()
+        raw_rhs = m_ps.group(2).strip()
+        is_sq = len(raw_rhs) >= 2 and raw_rhs[0] == "'" and raw_rhs[-1] == "'"
+        unq_rhs = raw_rhs[1:-1] if is_sq else _unquote_shell_word(raw_rhs)
+        rhs = unq_rhs if is_sq else _expand_dispatch_local_vars(unq_rhs, local_vars)
+        local_vars[f"ci:{var_name}"] = rhs or None
+        return True
+    m_cmd = re.match(r"^set\s+\"?([A-Za-z_][A-Za-z0-9_]*)=(.+?)\"?$", s, re.IGNORECASE)
+    if m_cmd:
+        var_name = m_cmd.group(1).lower()
+        rhs = _expand_dispatch_local_vars(_unquote_shell_word(m_cmd.group(2).strip()), local_vars)
+        local_vars[f"ci:{var_name}"] = rhs or None
+        return True
+    m_sh = re.match(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$", s)
+    if m_sh and len(_safe_split_tokens(s)) <= (2 if s.startswith("export ") else 1):
+        var_name = m_sh.group(1)
+        raw_rhs = m_sh.group(2).strip()
+        is_sq = len(raw_rhs) >= 2 and raw_rhs[0] == "'" and raw_rhs[-1] == "'"
+        unq_rhs = raw_rhs[1:-1] if is_sq else _unquote_shell_word(raw_rhs)
+        rhs = unq_rhs if is_sq else _expand_dispatch_local_vars(unq_rhs, local_vars)
+        local_vars[f"posix:{var_name}"] = rhs or None
+        return True
+    return False
+
+
+def _expand_dispatch_local_vars(token: str, local_vars: Dict[str, Optional[str]]) -> str:
+    if not token or not local_vars:
+        return token
+    out = token
+    if "$" in out:
+        def _repl_dollar(m: re.Match[str]) -> str:
+            raw_name = m.group(1) or m.group(2) or ""
+            val = local_vars.get(f"posix:{raw_name}")
+            if not (isinstance(val, str) and val):
+                val = local_vars.get(f"ci:{raw_name.lower()}")
+            if not (isinstance(val, str) and val):
+                val = local_vars.get(raw_name.lower())
+            return val if isinstance(val, str) and val else m.group(0)
+        out = re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)(?![A-Za-z0-9_:])", _repl_dollar, out)
+    if "%" in out:
+        def _repl_pct(m: re.Match[str]) -> str:
+            val = local_vars.get(f"ci:{m.group(1).lower()}") or local_vars.get(m.group(1).lower())
+            return val if isinstance(val, str) and val else m.group(0)
+        out = re.sub(r"%([A-Za-z_][A-Za-z0-9_]*)%", _repl_pct, out)
+    return out
+
+
+def _expand_clause_dispatch_tokens(clause: str, env_vars: Dict[str, Optional[str]]) -> List[str]:
+    result: List[str] = []
+    for raw_tok in _split_tokens_preserve_quotes(clause):
+        if len(raw_tok) >= 2 and raw_tok[0] == "'" and raw_tok[-1] == "'":
+            val = raw_tok[1:-1]
+        else:
+            unq = raw_tok.strip("\"'")
+            val = _expand_dispatch_local_vars(unq, env_vars)
+        if val:
+            result.append(val)
+    return result
+
+
+def _dispatch_commands(command: str, depth: int = 0, local_vars: Optional[Dict[str, Optional[str]]] = None):
     if depth > MAX_WRAPPER_DEPTH:
         return
+    env_vars: Dict[str, Optional[str]] = dict(local_vars) if local_vars else {}
     normalized_cmd = _shell_lex.join_powershell_line_continuations(command)
     clauses = _split_shell_clauses(normalized_cmd)
     if r'\"' in normalized_cmd:
@@ -3981,38 +3987,24 @@ def _dispatch_commands(command: str, depth: int = 0):
         ).strip()
         if not clause or clause.lower() in ("fi", "done", "esac"):
             continue
+        if _record_dispatch_local_var(clause, env_vars):
+            continue
         inner_pair = _unwrap_shell_script_with_tail(clause)
         if inner_pair is not None and inner_pair[0] and inner_pair[0] != _INVALID_ENCODED_SENTINEL:
-            yield from _dispatch_commands(inner_pair[0], depth + 1)
+            yield from _dispatch_commands(inner_pair[0], depth + 1, env_vars)
             if inner_pair[1]:
                 for tail_sub in _extract_cmd_substitutions(inner_pair[1]):
-                    yield from _dispatch_commands(tail_sub, depth + 1)
+                    yield from _dispatch_commands(tail_sub, depth + 1, env_vars)
             continue
         for sub_expr in _extract_cmd_substitutions(clause):
-            yield from _dispatch_commands(sub_expr, depth + 1)
-        tokens = _safe_split_tokens(clause)
+            yield from _dispatch_commands(sub_expr, depth + 1, env_vars)
+        tokens = _expand_clause_dispatch_tokens(clause, env_vars)
         while tokens:
             head = Path(tokens[0].replace(chr(92), "/")).name.lower().removesuffix(".exe")
             if head in ("&", "call", "if", "then", "else", "elif", "while", "until", "do", "!") or re.match(
                 r"^[A-Za-z_][A-Za-z0-9_]*=", tokens[0]
             ):
                 tokens.pop(0)
-                continue
-            if head == "command":
-                i = 1
-                is_query = False
-                while i < len(tokens) and tokens[i].startswith("-"):
-                    fl = tokens[i]
-                    i += 1
-                    if fl == "--":
-                        break
-                    if fl in ("-v", "-V") or (not fl.startswith("--") and any(c in fl[1:] for c in ("v", "V"))):
-                        is_query = True
-                        break
-                if is_query:
-                    tokens = []
-                    break
-                tokens = tokens[i:]
                 continue
             if head == "env":
                 i = 1
@@ -4041,28 +4033,30 @@ def _dispatch_commands(command: str, depth: int = 0):
                         continue
                     break
                 if split_sub is not None:
-                    yield from _dispatch_commands(split_sub, depth + 1)
+                    yield from _dispatch_commands(split_sub, depth + 1, env_vars)
                     tokens = []
                     break
                 tokens = tokens[i:]
                 continue
-            if head == "uv" and len(tokens) >= 2:
-                i = 1
-                while i < len(tokens) and tokens[i].startswith("-"):
-                    i += 2 if tokens[i] in ("--directory", "--project", "--config-file") and i + 1 < len(tokens) else 1
-                if i < len(tokens) and tokens[i].lower() == "run":
-                    i += 1
-                    uv_vals = ("--python", "-p", "--with", "--with-editable", "--with-requirements",
-                               "--directory", "--project", "--env-file", "--package")
-                    while i < len(tokens) and tokens[i].startswith("-"):
-                        fl = tokens[i]
-                        i += 1
-                        if fl == "--":
-                            break
-                        if fl in uv_vals and i < len(tokens):
-                            i += 1
-                    tokens = tokens[i:]
-                    continue
+            wrapped = _shell_lex.consume_leading_wrapper(
+                tokens, 0, allow_subsystem=False, allow_wsl_only=True, allow_exec=True, allow_systemd_run=True,
+            )
+            if wrapped is not None:
+                if wrapped["lookup_only"]:
+                    tokens = []
+                    break
+                tokens = tokens[wrapped["next_idx"]:]
+                if len(tokens) == 1:
+                    yield from _dispatch_commands(tokens[0], depth + 1, env_vars)
+                    tokens = []
+                elif tokens:
+                    inner_pair = _unwrap_shell_script_with_tail(" ".join(tokens))
+                    if inner_pair is not None and inner_pair[0] and inner_pair[0] != _INVALID_ENCODED_SENTINEL:
+                        yield from _dispatch_commands(inner_pair[0], depth + 1, env_vars)
+                        if inner_pair[1]:
+                            for tail_sub in _extract_cmd_substitutions(inner_pair[1]):
+                                yield from _dispatch_commands(tail_sub, depth + 1, env_vars)
+                continue
             if head == "cmd":
                 marker = next((i for i, token in enumerate(tokens[1:], 1) if token.lower() in ("/c", "/k")), None)
                 if marker is None:
@@ -4081,67 +4075,37 @@ def _dispatch_commands(command: str, depth: int = 0):
             elif head == "eval":
                 i = 2 if len(tokens) >= 2 and tokens[1] == "--" else 1
                 if i < len(tokens):
-                    yield from _dispatch_commands(" ".join(tokens[i:]), depth + 1)
+                    yield from _dispatch_commands(" ".join(tokens[i:]), depth + 1, env_vars)
                 tokens = []
                 break
-            elif head == "exec":
-                i = 1
-                while i < len(tokens) and tokens[i].startswith("-"):
-                    fl = tokens[i]
-                    i += 1
-                    if fl == "--":
-                        break
-                    if fl == "-a" and i < len(tokens):
-                        i += 1
-                tokens = tokens[i:]
-                continue
             elif head in ("bash", "sh", "zsh", "pwsh", "powershell"):
                 unw_sub = _unwrap_shell_script_with_tail(" ".join(shlex.quote(t) for t in tokens))
                 if unw_sub is not None:
                     if unw_sub[0] and unw_sub[0] != _INVALID_ENCODED_SENTINEL:
-                        yield from _dispatch_commands(unw_sub[0], depth + 1)
+                        yield from _dispatch_commands(unw_sub[0], depth + 1, env_vars)
                         if unw_sub[1]:
                             for tail_sub in _extract_cmd_substitutions(unw_sub[1]):
-                                yield from _dispatch_commands(tail_sub, depth + 1)
+                                yield from _dispatch_commands(tail_sub, depth + 1, env_vars)
                     tokens = []
                     break
                 marker = next((i for i, token in enumerate(tokens[1:], 1) if token.lower() == "-command"
                                or re.fullmatch(r"-[a-z]*c", token.lower())), None)
                 if marker is None:
                     break
-                yield from _dispatch_commands(" ".join(tokens[marker + 1:]), depth + 1)
+                yield from _dispatch_commands(" ".join(tokens[marker + 1:]), depth + 1, env_vars)
                 tokens = []
-            elif head in ("wsl", "sudo", "timeout", "nohup", "nice", "systemd-run"):
-                takes_value = {
-                    "wsl": ("-d", "--distribution", "-u", "--user", "--cd"),
-                    "sudo": ("-u", "--user", "-g", "--group", "-h", "--host", "-p", "--prompt", "-C", "--close-from", "-T", "--command-timeout", "-r", "--role", "-t", "--type", "-D", "--chdir", "-R", "--chroot"),
-                    "timeout": ("-k", "--kill-after", "-s", "--signal"),
-                    "nice": ("-n", "--adjustment"), "nohup": (),
-                    "systemd-run": ("-p", "--property", "--unit", "-u", "--slice", "--working-directory", "-E", "--setenv", "--uid", "--gid", "--service-type", "--description"),
-                }[head]
-                i = 1
-                while i < len(tokens) and tokens[i].startswith("-"):
-                    flag = tokens[i]
-                    i += 1
-                    if flag == "--" or (head == "wsl" and flag in ("-e", "--exec")):
-                        break
-                    if flag in takes_value and i < len(tokens):
-                        i += 1
-                if head == "timeout" and i < len(tokens):
-                    i += 1
-                tokens = tokens[i:]
             else:
                 break
             if len(tokens) == 1:
-                yield from _dispatch_commands(tokens[0], depth + 1)
+                yield from _dispatch_commands(tokens[0], depth + 1, env_vars)
                 tokens = []
             elif tokens:
                 inner_pair = _unwrap_shell_script_with_tail(" ".join(tokens))
                 if inner_pair is not None and inner_pair[0] and inner_pair[0] != _INVALID_ENCODED_SENTINEL:
-                    yield from _dispatch_commands(inner_pair[0], depth + 1)
+                    yield from _dispatch_commands(inner_pair[0], depth + 1, env_vars)
                     if inner_pair[1]:
                         for tail_sub in _extract_cmd_substitutions(inner_pair[1]):
-                            yield from _dispatch_commands(tail_sub, depth + 1)
+                            yield from _dispatch_commands(tail_sub, depth + 1, env_vars)
         if tokens:
             yield tokens
 
@@ -4149,6 +4113,33 @@ def _dispatch_commands(command: str, depth: int = 0):
 def _native_readonly(args):
     kind = str(args.get("TypeName") or args.get("typeName") or args.get("agent_type") or args.get("subagent_type") or "self")
     return kind.startswith("readonly-") or kind in ("research", "browser", "image-generator", "Explore", "Plan", "explorer")
+
+
+_HARNESS_VALUE_OPTIONS = frozenset({
+    "--task", "--subtask", "--target", "--file", "--files", "--output", "--receipt",
+    "--stream", "--engine", "--model", "--effort", "--kind", "--plan-dir", "--ticket",
+    "--user-prompt", "--write-scope", "--verify-cmd", "--spec", "--isolation",
+    "--timeout", "--base-ref", "--root", "--allow-from-file", "--max-files",
+    "--max-bytes", "--caller", "--reason", "--session-id", "--state-dir", "--log-dir",
+    "--shard-count", "--max-shards", "--round", "--prompt", "--role", "--channel",
+    "--client", "--agent-type", "--approve-ticket", "--resume-ticket", "--cancel-ticket",
+})
+
+
+def _harness_tail_is_help(tail: List[str]) -> bool:
+    i = 0
+    n = len(tail)
+    while i < n:
+        t = tail[i]
+        if t == "--":
+            break
+        if t in ("-h", "--help"):
+            return True
+        if t in _HARNESS_VALUE_OPTIONS:
+            i += 2
+            continue
+        i += 1
+    return False
 
 
 def _dispatch_option(tokens, name):
@@ -4269,33 +4260,31 @@ def _find_unpaged_git_command(command: str, depth: int = 0) -> Optional[str]:
             if head in ("&", "call", "if", "then", "else", "elif", "while", "until", "do", "!", "command", "exec"):
                 tokens.pop(0)
                 continue
-            if head in ("wsl", "sudo", "timeout", "nohup", "nice", "systemd-run", "env"):
-                takes_val = {
-                    "wsl": ("-d", "--distribution", "-u", "--user", "--cd"),
-                    "sudo": ("-u", "--user", "-g", "--group", "-h", "--host", "-p", "--prompt", "-C", "--close-from", "-T", "--command-timeout", "-r", "--role", "-t", "--type", "-D", "--chdir", "-R", "--chroot"),
-                    "timeout": ("-k", "--kill-after", "-s", "--signal"),
-                    "nice": ("-n", "--adjustment"), "nohup": (), "env": ("-u", "--unset", "-C", "--chdir"),
-                    "systemd-run": ("-p", "--property", "--unit", "-u", "--slice", "--working-directory", "-E", "--setenv", "--uid", "--gid", "--service-type", "--description"),
-                }[head]
+            if head == "env":
                 idx = 1
                 saw_no_pager_env = False
-                while idx < len(tokens) and (tokens[idx].startswith("-") or (head == "env" and "=" in tokens[idx])):
+                while idx < len(tokens) and (tokens[idx].startswith("-") or "=" in tokens[idx]):
                     fl = tokens[idx]
                     idx += 1
-                    if fl == "--" or (head == "wsl" and fl in ("-e", "--exec")):
+                    if fl == "--":
                         break
-                    if head in ("env", "systemd-run") and re.search(r"(?:^|=)(?:GIT_PAGER|PAGER)=", fl, re.I):
+                    if re.search(r"(?:^|=)(?:GIT_PAGER|PAGER)=", fl, re.I):
                         saw_no_pager_env = True
-                    if fl in takes_val and idx < len(tokens):
-                        if head == "systemd-run" and fl in ("-E", "--setenv") and re.match(r"^(?:GIT_PAGER|PAGER)=", tokens[idx], re.I):
-                            saw_no_pager_env = True
+                    if fl in _shell_lex.WRAPPER_VALUE_FLAGS["env"] and idx < len(tokens):
                         idx += 1
                 if saw_no_pager_env:
                     tokens = []
                     break
-                if head == "timeout" and idx < len(tokens):
-                    idx += 1
                 tokens = tokens[idx:]
+                continue
+            wrapped_git = _shell_lex.consume_leading_wrapper(
+                tokens, 0, allow_subsystem=False, allow_wsl_only=True, allow_exec=True, allow_systemd_run=True,
+            )
+            if wrapped_git is not None:
+                if wrapped_git["lookup_only"] or wrapped_git["saw_no_pager_env"]:
+                    tokens = []
+                    break
+                tokens = tokens[wrapped_git["next_idx"]:]
                 if tokens:
                     m_sh = re.search(r"\b(?:(?:ba|z)?sh|pwsh|powershell)(?:\.exe)?\s+(?:-[A-Za-z]*c|-command)\s+", clause, re.I)
                     if m_sh:
@@ -4538,6 +4527,8 @@ def _check_dispatch_locked(payload, tool_name, args, sid, state_dir):
             ]
             if "cae_harness.py" in names and (names[0] == "cae_harness.py" or re.fullmatch(r"(?:python(?:[0-9.]+)?|py)", names[0])):
                 tail = tokens[names.index("cae_harness.py") + 1:]
+                if _harness_tail_is_help(tail):
+                    continue
                 task_like = tail[:1] in (["task"], ["followup"])
                 code_task = task_like and ("--kind=code" in tail or any(
                     tail[i:i+2] == ["--kind", "code"] for i in range(len(tail))))
@@ -4918,6 +4909,25 @@ def _is_headless_subtask() -> bool:
     return os.environ.get("CAE_HARNESS_DEPTH", "").strip() not in ("", "0")
 
 
+def _is_os_sandboxed_headless_subtask() -> bool:
+    return _is_headless_subtask() and os.environ.get("CAE_HARNESS_OS_SANDBOX", "").strip().lower() in (
+        "1", "read-only", "workspace-write",
+    )
+
+
+def _is_dynamic_unresolved_hit(action_desc: str, external_target: str) -> bool:
+    """判断边界命中是否仅源于静态分析无法求值的动态路径/命令（而非确证越界或敏感系统调用）。"""
+    tgt = str(external_target or "").strip()
+    act = str(action_desc or "")
+    if tgt == "<DYNAMIC_UNRESOLVED>" or "[未解析动态变量路径]" in act:
+        return True
+    # 逗号分隔的多候选路径里，仅当所有候选均为 <DYNAMIC_UNRESOLVED> 才视为纯动态未解析
+    if tgt and "," in tgt:
+        parts = [p.strip() for p in tgt.split(",") if p.strip()]
+        return bool(parts) and all(p == "<DYNAMIC_UNRESOLVED>" for p in parts)
+    return False
+
+
 def _build_boundary_violation_response(
     tool_name: str,
     action_desc: str,
@@ -5044,7 +5054,8 @@ def handle_pre_tool_use(payload: Dict[str, Any]) -> Dict[str, Any]:
                 cmd_str = str(args.get("CommandLine") or args.get("command_line") or args.get("command") or "")
                 cmd_summary = str(args.get("toolSummary") or args.get("description") or "").strip()
                 ext_hit = _detect_command_external_mutation(
-                    cmd_str, cwd or base_cwd, allowed_keys, allowed_res_keys, allow_os_temp
+                    cmd_str, cwd or base_cwd, allowed_keys, allowed_res_keys, allow_os_temp,
+                    allow_dynamic_unresolved=_is_os_sandboxed_headless_subtask(),
                 )
                 if ext_hit:
                     act_desc, ext_target, clause_snip = ext_hit
@@ -5559,12 +5570,16 @@ def handle_claude_pre_tool_use(payload: Dict[str, Any], state_dir: Optional[Path
         elif tool_name in ("Bash", "PowerShell", "exec_command", "bash", "shell", "shell_command"):
             is_msys = os.name == "nt" and client == "claude" and tool_name in ("Bash", "bash")
             hit = _detect_command_external_mutation(
-                _extract_native_shell_command(args), base_cwd, allowed, resolved, allow_temp, msys_shell=is_msys
+                _extract_native_shell_command(args), base_cwd, allowed, resolved, allow_temp,
+                msys_shell=is_msys, allow_dynamic_unresolved=_is_os_sandboxed_headless_subtask(),
             )
         elif tool_name.lower() == "write_stdin":
             stdin_text = str(args.get("chars") if args.get("chars") is not None else (args.get("input") or ""))
             if stdin_text.strip():
-                hit = _detect_command_external_mutation(stdin_text, base_cwd, allowed, resolved, allow_temp)
+                hit = _detect_command_external_mutation(
+                    stdin_text, base_cwd, allowed, resolved, allow_temp,
+                    allow_dynamic_unresolved=_is_os_sandboxed_headless_subtask(),
+                )
     if hit and not _is_headless_subtask() and user_words.valid_session_id(sid):
         with contextlib.suppress(OSError, ValueError):
             with user_words.session_state_lock(state_dir, sid):

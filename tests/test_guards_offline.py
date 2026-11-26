@@ -4349,6 +4349,318 @@ class TestDispatchAndBillingGuards(unittest.TestCase):
         ):
             self.assertEqual(run_cmd(safe_rpc)["decision"], "allow", safe_rpc)
 
+    def test_v204_hooks_sandbox_dynamic_tasklog_harness_var_and_stop_gate(self) -> None:
+        """回归测试：OS 沙箱无头动态路径放行、复合 TaskId 日志定位、$HARNESS 局部变量展开、
+        --help 豁免、Antigravity default_mode=enforce、fullyIdle=False 推迟终态自审与 brain 目录豁免。"""
+        from _lib import adaptive_policy
+
+        # 1) adaptive_policy 中 antigravity 默认 default_mode 为 enforce（codex/claude 保持 advisory）
+        real_profile = json.loads(
+            (HOOKS_DIR.parent / "skills" / "cae-harness" / "fleet_profile.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            adaptive_policy.resolve_adaptive_handoff_policy(real_profile, "antigravity")["default_mode"],
+            "enforce",
+        )
+        self.assertEqual(
+            adaptive_policy.resolve_adaptive_handoff_policy({}, "antigravity")["default_mode"],
+            "enforce",
+        )
+        self.assertEqual(
+            adaptive_policy.resolve_adaptive_handoff_policy({}, "codex")["default_mode"],
+            "advisory",
+        )
+
+        # 2) _locate_task_log_file 兼容 <convId>/task-N 复合 TaskId，同时防路径穿越
+        base_tmp = self.project.parent
+        conv_root = base_tmp / "brain" / "conv-alpha"
+        task_dir = conv_root / ".system_generated" / "tasks"
+        task_dir.mkdir(parents=True)
+        log_file = task_dir / "task-42.log"
+        log_file.write_text("running\n", encoding="utf-8")
+        tp_path = conv_root / ".system_generated" / "logs" / "transcript.jsonl"
+        tp_path.parent.mkdir(parents=True)
+        tp_path.write_text("", encoding="utf-8")
+        self.assertEqual(
+            status_guard._locate_task_log_file(str(tp_path), "conv-alpha/task-42"),
+            log_file,
+        )
+        self.assertIsNone(status_guard._locate_task_log_file(str(tp_path), "../evil/task-42"))
+
+        # 3) _dispatch_commands 展开 $HARNESS 与 HARNESS= 局部变量，且 --help/-h 不触发重负载门禁
+        ps_cmd = '$HARNESS = "$HOME\\.gemini\\config\\plugins\\user-guard\\skills\\cae-harness\\scripts\\cae_harness.py"; python -B -X utf8 "$HARNESS" batch --help'
+        parsed_cmds = list(status_guard._dispatch_commands(ps_cmd))
+        self.assertTrue(any("cae_harness.py" in t for cmd in parsed_cmds for t in cmd))
+        with unittest.mock.patch.dict(os.environ, {"CAE_HARNESS_DEPTH": ""}):
+            os.environ.pop("CAE_HARNESS_DEPTH", None)
+            help_res = status_guard.handle_pre_tool_use({
+                "conversationId": "v204-help-ok",
+                "cwd": str(self.project),
+                "workspacePaths": [str(self.project)],
+                "transcriptPath": str(tp_path),
+                "toolCall": {"name": "run_command", "args": {"CommandLine": ps_cmd}},
+            })
+            self.assertEqual(help_res["decision"], "allow")
+            heavy_ps = '$HARNESS = "scripts/cae_harness.py"; python "$HARNESS" batch --spec-file spec.json'
+            heavy_res = status_guard.handle_pre_tool_use({
+                "conversationId": "v204-var-batch",
+                "cwd": str(self.project),
+                "workspacePaths": [str(self.project)],
+                "transcriptPath": str(tp_path),
+                "toolCall": {"name": "run_command", "args": {"CommandLine": heavy_ps}},
+            })
+            self.assertEqual(heavy_res["decision"], "deny")
+            self.assertIn("重负载", heavy_res.get("reason", ""))
+
+        # 4) OS 沙箱已激活的无头子任务对动态未解析路径放行，但对确证越界仍硬 deny；无沙箱无头子任务仍硬 deny
+        dyn_py = 'python -c "import sys, pathlib; pathlib.Path(sys.argv[1]).write_text(\'ok\')" inside.txt'
+        outside_path = str((base_tmp / "outside_escape.txt").resolve())
+        escaped_py = f'python -c "import pathlib; pathlib.Path({outside_path!r}).write_text(\'bad\')"'
+        with unittest.mock.patch.dict(os.environ, {"CAE_HARNESS_DEPTH": "1", "CAE_HARNESS_OS_SANDBOX": "workspace-write"}):
+            res_dyn_ok = status_guard.handle_pre_tool_use({
+                "conversationId": "v204-sandbox-dyn",
+                "cwd": str(self.project),
+                "workspacePaths": [str(self.project)],
+                "toolCall": {"name": "run_command", "args": {"CommandLine": dyn_py}},
+            })
+            self.assertEqual(res_dyn_ok["decision"], "allow")
+            res_esc_deny = status_guard.handle_pre_tool_use({
+                "conversationId": "v204-sandbox-esc",
+                "cwd": str(self.project),
+                "workspacePaths": [str(self.project)],
+                "toolCall": {"name": "run_command", "args": {"CommandLine": escaped_py}},
+            })
+            self.assertEqual(res_esc_deny["decision"], "deny")
+            # Claude/Codex 协议路径同样对 OS 沙箱动态未解析放行、对确证越界硬阻断
+            cc_dyn = status_guard.handle_claude_pre_tool_use({
+                "session_id": "v204-cc-sandbox",
+                "_client": "codex",
+                "cwd": str(self.project),
+                "tool_name": "exec_command",
+                "tool_input": {"cmd": dyn_py},
+            })
+            self.assertEqual(cc_dyn, {})
+            cc_esc = status_guard.handle_claude_pre_tool_use({
+                "session_id": "v204-cc-esc",
+                "_client": "codex",
+                "cwd": str(self.project),
+                "tool_name": "exec_command",
+                "tool_input": {"cmd": escaped_py},
+            })
+            self.assertEqual(cc_esc.get("hookSpecificOutput", {}).get("permissionDecision"), "deny")
+        with unittest.mock.patch.dict(os.environ, {"CAE_HARNESS_DEPTH": "1"}, clear=False):
+            os.environ.pop("CAE_HARNESS_OS_SANDBOX", None)
+            res_nosandbox = status_guard.handle_pre_tool_use({
+                "conversationId": "v204-nosandbox-dyn",
+                "cwd": str(self.project),
+                "workspacePaths": [str(self.project)],
+                "toolCall": {"name": "run_command", "args": {"CommandLine": dyn_py}},
+            })
+            self.assertEqual(res_nosandbox["decision"], "deny")
+
+        # 5) reply_repeat_guard: brain/ 目录下的长文不触发 Gate C；fullyIdle=False 推迟终态 Gate C；
+        #    check-grounding 仅报旧档错误而本轮写入文档零命中时，不再陷入 Gate C 死循环
+        self.assertFalse(reply_repeat_guard._is_formal_deliverable_doc(
+            "antigravity/brain/conv-1/draft_report.md"
+        )[0])
+        tp_idle = base_tmp / "tp_idle.jsonl"
+        long_body = "核心分析正文。" * 800
+        _append_jsonl(tp_idle, {"type": "USER_INPUT", "step_index": 0, "content": "请重写 paper.md"})
+        _append_jsonl(tp_idle, {
+            "type": "PLANNER_RESPONSE", "source": "MODEL", "step_index": 1,
+            "tool_calls": [{"name": "write_file", "args": {"Path": json.dumps("docs/paper.md"), "Content": json.dumps(long_body)}}],
+        })
+        _append_jsonl(tp_idle, {"type": "GENERIC", "step_index": 2, "content": "Created file docs/paper.md"})
+        _append_jsonl(tp_idle, {"type": "PLANNER_RESPONSE", "source": "MODEL", "step_index": 3, "content": "已写入 docs/paper.md，异步审查仍在后台运行，稍后补充。"})
+        res_busy = reply_repeat_guard.handle_stop_repeat_guard({
+            "conversationId": "v204-busy-defer",
+            "terminationReason": "model_stop",
+            "fullyIdle": False,
+            "transcriptPath": str(tp_idle),
+        })
+        self.assertEqual(res_busy["decision"], "allow")
+        # 后台空闲后，未审校且未标注初稿仍正常触发 Gate C
+        res_idle = reply_repeat_guard.handle_stop_repeat_guard({
+            "conversationId": "v204-busy-defer",
+            "terminationReason": "model_stop",
+            "fullyIdle": True,
+            "transcriptPath": str(tp_idle),
+        })
+        self.assertEqual(res_idle["decision"], "continue")
+        self.assertIn("长文交付自审提醒", res_idle.get("reason", ""))
+
+        # 同一份文档在运行 check-grounding 返回 exit 2 但 findings 全部位于其他旧文件时，放行不再死循环
+        tp_cg = base_tmp / "tp_cg.jsonl"
+        _append_jsonl(tp_cg, {"type": "USER_INPUT", "step_index": 0, "content": "请重写 paper.md"})
+        _append_jsonl(tp_cg, {
+            "type": "PLANNER_RESPONSE", "source": "MODEL", "step_index": 1,
+            "tool_calls": [{"name": "write_file", "args": {"Path": json.dumps("docs/paper.md"), "Content": json.dumps(long_body)}}],
+        })
+        _append_jsonl(tp_cg, {"type": "GENERIC", "step_index": 2, "content": "Created file docs/paper.md"})
+        _append_jsonl(tp_cg, {
+            "type": "PLANNER_RESPONSE", "source": "MODEL", "step_index": 3,
+            "tool_calls": [{"name": "run_command", "args": {"CommandLine": json.dumps("python cae_harness.py check-grounding --target . --strict --doc-hygiene")}}],
+        })
+        _append_jsonl(tp_cg, {
+            "type": "GENERIC", "step_index": 4,
+            "content": 'Command exited with code 2.\n{"checked_file_count": 2, "finding_count": 1, "findings": [{"file": "legacy_notes.md", "line": 3, "category": "slash_chain"}]}',
+        })
+        _append_jsonl(tp_cg, {"type": "PLANNER_RESPONSE", "source": "MODEL", "step_index": 5, "content": "已写入 docs/paper.md 并完成文档自检。"})
+        res_cg = reply_repeat_guard.handle_stop_repeat_guard({
+            "conversationId": "v204-cg-otherfile",
+            "terminationReason": "model_stop",
+            "fullyIdle": True,
+            "transcriptPath": str(tp_cg),
+        })
+        self.assertEqual(res_cg["decision"], "allow")
+
+    def test_v204_codex_adversarial_guard_hardening(self):
+        base_tmp = self.project.parent
+        outside = (base_tmp / "outside_adv").resolve()
+        outside.mkdir(parents=True, exist_ok=True)
+        outside_posix = outside.as_posix()
+
+        # 1) S1a-1: OS 沙箱动态豁免绝不短路后续越界命令或 Python 越界写
+        with unittest.mock.patch.dict(
+            os.environ, {"CAE_HARNESS_DEPTH": "1", "CAE_HARNESS_OS_SANDBOX": "workspace-write"}, clear=False
+        ):
+            res_shell_chain = status_guard.handle_pre_tool_use({
+                "conversationId": "v204-adv-chain",
+                "cwd": str(self.project),
+                "workspacePaths": [str(self.project)],
+                "toolCall": {"name": "run_command", "args": {"CommandLine": f'rm "$DYN_PATH"; rm -rf "{outside_posix}/escape.txt"'}},
+            })
+            self.assertEqual(res_shell_chain["decision"], "deny")
+            py_chain = (
+                "python -c \"import pathlib, sys; "
+                "pathlib.Path(sys.argv[1]).write_text('a'); "
+                f"pathlib.Path('{outside_posix}/escape.txt').write_text('b')\""
+            )
+            res_py_chain = status_guard.handle_pre_tool_use({
+                "conversationId": "v204-adv-pychain",
+                "cwd": str(self.project),
+                "workspacePaths": [str(self.project)],
+                "toolCall": {"name": "run_command", "args": {"CommandLine": py_chain}},
+            })
+            self.assertEqual(res_py_chain["decision"], "deny")
+
+        # 2) S1a-2: nohup -- 与 uv --directory 均正确拆壳并切换工作目录
+        res_nohup = status_guard.handle_pre_tool_use({
+            "conversationId": "v204-adv-nohup",
+            "cwd": str(self.project),
+            "workspacePaths": [str(self.project)],
+            "toolCall": {"name": "run_command", "args": {"CommandLine": f'nohup -- rm -rf "{outside_posix}/x.txt"'}},
+        })
+        self.assertEqual(res_nohup["decision"], "force_ask")
+        res_uv_dir = status_guard.handle_pre_tool_use({
+            "conversationId": "v204-adv-uvdir",
+            "cwd": str(self.project),
+            "workspacePaths": [str(self.project)],
+            "toolCall": {"name": "run_command", "args": {"CommandLine": f'uv --directory "{outside_posix}" run touch leaked.txt'}},
+        })
+        self.assertEqual(res_uv_dir["decision"], "force_ask")
+
+        # 3) S1a-3 & S1a-help: Bash 变量区分大小写、单引号不展开；--task "--help" 不触发免票
+        cmds = list(status_guard._dispatch_commands('CODEX=codex; codex=echo; $CODEX exec "hi"; echo \'$CODEX\''))
+        self.assertEqual(cmds[0][0], "codex")
+        self.assertEqual(cmds[1], ["echo", "$CODEX"])
+        self.assertFalse(status_guard._harness_tail_is_help(["task", "--task", "--help", "--target", "."]))
+        self.assertFalse(status_guard._harness_tail_is_help(["task", "--", "--help"]))
+        self.assertTrue(status_guard._harness_tail_is_help(["task", "--help"]))
+
+        # 4) S1a-4: 跨会话复合 TaskId 绝不回退到当前会话同名日志
+        cur_tr = base_tmp / "brain_iso" / "conv-a" / ".system_generated" / "logs" / "transcript.jsonl"
+        cur_tr.parent.mkdir(parents=True, exist_ok=True)
+        cur_tr.write_text("", encoding="utf-8")
+        cur_log = base_tmp / "brain_iso" / "conv-a" / ".system_generated" / "tasks" / "task-77.log"
+        cur_log.parent.mkdir(parents=True, exist_ok=True)
+        cur_log.write_text("cur", encoding="utf-8")
+        loc_other = status_guard._locate_task_log_file(str(cur_tr), "conv-b/task-77")
+        self.assertIsNotNone(loc_other)
+        self.assertIn("conv-b", loc_other.as_posix())
+        self.assertNotEqual(loc_other.resolve(), cur_log.resolve())
+
+        # 5) S1b-1: handoff_gate 正确拆解 exec cat figure.png
+        tokens, _ = status_guard.handoff_gate._unwrap_clause_or_shell(["exec", "cat", "figure.png"])
+        self.assertEqual(tokens, ["cat", "figure.png"])
+
+        # 6) S1b-2 / S1b-3 / S1b-4:
+        #    - docs/brain/report.tex 不被跳过
+        self.assertTrue(reply_repeat_guard._is_formal_deliverable_doc("docs/brain/report.tex")[0])
+        #    - fullyIdle=False 仍拦截虚假“全套测试通过”；无关 SYSTEM_MESSAGE 与 Created subagent 不充当已完成审查
+        tp_adv = base_tmp / "tp_adv.jsonl"
+        long_body = "理论推导与数值离散细节。" * 700
+        _append_jsonl(tp_adv, {"type": "USER_INPUT", "step_index": 0, "content": "请重写并核查测试"})
+        _append_jsonl(tp_adv, {
+            "type": "PLANNER_RESPONSE", "source": "MODEL", "step_index": 1,
+            "tool_calls": [{"name": "run_command", "args": {"CommandLine": json.dumps("python -m unittest")}}],
+        })
+        _append_jsonl(tp_adv, {"type": "GENERIC", "step_index": 2, "content": "Ran 50 tests in 1.2s\n\nFAILED (failures=2)"})
+        _append_jsonl(tp_adv, {"type": "PLANNER_RESPONSE", "source": "MODEL", "step_index": 3, "content": "全套测试均已全部通过，正在等待后台汇总。"})
+        res_false_green = reply_repeat_guard.handle_stop_repeat_guard({
+            "conversationId": "v204-adv-busy-green",
+            "terminationReason": "model_stop",
+            "fullyIdle": False,
+            "transcriptPath": str(tp_adv),
+        })
+        self.assertEqual(res_false_green["decision"], "continue")
+        self.assertIn("测试结果核验", res_false_green.get("reason", ""))
+
+        #    - check-grounding --hygiene-only 或漏检刚写文件、以及无关 SYSTEM_MESSAGE 均不得放行 Gate C
+        tp_rev = base_tmp / "tp_rev.jsonl"
+        _append_jsonl(tp_rev, {"type": "USER_INPUT", "step_index": 0, "content": "重写 docs/brain/report.tex"})
+        _append_jsonl(tp_rev, {
+            "type": "PLANNER_RESPONSE", "source": "MODEL", "step_index": 1,
+            "tool_calls": [{"name": "write_file", "args": {"Path": json.dumps("docs/brain/report.tex"), "Content": json.dumps(long_body)}}],
+        })
+        _append_jsonl(tp_rev, {"type": "GENERIC", "step_index": 2, "content": "Created file docs/brain/report.tex"})
+        _append_jsonl(tp_rev, {
+            "type": "PLANNER_RESPONSE", "source": "MODEL", "step_index": 3,
+            "tool_calls": [{"name": "invoke_subagent", "args": {"TypeName": json.dumps("readonly-auditor")}}],
+        })
+        _append_jsonl(tp_rev, {"type": "GENERIC", "step_index": 4, "content": "Created the following subagent: conv-rev-999"})
+        _append_jsonl(tp_rev, {"type": "SYSTEM_MESSAGE", "step_index": 5, "sender": "other-task-1", "content": "Task other-task-1 finished review check"})
+        _append_jsonl(tp_rev, {
+            "type": "PLANNER_RESPONSE", "source": "MODEL", "step_index": 6,
+            "tool_calls": [{"name": "run_command", "args": {"CommandLine": json.dumps("python cae_harness.py check-grounding --target docs/brain/report.tex --hygiene-only")}}],
+        })
+        _append_jsonl(tp_rev, {
+            "type": "GENERIC", "step_index": 7,
+            "content": 'Command exited with code 0.\n{"hygiene_only": true, "checked_files": ["docs/brain/report.tex"], "findings": []}',
+        })
+        _append_jsonl(tp_rev, {"type": "PLANNER_RESPONSE", "source": "MODEL", "step_index": 8, "content": "已完成 docs/brain/report.tex 定稿交付。"})
+        ev_rev = reply_repeat_guard._inspect_turn_evidence(tp_rev)
+        self.assertIsNotNone(ev_rev)
+        self.assertEqual(len(ev_rev["large_doc_writes"]), 1)
+        self.assertFalse(ev_rev["has_independent_review"])
+
+        #    - 端到端 Stop 核验：仅跑 check-grounding --hygiene-only 与无关 SYSTEM_MESSAGE 时仍触发 Gate C
+        tp_hyg = base_tmp / "tp_hyg.jsonl"
+        _append_jsonl(tp_hyg, {"type": "USER_INPUT", "step_index": 0, "content": "重写 docs/brain/report.tex"})
+        _append_jsonl(tp_hyg, {
+            "type": "PLANNER_RESPONSE", "source": "MODEL", "step_index": 1,
+            "tool_calls": [{"name": "write_file", "args": {"Path": json.dumps("docs/brain/report.tex"), "Content": json.dumps(long_body)}}],
+        })
+        _append_jsonl(tp_hyg, {"type": "GENERIC", "step_index": 2, "content": "Created file docs/brain/report.tex"})
+        _append_jsonl(tp_hyg, {"type": "SYSTEM_MESSAGE", "step_index": 3, "sender": "other-task-1", "content": "Task other-task-1 finished review check"})
+        _append_jsonl(tp_hyg, {
+            "type": "PLANNER_RESPONSE", "source": "MODEL", "step_index": 4,
+            "tool_calls": [{"name": "run_command", "args": {"CommandLine": json.dumps("python cae_harness.py check-grounding --target docs/brain/report.tex --hygiene-only")}}],
+        })
+        _append_jsonl(tp_hyg, {
+            "type": "GENERIC", "step_index": 5,
+            "content": 'Command exited with code 0.\n{"hygiene_only": true, "checked_files": ["docs/brain/report.tex"], "findings": []}',
+        })
+        _append_jsonl(tp_hyg, {"type": "PLANNER_RESPONSE", "source": "MODEL", "step_index": 6, "content": "已完成 docs/brain/report.tex 定稿交付。"})
+        res_gate_c = reply_repeat_guard.handle_stop_repeat_guard({
+            "conversationId": "v204-adv-gatec",
+            "terminationReason": "model_stop",
+            "fullyIdle": True,
+            "transcriptPath": str(tp_hyg),
+        })
+        self.assertEqual(res_gate_c["decision"], "continue")
+        self.assertIn("长文交付自审提醒", res_gate_c.get("reason", ""))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -2,6 +2,24 @@
 
 本文件记录四客户端共用规则、会话钩子、后台验证工具与上游维护流程的版本演进。当前插件版本以 `template/user-guard/plugin.json` 为准；常驻使用文档只说明机制和配置键，不重复维护版本号与性能日期。
 
+## [2.0.4] - 2026-11-26
+
+围绕真实双端对话中暴露的钩子误判与超时损耗完成系统性机制修复，将单体 `cae_harness.py` 按职责拆分为内部子包 `_harness/`，并新增独立按需学术写作技能 `cae-writing`（零新增常驻硬钩子）：
+
+- **会话钩子共享拆壳与安全边界加固（`hooks/_lib/shell_lex.py`、`adaptive_policy.py`、`handoff_gate.py`、`status_guard.py`、`reply_repeat_guard.py`、`fleet_profile.json`）**：
+  - 将四处重复的前导命令拆壳逻辑收敛至 `shell_lex.consume_leading_wrapper` 与 `unquote_split_string_payload`，补齐 `nohup --`、`uv --directory` 与 `handoff_gate` 中 `exec` 拆解；
+  - 修正 `adaptive_policy.py` 与 `fleet_profile.json` 中 Antigravity 交接默认模式为 `enforce`（保持 Codex 与 Claude Code 为 `advisory`）；
+  - 修正 `status_guard.py` 复合 `<convId>/task-N` 日志定位（显式跨会话标识禁止回退当前会话并校验链接与目录 containment）、OS 沙箱动态未解析路径改在扫描器内部跳过而不短路后续越界与敏感操作检测、`_dispatch_commands` 按 POSIX 大小写敏感与 PowerShell/CMD 大小写不敏感分域并保护单引号词元、精细界定 `--help` 参数作用域；
+  - 修正 `reply_repeat_guard.py` 仅对 `antigravity/brain` 与 `.system_generated` 豁免长文交付自审、`fullyIdle=False` 仅推迟 Gate C 而不屏蔽虚假测试通过或零探测否定拦截、分离 `wait:` 短等待签名与终态拦截签名、严格绑定挂起异步审查代理与任务回调，并核验 `check-grounding` 报告覆盖全部本轮写入文档且非 `--hygiene-only`。
+- **`cae_harness.py` 模块化拆分与无头派工可靠性修复（`scripts/cae_harness.py`、`scripts/_harness/*.py`、`fleet_state.py`、`install.py`）**：
+  - 入口脚本 `cae_harness.py` 先对目录与 `_harness/{config,catalog,engines,grounding,reconcile,read_plan,dispatch}.py` 逐一执行符号链接与重解析点校验再载入命名空间，保持全部 CLI 命令与模块接口兼容，同步纳入 `fleet_state.py` `core_sha256` 校验与 `install.py` 镜像分发；
+  - 修复 `engines.py` 对 Codex `custom_tool_call("exec")` 的单遍 JS 路径追踪与混合退出码判错，收紧 `_citation_audit` 别名回退仅用于不存在路径且禁止 `..` 路径穿越，收敛 OS 只读沙箱标记至真正强制沙箱的 `codex` 后端；对 `agy` 取消无效的 `soft_timeout_ratio` 15% 预扣（将完整 `timeout` 交给主回合 `--print-timeout`，同时保留 `agy_background_turn_in_progress` 不可续接防护）；
+  - 统一 `grounding.py` 归档与运行时排除目录及通用项目报错文案，新增 `--output`（原子写入且防覆盖目标或链接）与 `--hygiene-only`（禁止与 `--base-ref`/`--allow-from-file` 混用且空适用文档集显式报错）。
+- **新增按需学术写作技能 `cae-writing`（`template/user-guard/skills/cae-writing/`、`README.md`、`AGENTS.md`、`template/user-guard/README.md`、`docs/architecture-and-hooks.md`）**：
+  - 建立独立按需加载的 `cae-writing` 技能及 6 份分体裁参考手册（`prose-baseline.md`、`journal-zh.md`、`journal-en.md`、`monograph.md`、`formal-report.md`、`presubmission-and-rebuttal.md`），坚持项目自有规范优先、正向结构先于负向禁令、单一全景执笔与净室读者盲读分工，明确保密评审与外部模型传输伦理边界，同步四端安装分发。
+
+---
+
 ## [2.0.3] - 2026-11-26
 
 适配 Antigravity `v2.35.2` 与 CLI `v1.5.17` 协议及清单规范，补齐桌面 GUI 进程防卡死守卫、零进程版本探测与模型退役模式修复：

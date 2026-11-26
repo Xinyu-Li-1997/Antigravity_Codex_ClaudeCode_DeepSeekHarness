@@ -14,7 +14,8 @@
 | --- | --- | --- |
 | [rules/AGENTS.md](../template/user-guard/rules/AGENTS.md) | 通用 + 上游 | `R0–R11` 全局规则唯一模板；约束受众分层、机械下沉与对称诚实披露，不含时期性模型名 |
 | [fleet_profile.json](../template/user-guard/skills/cae-harness/fleet_profile.json) | 通用 + 上游 | 唯一动态配置源：维护五角色 `roles`、四端 `native_agent_profiles`、`runtime_tunables`、`subscription_matrix` 与 `capability_ledger` |
-| [cae_harness.py](../template/user-guard/skills/cae-harness/scripts/cae_harness.py) | 通用 + 上游 | 跨端无头调度与离线诊断总控：P0 点名锁定、角色选路与风险升挡、`--isolation` 四级隔离、持久化会话与超时抢救、`<ticket_id>_card.md` 落盘，以及 `check-grounding`（含 `--doc-hygiene`）、`read-plan`、`cross-check`、`reconcile` 四项离线确定性工具 |
+| [cae_harness.py](../template/user-guard/skills/cae-harness/scripts/cae_harness.py) 与 `scripts/_harness/` | 通用 + 上游 | 跨端无头调度与离线诊断总控（按配置、目录、执行引擎、文档核验、机械对账、阅读分片与调度子模块拆分）：P0 点名锁定、角色选路与风险升挡、`--isolation` 四级隔离、持久化会话与超时抢救、`<ticket_id>_card.md` 落盘，以及 `check-grounding`（含 `--doc-hygiene`/`--hygiene-only`/`--output`）、`read-plan`、`cross-check`、`reconcile` 四项离线确定性工具 |
+| [skills/cae-writing/](../template/user-guard/skills/cae-writing/SKILL.md) | 通用 | 按需学术写作与改稿技能：按体裁分册加载中文期刊、英文期刊、学术专著、科研报告与投稿前自审及审稿回复指南，严守审稿保密伦理、优先尊重项目自有词表，不增加常驻钩子 |
 | [user_words.py](../template/user-guard/hooks/user_words.py) | 通用 + 上游 | 钩子共用基础库：跨平台文件锁、原子写、三端轨迹去噪与子代理摘要提取、历史确认单折叠及账单存取 |
 | `hooks/_lib/` | 通用 + 上游 | `fs_safety.py`（重解析点防御原子写）、`shell_lex.py`（Shell 拆壳与 PowerShell 续行归一化）、`adaptive_policy.py`（读取 `modelName` 与挡位并按窗口缩放阈值）、`process_guard.py`（墙钟自毁与 POSIX 条件虚拟内存上限） |
 | [session_context_loader.py](../template/user-guard/hooks/session_context_loader.py) | 通用 + 上游 | 恢复与调用前门禁：普通回合零字节注入；压缩后分块补回原话、实质子代理摘要、未决票据总览与有界对账及阅读计划指针 |
@@ -165,5 +166,5 @@ python -B -X utf8 "$HOME\.claude\hooks\ccswitch_admin.py" switch-card "<目标�
 - **按托管文件名精确卸载**（`install.py` 采用原地幂等同步且不留 `.bak-*` 文件；卸载时请勿删除整个 `hooks/` 目录，以免误删自建脚本）：
   1. **Antigravity**：删除 `~/.gemini/config/plugins/user-guard` 与 `~/.gemini/antigravity/plugin_data/user-guard`。
   2. **Codex 与 Claude Code 托管钩子**：仅删除 `hooks/` 下托管脚本 `user_words.py`、`session_context_loader.py`、`status_guard.py`、`reply_repeat_guard.py`、`handoff_gate.py`（Claude 含 `ccswitch_admin.py`）、`hooks/_lib/` 及不再使用的 `hooks/state/`、`hooks/logs/`。
-  3. **代理、技能与可选路由**：删除 `~/.codex/agents/` 与 `~/.claude/agents/` 下的 `readonly-*`，三端 `skills/` 下的 `cae-harness` 与 `fleet-evolve`，以及可选的 `~/.claude/router/`。
+  3. **代理、技能与可选路由**：删除 `~/.codex/agents/` 与 `~/.claude/agents/` 下的 `readonly-*`，三端 `skills/` 下的 `cae-harness`、`cae-writing` 与 `fleet-evolve`，以及可选的 `~/.claude/router/`。
   4. **宿主配置与规则文件**：从 `~/.codex/hooks.json` 与 `~/.claude/settings.json` 移除托管钩子项；三端顶层规则文件若无个人内容可直接删除，若有自定义尾段则仅删去标准 `R0–R11` 至 `## 工具与运行环境` 章节。

@@ -4,7 +4,7 @@
 
 ## 内容归属与维护范围
 
-[全局规则模板](template/user-guard/rules/AGENTS.md) 是工程规则的唯一来源。本文件说明仓库维护与安装入口；[cae-harness 技能](template/user-guard/skills/cae-harness/SKILL.md) 负责日常派工、持久化续接、确认票据及事实锚定；[fleet-evolve 技能](template/user-guard/skills/fleet-evolve/SKILL.md) 负责全局工具链评估、审批和同步。细则按归属单点维护，已被代码或钩子硬守住的机制不在此重复展开。
+[全局规则模板](template/user-guard/rules/AGENTS.md) 是工程规则的唯一来源。本文件说明仓库维护与安装入口；[cae-harness 技能](template/user-guard/skills/cae-harness/SKILL.md) 负责日常派工、持久化续接、确认票据及事实锚定；[cae-writing 技能](template/user-guard/skills/cae-writing/SKILL.md) 按体裁提供按需学术写作与改稿规范（不增设常驻硬钩子）；[fleet-evolve 技能](template/user-guard/skills/fleet-evolve/SKILL.md) 负责全局工具链评估、审批和同步。细则按归属单点维护，已被代码或钩子硬守住的机制不在此重复展开。
 
 [fleet_profile.json](template/user-guard/skills/cae-harness/fleet_profile.json) 统一保存五个动态角色槽位（`orchestrator`、`math`、`code`、`review`、`fast`）、`native_agent_profiles`、`runtime_tunables`、`subscription_matrix` 与 `capability_ledger`。常驻文档仅引用角色与配置键，不写时期性模型名、静态日期或插件版本数字；版本以 `template/user-guard/plugin.json` 为准，历史见 Git 与 `CHANGELOG.md`。
 

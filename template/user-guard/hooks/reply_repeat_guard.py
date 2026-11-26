@@ -1040,11 +1040,16 @@ def _turn_suite_results(path):
                     yield int(result["julia_total"]), "Pass" in result["julia_columns"] and result["julia_pass"] == result["julia_total"]
 
 
+def _has_terminal_block_sig(blocked_sigs: List[str]) -> bool:
+    """判断本回合是否已触发过终态质量/实证阻断（忽略早期短等待 wait: 阻断签名）。"""
+    return any(not str(sig).startswith("wait:") for sig in (blocked_sigs or ()))
+
+
 def _check_test_suite_locked(payload, reply, state_file, state, sid, turn_key, decision):
     record = state["turns"][turn_key]
     green = r"(?:全绿|全部通过|全过|\bpassed\b)"
     reply = "\n".join(user_words.markdown_unquoted_lines(reply))
-    if record["blockedSignatures"] or not re.search(green, reply, re.I):
+    if _has_terminal_block_sig(record["blockedSignatures"]) or not re.search(green, reply, re.I):
         return None
     raw_path = payload.get("transcriptPath") or payload.get("transcript_path")
     if not raw_path:
@@ -1099,7 +1104,7 @@ _SCOPE_DISCLOSURE_RE = re.compile(
     re.I,
 )
 _UNREVIEWED_DISCLOSURE_RE = re.compile(
-    r"(?:初稿|草稿|未经(?:跨端|独立)(?:审查|审校|核验|复核)|尚未(?:跨端|独立|运行)[^\n。；]{0,12}(?:审查|审校|核验|复核|check-grounding)|待(?:跨端|独立)?(?:审查|审校|复核|验证)|\bunreviewed\s+draft\b|\bnot\s+yet\s+reviewed\b)",
+    r"(?:初稿|草稿|未经(?:跨端|独立)(?:审查|审校|核验|复核)|尚未(?:跨端|独立|运行)[^\n。；]{0,12}(?:审查|审校|核验|复核|check-grounding)|待(?:跨端|独立)?(?:审查|审校|复核|验证)|check-grounding[^\n。；]{0,24}(?:检出|报告|发现|遗留|未通过|非零)|\bunreviewed\s+draft\b|\bnot\s+yet\s+reviewed\b)",
     re.I,
 )
 _NONZERO_EXIT_RE = re.compile(
@@ -1111,7 +1116,7 @@ _TOOL_DENIED_OR_ERR_RE = re.compile(
     re.I,
 )
 _BACKGROUND_PENDING_RE = re.compile(
-    r"(?:running\s+as\s+a\s+background\s+task|running\s+in\s+(?:the\s+)?background|background\s+task.*started|Task\s+id\s+\S+\s+started)",
+    r"(?:running\s+as\s+a\s+background\s+task|running\s+in\s+(?:the\s+)?background|background\s+task.*started|Task\s+id\s+\S+\s+started|Created\s+the\s+following\s+subagent)",
     re.I,
 )
 _INDEX_PATH_HINTS = (
@@ -1134,7 +1139,7 @@ _HARNESS_REVIEW_CMD_RE = re.compile(
 _FORMAL_DOC_EXTS = frozenset({".tex", ".md", ".rst"})
 _FORMAL_DOC_SKIP_DIRS = frozenset({
     "tests", "test", "scratch", "tmp", "temp", ".git", "plugin_data",
-    "state", "logs", "handoff", "archive", "archived",
+    "state", "logs", "handoff", "archive", "archived", ".system_generated",
 })
 _FORMAL_DOC_SKIP_NAMES = frozenset({
     "changelog.md", "license.md", "notice.md", "todo.md", "notes.md",
@@ -1194,9 +1199,70 @@ def _is_formal_deliverable_doc(raw_path: str) -> Tuple[bool, str]:
             or low_name.endswith(_FORMAL_DOC_SKIP_SUFFIXES)
             or any(tag in low_name for tag in ("handoff", "prompt", "task_"))):
         return False, norm
-    if any(part.lower() in _FORMAL_DOC_SKIP_DIRS for part in p.parts[:-1]):
+    parent_parts = [part.lower() for part in p.parts[:-1]]
+    if any(part in _FORMAL_DOC_SKIP_DIRS for part in parent_parts):
+        return False, norm
+    if any(
+        parent_parts[i] == "brain" and i > 0 and parent_parts[i - 1] == "antigravity"
+        for i in range(len(parent_parts))
+    ):
         return False, norm
     return True, norm
+
+
+def _norm_doc_cmp_path(raw: str) -> str:
+    s = str(raw or "").replace("\\", "/").strip().lower()
+    while s.startswith("./"):
+        s = s[2:]
+    return s
+
+
+def _doc_paths_match(doc_path: str, cand_path: str) -> bool:
+    a = _norm_doc_cmp_path(doc_path)
+    b = _norm_doc_cmp_path(cand_path)
+    if not a or not b:
+        return False
+    return a == b or a.endswith("/" + b) or b.endswith("/" + a)
+
+
+def _grounding_result_verifies_docs(text: str, is_err: bool, written_docs: List[Dict[str, Any]]) -> bool:
+    """核验 check-grounding 输出是否完整覆盖本轮写入的全部正式文档，且未启用 --hygiene-only 逃逸事实锚定。"""
+    if _TOOL_DENIED_OR_ERR_RE.search(text):
+        return False
+    parsed_rep: Optional[Dict[str, Any]] = None
+    if '"checked_files"' in text or '"checked_file_count"' in text or '"findings"' in text:
+        j_start = text.find("{")
+        j_end = text.rfind("}")
+        if j_start != -1 and j_end > j_start:
+            try:
+                obj = json.loads(text[j_start : j_end + 1])
+                if isinstance(obj, dict):
+                    parsed_rep = obj
+            except ValueError:
+                parsed_rep = None
+    if parsed_rep is not None:
+        if parsed_rep.get("hygiene_only") is True:
+            return False
+        checked_files = parsed_rep.get("checked_files")
+        if isinstance(checked_files, list) and written_docs:
+            checked_strs = [str(x) for x in checked_files if isinstance(x, str)]
+            if not all(any(_doc_paths_match(d["path"], cf) for cf in checked_strs) for d in written_docs):
+                return False
+        findings = parsed_rep.get("findings")
+        if isinstance(findings, list):
+            finding_files = [
+                str(f.get("file") or "")
+                for f in findings
+                if isinstance(f, dict) and f.get("file")
+            ]
+            if written_docs and any(
+                _doc_paths_match(d["path"], ff) for d in written_docs for ff in finding_files
+            ):
+                return False
+            if not written_docs and is_err and finding_files:
+                return False
+            return True
+    return not is_err
 
 
 def _is_index_path(path_str: str) -> bool:
@@ -1276,6 +1342,23 @@ def _inspect_turn_evidence(path: Path) -> Optional[Dict[str, Any]]:
 
     pending_by_id: Dict[str, Dict[str, Any]] = {}
     pending_unid: List[Dict[str, Any]] = []
+    pending_review_agents: Set[str] = set()
+    pending_review_tasks: Dict[str, bool] = {}
+
+    def _register_pending_review(text: str, is_grounding: bool) -> None:
+        sub_cid = user_words.parse_agy_created_subagent(text)
+        if sub_cid:
+            pending_review_agents.add(sub_cid)
+        for m_tid in re.finditer(
+            r"\b(?:Task\s+id|task_id|Command\s+id)\s*[:：]?\s*([A-Za-z0-9_/-]+)|\b(task-\d+)\b",
+            text,
+            re.I,
+        ):
+            tid = (m_tid.group(1) or m_tid.group(2) or "").strip()
+            if tid:
+                pending_review_tasks[tid] = is_grounding
+                if "/" in tid:
+                    pending_review_tasks[tid.rsplit("/", 1)[-1]] = is_grounding
 
     def _settle_result(call_id: str, text: str, is_err: bool) -> None:
         nonlocal total, succeeded, failed, consulted_index, result_seq, latest_write_seq, verified_review_seq
@@ -1292,16 +1375,24 @@ def _inspect_turn_evidence(path: Path) -> Optional[Dict[str, Any]]:
                 if kind == "probe":
                     total += 1
                     failed += 1
+                elif kind == "review" and meta.get("is_grounding"):
+                    if _grounding_result_verifies_docs(text, True, large_doc_writes):
+                        verified_review_seq = result_seq
                 return
             if kind == "write_doc":
-                doc_info = meta["doc_info"]
-                if doc_info and doc_info["path"] not in seen_writes:
-                    seen_writes.add(doc_info["path"])
-                    large_doc_writes.append(doc_info)
+                for doc_info in meta.get("doc_infos") or ():
+                    if doc_info and doc_info["path"] not in seen_writes:
+                        seen_writes.add(doc_info["path"])
+                        large_doc_writes.append(doc_info)
                 latest_write_seq = result_seq
                 return
             if kind == "review":
-                if not _BACKGROUND_PENDING_RE.search(text):
+                if _BACKGROUND_PENDING_RE.search(text):
+                    _register_pending_review(text, bool(meta.get("is_grounding")))
+                elif meta.get("is_grounding"):
+                    if _grounding_result_verifies_docs(text, False, large_doc_writes):
+                        verified_review_seq = result_seq
+                else:
                     verified_review_seq = result_seq
                 return
             if kind == "probe":
@@ -1341,11 +1432,12 @@ def _inspect_turn_evidence(path: Path) -> Optional[Dict[str, Any]]:
                 if isinstance(raw_cmd, list)
                 else user_words._unquote_proto_scalar(raw_cmd)
             )
-            meta: Dict[str, Any] = {"kind": "other", "paths": [], "broad_search": False, "doc_info": None}
+            meta: Dict[str, Any] = {"kind": "other", "paths": [], "broad_search": False, "doc_infos": [], "is_grounding": False}
             if tlow in ("update_focus", "update_steps"):
                 meta["kind"] = "ui"
             elif _HARNESS_REVIEW_CMD_RE.search(cmd_str or raw_text):
                 meta["kind"] = "review"
+                meta["is_grounding"] = bool(re.search(r"\bcheck-grounding\b", cmd_str or raw_text, re.I))
             elif tlow in ("invoke_subagent", "spawn_agent", "agent", "task", "subagent", "dispatch_agent", "run_workflow", "swarm"):
                 if re.search(r"(?:audit|review|collaborator|verifier|readonly-auditor|readonly-collaborator)", raw_text, re.I):
                     meta["kind"] = "review"
@@ -1390,32 +1482,77 @@ def _inspect_turn_evidence(path: Path) -> Optional[Dict[str, Any]]:
                             pass
                     if size_chars >= _LARGE_DOC_REWRITE_MIN_CHARS:
                         meta["kind"] = "write_doc"
-                        meta["doc_info"] = {"path": norm_doc, "chars": size_chars}
+                        meta["doc_infos"] = [{"path": norm_doc, "chars": size_chars}]
             elif tlow == "apply_patch":
                 patch_text = str(parsed.get("input") or parsed.get("patch") or raw_text or "")
                 cur_doc = ""
                 cur_added = 0
-                best_doc: Optional[Dict[str, Any]] = None
+                doc_infos: List[Dict[str, Any]] = []
                 for pline in patch_text.splitlines():
                     pm = re.match(r"^\*\*\*\s+(?:Add|Update)\s+File:\s+(.+)$", pline.strip())
                     if pm:
-                        if cur_doc and cur_added >= _LARGE_DOC_REWRITE_MIN_CHARS and (best_doc is None or cur_added > best_doc["chars"]):
-                            best_doc = {"path": cur_doc, "chars": cur_added}
+                        if cur_doc and cur_added >= _LARGE_DOC_REWRITE_MIN_CHARS:
+                            doc_infos.append({"path": cur_doc, "chars": cur_added})
                         ok_doc, norm_doc = _is_formal_deliverable_doc(pm.group(1))
                         cur_doc = norm_doc if ok_doc else ""
                         cur_added = 0
                     elif cur_doc and pline.startswith("+") and not pline.startswith("+++"):
                         cur_added += len(pline)
-                if cur_doc and cur_added >= _LARGE_DOC_REWRITE_MIN_CHARS and (best_doc is None or cur_added > best_doc["chars"]):
-                    best_doc = {"path": cur_doc, "chars": cur_added}
-                if best_doc is not None:
+                if cur_doc and cur_added >= _LARGE_DOC_REWRITE_MIN_CHARS:
+                    doc_infos.append({"path": cur_doc, "chars": cur_added})
+                if doc_infos:
                     meta["kind"] = "write_doc"
-                    meta["doc_info"] = best_doc
+                    meta["doc_infos"] = doc_infos
 
             if call_id:
                 pending_by_id[call_id] = meta
             else:
                 pending_unid.append(meta)
+
+        if entry.get("type") == "SYSTEM_MESSAGE":
+            sys_txt = str(entry.get("content") or "")
+            sender = str(entry.get("sender") or entry.get("from") or "").strip()
+            matched_agent = next(
+                (aid for aid in pending_review_agents if aid == sender or aid in sys_txt),
+                None,
+            )
+            if matched_agent is not None:
+                if (
+                    not _NONZERO_EXIT_RE.search(sys_txt)
+                    and not _TOOL_DENIED_OR_ERR_RE.search(sys_txt)
+                    and (
+                        bool(user_words._extract_agy_subagent_return_body(sys_txt)[1])
+                        or bool(re.search(r"finished|completed|完成", sys_txt, re.I))
+                    )
+                ):
+                    result_seq += 1
+                    verified_review_seq = result_seq
+                pending_review_agents.discard(matched_agent)
+                continue
+            matched_task = next(
+                (
+                    tid
+                    for tid in pending_review_tasks
+                    if tid == sender
+                    or re.search(rf"(?<![A-Za-z0-9_-]){re.escape(tid)}(?![A-Za-z0-9_-])", sys_txt)
+                ),
+                None,
+            )
+            if matched_task is not None:
+                is_g_task = pending_review_tasks.pop(matched_task)
+                if is_g_task:
+                    if _grounding_result_verifies_docs(sys_txt, bool(_NONZERO_EXIT_RE.search(sys_txt)), large_doc_writes):
+                        result_seq += 1
+                        verified_review_seq = result_seq
+                elif (
+                    re.search(r"finished|completed|exited\s+with\s+code\s+0|完成", sys_txt, re.I)
+                    and not _NONZERO_EXIT_RE.search(sys_txt)
+                    and not _TOOL_DENIED_OR_ERR_RE.search(sys_txt)
+                    and not re.search(r"\b(?:failed|timed\s*out|killed)\b", sys_txt, re.I)
+                ):
+                    result_seq += 1
+                    verified_review_seq = result_seq
+            continue
 
         if entry.get("type") in ("GENERIC", "TOOL_RESULT", "TOOL_RESPONSE"):
             result = entry.get("tool_result")
@@ -1518,10 +1655,11 @@ def _check_turn_evidence_locked(
     decision: str,
     *,
     client: str = "antigravity",
+    defer_deliverable_review: bool = False,
 ) -> Optional[Tuple[str, Dict[str, Any]]]:
     """统一执行三端回合实证核验（单次扫描，每回合至多拦截一次）：零探测否定、局部排查全称缺口、长文单端免审。"""
     record = state["turns"][turn_key]
-    if record["blockedSignatures"]:
+    if _has_terminal_block_sig(record["blockedSignatures"]):
         return None
     raw_path = payload.get("transcriptPath") or payload.get("transcript_path")
     if not raw_path:
@@ -1573,7 +1711,7 @@ def _check_turn_evidence_locked(
         return "partial_scope_verdict", {"decision": decision, "reason": reason}
 
     # Gate C: 单端整篇写入正式长文（.tex / .md / .rst）却无覆盖当前交付的独立复核记录且未标明初稿待审
-    if (ev["large_doc_writes"] and not ev["has_independent_review"]
+    if (not defer_deliverable_review and ev["large_doc_writes"] and not ev["has_independent_review"]
             and not _UNREVIEWED_DISCLOSURE_RE.search(plain)):
         if _heavy_report_blocked(state_file.parent, sid, turn_key, payload):
             return None
@@ -1697,10 +1835,13 @@ def _handle_stop_locked(payload: Dict[str, Any], state_dir: Path, conversation_i
         },
     )
 
+    # 后台任务或子代理尚未全部空闲（fullyIdle=False）时，仅推迟 Gate C 长文交付自审提醒，
+    # 虚假测试“全过”宣称、零探测否定结论与局部全称缺口定论依然即时拦截。
     if correction := _check_test_suite_locked(payload, latest_reply, state_file, state, conversation_id, turn_key, "continue"):
         return correction
     if ev_hit := _check_turn_evidence_locked(
-        payload, latest_reply, state_file, state, conversation_id, turn_key, "continue", client="antigravity",
+        payload, latest_reply, state_file, state, conversation_id, turn_key, "continue",
+        client="antigravity", defer_deliverable_review=(payload.get("fullyIdle") is False),
     ):
         ev_kind, ev_resp = ev_hit
         log_event("Stop:reply_repeat_guard", conversation_id, f"BLOCKED {ev_kind} in {turn_key}")
@@ -1744,7 +1885,7 @@ def _handle_stop_locked(payload: Dict[str, Any], state_dir: Path, conversation_i
 
     # fullyIdle=false 仍可能需要交接，也允许单次防重复提醒。它只表示存在后台任务。
     if count >= CONSECUTIVE_WAIT_LIMIT and not blocked_sigs and not _heavy_report_blocked(state_dir, conversation_id, turn_key, payload):
-        blocked_sigs.append(sig)
+        blocked_sigs.append(f"wait:{sig}")
         _save_repeat_state(state_file, state, conversation_id)
         log_event(
             "Stop:reply_repeat_guard",
@@ -2062,7 +2203,7 @@ def handle_claude_stop_repeat_guard(payload: Dict[str, Any], state_dir: Optional
             block = (record["consecutiveShortWaitCount"] >= CONSECUTIVE_WAIT_LIMIT and not record["blockedSignatures"]
                      and not _heavy_report_blocked(state_dir, sid, turn_key, payload))
             if block:
-                record["blockedSignatures"].append(hashlib.sha256(record["lastNormalizedReply"].encode("utf-8")).hexdigest()[:16])
+                record["blockedSignatures"].append("wait:" + hashlib.sha256(record["lastNormalizedReply"].encode("utf-8")).hexdigest()[:16])
             _save_repeat_state(state_file, state, sid)
             if block:
                 user_words.append_jsonl_log(logs_dir / "lifecycle.log", {

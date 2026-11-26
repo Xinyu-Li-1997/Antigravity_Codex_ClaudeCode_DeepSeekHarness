@@ -226,13 +226,19 @@ def _repo_meta(repo_root: Path) -> Dict[str, str]:
     skill_sha256 = hashlib.sha256(skill_md.read_bytes()).hexdigest() if skill_md.is_file() else ""
     profile_sha256 = hashlib.sha256(profile_json.read_bytes()).hexdigest() if profile_json.is_file() else ""
     core_digest = hashlib.sha256()
-    for rel in (
+    core_paths = [
         "install.py",
         "template/user-guard/plugin.json",
         "template/user-guard/skills/fleet-evolve/SKILL.md",
         "template/user-guard/skills/cae-harness/fleet_profile.json",
         "template/user-guard/skills/cae-harness/scripts/cae_harness.py",
-    ):
+    ]
+    harness_pkg = repo_root / "template" / "user-guard" / "skills" / "cae-harness" / "scripts" / "_harness"
+    if harness_pkg.is_dir():
+        for sub_py in sorted(harness_pkg.glob("*.py")):
+            if sub_py.is_file() and not _is_reparse_or_symlink(sub_py):
+                core_paths.append(sub_py.relative_to(repo_root).as_posix())
+    for rel in core_paths:
         target = repo_root / rel
         core_digest.update(rel.encode("utf-8") + b"\0")
         if target.is_file():

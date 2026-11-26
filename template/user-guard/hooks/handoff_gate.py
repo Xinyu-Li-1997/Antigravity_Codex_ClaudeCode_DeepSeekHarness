@@ -518,17 +518,7 @@ def _strip_token_quotes(tok: str) -> str:
     return s
 
 
-def _unquote_split_string_payload(inner: str) -> str:
-    """剥离 Windows shlex(posix=False) 拆解 --split-string="..." 后残留的外层成对引号。"""
-    s = inner.strip()
-    if len(s) >= 2 and s[0] in ("'", '"'):
-        q = s[0]
-        if s[-1] == q:
-            return _strip_token_quotes(s)
-        end = s.find(q, 1)
-        if end != -1:
-            return _strip_token_quotes(s[: end + 1]) + s[end + 1 :]
-    return s
+_unquote_split_string_payload = _shell_lex.unquote_split_string_payload
 
 
 _ENCODED_CMD_BLOCKED_SENTINEL = "\x00__BLOCKED_ENCODED_COMMAND__"
@@ -543,16 +533,6 @@ def _unwrap_clause_or_shell(tokens: List[str]) -> Tuple[List[str], Optional[str]
         head_name = Path(head_raw.replace("\\", "/")).name.lower()
         if head_raw == "&":
             idx += 1
-            continue
-        if head_name == "command":
-            idx += 1
-            while idx < n and _strip_token_quotes(tokens[idx]).startswith("-"):
-                fl = _strip_token_quotes(tokens[idx])
-                idx += 1
-                if fl == "--":
-                    break
-                if fl in ("-v", "-V") or (not fl.startswith("--") and any(c in fl[1:] for c in ("v", "V"))):
-                    return [], None
             continue
         if head_name == "env":
             idx += 1
@@ -574,68 +554,16 @@ def _unwrap_clause_or_shell(tokens: List[str]) -> Tuple[List[str], Optional[str]
                 if fl in ("-u", "--unset", "-C", "--chdir") and idx < n:
                     idx += 1
             continue
-        if head_name == "nohup":
-            idx += 1
-            continue
-        if head_name == "nice":
-            idx += 1
-            while idx < n and _strip_token_quotes(tokens[idx]).startswith("-"):
-                fl = _strip_token_quotes(tokens[idx])
-                idx += 1
-                if fl == "--":
-                    break
-                if fl in ("-n", "--adjustment") and idx < n:
-                    idx += 1
-            continue
-        if head_name == "uv" and idx + 1 < n:
-            j = idx + 1
-            while j < n and _strip_token_quotes(tokens[j]).startswith("-"):
-                j += 2 if _strip_token_quotes(tokens[j]) in ("--directory", "--project", "--config-file") and j + 1 < n else 1
-            if j < n and _strip_token_quotes(tokens[j]).lower() == "run":
-                j += 1
-                uv_vals = ("--python", "-p", "--with", "--with-editable", "--with-requirements",
-                           "--directory", "--project", "--env-file", "--package")
-                while j < n and _strip_token_quotes(tokens[j]).startswith("-"):
-                    fl = _strip_token_quotes(tokens[j])
-                    j += 1
-                    if fl == "--":
-                        break
-                    if fl in uv_vals and j < n:
-                        j += 1
-                idx = j
-                continue
-        if head_name == "sudo":
-            idx += 1
-            while idx < n and _strip_token_quotes(tokens[idx]).startswith("-"):
-                fl = _strip_token_quotes(tokens[idx])
-                idx += 1
-                if fl == "--":
-                    break
-                if fl in ("-u", "--user", "-g", "--group", "-h", "--host", "-p", "--prompt", "-r", "--role", "-t", "--type", "-C", "--close-from", "-T", "--command-timeout", "-D", "--chdir", "-R", "--chroot") and idx < n:
-                    idx += 1
-            continue
         if "=" in head_raw and not head_raw.startswith("-") and "/" not in head_raw and "\\" not in head_raw:
             idx += 1
             continue
-        if head_name in ("timeout", "timeout.exe"):
-            idx += 1
-            while idx < n and _strip_token_quotes(tokens[idx]).startswith("-"):
-                flag_t = _strip_token_quotes(tokens[idx])
-                idx += 1
-                if flag_t in ("-k", "--kill-after", "-s", "--signal") and idx < n:
-                    idx += 1
-            if idx < n:
-                idx += 1
-            continue
-        if head_name in SUBSYSTEM_WRAPPERS:
-            idx += 1
-            while idx < n and _strip_token_quotes(tokens[idx]).startswith("-"):
-                flag = _strip_token_quotes(tokens[idx])
-                idx += 1
-                if flag in ("--", "-e", "--exec"):
-                    break
-                if flag in ("-d", "--distribution", "-u", "--user", "--cd") and idx < n:
-                    idx += 1
+        wrapped = _shell_lex.consume_leading_wrapper(
+            tokens, idx, unquote=_strip_token_quotes, allow_subsystem=True, allow_exec=True,
+        )
+        if wrapped is not None:
+            if wrapped["lookup_only"]:
+                return [], None
+            idx = wrapped["next_idx"]
             continue
         if head_name in SHELL_WRAPPERS:
             shell_idx = idx

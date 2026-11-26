@@ -3068,6 +3068,12 @@ raise SystemExit(module.main(sys.argv[3:]))
             (fake_repo / "template" / "user-guard" / "skills" / "fleet-evolve" / "SKILL.md").write_text("# Skill\n", encoding="utf-8")
             (fake_repo / "template" / "user-guard" / "skills" / "cae-harness" / "fleet_profile.json").write_bytes(profile_path.read_bytes())
             (fake_repo / "template" / "user-guard" / "skills" / "cae-harness" / "scripts" / "cae_harness.py").write_bytes(harness_py.read_bytes())
+            src_harness_pkg = harness_py.parent / "_harness"
+            if src_harness_pkg.is_dir():
+                dst_harness_pkg = fake_repo / "template" / "user-guard" / "skills" / "cae-harness" / "scripts" / "_harness"
+                dst_harness_pkg.mkdir(parents=True, exist_ok=True)
+                for sub_f in src_harness_pkg.glob("*.py"):
+                    (dst_harness_pkg / sub_f.name).write_bytes(sub_f.read_bytes())
             (fake_repo / "README.md").write_text(
                 "# 说明\n\n面向流体求解器、CAM 刀轨规划与曲面求交。\n",
                 encoding="utf-8",

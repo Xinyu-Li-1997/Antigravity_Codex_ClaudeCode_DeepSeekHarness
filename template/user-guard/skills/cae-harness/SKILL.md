@@ -40,7 +40,7 @@ description: >
 外部无头调用自动补齐声明窗口、防分页环境变量、分后端只读内联、自适应快照与脱敏，由脚本机械执行：
 - **精确输入信封**：用 `--files <相对路径>`（流字段 `files`）显式声明必读文件，用 `--negative-scope-file`（`negative_scope_files`）与 `env_contract` 声明禁止越界范围与环境约定。超声明窗口时默认报 `over_context_window` 并给出 `suggested_shards`（确需抽查加 `--allow-over-budget`）。
 - **默认持久化与 `followup` 续接**：按 `persist_sessions_by_default` 默认持久化（`--ephemeral` 关闭），会话归档至 `<plan_dir>/headless_sessions/`。复核存疑或从超时断点续查时运行 `followup --receipt <回执.json> [--stream <流号>] [--effort <挡位>] --task "<追问>"`；续接超时回执未指定挡位时自动按 `followup_default_effort` 降挡，若原回执标记 `resumable: false` 则阻断并提示分片重开。
-- **双层超时抢救与引用核验**：持久化开启且 `timeout >= 120 s` 时，到达 `soft_timeout_ratio` 自动降挡向独立 `result_wrapup.json` 紧凑只读收口；硬超时如实保留总时长、部分 Token 与 `timeout_salvage`。只读回执自动产出 `citation_audit`（核验引用文件存在性、行数上限与是否真实打开），供主会话按 R6 复核。
+- **超时抢救与引用核验**：Codex、Claude Code 与 DSH 在持久化开启且 `timeout >= 120 s` 时，到达 `soft_timeout_ratio` 自动降挡向独立 `result_wrapup.json` 紧凑只读收口。`agy` 因 `--print-timeout` 不取消后台回合，不预扣收口预算而是将完整 `timeout` 交给主回合，超时后标记 `resumable: false` 防误续接。硬超时均保留总时长、部分 Token 与 `timeout_salvage`，只读回执自动产出 `citation_audit` 供主会话按 R6 复核。
 
 ## 两道可用性检查与全通道确认单
 

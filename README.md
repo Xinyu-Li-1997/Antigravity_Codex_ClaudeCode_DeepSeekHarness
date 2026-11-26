@@ -107,6 +107,7 @@
 | **日常研发：协作分工、大型仓库分片阅读、Euler HLLC 求解器闭环示例与 L1–L4 证据矩阵** | [日常工作流指南](docs/workflow-guide.md) |
 | **原理与运维：模块架构、四阶段钩子细节、配置键、预算公式、本地路由、体检建议与精确卸载** | [架构设计与钩子说明](docs/architecture-and-hooks.md) |
 | **脚本命令与完整参数规范** | [cae-harness 技能规程](template/user-guard/skills/cae-harness/SKILL.md) |
+| **按需学术写作与改稿指南（论文、专著、科研报告与审稿回复）** | [cae-writing 写作规范](template/user-guard/skills/cae-writing/SKILL.md) |
 | **上游维护流程：四维评估、审批门禁与多客户端及跨环境同步** | [fleet-evolve 维护规程](template/user-guard/skills/fleet-evolve/SKILL.md) · [仓库维护说明](AGENTS.md) |
 | **插件目录索引、版本演进与时间戳凭证** | [插件模板索引](template/user-guard/README.md) · [更新日志](CHANGELOG.md) · [时间戳与 DOI 说明](.timestamps/README.md) |
 
@@ -120,7 +121,7 @@ Antigravity_Codex_ClaudeCode_DeepSeekHarness/
 ├── install.py, install.ps1, install.sh    # 跨平台安装同步、配置体检、Windows 与 WSL2 对齐及 ABI 检查
 ├── docs/                                  # 日常工作流指南、架构与钩子说明及 3 张 SVG 流程图
 ├── template/
-│   ├── user-guard/                        # 共用规则 (R0–R11)、钩子库、只读代理、动态配置与双技能
+│   ├── user-guard/                        # 共用规则 (R0–R11)、钩子库、只读代理、动态配置与三项技能
 │   ├── codex/                             # Codex 事件钩子与只读子代理模板
 │   └── claude/                            # Claude Code 事件钩子、只读代理与本地路由及配置切换脚本
 └── tests/                                 # 多平台安装、钩子守卫、调度器与文档规范离线测试套件
