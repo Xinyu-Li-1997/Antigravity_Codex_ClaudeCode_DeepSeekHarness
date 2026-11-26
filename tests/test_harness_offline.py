@@ -8499,6 +8499,44 @@ else:
         self.assertEqual(by_id['A']['status'], 'scope_violation')
         self.assertIn('b.txt', by_id['A']['scope_violations'])
 
+    def test_v205_cmd_batch_staggers_concurrent_agy_wave_launches(self):
+        """v2.0.5: 同波次多个 agy 流启动按 _AGY_BATCH_LAUNCH_STAGGER_SEC 轻微错峰，codex 与 dry_run 不受影响。"""
+        proj = self.root / 'v205_stagger_proj'
+        proj.mkdir()
+        (proj / 'a.txt').write_text('ok', encoding='utf-8')
+        spec_agy = self.root / 'v205_agy_wave.json'
+        spec_agy.write_text(json.dumps([
+            {'stream_id': 'S1', 'wave': 1, 'kind': 'review', 'engine': 'agy:review', 'target': str(proj), 'subtask': '审 1'},
+            {'stream_id': 'S2', 'wave': 1, 'kind': 'review', 'engine': 'agy:review', 'target': str(proj), 'subtask': '审 2'},
+            {'stream_id': 'S3', 'wave': 1, 'kind': 'review', 'engine': 'codex:review', 'target': str(proj), 'subtask': '审 3'},
+            {'stream_id': 'S4', 'wave': 1, 'kind': 'review', 'engine': 'codex:review', 'target': str(proj), 'subtask': '审 4'},
+        ], ensure_ascii=False), encoding='utf-8')
+
+        sleep_calls = []
+
+        def fake_invoke(spec, *a, **kw):
+            rec = kw.get('receipt')
+            if isinstance(rec, dict):
+                rec['launch_attempted'] = True
+            return {'summary': 'ok', 'content': 'ok', 'evidence': [], 'unverified': []}
+
+        with patch.object(harness, '_args_backends', return_value=self.four_backends()), \
+             patch.object(harness, 'invoke_engine', side_effect=fake_invoke), \
+             patch.object(harness, '_AGY_BATCH_LAUNCH_STAGGER_SEC', 0.25), \
+             patch.object(harness.time, 'sleep', side_effect=lambda sec: sleep_calls.append(sec)):
+            rc, rep = self.capture(harness.cmd_batch, self.args('batch', '--spec-file', str(spec_agy)))
+            self.assertEqual(rc, 0)
+            self.assertEqual(rep['status'], 'ok')
+            # 两个同波次 agy 流应触发 1 次约 0.25s 错峰等待，codex 流不触发
+            self.assertEqual(len(sleep_calls), 1)
+            self.assertGreater(sleep_calls[0], 0.0)
+            self.assertLessEqual(sleep_calls[0], 0.30)
+
+            sleep_calls.clear()
+            rc_dry, _ = self.capture(harness.cmd_batch, self.args('batch', '--spec-file', str(spec_agy), '--dry-run'))
+            self.assertEqual(rc_dry, 0)
+            self.assertEqual(sleep_calls, [])
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

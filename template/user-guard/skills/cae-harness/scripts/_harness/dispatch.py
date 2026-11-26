@@ -5,6 +5,9 @@
 # ════════════════════════════════════════════════════════════════════════════
 
 
+_AGY_BATCH_LAUNCH_STAGGER_SEC = 1.5
+
+
 def run_physics_gate_loop(target_dir, task_desc, verify_cmd, worker_fn, verify_fn=None, max_rounds=3,
                           caller='caller', timeout_sec=600, write_scope=None):
     if not str(verify_cmd).strip():
@@ -3300,8 +3303,26 @@ def cmd_batch(args):
         groups.setdefault(_engine_parts(stream['engine'])[0], []).append((index, stream))
     def run_backend(item):
         prefix, group = item
+        stagger = _AGY_BATCH_LAUNCH_STAGGER_SEC if (prefix == 'agy' and not args.dry_run and len(group) > 1) else 0.0
+        stagger_lock = threading.Lock()
+        next_launch_at = [0.0]
+
+        def run_paced(stream):
+            if stagger > 0.0:
+                delay = 0.0
+                with stagger_lock:
+                    now = time.monotonic()
+                    if next_launch_at[0] > now:
+                        delay = next_launch_at[0] - now
+                        next_launch_at[0] += stagger
+                    else:
+                        next_launch_at[0] = now + stagger
+                if delay > 0.0:
+                    time.sleep(delay)
+            return run(stream)
+
         with concurrent.futures.ThreadPoolExecutor(max_workers=_positive_int(limits.get(prefix)) or 2) as pool:
-            return list(zip((index for index, _ in group), pool.map(run, (stream for _, stream in group))))
+            return list(zip((index for index, _ in group), pool.map(run_paced, (stream for _, stream in group))))
     results = [None] * len(streams)
     for _, groups in sorted(waves.items()):
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(groups)) as pool:

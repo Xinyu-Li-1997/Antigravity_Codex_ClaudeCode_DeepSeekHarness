@@ -4661,6 +4661,97 @@ class TestDispatchAndBillingGuards(unittest.TestCase):
         self.assertEqual(res_gate_c["decision"], "continue")
         self.assertIn("长文交付自审提醒", res_gate_c.get("reason", ""))
 
+    def test_v205_ast_kwargs_bound_path_parent_and_pure_fn_budget(self):
+        """v2.0.5: 回归位置/单键已绑定实参不被 **kwargs 误污染、Path.parent 词法求值与纯只读函数免重复展开。"""
+        proj = self.project.parent / "proj_v205"
+        proj.mkdir(parents=True, exist_ok=True)
+        allowed_norm = [status_guard._normalize_cross_env_lexical(str(proj), from_shell=False)]
+        allowed_res = [status_guard._normalize_cross_env_lexical(str(proj.resolve()), from_shell=False)]
+
+        def scan(code: str):
+            return status_guard._scan_inline_python_code(
+                code, str(proj), allowed_norm, allowed_res, allow_os_temp=True
+            )
+
+        # 1) np.savez_compressed(DATA_DIR / "out.npz", **payload) 位置绑定第 0 参不被 **payload 误报
+        self.assertIsNone(scan(
+            "import numpy as np\n"
+            "from pathlib import Path\n"
+            "DATA_DIR = Path('data')\n"
+            "payload = {'u': [1, 2]}\n"
+            "np.savez_compressed(DATA_DIR / 'snell.npz', **payload)\n"
+            "np.savez_compressed(file=DATA_DIR / 'snell2.npz', **payload)\n"
+        ))
+        # 但未绑定位置/精确键的 **payload、前导 *args、项目外目标或 open(**kw) 的未知 mode 仍必须拦截
+        self.assertIsNotNone(scan("import numpy as np\npayload = {'a': 1}\nnp.savez_compressed(**payload)\n"))
+        self.assertIsNotNone(scan("import numpy as np\nargs = []\nnp.savez_compressed(*args, 'data/a.npz')\n"))
+        self.assertIsNotNone(scan("import numpy as np\npayload = {'a': 1}\nnp.savez_compressed('../escape.npz', **payload)\n"))
+        self.assertIsNone(scan("open('../outside_ro.txt', 'r')\n"))
+        self.assertIsNotNone(scan("kw = {'mode': 'w'}\nopen('../outside_ro.txt', **kw)\n"))
+
+        # 2) Path.parent 词法求值：项目内路径 mkdir 放行，越界/逃逸/`.`/temp 父目录仍拦截
+        self.assertIsNone(scan(
+            "from pathlib import Path\n"
+            "dst = Path('skills/cae-writing/SKILL.md')\n"
+            "dst.parent.mkdir(parents=True, exist_ok=True)\n"
+            "dst.parent.parent.mkdir(parents=True, exist_ok=True)\n"
+        ))
+        self.assertIsNone(scan(
+            "import tempfile\n"
+            "from pathlib import Path\n"
+            "p = Path(tempfile.gettempdir()) / 'sub' / 'item.txt'\n"
+            "p.parent.mkdir(parents=True, exist_ok=True)\n"
+        ))
+        self.assertIsNotNone(scan("from pathlib import Path\nPath('../outside/file.txt').parent.mkdir(parents=True, exist_ok=True)\n"))
+        self.assertIsNotNone(scan("from pathlib import Path\nPath('.').resolve().parent.mkdir(exist_ok=True)\n"))
+        self.assertIsNotNone(scan("from pathlib import Path\nPath('~').expanduser().parent.mkdir(exist_ok=True)\n"))
+        self.assertIsNotNone(scan("import tempfile\nfrom pathlib import Path\nPath(tempfile.gettempdir()).parent.mkdir(exist_ok=True)\n"))
+
+        # 3) 大型纯只读数值计算函数多次调用不触发 <AST_BUDGET_LIMIT>
+        math_lines = ["import numpy as np", "from solver_pkg.core import eval_flux", "def pure_kernel(x):"]
+        for i in range(180):
+            math_lines.append(f"    v{i} = np.maximum(x + {i}, 0.0)")
+        math_lines.append("    return eval_flux(v0, v179)")
+        math_lines.append("def run_variant(cfg):")
+        math_lines.append("    def step(u):")
+        math_lines.append("        return pure_kernel(u) + pure_kernel(u) + pure_kernel(u)")
+        math_lines.append("    return step(cfg)")
+        for i in range(15):
+            math_lines.append(f"print(run_variant({i}))")
+        self.assertIsNone(scan("\n".join(math_lines)))
+
+        # 对抗绕过：回调传 open / 类方法写入 / 间接调用写函数 / 前向引用写函数均必须继续拦截
+        self.assertIsNotNone(scan(
+            "def call_cb(cb, p):\n"
+            "    return cb(p, 'w')\n"
+            "call_cb(open, '../escape.txt')\n"
+        ))
+        self.assertIsNotNone(scan(
+            "from pathlib import Path\n"
+            "class Writer:\n"
+            "    def go(self, p):\n"
+            "        Path(p).write_text('x')\n"
+            "def invoke_obj(obj, p):\n"
+            "    obj.go(p)\n"
+            "invoke_obj(Writer(), '../escape.txt')\n"
+        ))
+        self.assertIsNotNone(scan(
+            "from pathlib import Path\n"
+            "def inner_write(p):\n"
+            "    Path(p).write_text('x')\n"
+            "def outer(p):\n"
+            "    inner_write(p)\n"
+            "outer('../escape.txt')\n"
+        ))
+        self.assertIsNotNone(scan(
+            "from pathlib import Path\n"
+            "def fwd(p):\n"
+            "    late_write(p)\n"
+            "def late_write(p):\n"
+            "    Path(p).write_text('x')\n"
+            "fwd('../escape.txt')\n"
+        ))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -2,6 +2,19 @@
 
 本文件记录四客户端共用规则、会话钩子、后台验证工具与上游维护流程的版本演进。当前插件版本以 `template/user-guard/plugin.json` 为准；常驻使用文档只说明机制和配置键，不重复维护版本号与性能日期。
 
+## [2.0.5] - 2026-11-26
+
+修复真实跨端科研会话中暴露的三处 `status_guard.py` Python AST 静态边界误报，并为同波次并发 `agy` 无头子进程增加轻量错峰启动：
+
+- **Python AST 目录边界误报修复（`template/user-guard/hooks/status_guard.py`、`tests/test_guards_offline.py`）**：
+  - 修复 `_ast_call_arg_candidates` 对 `numpy.savez` 与 `numpy.savez_compressed` 数组字典解包（`**kwds`）的过度保守判定：当第 0 参目标路径已由无前导 `*args` 的位置实参或 `file=` 明确绑定时（如 `np.savez_compressed(DATA_DIR / "out.npz", **payload)`），不再误判为 `<DYNAMIC_UNRESOLVED>`；同时对含 `dir_fd`/`opener` 风险的 `os.*`/`open` 解包与未绑定目标保持严格拦截；
+  - 在 `_eval_ast_path_candidates` 中补齐 `Path.parent` 的静态词法求值（含 `_AstTempPath` 越界退化保护，拒绝含 `..`、`.` 与 `~` 的折叠），解决 `dst.parent.mkdir(parents=True, exist_ok=True)` 对项目内静态路径的误报；
+  - 在 `_iter_ast_calls_in_order` 中引入单遍符号统计与两层纯只读函数判定：对不含写/子进程/动态执行/可写回调及全局状态修改的纯数值计算函数跳过调用点重复展开，避免高频调用的大型科学计算脚本触碰 `<AST_BUDGET_LIMIT>`，同时对回调传入、类方法写入与前向引用写函数保持零绕过拦截。
+- **同波次 `agy` 无头并发轻量错峰（`template/user-guard/skills/cae-harness/scripts/_harness/dispatch.py`、`tests/test_harness_offline.py`）**：
+  - 在 `cmd_batch` 的 `agy` 后端线程池中新增 `1.5 s` 启动错峰节拍（`_AGY_BATCH_LAUNCH_STAGGER_SEC`，仅作用于同波次多流非 `--dry-run` 调用），避免多个 `agy` 进程毫秒级同时冷启动竞争共享状态目录导致空会话编号错误。
+
+---
+
 ## [2.0.4] - 2026-11-26
 
 围绕真实双端对话中暴露的钩子误判与超时损耗完成系统性机制修复，将单体 `cae_harness.py` 按职责拆分为内部子包 `_harness/`，并新增独立按需学术写作技能 `cae-writing`（零新增常驻硬钩子）：

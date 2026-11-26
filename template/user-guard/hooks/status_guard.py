@@ -33,7 +33,7 @@ import sys
 import tempfile
 import time
 import traceback
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Dict, List, Optional, Tuple
 
 HOOKS_DIR = Path(__file__).resolve().parent
@@ -1420,6 +1420,17 @@ _AST_WRITE_CALL_ARGS = {
     "shutil.unpack_archive": ((1, ("extract_dir",)),),
     "logging.FileHandler": ((0, ("filename",)),),
 }
+_AST_CHECKED_ATTRS = frozenset(
+    {
+        "open", "write_text", "write_bytes", "unlink", "rmdir", "mkdir", "touch",
+        "symlink_to", "hardlink_to", "chmod", "lchmod", "rename", "replace",
+        "extractall", "extract", "savefig", "to_csv", "to_parquet", "to_excel",
+        "to_feather", "to_pickle",
+        "update", "setdefault", "pop", "popitem", "clear",
+    }
+    | {name for names in _AST_MODULE_CALLS.values() for name in names}
+)
+_AST_UNSAFE_BUILTIN_CALLS = frozenset({"open", "exec", "eval", "getattr", "__import__"})
 
 
 class _AstModule:
@@ -1523,17 +1534,23 @@ def _ast_call_qualnames(fn, bindings):
     return names
 
 
-def _ast_call_arg_candidates(node, index, keywords, bindings, default=_AST_DYNAMIC):
-    """合并位置与关键字实参；影响该参数位置的解包及未知关键字均保留动态候选。"""
+def _ast_call_arg_candidates(node, index, keywords, bindings, default=_AST_DYNAMIC, allow_bound_kw_unpack=False):
+    """合并位置与关键字实参；默认对解包保守补入动态候选，仅对不含 dir_fd/opener 的受控 API 在实参已明确绑定时放行 **kwargs。"""
     values = set()
-    if len(node.args) > index and not isinstance(node.args[index], ast.Starred):
+    has_prior_star = any(isinstance(arg, ast.Starred) for arg in node.args[:index + 1])
+    pos_bound = len(node.args) > index and not has_prior_star
+    if pos_bound:
         values.update(_eval_ast_path_candidates(node.args[index], bindings))
+    kw_bound = False
     for kw in node.keywords:
         if kw.arg in keywords:
             values.update(_eval_ast_path_candidates(kw.value, bindings))
+            if kw.arg == keywords[0]:
+                kw_bound = True
     if not values:
         values.update(_ast_values(default))
-    if any(isinstance(arg, ast.Starred) for arg in node.args[:index + 1]) or any(kw.arg is None for kw in node.keywords):
+    has_kw_unpack = any(kw.arg is None for kw in node.keywords)
+    if has_prior_star or (has_kw_unpack and not (allow_bound_kw_unpack and (pos_bound or kw_bound))):
         values.add(_AST_DYNAMIC)
     return frozenset(values)
 
@@ -1549,6 +1566,25 @@ def _ast_temp_path_candidates(node, name, bindings):
         return frozenset((_AST_DYNAMIC,)) if node.args or node.keywords else frozenset((_AstTempPath(tempfile.gettempdir()),))
     parents = _ast_call_arg_candidates(node, _AST_TEMP_DIR_INDEX[name], ("dir",), bindings, None)
     return frozenset(_AstTempPath(tempfile.gettempdir()) if parent is None else parent for parent in parents)
+
+
+def _ast_lexical_parent(raw: str) -> Optional[str]:
+    """对不含 '..' 且非当前/宿主根占位的静态路径求词法父目录；其余情况返回 None 交由动态守卫拦截。"""
+    if not raw or any(ch in raw for ch in ("\x00", "$", "%")):
+        return None
+    cleaned = raw.strip()
+    if not cleaned or cleaned in (".", "..", "~") or cleaned.rstrip("/\\") == "~":
+        return None
+    segs = [s for s in cleaned.replace("\\", "/").split("/") if s]
+    if not segs or all(s == "." for s in segs) or any(s == ".." for s in segs):
+        return None
+    if re.match(r"^[A-Za-z]:", cleaned) or cleaned.startswith("\\\\") or "\\" in cleaned:
+        parent = str(PureWindowsPath(cleaned).parent)
+    else:
+        parent = str(PurePosixPath(cleaned).parent)
+    if parent == cleaned and cleaned not in ("/", "\\") and not re.match(r"^[A-Za-z]:[/\\]?$", cleaned):
+        return None
+    return parent
 
 
 def _eval_ast_path_candidates(node, bindings):
@@ -1576,6 +1612,23 @@ def _eval_ast_path_candidates(node, bindings):
         owners = _eval_ast_path_candidates(node.value, bindings)
         if node.attr in ("name", "stem") and owners and all(isinstance(o, str) for o in owners):
             return frozenset((_AstSafeSegment("__ast_safe_seg__"),))
+        if node.attr == "parent" and owners and all(
+            isinstance(o, str) and not isinstance(o, (_AstSubtree, _AstSafeSegment)) for o in owners
+        ):
+            parents = set()
+            for o in owners:
+                parent_str = _ast_lexical_parent(o)
+                if parent_str is None:
+                    parents.add(_AST_DYNAMIC)
+                elif isinstance(o, _AstTempPath):
+                    root = _normalize_cross_env_lexical(tempfile.gettempdir())
+                    if _is_under_norm_key(_normalize_cross_env_lexical(parent_str), root):
+                        parents.add(_AstTempPath(parent_str))
+                    else:
+                        parents.add(parent_str)
+                else:
+                    parents.add(parent_str)
+            return frozenset(parents) or dynamic
         attr_vals = set()
         for owner in owners:
             if isinstance(owner, _AstModule):
@@ -1868,14 +1921,143 @@ def _merge_ast_bindings(bindings, alternatives):
         )
 
 
-def _iter_ast_calls_in_order(node, bindings, active=(), budget=None):
-    """按求值顺序遍历；分支保守合并，函数按每次调用时的绑定重新审查。"""
+def _collect_ast_tree_ctx(tree: ast.AST) -> Dict[str, Any]:
+    """单遍统计整棵 AST 的类方法名、符号绑定次数及安全外部导入，用于判定纯只读函数。"""
+    class_methods = set()
+    assign_counts: Dict[str, int] = {}
+    safe_ext_imports = set()
+    unsafe_imports = set()
+
+    def _bump(name: str) -> None:
+        if name:
+            assign_counts[name] = assign_counts.get(name, 0) + 1
+
+    for sub in ast.walk(tree):
+        if isinstance(sub, ast.ClassDef):
+            _bump(sub.name)
+            for stmt in sub.body:
+                if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    class_methods.add(stmt.name)
+                elif isinstance(stmt, ast.Assign):
+                    for tgt in stmt.targets:
+                        if isinstance(tgt, ast.Name):
+                            class_methods.add(tgt.id)
+        elif isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            _bump(sub.name)
+        elif isinstance(sub, ast.Name) and isinstance(sub.ctx, (ast.Store, ast.Del)):
+            _bump(sub.id)
+        elif isinstance(sub, ast.ExceptHandler) and sub.name:
+            _bump(sub.name)
+        elif isinstance(sub, ast.Import):
+            for alias in sub.names:
+                bound = alias.asname or alias.name.split(".", 1)[0]
+                _bump(bound)
+                if alias.name in _AST_MODULE_CALLS:
+                    unsafe_imports.add(bound)
+        elif isinstance(sub, ast.ImportFrom):
+            is_unsafe_mod = (sub.module in _AST_MODULE_CALLS) or any(a.name == "*" for a in sub.names)
+            for alias in sub.names:
+                if alias.name == "*":
+                    continue
+                bound = alias.asname or alias.name
+                _bump(bound)
+                if is_unsafe_mod:
+                    unsafe_imports.add(bound)
+                else:
+                    safe_ext_imports.add(bound)
+    return {
+        "class_methods": frozenset(class_methods),
+        "assign_counts": assign_counts,
+        "safe_ext_imports": frozenset(
+            n for n in safe_ext_imports if assign_counts.get(n, 0) == 1 and n not in unsafe_imports
+        ),
+    }
+
+
+def _iter_fn_shallow_nodes(fn_node: ast.AST):
+    """遍历函数自身语句及嵌套函数的装饰器/默认值，不重复深入已独立判定的嵌套函数体。"""
+    body_items = fn_node.body if isinstance(fn_node.body, list) else [fn_node.body]
+    stack = list(reversed(body_items))
+    while stack:
+        cur = stack.pop()
+        yield cur
+        if isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            for dec in getattr(cur, "decorator_list", ()):
+                stack.append(dec)
+            for val in list(cur.args.defaults) + [d for d in cur.args.kw_defaults if d is not None]:
+                stack.append(val)
+            continue
+        children = list(ast.iter_child_nodes(cur))
+        for child in reversed(children):
+            stack.append(child)
+
+
+def _is_ast_fn_pure_readonly(fn_node, local, tree_ctx, param_names) -> bool:
+    """判定函数体不含任何写/子进程/动态执行/可写回调或全局状态修改，可跳过调用点重复展开。"""
+    if getattr(fn_node, "_guard_globals", None):
+        return False
+    class_methods = tree_ctx["class_methods"]
+    assign_counts = tree_ctx["assign_counts"]
+    safe_ext_imports = tree_ctx["safe_ext_imports"]
+
+    for sub in _iter_fn_shallow_nodes(fn_node):
+        if isinstance(sub, ast.ImportFrom):
+            if sub.module in _AST_MODULE_CALLS or any(a.name == "*" for a in sub.names):
+                return False
+        elif isinstance(sub, ast.Import):
+            if any(a.name in _AST_MODULE_CALLS for a in sub.names):
+                return False
+        elif isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            if not getattr(sub, "_guard_pure_readonly", False):
+                return False
+        elif isinstance(sub, ast.ClassDef):
+            return False
+        elif isinstance(sub, ast.Call):
+            func = sub.func
+            if isinstance(func, ast.Attribute):
+                if func.attr in _AST_CHECKED_ATTRS or func.attr in class_methods:
+                    return False
+            elif isinstance(func, ast.Name):
+                fid = func.id
+                if fid in _AST_UNSAFE_BUILTIN_CALLS or fid in param_names:
+                    return False
+                if fid in local:
+                    cands = _ast_values(local[fid])
+                    if not cands or assign_counts.get(fid, 0) > 1 or not all(
+                        isinstance(c, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
+                        and getattr(c, "_guard_pure_readonly", False)
+                        for c in cands
+                    ):
+                        return False
+                elif assign_counts.get(fid, 0) > 0 and fid not in safe_ext_imports:
+                    return False
+            else:
+                return False
+    return True
+
+
+def _ast_arg_blocks_pure_skip(val) -> bool:
+    if isinstance(val, (_AstCallable, _AstClass, _AstBoundMethod, _AstDict)):
+        return True
+    if isinstance(val, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+        return not getattr(val, "_guard_pure_readonly", False)
+    if isinstance(val, tuple):
+        return any(_ast_arg_blocks_pure_skip(item) for item in val)
+    return False
+
+
+def _iter_ast_calls_in_order(node, bindings, active=(), budget=None, tree_ctx=None, enclosing_params=frozenset()):
+    """按求值顺序遍历；分支保守合并，纯只读函数跳过调用点重复展开，其余函数按实参重新审查。"""
     if budget is None:
         budget = [0, time.monotonic() + _AST_MAX_SCAN_SEC]
+    if tree_ctx is None:
+        tree_ctx = _collect_ast_tree_ctx(node)
     budget[0] += 1
     if budget[0] > _AST_MAX_VISITED_NODES or ((budget[0] & 0xFF) == 0 and time.monotonic() > budget[1]):
         raise _AstScanBudgetExceeded()
-    walk = lambda child, scope=bindings: _iter_ast_calls_in_order(child, scope, active, budget)
+    walk = lambda child, scope=bindings: _iter_ast_calls_in_order(
+        child, scope, active, budget, tree_ctx, enclosing_params
+    )
     if isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
         if node.value is not None:
             yield from walk(node.value)
@@ -1904,12 +2086,20 @@ def _iter_ast_calls_in_order(node, bindings, active=(), budget=None):
         if not isinstance(node, ast.Lambda):
             bindings[node.name] = frozenset((node,))
         # 定义时检查已知危险路径；未知形参留待调用点叠加实参后核验。
+        node._guard_pure_readonly = False
         local = _copy_ast_bindings(bindings)
         local[_AST_DEFINITION] = frozenset((True,))
         for arg in params:
             local[arg.arg] = node._guard_defaults.get(arg.arg, frozenset((_AST_DYNAMIC,)))
+        own_params = {arg.arg for arg in params}
+        if node.args.vararg:
+            own_params.add(node.args.vararg.arg)
+        if node.args.kwarg:
+            own_params.add(node.args.kwarg.arg)
+        fn_param_scope = enclosing_params | own_params
         for stmt in node.body if isinstance(node.body, list) else [node.body]:
-            yield from _iter_ast_calls_in_order(stmt, local, active + (node,), budget)
+            yield from _iter_ast_calls_in_order(stmt, local, active + (node,), budget, tree_ctx, fn_param_scope)
+        node._guard_pure_readonly = _is_ast_fn_pure_readonly(node, local, tree_ctx, fn_param_scope)
         return
     if isinstance(node, ast.ClassDef):
         for expr in list(node.decorator_list) + list(node.bases) + list(node.keywords):
@@ -2046,6 +2236,16 @@ def _iter_ast_calls_in_order(node, bindings, active=(), budget=None):
                     if isinstance(key, str):
                         bindings[key] = _ast_values(bindings[key]) | frozenset((_AST_DYNAMIC,))
                 continue
+            if (
+                getattr(function, "_guard_pure_readonly", False)
+                and bound_self is None
+                and not any(
+                    _ast_arg_blocks_pure_skip(v)
+                    for expr in list(node.args) + [kw.value for kw in node.keywords]
+                    for v in _eval_ast_path_candidates(expr, bindings)
+                )
+            ):
+                continue
             local = _copy_ast_bindings(bindings)
             local.pop(_AST_DEFINITION, None)
             params = list(function.args.posonlyargs) + list(function.args.args)
@@ -2064,7 +2264,7 @@ def _iter_ast_calls_in_order(node, bindings, active=(), budget=None):
                 for arg in params + list(function.args.kwonlyargs):
                     local[arg.arg] = _ast_values(local[arg.arg]) | frozenset((_AST_DYNAMIC,))
             for stmt in function.body if isinstance(function.body, list) else [function.body]:
-                yield from _iter_ast_calls_in_order(stmt, local, active + (function,), budget)
+                yield from _iter_ast_calls_in_order(stmt, local, active + (function,), budget, tree_ctx, enclosing_params)
             bindings[_AST_CWD] = local.get(_AST_CWD, bindings.get(_AST_CWD, frozenset(("",))))
             for name in getattr(function, "_guard_globals", ()):
                 bindings[name] = local.get(name, frozenset((_AST_DYNAMIC,)))
@@ -2073,6 +2273,8 @@ def _iter_ast_calls_in_order(node, bindings, active=(), budget=None):
                 esc_fn = esc.func if isinstance(esc, _AstBoundMethod) else esc
                 if not isinstance(esc_fn, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
                     continue
+                if not isinstance(esc, _AstBoundMethod) and getattr(esc_fn, "_guard_pure_readonly", False):
+                    continue
                 if esc_fn in active or len(active) >= 12:
                     continue
                 esc_local = _copy_ast_bindings(bindings)
@@ -2080,7 +2282,7 @@ def _iter_ast_calls_in_order(node, bindings, active=(), budget=None):
                 for arg in list(esc_fn.args.posonlyargs) + list(esc_fn.args.args) + list(esc_fn.args.kwonlyargs):
                     esc_local[arg.arg] = frozenset((_AST_DYNAMIC,))
                 for stmt in esc_fn.body if isinstance(esc_fn.body, list) else [esc_fn.body]:
-                    yield from _iter_ast_calls_in_order(stmt, esc_local, active + (esc_fn,), budget)
+                    yield from _iter_ast_calls_in_order(stmt, esc_local, active + (esc_fn,), budget, tree_ctx, enclosing_params)
         return
     for child in ast.iter_child_nodes(node):
         yield from walk(child)
@@ -2334,7 +2536,10 @@ def _scan_inline_python_code(
                             if hit:
                                 return hit
                     elif qualname in {"numpy." + name for name in _AST_MODULE_CALLS["numpy"]}:
-                        tgt = _ast_call_arg_candidates(node, 0, ("file", "fname"), bindings)
+                        tgt = _ast_call_arg_candidates(
+                            node, 0, ("file", "fname"), bindings,
+                            allow_bound_kw_unpack=(qualname in ("numpy.savez", "numpy.savez_compressed")),
+                        )
                         if _bad(tgt):
                             hit = _accept_hit(f"NumPy 数组落盘 ({qualname})", _format_ast_candidates(tgt), snippet)
                             if hit:
