@@ -17,14 +17,14 @@
   <g><rect x="32" y="112" width="670" height="162" rx="14" fill="#ffffff" stroke="#b5c8e5"/>
     <text x="54" y="146" class="heading">常驻机制层：共用规则、钩子与验证入口</text>
     <text x="54" y="177" class="body">全局规则 R0–R11、5 个钩子模块、hooks/_lib/ 公共库与 readonly-* 约束边界。</text>
-    <text x="54" y="203" class="body">install.py 按协议分发；cae_harness.py 承接验证、分片、核对与对账。</text>
+    <text x="54" y="203" class="body">install.py 同步；cae_harness.py 调度核验，另含按需 cae-writing 与 cae-axioms。</text>
     <text x="54" y="229" class="body">交互主会话保留用户自选客户端、模型与推理强度，零时期性模型名硬编码。</text>
   </g>
   <g><rect x="738" y="112" width="670" height="162" rx="14" fill="#ffffff" stroke="#b5c8e5"/>
     <text x="760" y="146" class="heading">动态配置层：fleet_profile.json</text>
     <text x="760" y="177" class="body">五角色槽位（roles）与四端内生代理档案（native_agent_profiles）。</text>
     <text x="760" y="203" class="body">runtime_tunables 配合 adaptive_policy.py 动态派生恢复及交接阈值。</text>
-    <text x="760" y="229" class="body">subscription_matrix 与 capability_ledger 记录启停及离线性能更新时间。</text>
+    <text x="760" y="229" class="body">subscription_matrix 与 capability_ledger 记录启停、在线刷新与本机实测时间。</text>
   </g>
   <g><rect x="32" y="304" width="1376" height="126" rx="14" fill="#f3efff" stroke="#b8a7dc"/>
     <text x="54" y="338" class="heading">阶段一：独立 fleet-evolve 维护期评估与用户启停确认</text>
@@ -40,7 +40,7 @@
   <g><rect x="32" y="640" width="1376" height="166" rx="14" fill="#fff8e9" stroke="#d7b265"/>
     <text x="54" y="674" class="heading">全通道重负载确认：用户明确点名（P0）与动态角色选路并列</text>
     <text x="54" y="705" class="body">plan 将 4 列总览与 14 项明细写入 &lt;ticket_id&gt;_card.md，日常对话仅展 3 句话 chat_brief 与可点击链接。</text>
-    <text x="54" y="731" class="body">明细文件附离线性能更新时间（last_online_refresh_at / local_bench_verified_at）与三选项。</text>
+    <text x="54" y="731" class="body">明细文件附在线刷新与本机实测时间（last_online_refresh_at / local_bench_verified_at）与三选项。</text>
     <text x="54" y="757" class="body">获批后以 --approve-ticket 登记；PreToolUse 核验票据、隔离一致性并拦截裸调 CLI。</text>
     <text x="54" y="783" class="body">点名锁定指定维度；窗口、非委派挡位、--isolation 隔离、行号内联与快照按端补齐。</text>
   </g>
@@ -59,7 +59,7 @@
   <g><rect x="32" y="998" width="1376" height="132" rx="14" fill="#eefaf4" stroke="#81bfa0"/>
     <text x="54" y="1032" class="heading">共有会话生命周期门禁与四客户端协议适配</text>
     <text x="54" y="1063" class="body">Antigravity、Codex、Claude Code 接入 5 个共用钩子模块；DSH 为 soft_rules_only 并由 install.py 探测 hook_protocol。</text>
-    <text x="54" y="1089" class="body">压缩后折叠历史明细，完整还原未决确认单并有界带回对账与 read-plan 指针；交接期放行只读诊断。</text>
+    <text x="54" y="1089" class="body">压缩后折叠历史明细，恢复未决总览与明细链接并带回对账与 read-plan 指针；交接期放行只读诊断。</text>
     <text x="54" y="1115" class="body">派单完工硬出机械对账表；Stop 核验成败、Token、同名回执消歧与 reconcile_file 链接，主会话按 R6 复核。</text>
   </g>
 </svg>

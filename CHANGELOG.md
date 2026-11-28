@@ -2,6 +2,26 @@
 
 本文件记录四客户端共用规则、会话钩子、后台验证工具与上游维护流程的版本演进。当前插件版本以 `template/user-guard/plugin.json` 为准；常驻使用文档只说明机制和配置键，不重复维护版本号与性能日期。
 
+## [2.1.0] - 2026-11-28
+
+新增点名触发的通用与科学计算公理审查技能 `cae-axioms`（四层条款级单向无环法典、纯标准库双档硬公理状态机、零 Mathlib 纯核 Lean 4 真内核校验驱动与净室 `packet_replay` 复演协议），并完成全仓公开文档、架构图示、经典文献溯源、法律安全治理与多端双平台配置全面核校：
+
+- **按需公理审查法典与公开经典文献溯源（`template/user-guard/skills/cae-axioms/references/`、`SKILL.md`）**：
+  - 建立四层条款级单向无环图（DAG）软公理分册：`layer1-logic-epistemology.md`（封板通用多类经典逻辑与外生反身底座，零学科特例）、`layer1_5-math-computation.md`（封板形式数学与有限计算底座，含测度-微分化归、弱解间断与四类约束原型，零物理前提）、`layer2m-rational-mechanics.md`（演进态正测度理性力学与热力学公理，借 `2A·D1–D2 -> 2M -> 2A 规范` 条款级无环依赖消除跨层回环，零离散前提）与 `layer2-domain-audit.md`（封板 `2A` 经验物理、`2B` 书面评议与 `2C` 反身生态分支）；
+  - 新增元层非前提索引 [references/layer-citations.md](template/user-guard/skills/cae-axioms/references/layer-citations.md)，逐层补齐国际公认公开经典教材与奠基文献出处，明确文献仅作术语锚定与溯源而非诉诸权威前提，并界定与 Lean 4 及第三层外部仓库的零源码内嵌边界。
+- **双档 Python 3.11+ 硬公理状态机与净室 `packet_replay`（`scripts/axiom_gate.py`、`scripts/_axiom_lib/{contract,lean_gate,evidence,rules,case,replay}.py`）**：
+  - 按职责拆分为薄安全入口 `axiom_gate.py`（非符号链接/重解析点校验）与 6 个标准库模块，严格分离通用第一层档 `--profile core`（`L0`–`L3` 四关，零物理字段）与科学计算扩展档 `--profile cae`（`S0`–`S4` 五关，默认档位）；
+  - 实施单源严格 Schema（拒未知键、重复键、布尔冒充整数与字符串真值强转）、`L1` 有限模块 DAG 无环与跨文件边界对账、根冲突吸收态 `HALT_ROOT_CONFLICT`（跨平台文件锁与事务幂等子单派生，永久继承不可变冲突历史）、`stage_digest` 前驱链校验与双哈希（`raw_sha256` / `normalized_sha256`）精准级联失活；
+  - 正交切分三档终态 `STRUCTURE_PASSED`、`VERIFIED_NO_T` 与 `VERIFIED_T_ASSERTED`，落地 100% 复用 `cae_harness.py --clean-room` 的 `export-packet` / `verify-replay` 净室复演协议（`cae_harness` 净室镜像与内联同步支持自动识别复演包 `manifest.json` 及无扩展名 `blobs/<sha256>`，交叉验签 `APPROVED` 票据、机械对账账本与盲推断言，拒收 `ast_only`、`timeout_salvage` 与无退出码离线探针，绝不自动执行包内命令），并补齐 `feedback` 脱敏防跨层倒灌准入守卫。
+- **零 Mathlib 纯核 Lean 4 骨架与真内核驱动（`lean/{LogicCore,ConvexDirectSum,GalileanBox,DissipationGeneric}.lean`、`_axiom_lib/KernelAudit.lean`）**：
+  - 编写四份零 Mathlib、零 Lake 纯核 Lean 4 骨架：`LogicCore.lean`（40 条契约定理与完整 `Nonempty` 见证）、`ConvexDirectSum.lean`（非退化有序交换环、幂等直和与双极限/原型 IV.2 反例）、`GalileanBox.lean`（正测度控制体、重合界面平衡、伽利略推动与共动通量纯化）与 `DissipationGeneric.lean`（非退化有序交换环、反对称零二次型、有限差半正定耗散与算子级双退化三维双活跃见证）；
+  - 落地静态预检硬短路与受控真内核驱动 `KernelAudit.lean`（锁验自身 SHA-256、洁净临时目录独立编译 `.olean`、禁用初始化器加载并执行 `Kernel.Environment.replay` 与全量 `collectAxioms ⊆ {propext, Classical.choice, Quot.sound}` 闭包核验），支持 Windows 原生 `--run-lean` 与跨侧 `--wsl-lean`。
+- **跨模块集成、测试矩阵、公开文档与开源治理全面更新（`grounding.py`、`fleet_state.py`、`install.py`、`tests/`、`docs/`、`README.md`、`SECURITY.md`、`LEGAL.md`、`CITATION.cff`、`CONTRIBUTING.md`、`NOTICE`、`plugin.json`）**：
+  - 将 `axiom_gate.py` 与 `_axiom_lib` 纳入 `cae-harness` `grounding.py` 脚本锚点校验，将 `cae-axioms` 核心脚本与 `.lean` 文件纳入 `fleet_state.py` `core_sha256` 完整性锁与 `install.py` 四端双平台同步检测；新增 `tests/test_axioms_offline.py` 全面离线回归并扩展 `tests/test_e2e_integration.py` 的 `test_52` 机械守卫 `.lean` 文件 SPDX 许可头；
+  - 新增架构图 [docs/assets/axiom-machine-architecture.svg](docs/assets/axiom-machine-architecture.svg) 并同步刷新存量架构与流程图，整篇重写与润色 `README.md`（控制在入口体积预算内）、`docs/workflow-guide.md`、`docs/architecture-and-hooks.md`、`AGENTS.md` 与 `template/user-guard/README.md`，同步补齐 `SECURITY.md`、`LEGAL.md`、`CITATION.cff`、`CONTRIBUTING.md`、`NOTICE`、`.github/ISSUE_TEMPLATE/bug_report.yml` 与 `plugin.json` 中的 `cae-axioms` 安全边界、Lean 工具链非关联声明及引用元数据。
+
+---
+
 ## [2.0.6] - 2026-11-26
 
 补齐开源法律治理体系、全仓脚本许可证与版权头、GitHub 合规交互模板及自动化回归守卫，并对公开文档的许可条款、数据流向与权属表述完成跨端核校：

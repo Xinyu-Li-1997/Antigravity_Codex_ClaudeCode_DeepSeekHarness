@@ -8,9 +8,9 @@
 
 | 类别 | 是否在本仓库安全范围内 | 说明 |
 | --- | --- | --- |
-| 本仓库脚本、安装器与钩子 | 是 | 覆盖 `install.py`、`install.ps1`、`install.sh`、`template/user-guard/skills/cae-harness/scripts/cae_harness.py`、`fleet_state.py`、共用 5 个生命周期钩子及 `hooks/_lib/`、`router.py`、`ccswitch_admin.py` 与辅助 Shell 脚本 |
-| 文档自动脱敏与静态守卫 | 是 | 覆盖路径边界校验、符号链接防御、凭据脱敏规则与 CI 回归测试 |
-| 第三方官方客户端与模型服务 | 否 | Antigravity、Codex、Claude Code、DeepSeek Harness（DSH）、CC Switch、Zotero、`zotero-mcp` 及上游模型接口的安全问题请直接向对应厂商或项目方报告 |
+| 本仓库脚本、安装器与钩子 | 是 | 覆盖 `install.py`、`install.ps1`、`install.sh`、`cae_harness.py` 及 `_harness/`、`axiom_gate.py` 及 `_axiom_lib/`、`KernelAudit.lean`、`fleet_state.py`、共用 5 个生命周期钩子及 `hooks/_lib/`、`router.py`、`ccswitch_admin.py` 与辅助 Shell 脚本 |
+| 文档脱敏、静默执行与状态机守卫 | 是 | 覆盖路径边界校验、符号链接防御、凭据脱敏规则、`axiom_gate.py` 探针显式授权（`--allow-probe-exec`）与复演包零自动执行边界及 CI 回归测试 |
+| 第三方官方客户端、编译器与服务 | 否 | Antigravity、Codex、Claude Code、DeepSeek Harness（DSH）、CC Switch、Zotero、`zotero-mcp`、Lean 4 / `elan` 及上游模型接口的安全问题请直接向对应厂商或项目方报告 |
 | 用户自建代理与外部环境 | 否 | 用户本机操作系统、外部网络代理及自行填写的密钥保管由用户自行负责 |
 
 ## 二、私密漏洞报告渠道
@@ -38,4 +38,4 @@
 
 This English summary is provided for convenience only; in case of discrepancy, the Chinese text prevails.
 
-Please report suspected security vulnerabilities in this repository privately through GitHub **Private Vulnerability Reporting** under the **Security** tab (hosted under GitHub's platform policies) rather than opening a public issue. Only code and scripts maintained in this repository (`main` branch and latest release) are in scope; vulnerabilities in third-party clients, CC Switch, Zotero, `zotero-mcp`, or upstream model providers must be reported directly to their respective vendors. Remove all real API keys, tokens, personal paths, and confidential project data before submitting a report, and keep all testing strictly inside your own local sandbox. This personal open-source project offers no bug bounty and no commercial response-time warranty; confirmed fixes are disclosed via GitHub Security Advisories or [CHANGELOG.md](CHANGELOG.md).
+Please report suspected security vulnerabilities in this repository privately through GitHub **Private Vulnerability Reporting** under the **Security** tab (hosted under GitHub's platform policies) rather than opening a public issue. Only code, hooks, and verification scripts maintained in this repository (`main` branch and latest release, including `cae_harness.py`, `axiom_gate.py`, `_axiom_lib/`, and `KernelAudit.lean`) are in scope; vulnerabilities in third-party clients, CC Switch, Zotero, `zotero-mcp`, Lean 4 / `elan`, or upstream model providers must be reported directly to their respective vendors. Remove all real API keys, tokens, personal paths, and confidential project data before submitting a report, and keep all testing strictly inside your own local sandbox. This personal open-source project offers no bug bounty and no commercial response-time warranty; confirmed fixes are disclosed via GitHub Security Advisories or [CHANGELOG.md](CHANGELOG.md).

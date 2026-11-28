@@ -2833,6 +2833,16 @@ def collect_target_files(target, skipped_files=None, *, verify_readable=True, re
         return any(fnmatch.fnmatchcase(rel, pat) or rel.split('/')[0] == pat for pat in patterns)
 
     candidates = [target] if target.is_file() else []
+    blobs_dir = target / 'blobs'
+    manifest_file = target / 'manifest.json'
+    is_replay_packet = (
+        target.is_dir()
+        and manifest_file.is_file()
+        and not _is_link(manifest_file)
+        and blobs_dir.is_dir()
+        and not _is_link(blobs_dir)
+    )
+    resolved_blobs_dir = blobs_dir.resolve() if is_replay_packet else None
     if target.is_dir():
         for root, dirs, files in os.walk(target):
             dirs[:] = sorted(
@@ -2846,8 +2856,10 @@ def collect_target_files(target, skipped_files=None, *, verify_readable=True, re
                 if _is_link(directory):
                     skipped.append({'file': directory.relative_to(target).as_posix(), 'reason': 'directory_link'})
                     dirs.remove(name)
+            in_packet_blobs = resolved_blobs_dir is not None and Path(root).resolve() == resolved_blobs_dir
             for name in sorted(files):
-                if Path(name).suffix.lower() not in SOURCE_EXTENSIONS and name not in NAMED_TEXT_FILES:
+                is_packet_blob = in_packet_blobs and bool(re.fullmatch(r'[0-9a-f]{64}', name))
+                if not is_packet_blob and Path(name).suffix.lower() not in SOURCE_EXTENSIONS and name not in NAMED_TEXT_FILES:
                     continue
                 cand = Path(root) / name
                 if _excluded_by_agentignore(cand):

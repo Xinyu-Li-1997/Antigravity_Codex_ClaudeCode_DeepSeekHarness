@@ -3401,9 +3401,9 @@ raise SystemExit(module.main(sys.argv[3:]))
 
         script_files = [
             rel for rel in self._managed_repo_files()
-            if rel.endswith((".py", ".sh", ".ps1"))
+            if rel.endswith((".py", ".sh", ".ps1", ".lean"))
         ]
-        self.assertGreaterEqual(len(script_files), 30)
+        self.assertGreaterEqual(len(script_files), 40)
         for rel in script_files:
             head = "\n".join((REPO_ROOT / rel).read_text(encoding="utf-8-sig").splitlines()[:6])
             self.assertIn("SPDX-License-Identifier: Apache-2.0", head, f"{rel} 缺少 SPDX Apache-2.0 许可头")

@@ -70,9 +70,9 @@
   <g>
     <rect x="50" y="680" width="624" height="146" rx="12" fill="#eefaf4" stroke="#82bfa0"/>
     <text x="72" y="712" class="heading">4. 定量验收、机械对账与对称核验</text>
-    <text x="72" y="740" class="body">只读任务比对文件快照；可写 gate 锁定写入白名单并强制跑通验收命令。</text>
-    <text x="72" y="766" class="body">完工自动产出 reconcile 机械对账表；多端审查经 cross-check 核对盲区与分歧。</text>
-    <text x="72" y="792" class="body">回合结束对称拦截矛盾全过宣称与未实查否定结论；文档支持 --doc-hygiene 校验。</text>
+    <text x="72" y="740" class="body">只读任务比对文件快照；可写 gate 锁定白名单并强制跑通验收命令。</text>
+    <text x="72" y="766" class="body">完工产出 reconcile 对账表；多端审查经 cross-check 查盲区与分歧。</text>
+    <text x="72" y="792" class="body">回合结束对称核验；文档走 --doc-hygiene，按需启用 cae-writing / cae-axioms。</text>
   </g>
 
   <!-- Center Workspace Mode Isolation Divider -->
@@ -93,17 +93,18 @@
     <text x="788" y="216" class="heading">1. 按维护需求选择三种模式（fleet-evolve）</text>
     <text x="788" y="244" class="body">全面更新（full）：盘点四端客户端、双端环境、内生代理档案与五类角色。</text>
     <text x="788" y="270" class="body">机制与文档整理（hygiene）：选型不变，将问题下沉为单测守卫并分层整理文档。</text>
-    <text x="788" y="294" class="body">只读巡检（audit）：零修改检查配置漂移、双端对齐、DSH 协议与 ABI 风险。</text>
+    <text x="788" y="294" class="body">只读巡检（audit）：零修改输出诊断即结束，不进入后续变更流程。</text>
   </g>
 
   <path class="link" d="M 1078 306 L 1078 336"/>
+  <text x="1092" y="326" class="badge">full / hygiene 变更路径</text>
 
   <g>
     <rect x="766" y="336" width="624" height="142" rx="12" fill="#ffffff" stroke="#c5b6e3"/>
-    <text x="788" y="368" class="heading">2. 能力评估与本机可用性探测（full 模式）</text>
+    <text x="788" y="368" class="heading">2. 能力评估与本机可用性探测（仅 full 模式）</text>
     <text x="788" y="396" class="body">结合官方资料、本机报错与实测证据，同时记录模型优势与已知局限。</text>
     <text x="788" y="422" class="body">同步核实本机各端安装状态、订阅启停状态与可用额度类型。</text>
-    <text x="788" y="448" class="body">离线刷新时间记入动态配置文件，日常派工仅离线复查，不触发联网刷新。</text>
+    <text x="788" y="448" class="body">在线刷新与本机实测时间记入动态配置，日常派工仅离线复查（hygiene 跳过本步）。</text>
   </g>
 
   <path class="link" d="M 1078 478 L 1078 508"/>
@@ -120,9 +121,9 @@
 
   <g>
     <rect x="766" y="680" width="624" height="146" rx="12" fill="#eefaf4" stroke="#82bfa0"/>
-    <text x="788" y="712" class="heading">4. 双端同步、重启核验与全仓验收</text>
-    <text x="788" y="740" class="body">获批后在 Windows 与 WSL2 分别同步，并通过 --audit-upgrade 核验零漂移。</text>
+    <text x="788" y="712" class="heading">4. 按需双端同步、重启核验与全仓验收</text>
+    <text x="788" y="740" class="body">获批后同步本机；同时使用 Windows 与 WSL2 时须两侧分别同步并核验零漂移。</text>
     <text x="788" y="766" class="body">涉及主会话客户端更新时，经重启前后两步状态锁核验归位。</text>
-    <text x="788" y="792" class="body">最终通过全量离线回归、公开脱敏与 check-grounding --strict --doc-hygiene 门禁。</text>
+    <text x="788" y="792" class="body">最终通过全量回归、公开脱敏与 check-grounding --strict --doc-hygiene。</text>
   </g>
 </svg>

@@ -16,6 +16,7 @@
 | [fleet_profile.json](../template/user-guard/skills/cae-harness/fleet_profile.json) | 通用 + 上游 | 唯一动态配置源：维护五角色 `roles`、四端 `native_agent_profiles`、`runtime_tunables`、`subscription_matrix` 与 `capability_ledger` |
 | [cae_harness.py](../template/user-guard/skills/cae-harness/scripts/cae_harness.py) 与 `scripts/_harness/` | 通用 + 上游 | 跨端无头调度与离线诊断总控（按配置、目录、执行引擎、文档核验、机械对账、阅读分片与调度子模块拆分）：P0 点名锁定、角色选路与风险升挡、`--isolation` 四级隔离、持久化会话与超时抢救、`<ticket_id>_card.md` 落盘，以及 `check-grounding`（含 `--doc-hygiene`/`--hygiene-only`/`--output`）、`read-plan`、`cross-check`、`reconcile` 四项离线确定性工具 |
 | [skills/cae-writing/](../template/user-guard/skills/cae-writing/SKILL.md) | 通用 | 按需学术写作与改稿技能：按体裁分册加载中文期刊、英文期刊、学术专著、科研报告与投稿前自审及审稿回复指南，严守审稿保密伦理、优先尊重项目自有词表，不增加常驻钩子 |
+| [skills/cae-axioms/](../template/user-guard/skills/cae-axioms/SKILL.md) | 通用 | 点名触发的公理审查与硬状态机技能：承载四层条款级单向公理分册与 [文献溯源](../template/user-guard/skills/cae-axioms/references/layer-citations.md)、双档状态机（`axiom_gate.py` 与 `_axiom_lib/`）、零 Mathlib 纯核 Lean 4 真内核驱动（`KernelAudit.lean` 与四份 `lean/` 骨架）及净室 `packet_replay` 协议，不增加常驻钩子 |
 | [user_words.py](../template/user-guard/hooks/user_words.py) | 通用 + 上游 | 钩子共用基础库：跨平台文件锁、原子写、三端轨迹去噪与子代理摘要提取、历史确认单折叠及账单存取 |
 | `hooks/_lib/` | 通用 + 上游 | `fs_safety.py`（重解析点防御原子写）、`shell_lex.py`（Shell 拆壳与 PowerShell 续行归一化）、`adaptive_policy.py`（读取 `modelName` 与挡位并按窗口缩放阈值）、`process_guard.py`（墙钟自毁与 POSIX 条件虚拟内存上限） |
 | [session_context_loader.py](../template/user-guard/hooks/session_context_loader.py) | 通用 + 上游 | 恢复与调用前门禁：普通回合零字节注入；压缩后分块补回原话、实质子代理摘要、未决票据总览与有界对账及阅读计划指针 |
@@ -76,7 +77,7 @@
 | **工具执行前** | `status_guard.py` + `handoff_gate.py` | 守卫项目外写删边界与同会话外部目录续租（不禁止本机只读诊断），拦截空转轮询与裸调 CLI，交接期放行只读核验 |
 | **回合结束时** | `reply_repeat_guard.py` + `handoff_gate.py` | 拦截空等刷屏、重复贴票、局部补测冒充全过及三类回合实证失实（零探测否定、局部排查全称缺口、长文单端整写免审），并核验回执、`reconcile_file` 链接与交接提示词 |
 
-各客户端按原生协议接入同一套钩子，不依赖客户端私有扩展字段：
+Antigravity、Codex 与 Claude Code 按原生协议接入同一套生命周期硬钩子，DSH 当前以软规则配合无头调度快照兜底，均不依赖客户端私有扩展字段：
 
 | 客户端 | 全局目录与宿主事件适配 |
 | --- | --- |
@@ -166,5 +167,29 @@ python -B -X utf8 "$HOME\.claude\hooks\ccswitch_admin.py" switch-card "<目标�
 - **按托管文件名精确卸载**（`install.py` 采用原地幂等同步且不留 `.bak-*` 文件；卸载时请勿删除整个 `hooks/` 目录，以免误删自建脚本）：
   1. **Antigravity**：删除 `~/.gemini/config/plugins/user-guard` 与 `~/.gemini/antigravity/plugin_data/user-guard`。
   2. **Codex 与 Claude Code 托管钩子**：仅删除 `hooks/` 下托管脚本 `user_words.py`、`session_context_loader.py`、`status_guard.py`、`reply_repeat_guard.py`、`handoff_gate.py`（Claude 含 `ccswitch_admin.py`）、`hooks/_lib/` 及不再使用的 `hooks/state/`、`hooks/logs/`。
-  3. **代理、技能与可选路由**：删除 `~/.codex/agents/` 与 `~/.claude/agents/` 下的 `readonly-*`，三端 `skills/` 下的 `cae-harness`、`cae-writing` 与 `fleet-evolve`，以及可选的 `~/.claude/router/`。
+  3. **代理、技能与可选路由**：删除 `~/.codex/agents/` 与 `~/.claude/agents/` 下的 `readonly-*`，三端 `skills/` 下的 `cae-harness`、`cae-writing`、`cae-axioms` 与 `fleet-evolve`，以及可选的 `~/.claude/router/`。
   4. **宿主配置与规则文件**：从 `~/.codex/hooks.json` 与 `~/.claude/settings.json` 移除托管钩子项；三端顶层规则文件若无个人内容可直接删除，若有自定义尾段则仅删去标准 `R0–R11` 至 `## 工具与运行环境` 章节。
+
+---
+
+## 六、按需公理审查引擎与纯核 Lean 4 校验架构（`cae-axioms`）
+
+[cae-axioms](../template/user-guard/skills/cae-axioms/SKILL.md) 完全复用本仓库零外部运行时依赖的工程基线，不挂载常驻会话钩子，也不在 `axiom_gate.py` 内重复实现模型客户端或调度器；所有模块同步纳入 `install.py` 四端镜像分发与 `fleet_state.py` 核心完整性校验（`core_sha256`）。
+
+![按需公理审查与硬状态机架构](assets/axiom-machine-architecture.svg)
+
+### 1. 模块边界与条款级单向无环法典
+
+- **条款级单向无环图（DAG）**：四份公理分册严守 `第一层（零.1、零.3、一节、五.1）-> 层 1.5`、`第一层 + 层 1.5（一至二节）+ 2A·D1–D2 -> 层 2M -> 2A 审查规范`，`2B` 与 `2C` 跨档通用；`2A·D1–D3` 不依赖层 `2M`，从源头消除跨层回环。所有经典文献依据与第三层外部仓库隔离声明独立汇总于 [references/layer-citations.md](../template/user-guard/skills/cae-axioms/references/layer-citations.md)，不作为诉诸权威的前提混入公理正文。
+- **薄入口与标准库内部包 `_axiom_lib/`**：[axiom_gate.py](../template/user-guard/skills/cae-axioms/scripts/axiom_gate.py) 先执行目录与模块非符号链接/重解析点校验，再装载 `_axiom_lib/{contract,lean_gate,evidence,rules,case,replay}.py` 与受控单文件真内核驱动 `KernelAudit.lean`，保证 `advance`、`export-packet`、`verify-replay` 与 `report` 共用单一 Schema 与判定核。
+
+### 2. 状态机安全不变量、双哈希失活与净室 `packet_replay`
+
+- **单源严格 Schema 与前驱哈希链**：拒绝未知键、重复 JSON 键、布尔冒充整数、字符串真值强转与非标准数值；每次推进均由前驱记录重算 `stage_digest` 链与 `immutable_conflict_history` 哈希链并持跨平台文件锁（`msvcrt.locking` / `fcntl.flock`）写盘，防止跳步、并发覆写与双写中断锁死。
+- **双哈希精准失活**：对所有锚定文件同时记录 `raw_sha256` 与严格 `\r\n -> \n` 归一化的 `normalized_sha256`（脚本、BOM 文件、`.olean` 及探针目标强制按 `raw_sha256` 判漂移）。第 $k$ 关锚定源码漂移仅精准将第 $k$ 关及下游（含 `replay_certificate`）置为 `STALE_INVALIDATED`，保留前序有效前缀；根冲突吸收态 `HALT_ROOT_CONFLICT` 绝不因文件漂移自动解锁。
+- **净室复演与零自动命令执行边界**：`export-packet` 按 Schema 剥离主会话自评布尔与诱导标题，打包完整源码 `blobs` 与基线机械 diff。`verify-replay` 整单升格时交叉验签 `cae_harness.py` 的 `APPROVED` 票据、机械对账账本、零改动净室回执与逐关盲推断言，拒绝 `timeout_salvage`、`ast_only` 与无明确退出码的离线自报探针，且**绝不自动执行复演包内任何命令**（实跑探针须由用户显式传 `--allow-probe-exec` 现场重跑本地案卷已锁定命令）。
+
+### 3. 纯核 Lean 4 反空真门禁与真内核重放
+
+- **静态预检硬短路**：先剥离注释后逐词法拦截 `sorry`、`sorryAx`、`admit`、`axiom`、`unsafe`、`partial`、`opaque`、`implemented_by`、`extern`、`csimp`、`initialize`、`run_cmd`、`native_decide` 与非法 `set_option`（仅独占行放行 `set_option autoImplicit false`）。同时核验零前提构造性 `Nonempty` 见证。静态预检任一违规即刻短路，绝不启动外部 `lean` 编译器。
+- **受控真内核编译与重放（`--run-lean` / `--wsl-lean`）**：锁定 `KernelAudit.lean` 自身 SHA-256，在洁净临时目录与隔离 `LEAN_PATH` 中经 `Parser.parseHeader` 校验导入白名单，现场编译 `.olean` 并禁用初始化器加载后执行 `Kernel.Environment.replay`。驱动逐常量核查无 `unsafe` 或编译器逃逸属性、全量 `collectAxioms` 闭包属于 `{propext, Classical.choice, Quot.sound}`，以及 `LogicCore.lean` 40 条契约定理黄金类型签名与 `_root_.Nonempty` 精确常量。四份纯核骨架均零 Mathlib、零 Lake，Windows 与 WSL2 双端 `.olean` 可独立编译校验且不污染源码目录。

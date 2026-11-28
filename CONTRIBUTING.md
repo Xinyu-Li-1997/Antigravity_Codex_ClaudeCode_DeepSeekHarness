@@ -42,11 +42,14 @@ python -B -X utf8 -m unittest discover -s tests -p "test_*.py"
 # WSL2 / Linux
 python3 -B -X utf8 template/user-guard/skills/cae-harness/scripts/cae_harness.py check-grounding --target . --strict --doc-hygiene
 python3 -B -X utf8 -m unittest discover -s tests -p "test_*.py"
+
+# 若本机已安装 Lean 4，改动 cae-axioms 骨架或内核驱动时请补充真内核校验：
+python -B -X utf8 template/user-guard/skills/cae-axioms/scripts/axiom_gate.py check-lean --profile cae --run-lean
 ```
 
 提交前请一并自查四项基本规范：
 
-1. **新增源码头**：新创建的 Python、Shell 或 PowerShell 脚本顶部应附带精简的版权声明与 `SPDX-License-Identifier: Apache-2.0` 标识。
+1. **新增源码头**：新创建的 Python、Shell、PowerShell 或 Lean 4（`.lean`）源文件顶部应附带精简的版权声明与 `SPDX-License-Identifier: Apache-2.0` 标识。
 2. **严禁夹带敏感信息**：不得在提交或描述中留存真实 API Key、认证令牌、真实用户名路径、硬件型号、私网 IP、真实个人邮箱或未脱敏会话日志。
 3. **不弱化测试判据**：不得通过放宽容差、删改既有断言或缩窄文档校验范围来绕过测试。
 4. **遵守文档分层**：面向不同读者的公开文档按 [AGENTS.md](AGENTS.md) 的四级分层单点维护，避免在多份文档中重复粘贴细节。
@@ -61,4 +64,4 @@ python3 -B -X utf8 -m unittest discover -s tests -p "test_*.py"
 
 This English summary is provided for convenience only; in case of discrepancy, the Chinese text prevails, while the English text of [LICENSE](LICENSE) and [Developer Certificate of Origin 1.1](https://developercertificate.org/) governs their respective terms.
 
-Unless you explicitly state otherwise, all contributions intentionally submitted for inclusion in this repository are licensed under [Apache License 2.0](LICENSE) (Section 5) without additional terms, while you retain copyright in your contributions. Every commit must include a `Signed-off-by` line (`git commit -s`, preferably using your GitHub `noreply` address) certifying compliance with Developer Certificate of Origin 1.1. Contributors must also ensure proper employer authorization where applicable, independent human review of AI-assisted changes, absence of incompatible strong Copyleft code or sensitive credentials, strict adherence to the Python 3.11+ standard library, and passing `check-grounding --target . --strict --doc-hygiene` plus the full offline `unittest` suite on Windows (`python`) or WSL2/Linux (`python3`).
+Unless you explicitly state otherwise, all contributions intentionally submitted for inclusion in this repository are licensed under [Apache License 2.0](LICENSE) (Section 5) without additional terms, while you retain copyright in your contributions. Every commit must include a `Signed-off-by` line (`git commit -s`, preferably using your GitHub `noreply` address) certifying compliance with Developer Certificate of Origin 1.1. Contributors must ensure proper employer authorization where applicable, independent human review of AI-assisted changes, and absence of incompatible strong Copyleft code or sensitive credentials. New `.py`, `.sh`, `.ps1`, and `.lean` files require SPDX Apache-2.0 headers, and changes must stay within the Python 3.11+ standard library while passing `check-grounding --target . --strict --doc-hygiene` plus the full offline `unittest` suite on Windows (`python`) or WSL2/Linux (`python3`) (plus optional `axiom_gate.py check-lean --profile cae --run-lean` when Lean 4 is installed and `cae-axioms` is modified).

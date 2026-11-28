@@ -14,12 +14,14 @@ abstract: >-
   hooks (guarding both overclaimed verification and unverified negative claims),
   read-only review subagents, zero-blacklist lexical grounding and document
   hygiene checks, pre-read sizing and conservative sharding, cross-client
-  coverage verification, deterministic mechanical reconciliation tables, and
-  cross-client headless verification workflows across Google Antigravity,
-  OpenAI Codex, Claude Code, and DeepSeek Harness for scientific computing,
-  CAE, CFD, FEA, numerical PDE solvers, HPC, and high-reliability software
-  engineering, implemented purely on the Python 3.11+ standard library across
-  Windows, WSL2, and Linux.
+  coverage verification, deterministic mechanical reconciliation tables,
+  on-demand academic writing guides (cae-writing), and an on-demand four-layer
+  acyclic axiom verification machine (cae-axioms: dual-profile Python hard
+  state machine, optional zero-Mathlib Lean 4 kernel audit, and clean-room
+  packet replay) across Google Antigravity, OpenAI Codex, Claude Code, and
+  DeepSeek Harness for scientific computing, CAE, CFD, FEA, numerical PDE
+  solvers, HPC, and high-reliability software engineering, implemented purely on
+  the Python 3.11+ standard library across Windows, WSL2, and Linux.
 keywords:
   - scientific-computing
   - computer-aided-engineering
@@ -30,4 +32,7 @@ keywords:
   - verification-harness
   - deterministic-reconciliation
   - documentation-hygiene
+  - formal-verification
+  - lean4
+  - axiom-verification
   - reproducible-workflows

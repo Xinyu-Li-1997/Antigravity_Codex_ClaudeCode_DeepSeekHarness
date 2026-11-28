@@ -4,7 +4,7 @@
 
 ## 内容归属与维护范围
 
-[全局规则模板](template/user-guard/rules/AGENTS.md) 是工程规则的唯一来源。本文件说明仓库维护与安装入口；[cae-harness 技能](template/user-guard/skills/cae-harness/SKILL.md) 负责日常派工、持久化续接、确认票据及事实锚定；[cae-writing 技能](template/user-guard/skills/cae-writing/SKILL.md) 按体裁提供按需学术写作与改稿规范（不增设常驻硬钩子）；[fleet-evolve 技能](template/user-guard/skills/fleet-evolve/SKILL.md) 负责全局工具链评估、审批和同步。细则按归属单点维护，已被代码或钩子硬守住的机制不在此重复展开。
+[全局规则模板](template/user-guard/rules/AGENTS.md) 是工程规则的唯一来源。本文件说明仓库维护与安装入口，四项托管技能职责如下：[cae-harness 技能](template/user-guard/skills/cae-harness/SKILL.md) 负责日常派工、持久化续接、确认票据与事实锚定，[cae-writing 技能](template/user-guard/skills/cae-writing/SKILL.md) 按体裁提供按需学术写作规范（不增设常驻硬钩子）。[cae-axioms 技能](template/user-guard/skills/cae-axioms/SKILL.md) 提供点名触发的四层条款级单向公理分册、双档硬公理状态机（`axiom_gate.py` 与 `_axiom_lib/`）、纯核 Lean 4 真内核驱动（`KernelAudit.lean`）与净室 `packet_replay` 复演协议（零常驻钩子）。此外，[fleet-evolve 技能](template/user-guard/skills/fleet-evolve/SKILL.md) 负责全局工具链评估、审批和同步。细则按归属单点维护，已被代码或钩子硬守住的机制不在此重复展开。
 
 [fleet_profile.json](template/user-guard/skills/cae-harness/fleet_profile.json) 统一保存五个动态角色槽位（`orchestrator`、`math`、`code`、`review`、`fast`）、`native_agent_profiles`、`runtime_tunables`、`subscription_matrix` 与 `capability_ledger`。常驻文档仅引用角色与配置键，不写时期性模型名、静态日期或插件版本数字；版本以 `template/user-guard/plugin.json` 为准，历史见 Git 与 `CHANGELOG.md`。
 
@@ -14,7 +14,7 @@
 
 | 层次 | 归属路径 | 维护与更新边界 |
 | --- | --- | --- |
-| 项目主体代码层 | `install.py`、`template/user-guard/hooks/`（含 `_lib/fs_safety.py`、`shell_lex.py`、`adaptive_policy.py`、`process_guard.py`）、`cae_harness.py`、`fleet_state.py`、`ccswitch_admin.py`、`router.py`、`tests/` | 受 Git 与全量回归及 CI 门禁约束，仅通过工程重构或经批准补丁修改，不在日常会话中自改写。 |
+| 项目主体代码层 | `install.py`、`template/user-guard/hooks/`（含 `_lib/fs_safety.py`、`shell_lex.py`、`adaptive_policy.py`、`process_guard.py`）、`cae_harness.py` 及 `_harness/`、`axiom_gate.py` 及 `_axiom_lib/` 与 `lean/`、`fleet_state.py`、`ccswitch_admin.py`、`router.py`、`tests/` | 受 Git 与全量回归及 CI 门禁约束，仅通过工程重构或经批准补丁修改，不在日常会话中自改写。 |
 | 项目自更新层 | `fleet_profile.json`、`fleet-evolve`、`install.py --audit-upgrade` | `fleet_profile.json` 由 `fleet-evolve` 评估并经用户确认后更新，驱动模型矩阵、自适应策略参数及升级体检。 |
 | 分发给其他 Agent 的配置层 | `~/.gemini/config/plugins/user-guard/`、`~/.codex/`、`~/.claude/`、`~/.dsh/` | 由 `install.py` 按宿主协议分发同步并保留用户自定义尾段，属于部署产物，不在目标端手工硬改主干逻辑。 |
 

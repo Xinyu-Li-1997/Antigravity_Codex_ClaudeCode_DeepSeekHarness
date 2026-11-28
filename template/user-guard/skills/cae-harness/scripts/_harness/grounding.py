@@ -33,6 +33,7 @@ _GROUNDING_CLIENT_READONLY_TOOLS = (
 _GROUNDING_REPO_SCRIPT_TOKENS = (
     'install.py', 'install.ps1', 'install.sh',
     'cae_harness.py', '$harness', '${harness}', '%harness%', '_harness',
+    'axiom_gate.py', '$axiom_gate', '${axiom_gate}', '%axiom_gate%', '_axiom_lib',
     'fleet_state.py', 'ccswitch_admin.py', 'router.py',
     'handoff_gate.py', 'status_guard.py', 'reply_repeat_guard.py',
     'user_words.py', 'session_context_loader.py',

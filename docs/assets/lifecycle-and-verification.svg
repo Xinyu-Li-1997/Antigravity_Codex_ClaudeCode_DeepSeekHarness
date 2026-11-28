@@ -66,8 +66,8 @@
   </g>
   <g><rect x="32" y="842" width="1376" height="220" rx="14" fill="#ffffff" stroke="#b5c8e5"/>
     <text x="54" y="876" class="heading">共有钩子模块分工与各客户端宿主事件适配</text>
-    <text x="54" y="907" class="body">恢复与调用前：session_context_loader.py 与 handoff_gate.py 还原原话、关键返回与未决确认单并评估交接阶段。</text>
-    <text x="54" y="933" class="body">工具执行前：status_guard.py 与 handoff_gate.py 检查写边界、重复读日志、直接调 CLI、批准票据与收尾限制。</text>
+    <text x="54" y="907" class="body">恢复与调用前：session_context_loader.py 与 handoff_gate.py 还原原话、关键返回与未决总览链接并评估交接阶段。</text>
+    <text x="54" y="933" class="body">新指令与工具前：handoff_gate.py 更新交接判断；status_guard.py 查写边界、轮询、裸调 CLI 与已批票据。</text>
     <text x="54" y="959" class="body">回合结束时：reply_repeat_guard.py 与 handoff_gate.py 拦刷屏、矛盾全过与未实查否定，核对回执与对账。</text>
     <text x="54" y="985" class="body">协议映射：Antigravity 挂 4 类事件；Codex/Claude 挂 5 类事件；DSH 为 soft_rules_only 并由 install.py 探测 hook_protocol。</text>
     <text x="54" y="1011" class="body">共享基础库：user_words.py 与 hooks/_lib/ 承载跨平台锁、自适应阈值、轨迹解析与完成回执记录持久化。</text>

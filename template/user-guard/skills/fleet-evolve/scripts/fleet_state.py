@@ -240,6 +240,21 @@ def _repo_meta(repo_root: Path) -> Dict[str, str]:
         for sub_py in sorted(harness_pkg.glob("*.py")):
             if sub_py.is_file() and not _is_reparse_or_symlink(sub_py):
                 core_paths.append(sub_py.relative_to(repo_root).as_posix())
+    axioms_root = repo_root / "template" / "user-guard" / "skills" / "cae-axioms"
+    if axioms_root.is_dir():
+        axiom_gate_py = axioms_root / "scripts" / "axiom_gate.py"
+        if axiom_gate_py.is_file() and not _is_reparse_or_symlink(axiom_gate_py):
+            core_paths.append(axiom_gate_py.relative_to(repo_root).as_posix())
+        axiom_pkg = axioms_root / "scripts" / "_axiom_lib"
+        if axiom_pkg.is_dir():
+            for sub_f in sorted(axiom_pkg.iterdir()):
+                if sub_f.is_file() and sub_f.suffix in {".py", ".lean"} and not _is_reparse_or_symlink(sub_f):
+                    core_paths.append(sub_f.relative_to(repo_root).as_posix())
+        axiom_lean = axioms_root / "lean"
+        if axiom_lean.is_dir():
+            for lean_f in sorted(axiom_lean.glob("*.lean")):
+                if lean_f.is_file() and not _is_reparse_or_symlink(lean_f):
+                    core_paths.append(lean_f.relative_to(repo_root).as_posix())
     for rel in core_paths:
         target = repo_root / rel
         core_digest.update(rel.encode("utf-8") + b"\0")

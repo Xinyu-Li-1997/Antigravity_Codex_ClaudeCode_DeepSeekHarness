@@ -1,0 +1,169 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="1086" viewBox="0 0 1440 1086" role="img" aria-labelledby="title desc">
+  <title id="title">按需公理审查与硬状态机架构（cae-axioms）</title>
+  <desc id="desc">条款级单向无环分层法典、双档短路状态机、净室 packet_replay 复演门禁、可选纯核 Lean 4 真内核校验与双正交轴三档终态。</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M 0 1 L 8 5 L 0 9" fill="none" stroke="#64748b" stroke-width="1.6"/>
+    </marker>
+    <marker id="arrow-amber" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M 0 1 L 8 5 L 0 9" fill="none" stroke="#b45309" stroke-width="1.6"/>
+    </marker>
+    <marker id="arrow-green" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M 0 1 L 8 5 L 0 9" fill="none" stroke="#15803d" stroke-width="1.6"/>
+    </marker>
+  </defs>
+  <style>
+    text { font-family: "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; fill: #1e293b; }
+    .title { font-size: 27px; font-weight: 700; }
+    .subtitle { font-size: 16px; fill: #475569; }
+    .heading { font-size: 18px; font-weight: 700; }
+    .subhead { font-size: 16px; font-weight: 700; fill: #1e293b; }
+    .body { font-size: 14.5px; fill: #334155; }
+    .small { font-size: 13.5px; fill: #475569; }
+    .tag { font-size: 13px; font-weight: 700; fill: #475569; }
+    .tag-amber { font-size: 13px; font-weight: 700; fill: #b45309; }
+    .tag-green { font-size: 13px; font-weight: 700; fill: #15803d; }
+    .link { fill: none; stroke: #64748b; stroke-width: 2; marker-end: url(#arrow); }
+    .link-dash { fill: none; stroke: #64748b; stroke-width: 2; stroke-dasharray: 6 4; marker-end: url(#arrow); }
+    .link-amber { fill: none; stroke: #b45309; stroke-width: 2; stroke-dasharray: 6 4; marker-end: url(#arrow-amber); }
+    .link-green { fill: none; stroke: #15803d; stroke-width: 2; marker-end: url(#arrow-green); }
+  </style>
+  <rect width="1440" height="1086" rx="18" fill="#f3f6fb"/>
+  <text x="32" y="46" class="title">按需公理审查与硬状态机架构（cae-axioms）</text>
+  <text x="32" y="76" class="subtitle">点名启用（零常驻钩子）；条款级单向无环法典（DAG）、双档硬状态机、净室 packet_replay 与可选纯核 Lean 4 校验。</text>
+
+  <!-- Row 1: Four-Layer Clause-Level Acyclic DAG (y=104..254) -->
+  <g>
+    <rect x="32" y="104" width="320" height="150" rx="14" fill="#eaf2ff" stroke="#8fb3e8" stroke-width="1.5"/>
+    <text x="50" y="134" class="subhead">第一层：逻辑与认识论（frozen）</text>
+    <text x="50" y="158" class="small">layer1-logic-epistemology.md</text>
+    <text x="50" y="186" class="body">多类经典逻辑与实质前提 P1–P5，</text>
+    <text x="50" y="210" class="body">外生反身边界，零学科特例；</text>
+    <text x="50" y="234" class="body">--profile core 仅依赖本层。</text>
+  </g>
+  <path class="link" d="M 352 179 L 382 179"/>
+  <g>
+    <rect x="384" y="104" width="320" height="150" rx="14" fill="#f3efff" stroke="#b8a7dc" stroke-width="1.5"/>
+    <text x="402" y="134" class="subhead">层 1.5：数学与计算（frozen）</text>
+    <text x="402" y="158" class="small">layer1_5-math-computation.md</text>
+    <text x="402" y="186" class="body">仅承接第一层逻辑条款，</text>
+    <text x="402" y="210" class="body">测度化归、弱解间断与四原型，</text>
+    <text x="402" y="234" class="body">零物理前提，向力学提供载体。</text>
+  </g>
+  <path class="link" d="M 704 179 L 734 179"/>
+  <g>
+    <rect x="736" y="104" width="320" height="150" rx="14" fill="#f3efff" stroke="#b8a7dc" stroke-width="1.5"/>
+    <text x="754" y="134" class="subhead">层 2M：理性力学（evolving）</text>
+    <text x="754" y="158" class="small">layer2m-rational-mechanics.md</text>
+    <text x="754" y="186" class="body">承接层 1/1.5 与 2A·D1-D2，</text>
+    <text x="754" y="210" class="body">正测度收支、惯性对称群与</text>
+    <text x="754" y="234" class="body">凹熵耗散正交，零离散前提。</text>
+  </g>
+  <path class="link" d="M 1056 179 L 1086 179"/>
+  <g>
+    <rect x="1088" y="104" width="320" height="150" rx="14" fill="#ffffff" stroke="#b5c8e5" stroke-width="1.5"/>
+    <text x="1106" y="134" class="subhead">第二层：领域与反身（frozen）</text>
+    <text x="1106" y="158" class="small">layer2-domain-audit.md</text>
+    <text x="1106" y="186" class="body">2A 经验物理（D1-D3 前置）；</text>
+    <text x="1106" y="210" class="body">2B 书面评议与 2C 反身生态</text>
+    <text x="1106" y="234" class="body">跨档通用；引用见溯源分册。</text>
+  </g>
+
+  <!-- Clean Gutter 1 (y=254..304): Row 1 -> Row 2 + core root short-circuit -->
+  <path class="link" d="M 192 254 L 192 302"/>
+  <path class="link" d="M 830 254 L 830 302"/>
+  <path class="link-amber" d="M 420 304 L 420 278 L 1260 278 L 1260 302"/>
+  <text x="530" y="272" class="tag-amber">core / cae 根冲突均短路锁死</text>
+
+  <!-- Row 2: Dual-Profile Hard State Machine + Absorbing State (y=304..554) -->
+  <g>
+    <rect x="32" y="304" width="510" height="250" rx="14" fill="#eaf2ff" stroke="#8fb3e8" stroke-width="1.5"/>
+    <text x="52" y="336" class="heading">通用第一层档（--profile core）四关链</text>
+    <text x="52" y="362" class="small">零物理与 CAE 字段，仅依赖 LogicCore.lean 40 条定理</text>
+    <text x="52" y="394" class="body">1. L0_WELLFORMED：载体分离、编码体制与保守定义。</text>
+    <text x="52" y="422" class="body">2. L1_ROOT_CONSISTENCY：根可满足与模块 DAG 无环。</text>
+    <text x="52" y="450" class="body">3. L2_CONSTRAINT_ROLE：欠封闭、一.8 七分与并列律。</text>
+    <text x="52" y="478" class="body">4. L3_EMPIRICAL_EXIT：融贯符合分离与外生退出。</text>
+    <text x="52" y="514" class="small">纯欠封闭在 HOLD_L2 开放 declare_undetermined；</text>
+    <text x="52" y="536" class="small">全关离线推进默认止步 STRUCTURE_PASSED。</text>
+  </g>
+
+  <g>
+    <rect x="562" y="304" width="530" height="250" rx="14" fill="#f3efff" stroke="#b8a7dc" stroke-width="1.5"/>
+    <text x="582" y="336" class="heading">科学计算扩展档（--profile cae）五关链</text>
+    <text x="582" y="362" class="small">内嵌第一层判据并叠加层 1.5、层 2M 与第二层 2A（默认）</text>
+    <text x="582" y="394" class="body">1. S0_TYPING：正测度定义域守卫与编码体制分流。</text>
+    <text x="582" y="422" class="body">2. S1_ROOT_MEASURE：测度化归、奇异界面与非对易平均。</text>
+    <text x="582" y="450" class="body">3. S2_SYMMETRY_JUMP：惯性对称群与间断未知量计数。</text>
+    <text x="582" y="478" class="body">4. S3_CLOSURE_CONSTRAINT：四原型、宇称与凹熵核验。</text>
+    <text x="582" y="506" class="body">5. S4_LOCAL_SPECTRAL_VV：局部适定、校核确认与总成本。</text>
+    <text x="582" y="536" class="small">纯欠封闭在 HOLD_S3 开放 declare_undetermined。</text>
+  </g>
+
+  <path class="link-amber" d="M 1092 429 L 1110 429"/>
+  <g>
+    <rect x="1112" y="304" width="296" height="250" rx="14" fill="#fff8e9" stroke="#d7b265" stroke-width="1.5"/>
+    <text x="1130" y="336" class="subhead">根冲突吸收态（不可跳步）</text>
+    <text x="1130" y="362" class="small">HALT_ROOT_CONFLICT</text>
+    <text x="1130" y="392" class="body">L0–L1 或 S0–S2 冲突即锁死，</text>
+    <text x="1130" y="416" class="body">跨平台文件锁防并发，漂移不解锁。</text>
+    <text x="1130" y="450" class="subhead">合法出边（一.4 同一律回锁）</text>
+    <text x="1130" y="478" class="body">· rebase_ontology（更换本体）</text>
+    <text x="1130" y="504" class="body">· downgrade_claim（降格命题）</text>
+    <text x="1130" y="534" class="small">子单永久继承不可变冲突历史。</text>
+  </g>
+
+  <!-- Clean Gutter 2 (y=554..610): Row 2 -> Row 3 + direct offline path to STRUCTURE_PASSED -->
+  <path class="link" d="M 367 554 L 367 608"/>
+  <text x="380" y="586" class="tag">导盲包净室复演升格 VERIFIED_*</text>
+  <path class="link-dash" d="M 920 554 L 920 608"/>
+  <text x="934" y="586" class="tag">可选纯核 Lean 4 真内核校验</text>
+
+  <!-- Row 3: Clean-Room packet_replay (Left) + Optional Lean 4 Kernel Audit (Right) (y=610..806) -->
+  <g>
+    <rect x="32" y="610" width="670" height="196" rx="14" fill="#fff8e9" stroke="#d7b265" stroke-width="1.5"/>
+    <text x="54" y="642" class="heading">净室 packet_replay 复演门禁（升格 VERIFIED_* 必经）</text>
+    <text x="54" y="672" class="body">100% 复用 cae_harness.py --clean-room，状态机内不重复造调度器。</text>
+    <text x="54" y="698" class="body">export-packet 剥离自评结论并输出 manifest.json 与 blobs/&lt;sha256&gt;。</text>
+    <text x="54" y="724" class="body">经 plan 获批后对独立包目录执行盲审（自动镜像并内联全部 blob）。</text>
+    <text x="54" y="750" class="body">verify-replay 交叉验签票据、对账账本、文件树双哈希与盲推断言，</text>
+    <text x="54" y="776" class="body">绝不自动执行包内命令，实跑探针须显式传 --allow-probe-exec 重跑。</text>
+  </g>
+
+  <g>
+    <rect x="738" y="610" width="670" height="196" rx="14" fill="#ffffff" stroke="#b5c8e5" stroke-width="1.5"/>
+    <text x="760" y="642" class="heading">可选零 Mathlib 纯核 Lean 4 真内核校验（--run-lean / --wsl-lean）</text>
+    <text x="760" y="672" class="body">四份纯核骨架：LogicCore（40 条）、ConvexDirectSum、GalileanBox、</text>
+    <text x="760" y="698" class="body">DissipationGeneric（按档位加载，零 Mathlib / 零 Lake 外部依赖）。</text>
+    <text x="760" y="724" class="body">静态预检拦截 sorry、axiom、unsafe、native_decide 后即刻短路；</text>
+    <text x="760" y="750" class="body">受控驱动 KernelAudit.lean 在洁净临时目录现编 .olean 并执行真内核</text>
+    <text x="760" y="776" class="body">replay，全量公理闭包严限 propext、Classical.choice 与 Quot.sound。</text>
+  </g>
+
+  <!-- Clean Gutter 3 (y=806..858): BOTH packet_replay & optional Lean 4 feed Terminal States (x=32..942) -->
+  <path class="link-green" d="M 367 806 L 367 856"/>
+  <text x="380" y="836" class="tag-green">验签通过升格终态（常规离线推进先达 STRUCTURE_PASSED）</text>
+  <path class="link-dash" d="M 850 806 L 850 856"/>
+  <text x="862" y="836" class="tag">真内核加签</text>
+
+  <!-- Row 4: Dual-Axis Terminal States (x=32..942) + Layer 3 Hard Isolation (x=962..1408) (y=858..1058) -->
+  <g>
+    <rect x="32" y="858" width="910" height="200" rx="14" fill="#eefaf4" stroke="#81bfa0" stroke-width="1.5"/>
+    <text x="54" y="890" class="heading">双正交轴三档对外终态（核验完备度 × 目标断言强度）</text>
+    <text x="54" y="920" class="body">· STRUCTURE_PASSED：常规离线推进默认终态，report --require-verified 返退出码 2。</text>
+    <text x="54" y="948" class="body">· VERIFIED_NO_T：经净室复演并具实跑探针或真内核验签，不对目标下全称肯定。</text>
+    <text x="54" y="976" class="body">· VERIFIED_T_ASSERTED：外生目标叠加 exhaustive_domain 或 artifact_bound_lean</text>
+    <text x="54" y="1000" class="body">  充分证书，并逐条披露显式桥接前提；降格或重构子单永久标注原命题不可满足。</text>
+    <text x="54" y="1032" class="small">双哈希精准失活：第 k 关漂移仅将 k 及下游置为 STALE_INVALIDATED，保留有效前缀。</text>
+  </g>
+
+  <g>
+    <rect x="962" y="858" width="446" height="200" rx="14" fill="#ffffff" stroke="#b5c8e5" stroke-width="1.5"/>
+    <text x="984" y="890" class="heading">第三层外部资产隔离与脱敏反哺</text>
+    <text x="984" y="922" class="body">具体课题冲突树、数值反例脚本与外部</text>
+    <text x="984" y="948" class="body">独立证明仓库仅按路径只读挂载，</text>
+    <text x="984" y="974" class="body">绝不并入本仓库或向顶层回灌私有资产。</text>
+    <text x="984" y="1004" class="body">经典文献归档于 layer-citations.md；</text>
+    <text x="984" y="1030" class="body">实战新边界经 feedback 脱敏后分级修订。</text>
+  </g>
+</svg>

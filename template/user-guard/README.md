@@ -12,6 +12,7 @@
 | [hooks/](hooks/) | 五个共用生命周期钩子脚本及内部共享辅助库，负责上下文恢复、写边界守卫、票据核验、长会话交接与回合结束检查 |
 | [skills/cae-harness/](skills/cae-harness/) | 跨客户端无头调度与离线确定性核验技能，含动态配置文件 [fleet_profile.json](skills/cae-harness/fleet_profile.json) |
 | [skills/cae-writing/](skills/cae-writing/) | 按需加载的学术写作与改稿技能，按体裁提供论文、专著、报告与审稿回复结构指南（严守保密红线、零常驻钩子） |
+| [skills/cae-axioms/](skills/cae-axioms/) | 仅在点名时按需加载的公理审查技能，包含四层条款级单向公理分册、双档硬公理状态机（`axiom_gate.py` 与 `_axiom_lib/`）、零 Mathlib 纯核 Lean 4 真内核校验与净室 `packet_replay` 协议（零常驻钩子） |
 | [skills/fleet-evolve/](skills/fleet-evolve/) | 面向本配置仓库的工具链评估、提案审批与多客户端及跨环境同步规程 |
 
 Codex 与 Claude Code 的宿主适配模板分别位于 [template/codex](../codex/) 与 [template/claude](../claude/)。
@@ -34,3 +35,4 @@ python -B -X utf8 install.py --dry-run --yes
 - 日常协作流程与闭环示例：[日常工作流指南](../../docs/workflow-guide.md)
 - 模块原理、四客户端协议适配与卸载步骤：[架构设计与钩子说明](../../docs/architecture-and-hooks.md)
 - 完整脚本参数与确认票据规范：[cae-harness 技能规程](skills/cae-harness/SKILL.md)
+- 按需学术写作与公理审查技能：[cae-writing 写作规范](skills/cae-writing/SKILL.md) · [cae-axioms 公理与状态机](skills/cae-axioms/SKILL.md)

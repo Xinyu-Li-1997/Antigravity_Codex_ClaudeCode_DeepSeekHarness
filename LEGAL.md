@@ -8,8 +8,8 @@
 
 ## 一、独立开源项目与第三方商标声明
 
-1. **无官方关联与背书**：本项目为个人维护的独立第三方开源工具，与 Google、OpenAI、Anthropic、DeepSeek、Moonshot AI、Microsoft、GitHub、Zenodo、Zotero、FreeTSA 或第三方开源项目 CC Switch 等任何厂商、组织或权利人均不存在官方隶属、授权代理、商业合作、赞助或背书关系。
-2. **商标权属、无商标授权与调整意愿**：仓库名称、文档、配置与脚本中提及的 Antigravity、Gemini、Google、OpenAI、Codex、ChatGPT、Anthropic、Claude、Claude Code、DeepSeek、Moonshot AI 与 Kimi 等标识均归各自权利人所有。提及的 CC Switch、Zotero、Windows、PowerShell、Linux、WSL、Python、Microsoft、GitHub、Zenodo 与 FreeTSA 等产品名及标志同样归各自权利人所有。依 Apache License 2.0 第 6 条，本许可不授予任何商号、商标或产品名称使用许可。上述名称仅用于说明配置兼容、命令行调用与接口适配关系，不表示任何来源、隶属或认可；若权利人认为名称或用法可能引起混淆，作者愿意依第六节程序沟通并在合理期限内调整。
+1. **无官方关联与背书**：本项目为个人维护的独立第三方开源工具，与 Google、OpenAI、Anthropic、DeepSeek、Moonshot AI、Microsoft、GitHub、Zenodo、Zotero、FreeTSA、Lean Focused Research Organization 或第三方开源项目 CC Switch 等任何厂商、组织或权利人均不存在官方隶属、授权代理、商业合作、赞助或背书关系。
+2. **商标权属、无商标授权与调整意愿**：仓库名称、文档、配置与脚本中提及的 Antigravity、Gemini、Google、OpenAI、Codex、ChatGPT、Anthropic、Claude、Claude Code、DeepSeek、Moonshot AI 与 Kimi 等标识均归各自权利人所有。提及的 CC Switch、Zotero、Lean、Windows、PowerShell、Linux、WSL、Python、Microsoft、GitHub、Zenodo 与 FreeTSA 等产品名及标志同样归各自权利人所有。依 Apache License 2.0 第 6 条，除为合理且惯常地说明作品来源及复制 [NOTICE](NOTICE) 文件内容所必需者外，本许可不授予任何商号、商标、服务标志或产品名称使用许可。上述名称仅用于说明配置兼容、命令行调用与接口适配关系，不表示任何来源、隶属或认可；若权利人认为名称或用法可能引起混淆，作者愿意依第六节程序沟通并在合理期限内调整。
 3. **动态配置文件无商业评测或贬损意图**：`template/user-guard/skills/cae-harness/fleet_profile.json` 中的角色映射、上下文窗口参数、能力备注、`excluded_vendors` 与 `blocked_auto_tokens` 等配置项，仅为作者面向科学计算与工程研发环境的阶段性非商业适配记录。该文件不构成对任何第三方产品或服务的官方基准评测、质量承诺或商业评价，用户应结合自身实测与业务需求自行审阅并修改。
 
 ---
@@ -34,6 +34,7 @@
    - **本地数据库与回环路由**：`ccswitch_admin.py` 会读取或更新用户本机 CC Switch 的 SQLite 数据库。`router.py` 仅监听本机回环地址，在内存中读取卡片密钥并按配置转发 HTTPS 请求，仅在用户显式开启 `follow_windows_proxy` 时读取 Windows 系统代理注册表。
    - **WSLg 窗口恢复脚本**：`launch-cc-switch-wsl.sh` 在 WSL 环境下调用本地窗口接口检查可见性，并在窗口异常隐藏时可能重启无响应的 CC Switch 进程。
    - **第三方安装包下载风险**：`update-cc-switch-wsl.sh` 仅在用户显式执行时联网访问独立开源项目 `farion1231/cc-switch` 的 GitHub 发布页下载 `.deb` 安装包、结束正在运行的 CC Switch 进程并调用 `sudo apt install`；该脚本默认校验 SHA-256 摘要，若用户传入 `--no-hash` 跳过摘要核验，全部供应链安全风险由用户自行承担。
+   - **公理探针与可选 Lean 4 调用边界**：`axiom_gate.py` 默认不执行用户声明的外部探针命令；仅在用户显式传入 `--allow-probe-exec` 时运行本地案卷已锁定的探针，且 `verify-replay` 绝不自动执行复演包内命令。可选的 `--run-lean` 与 `--wsl-lean` 仅在隔离临时目录调用用户自行安装的 Lean 4 编译器。
    - **第三方费用与条款风险**：各官方客户端、模型接口及第三方兼容端点产生的订阅费、按量 API 费用、配额消耗、限流、政策变更或账号封禁后果，均由用户自行承担。
 
 ---
@@ -53,7 +54,7 @@
 
 - **运行时零第三方代码内嵌**：据维护者核查，本仓库核心脚本与钩子运行时仅依赖 Python 3.11+ 标准库，未在源码树中复制或内嵌任何第三方开源代码库，不构成强 Copyleft 许可证下的衍生作品。
 - **公钥证书与构建期工具**：`.timestamps/V1.0.0/freetsa-cacert.pem` 为 FreeTSA 公开根证书，权属归 FreeTSA 所有，仅用于离线验证对应版本的 RFC 3161 时间戳签名。`.github/workflows/ci.yml` 中引用的 GitHub Actions 仅在持续集成流水线运行期使用，不随本仓库源码分发。
-- **外部软件与独立扩展**：用户自行安装的各官方客户端、CC Switch、Zotero、可选第三方 `zotero-mcp` 扩展及相关模型服务，均受其各自独立的许可证与用户协议约束。本仓库不转授其任何权利，也不对其可用性、安全性或合规性承担责任。
+- **外部软件与独立扩展**：用户自行安装的各官方客户端、CC Switch、Zotero、可选第三方 `zotero-mcp` 扩展、可选外部 Lean 4 / `elan` 工具链、外部证明或数值工具及相关模型服务，均受其各自独立的许可证与用户协议约束。本仓库不内嵌亦不转授其任何权利，也不对其可用性、安全性或合规性承担责任。
 
 ---
 
@@ -61,7 +62,7 @@
 
 作者尊重各方合法知识产权与其他民事权益。若任何个人、企业或机构认为本仓库中的文本、配置、脚本、仓库名称或引用内容存在商标、著作权、专利、隐私或其他合规疑虑，可通过以下对应渠道提交具体说明：
 
-1. **正式侵权投诉与含隐私权属材料（GitHub 官方渠道）**：如涉及身份证明、非公开权属证书、私人联系方式或正式版权与商标下架请求，请优先通过 [GitHub 官方内容移除流程](https://docs.github.com/en/site-policy/content-removal-policies/submitting-content-removal-requests) 提交，以便由 GitHub 依平台政策私密接收并转交处理。
+1. **正式侵权投诉与正式下架通知（GitHub 官方渠道）**：如涉及正式版权或商标下架请求，请优先通过 [GitHub 官方内容移除流程](https://docs.github.com/en/site-policy/content-removal-policies/submitting-content-removal-requests) 提交，由 GitHub 依平台政策受理并转交处理。**请注意：依 GitHub 官方政策，版权移除通知在删去个人联络信息后可能被公开发布，且完整通知副本可能转交受影响仓库维护者，请勿附带与核验无关的保密原件。**
 2. **可公开脱敏异议（仓库异议模板）**：如涉及商标澄清、署名勘误、措辞调整等无需提交私人敏感证件的情形，可使用 [合规与知识产权异议模板](.github/ISSUE_TEMPLATE/compliance_and_ip_notice.md) 提交 Issue。**注意：GitHub Issue 为公开页面，请勿在其中填写身份证件号、私人住址、手机号或保密原件。**
 3. **安全漏洞专属通道**：GitHub 仓库 **Security** 页面的私密报告功能仅用于受理 [SECURITY.md](SECURITY.md) 所界定的安全漏洞，不适用于常规商业沟通或非安全类权属争议。
 
@@ -75,8 +76,8 @@
 
 This English summary is provided for convenience only; in case of discrepancy, the Chinese text prevails, while the English text of [LICENSE](LICENSE) governs Apache License 2.0 terms. If any provision of this notice is held unenforceable under applicable law, the remaining provisions remain in effect.
 
-`Antigravity_Codex_ClaudeCode_DeepSeekHarness` is an independent open-source project released under [Apache License 2.0](LICENSE) (`Copyright 2026 Xinyu Li (Xinyu-Li-1997)`). It is **not affiliated with, endorsed by, or sponsored by** Google, OpenAI, Anthropic, DeepSeek, Moonshot AI, Microsoft, GitHub, Zenodo, Zotero, FreeTSA, or CC Switch. Pursuant to Section 6 of Apache License 2.0, no trademark license is granted; all third-party product names belong to their respective owners and are used solely to describe compatibility, and the author is willing to discuss reasonable naming or wording adjustments upon good-faith notice.
+`Antigravity_Codex_ClaudeCode_DeepSeekHarness` is an independent open-source project released under [Apache License 2.0](LICENSE) (`Copyright 2026 Xinyu Li (Xinyu-Li-1997)`). It is **not affiliated with, endorsed by, or sponsored by** Google, OpenAI, Anthropic, DeepSeek, Moonshot AI, Microsoft, GitHub, Zenodo, Zotero, FreeTSA, Lean Focused Research Organization, or CC Switch. Pursuant to Section 6 of Apache License 2.0, no trademark license is granted except as required for reasonable and customary use in describing the origin of the Work and reproducing the content of the [NOTICE](NOTICE) file; all third-party product names belong to their respective owners and are used solely to describe compatibility, and the author is willing to discuss reasonable naming or wording adjustments upon good-faith notice.
 
 **AS-IS, Liability Limitation & Design Boundary:** To the maximum extent permitted by applicable law, this repository is provided **"AS IS"** without warranties of any kind (Section 7), and the author and contributors are not liable for direct or indirect damages arising from its use (Section 8), except where liability cannot be excluded under mandatory applicable law (such as personal injury or property loss caused by intent or gross negligence). This tool is not designed or certified for nuclear, aerospace, medical, autonomous, pressure-equipment, critical-infrastructure, or other life-safety production decisions without independent human verification and statutory certification; this is a risk notice and adds no restrictions to Apache License 2.0.
 
-**Local Execution, Data Flow & Notices:** Core verification commands and hooks run locally on the Python 3.11+ standard library with zero telemetry and do not provide public generative AI services, proxy circumvention, or access-control bypass. However, dispatch scripts invoke user-configured online official clients at the user's direction (transmitting user-provided content under each provider's terms, potentially cross-border), `router.py` forwards loopback requests to user-configured upstreams, and `update-cc-switch-wsl.sh` downloads third-party `farion1231/cc-switch` releases from GitHub upon explicit execution. For formal intellectual property notices containing private proof, please use [GitHub Content Removal Policies](https://docs.github.com/en/site-policy/content-removal-policies/submitting-content-removal-requests); for sanitized public notices, use the [compliance issue template](.github/ISSUE_TEMPLATE/compliance_and_ip_notice.md). Good-faith adjustments do not constitute admission of liability, and false or malicious notices carry statutory liability under applicable law.
+**Local Execution, Data Flow & Notices:** Core verification commands, `axiom_gate.py` (which only runs user-locked local probes with explicit `--allow-probe-exec`, never executes commands from replay packets, and invokes user-installed Lean 4 only in isolated temp directories), and hooks run locally on the Python 3.11+ standard library with zero telemetry and do not provide public generative AI services, proxy circumvention, or access-control bypass. However, dispatch scripts invoke user-configured online official clients at the user's direction (transmitting user-provided content under each provider's terms, potentially cross-border), `router.py` forwards loopback requests to user-configured upstreams, and `update-cc-switch-wsl.sh` downloads third-party `farion1231/cc-switch` releases from GitHub upon explicit execution. For formal copyright or trademark takedown notices, please use [GitHub Content Removal Policies](https://docs.github.com/en/site-policy/content-removal-policies/submitting-content-removal-requests) (note that GitHub may publish redacted notices and forward unredacted copies to affected maintainers under its policy, so avoid attaching unnecessary confidential originals); for sanitized public notices, use the [compliance issue template](.github/ISSUE_TEMPLATE/compliance_and_ip_notice.md). Good-faith adjustments do not constitute admission of liability, and false or malicious notices carry statutory liability under applicable law.

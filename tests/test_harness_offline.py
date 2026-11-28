@@ -8539,6 +8539,41 @@ else:
             self.assertEqual(rc_dry, 0)
             self.assertEqual(sleep_calls, [])
 
+    def test_axiom_gate_grounding_script_token_guard(self):
+        """Phase 1A: check-grounding --strict 须守卫 axiom_gate.py 与 $AXIOM_GATE 的命令行参数。"""
+        proj = self.root / 'proj_axiom_grounding'
+        proj.mkdir()
+        (proj / 'axiom_gate.py').write_text(
+            'import argparse\n'
+            'p = argparse.ArgumentParser()\n'
+            'p.add_argument("--profile", default="core")\n'
+            'p.add_argument("--run-lean", action="store_true")\n',
+            encoding='utf-8',
+        )
+        doc_ok = proj / 'guide_ok.md'
+        doc_ok.write_text(
+            '# 用法\n\n运行 `python -B -X utf8 "$AXIOM_GATE" --profile core --run-lean`。\n',
+            encoding='utf-8',
+        )
+        rc_ok, rep_ok = self.capture(
+            harness.cmd_check_grounding,
+            self.args('check-grounding', '--target', str(doc_ok), '--root', str(proj), '--strict'),
+        )
+        self.assertEqual(rc_ok, 0, rep_ok.get('findings'))
+
+        doc_bad = proj / 'guide_bad.md'
+        doc_bad.write_text(
+            '# 用法\n\n运行 `python -B -X utf8 "$AXIOM_GATE" --bogus-axiom-flag`。\n',
+            encoding='utf-8',
+        )
+        rc_bad, rep_bad = self.capture(
+            harness.cmd_check_grounding,
+            self.args('check-grounding', '--target', str(doc_bad), '--root', str(proj), '--strict'),
+        )
+        self.assertEqual(rc_bad, harness.EXIT_CODES['verification_failed'])
+        bad_tokens = {f['token'] for f in rep_bad['findings'] if f['category'] == 'ungrounded_identifier'}
+        self.assertIn('--bogus-axiom-flag', bad_tokens)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

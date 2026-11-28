@@ -23,15 +23,15 @@ body:
     attributes:
       label: 仓库版本或提交哈希（选填）
       description: 可填写 Release 版本号或 git rev-parse --short HEAD 输出
-      placeholder: V2.0.6 / main
+      placeholder: 发布标签（如 V2.x）或 git 短提交哈希 / main
     validations:
       required: false
   - type: input
     id: env
     attributes:
       label: 运行环境
-      description: 操作系统、Python 版本与涉及客户端（勿填真实用户名或主机名）
-      placeholder: Windows 11 / WSL2 Ubuntu 24.04 / Python 3.12 / Codex
+      description: 操作系统、Python 版本、涉及客户端及可选 Lean 4 版本（勿填真实用户名或主机名）
+      placeholder: Windows 11 / WSL2 Ubuntu 24.04 / Python 3.12 / Codex / Lean 4 (可选)
     validations:
       required: true
   - type: textarea
