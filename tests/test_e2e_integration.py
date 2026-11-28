@@ -2019,7 +2019,7 @@ class TestEndToEndIntegration(unittest.TestCase):
                 self.assertIsNone(INSTALLER._plan_codex_hooks(path, template, cmd).change)
                 scripts = root / "hooks"
                 scripts.mkdir()
-                for name in ("session_context_loader.py", "user_words.py"):
+                for name in ("uguard_hook.py", "session_context_loader.py", "handoff_gate.py", "user_words.py"):
                     shutil.copy2(TEMPLATE_DIR / "hooks" / name, scripts / name)
                 if (TEMPLATE_DIR / "hooks" / "_lib").is_dir():
                     shutil.copytree(TEMPLATE_DIR / "hooks" / "_lib", scripts / "_lib")
@@ -2032,12 +2032,13 @@ class TestEndToEndIntegration(unittest.TestCase):
                 self.assertTrue((root / "hooks" / "logs" / "session-context.jsonl").is_file())
                 disabled = INSTALLER._plan_codex_hooks(path, template, cmd, "off", 0)
             hooks = json.loads(disabled.change.content)["hooks"]
+            self.assertEqual(set(hooks.keys()), {"SessionStart", "PreToolUse", "Stop"})
             remaining = [handler for groups in hooks.values() for group in groups for handler in group["hooks"]]
             self.assertEqual(len(remaining), 3)
             commands = "\n".join(handler["command"] for handler in remaining)
-            for name in ("session_context_loader.py", "status_guard.py", "reply_repeat_guard.py"):
-                self.assertIn(name, commands)
-            self.assertNotIn("handoff_gate.py", commands)
+            for ev in ("--event SessionStart", "--event PreToolUse", "--event Stop"):
+                self.assertIn(ev, commands)
+            self.assertIn("uguard_hook.py", commands)
 
     def test_22_codex_toml_preflight_preserves_quoted_keys_comments_and_trust(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
