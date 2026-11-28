@@ -15,51 +15,51 @@
   <path class="link" d="M 367 968 L 367 998"/>
   <path class="link" d="M 1073 968 L 1073 998"/>
   <g><rect x="32" y="112" width="670" height="162" rx="14" fill="#ffffff" stroke="#b5c8e5"/>
-    <text x="54" y="146" class="heading">常驻机制层：共用规则、钩子与验证入口</text>
-    <text x="54" y="177" class="body">全局规则 R0–R11、5 个钩子模块、hooks/_lib/ 公共库与 readonly-* 约束边界。</text>
-    <text x="54" y="203" class="body">install.py 同步；cae_harness.py 调度核验，另含按需 cae-writing 与 cae-axioms。</text>
+    <text x="54" y="146" class="heading">常驻机制层：共用规则、单入口钩子与验证入口</text>
+    <text x="54" y="177" class="body">条件裁剪规则 R0–R11、单入口 uguard_hook.py、hooks/_lib/ 与 agents_spec.json 单源只读代理。</text>
+    <text x="54" y="203" class="body">install.py 按端分发；cae_harness.py 调度核验，另含按需 cae-writing 与 cae-axioms。</text>
     <text x="54" y="229" class="body">交互主会话保留用户自选客户端、模型与推理强度，零时期性模型名硬编码。</text>
   </g>
   <g><rect x="738" y="112" width="670" height="162" rx="14" fill="#ffffff" stroke="#b5c8e5"/>
-    <text x="760" y="146" class="heading">动态配置层：fleet_profile.json</text>
-    <text x="760" y="177" class="body">五角色槽位（roles）与四端内生代理档案（native_agent_profiles）。</text>
-    <text x="760" y="203" class="body">runtime_tunables 配合 adaptive_policy.py 动态派生恢复及交接阈值。</text>
-    <text x="760" y="229" class="body">subscription_matrix 与 capability_ledger 记录启停、在线刷新与本机实测时间。</text>
+    <text x="760" y="146" class="heading">动态配置层：fleet_profile.json + local overlay</text>
+    <text x="760" y="177" class="body">五角色槽位（roles）、四端代理档案与 client_capability_baselines 能力基线。</text>
+    <text x="760" y="203" class="body">runtime_tunables 配合 adaptive_policy.py 动态派生恢复与交接阈值。</text>
+    <text x="760" y="229" class="body">支持不进 Git 的 fleet_profile.local.json（hook_safety 只紧不松）与启停台账。</text>
   </g>
   <g><rect x="32" y="304" width="1376" height="126" rx="14" fill="#f3efff" stroke="#b8a7dc"/>
-    <text x="54" y="338" class="heading">阶段一：独立 fleet-evolve 维护期评估与用户启停确认</text>
-    <text x="54" y="369" class="body">结合联网评估与本机探测展示各客户端和模型的可用性及额度类型；由用户确认决定启停。</text>
-    <text x="54" y="395" class="body">subscription_matrix 中 enabled: false 的项全局跳过；日常派工只读本地时间，不联网查榜单。</text>
+    <text x="54" y="338" class="heading">阶段一：上游专属 fleet-evolve 四端只读探针与用户审定</text>
+    <text x="54" y="369" class="body">只留配置仓库不向宿主机分发；常驻四端四值能力矩阵 capability_matrix 与双轨信号，硬禁静默改主体代码。</text>
+    <text x="54" y="395" class="body">subscription_matrix 中 enabled: false 的项全局跳过；日常派工仅离线读取，不联网查榜单。</text>
   </g>
   <g><rect x="32" y="460" width="1376" height="150" rx="14" fill="#eefaf4" stroke="#81bfa0"/>
-    <text x="54" y="494" class="heading">阶段二：plan 生成确认单前纯离线可用性与额度复查</text>
+    <text x="54" y="494" class="heading">阶段二：外部无头 plan 生成确认单前纯离线可用性与额度复查</text>
     <text x="54" y="525" class="body">离线核对本机可执行文件、凭据配置、所需本地回环路由存活与当前配额冷却记录。</text>
     <text x="54" y="551" class="body">读取本地可得的滚动窗口百分比与重置时间、卡片套餐或余额类型、日月费用限额。</text>
     <text x="54" y="577" class="body">过滤不可用或超限通道；本机未暴露的信息保持未知，不推断服务端实时余额充足。</text>
   </g>
   <g><rect x="32" y="640" width="1376" height="166" rx="14" fill="#fff8e9" stroke="#d7b265"/>
-    <text x="54" y="674" class="heading">全通道重负载确认：用户明确点名（P0）与动态角色选路并列</text>
-    <text x="54" y="705" class="body">plan 将 4 列总览与 14 项明细写入 &lt;ticket_id&gt;_card.md，日常对话仅展 3 句话 chat_brief 与可点击链接。</text>
-    <text x="54" y="731" class="body">明细文件附在线刷新与本机实测时间（last_online_refresh_at / local_bench_verified_at）与三选项。</text>
-    <text x="54" y="757" class="body">获批后以 --approve-ticket 登记；PreToolUse 核验票据、隔离一致性并拦截裸调 CLI。</text>
-    <text x="54" y="783" class="body">点名锁定指定维度；窗口、非委派挡位、--isolation 隔离、行号内联与快照按端补齐。</text>
+    <text x="54" y="674" class="heading">跨端重负载持票确认与同端原生编排共存分流</text>
+    <text x="54" y="705" class="body">外部无头重负载经 plan 写入 &lt;ticket_id&gt;_card.md，对话仅展 3 句话 chat_brief 与可点击链接。</text>
+    <text x="54" y="731" class="body">点名锁定（P0）与动态角色选路并列；明细附离线刷新/实测时间与三选项。</text>
+    <text x="54" y="757" class="body">获批后以 --approve-ticket 登记；PreToolUse 核验外部票据并硬拦截裸调无头 CLI。</text>
+    <text x="54" y="783" class="body">同端只读多路、显式原生斜杠编排与子代理会话直接放行；未指示可写多路交宿主 ask，R4 写边界全程硬守。</text>
   </g>
   <g><rect x="32" y="836" width="670" height="132" rx="14" fill="#ffffff" stroke="#b5c8e5"/>
     <text x="54" y="870" class="heading">外部通道：cae-harness 跨端无头子进程</text>
-    <text x="54" y="901" class="body">batch 按各后端并发上限执行 cae_harness_headless 通道。</text>
+    <text x="54" y="901" class="body">batch / gate / audit 持票执行 cae_harness_headless 跨端任务。</text>
     <text x="54" y="927" class="body">支持 --isolation 四级正交隔离；只读带行号内联与快照，可写锁范围与验收命令。</text>
     <text x="54" y="953" class="body">各客户端按自身 CLI 协议能力适配参数、结构化输出与脱敏。</text>
   </g>
   <g><rect x="738" y="836" width="670" height="132" rx="14" fill="#ffffff" stroke="#b5c8e5"/>
-    <text x="760" y="870" class="heading">内部通道：各客户端原生子代理与工作流</text>
-    <text x="760" y="901" class="body">覆盖 native_subagent、native_workflow、native_swarm（swarm add 精确计流）。</text>
-    <text x="760" y="927" class="body">优先解析代理定义显式 model 与 inherit；多路或可写委派统一纳入确认。</text>
-    <text x="760" y="953" class="body">由当前主会话客户端按获批计划调用，不交给 batch，不套用无头隔离承诺。</text>
+    <text x="760" y="870" class="heading">内部通道：各客户端原生模式与硬化只读代理</text>
+    <text x="760" y="901" class="body">原生放行 /teamwork、/swarm、/boost、/plan、/goal、spawn_agent 与 Claude Agent。</text>
+    <text x="760" y="927" class="body">三端 readonly-* 锚定 agents_spec.json（Claude 平台级 disallowedTools + dontAsk 硬化）。</text>
+    <text x="760" y="953" class="body">由当前主会话客户端原生编排调度，零冗余外置票据摩擦，不替代跨端独立盲审。</text>
   </g>
   <g><rect x="32" y="998" width="1376" height="132" rx="14" fill="#eefaf4" stroke="#81bfa0"/>
-    <text x="54" y="1032" class="heading">共有会话生命周期门禁与四客户端协议适配</text>
-    <text x="54" y="1063" class="body">Antigravity、Codex、Claude Code 接入 5 个共用钩子模块；DSH 为 soft_rules_only 并由 install.py 探测 hook_protocol。</text>
-    <text x="54" y="1089" class="body">压缩后折叠历史明细，恢复未决总览与明细链接并带回对账与 read-plan 指针；交接期放行只读诊断。</text>
-    <text x="54" y="1115" class="body">派单完工硬出机械对账表；Stop 核验成败、Token、同名回执消歧与 reconcile_file 链接，主会话按 R6 复核。</text>
+    <text x="54" y="1032" class="heading">单入口生命周期门禁与四客户端因地制宜适配</text>
+    <text x="54" y="1063" class="body">AGY 窄匹配 4 事件、Codex/Claude 单入口 5 事件（policy.json 护信任哈希）；DSH 为 no_lifecycle_hooks（原生文件沙箱）。</text>
+    <text x="54" y="1089" class="body">四端默认 advisory；手动 /compact 独立计数不触震荡，活跃 /goal 不被启发式强杀，压缩带回原话与对账指针。</text>
+    <text x="54" y="1115" class="body">外部派单完工硬出机械对账表；Stop 硬验外部账单与测试成败，启发式实证默认 advisory 温和记录，主会话按 R6 复核。</text>
   </g>
 </svg>

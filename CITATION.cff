@@ -10,11 +10,14 @@ url: "https://doi.org/10.5281/zenodo.24293507"
 doi: 10.5281/zenodo.24293507
 license: Apache-2.0
 abstract: >-
-  Shared engineering rules (R0-R11), symmetrical deterministic session lifecycle
-  hooks (guarding both overclaimed verification and unverified negative claims),
-  read-only review subagents, zero-blacklist lexical grounding and document
-  hygiene checks, pre-read sizing and conservative sharding, cross-client
-  coverage verification, deterministic mechanical reconciliation tables,
+  Shared engineering rules (R0-R11) with client-idiomatic conditional filtering,
+  a unified byte-stable single-entry lifecycle hook dispatcher (uguard_hook.py)
+  that coexists cleanly with same-host native orchestration while hard-guarding
+  workspace write boundaries, external headless dispatches, and completion bills,
+  single-source hardened read-only review subagents, zero-blacklist lexical
+  grounding and document hygiene checks, pre-read sizing and conservative
+  sharding, cross-client coverage verification, deterministic mechanical
+  reconciliation tables, read-only four-client capability evolution probes,
   on-demand academic writing guides (cae-writing), and an on-demand four-layer
   acyclic axiom verification machine (cae-axioms: dual-profile Python hard
   state machine, optional zero-Mathlib Lean 4 kernel audit, and clean-room

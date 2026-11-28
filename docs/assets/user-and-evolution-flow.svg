@@ -28,9 +28,9 @@
 
   <g>
     <rect x="50" y="184" width="624" height="96" rx="12" fill="#ffffff" stroke="#b8cde8"/>
-    <text x="72" y="216" class="heading">1. 自然中文输入与主会话分流</text>
-    <text x="72" y="244" class="body">主会话保留用户自选客户端、模型与强度；局部小修改在主会话直接闭环。</text>
-    <text x="72" y="268" class="body">Antigravity、Codex、Claude Code 与 DSH 四端对等，单端亦可独立运行。</text>
+    <text x="72" y="216" class="heading">1. 同端归原生、跨端与铁面验收归本仓</text>
+    <text x="72" y="244" class="body">同端规划、/teamwork、/swarm、/goal、/compact、spawn_agent 与 Agent 直走原生。</text>
+    <text x="72" y="268" class="body">Antigravity、Codex、Claude Code 与 DSH 四端对等，按端裁剪规则与单入口钩子。</text>
   </g>
 
   <path class="link" d="M 200 280 L 200 310"/>
@@ -51,7 +51,7 @@
     <text x="390" y="370" class="body">仅说明推导、实现或审查目标。</text>
     <text x="390" y="396" class="body">按统筹、数理、编码、审查与快检</text>
     <text x="390" y="422" class="body">五类动态角色从可用端自动分配。</text>
-    <text x="390" y="448" class="body">关键审查优先跨客户端独立执行。</text>
+    <text x="390" y="448" class="body">本机私有覆盖放 fleet_profile.local.json。</text>
   </g>
 
   <path class="link" d="M 200 478 L 200 508"/>
@@ -59,20 +59,20 @@
 
   <g>
     <rect x="50" y="508" width="624" height="142" rx="12" fill="#ffffff" stroke="#b8cde8"/>
-    <text x="72" y="540" class="heading">3. 读前分片、简洁确认与压缩恢复</text>
+    <text x="72" y="540" class="heading">3. 读前分片、外部持票与压缩恢复</text>
     <text x="72" y="568" class="body">大仓库先经 read-plan 评估体积并切分保守波次，避免上下文溢出。</text>
-    <text x="72" y="594" class="body">重负载任务先落盘明细文件，对话仅展示三句话摘要与链接，确认后放行。</text>
-    <text x="72" y="620" class="body">长对话压缩后自动分块恢复用户原话、实质子任务结论与未决任务总览。</text>
+    <text x="72" y="594" class="body">外部重负载落盘明细文件并展三句话摘要获批；同端原生模式无冗余索票。</text>
+    <text x="72" y="620" class="body">长对话压缩后自动恢复原话、双窗口回复索引与未决总览，手动 /compact 零误杀。</text>
   </g>
 
   <path class="link" d="M 362 650 L 362 680"/>
 
   <g>
     <rect x="50" y="680" width="624" height="146" rx="12" fill="#eefaf4" stroke="#82bfa0"/>
-    <text x="72" y="712" class="heading">4. 定量验收、机械对账与对称核验</text>
-    <text x="72" y="740" class="body">只读任务比对文件快照；可写 gate 锁定白名单并强制跑通验收命令。</text>
-    <text x="72" y="766" class="body">完工产出 reconcile 对账表；多端审查经 cross-check 查盲区与分歧。</text>
-    <text x="72" y="792" class="body">回合结束对称核验；文档走 --doc-hygiene，按需启用 cae-writing / cae-axioms。</text>
+    <text x="72" y="712" class="heading">4. 定量验收、机械对账与按需专项技能</text>
+    <text x="72" y="740" class="body">只读任务比对文件快照；可写 gate 锁白名单并跑通验收命令，R4 写边界全程硬守。</text>
+    <text x="72" y="766" class="body">外部完工产出 reconcile 对账表；多端审查经 cross-check 查盲区与分歧。</text>
+    <text x="72" y="792" class="body">文档走 check-grounding --doc-hygiene；按需点名启用 cae-writing 与 cae-axioms。</text>
   </g>
 
   <!-- Center Workspace Mode Isolation Divider -->
@@ -85,15 +85,15 @@
 
   <!-- Right Lane Container: upstream config repo -->
   <rect x="744" y="102" width="668" height="748" rx="16" fill="#f4effc" stroke="#bdaae0" stroke-width="1.5"/>
-  <text x="768" y="138" class="lane">本配置仓库维护与更新（上游维护模式）</text>
-  <text x="768" y="163" class="lane-sub">模型换代或机制演进时在本仓库维护；普通课题误调维护脚本返回退出码 2</text>
+  <text x="768" y="138" class="lane">本配置仓库维护与元更新（上游维护模式）</text>
+  <text x="768" y="163" class="lane-sub">fleet-evolve 仅留本仓库不下发宿主；严守公理边界（只读探测 + 提案，禁自改主体代码）</text>
 
   <g>
     <rect x="766" y="184" width="624" height="122" rx="12" fill="#ffffff" stroke="#c5b6e3"/>
     <text x="788" y="216" class="heading">1. 按维护需求选择三种模式（fleet-evolve）</text>
-    <text x="788" y="244" class="body">全面更新（full）：盘点四端客户端、双端环境、内生代理档案与五类角色。</text>
+    <text x="788" y="244" class="body">全面更新（full）：盘点四端能力矩阵、双端环境、代理档案与五类角色。</text>
     <text x="788" y="270" class="body">机制与文档整理（hygiene）：选型不变，将问题下沉为单测守卫并分层整理文档。</text>
-    <text x="788" y="294" class="body">只读巡检（audit）：零修改输出诊断即结束，不进入后续变更流程。</text>
+    <text x="788" y="294" class="body">只读巡检（audit）：零修改输出双轨诊断即结束，不进入后续变更流程。</text>
   </g>
 
   <path class="link" d="M 1078 306 L 1078 336"/>
@@ -101,10 +101,10 @@
 
   <g>
     <rect x="766" y="336" width="624" height="142" rx="12" fill="#ffffff" stroke="#c5b6e3"/>
-    <text x="788" y="368" class="heading">2. 能力评估与本机可用性探测（仅 full 模式）</text>
-    <text x="788" y="396" class="body">结合官方资料、本机报错与实测证据，同时记录模型优势与已知局限。</text>
-    <text x="788" y="422" class="body">同步核实本机各端安装状态、订阅启停状态与可用额度类型。</text>
-    <text x="788" y="448" class="body">在线刷新与本机实测时间记入动态配置，日常派工仅离线复查（hygiene 跳过本步）。</text>
+    <text x="788" y="368" class="heading">2. 四端四值能力探针与双轨信号（audit-upgrade）</text>
+    <text x="788" y="396" class="body">只读探测四端 CLI 能力矩阵、插件清单校验与模式指南覆盖度（四值证据口径）。</text>
+    <text x="788" y="422" class="body">运维阻断进 recommended_actions，协议演进进 evolution_signals，互不污染日常对齐。</text>
+    <text x="788" y="448" class="body">core_sha256 全覆锁定钩子、规则与模板；在线刷新时间落盘，日常派工仅离线复查。</text>
   </g>
 
   <path class="link" d="M 1078 478 L 1078 508"/>

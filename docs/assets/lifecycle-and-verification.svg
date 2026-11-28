@@ -22,41 +22,41 @@
     <text x="54" y="248" class="body">轻重任务分流阈值统一读取 runtime_tunables.dispatch_confirmation。</text>
   </g>
   <g><rect x="32" y="302" width="850" height="134" rx="14" fill="#fff8e9" stroke="#d7b265"/>
-    <text x="54" y="334" class="heading">完整确认：内部原生与外部无头通道统一生成确认单</text>
-    <text x="54" y="363" class="body">4 列总览与 14 项明细写入 &lt;ticket_id&gt;_card.md，对话仅发 3 句话 chat_brief 与链接，禁重复刷票。</text>
-    <text x="54" y="388" class="body">用户明确批准后运行 plan --approve-ticket；执行阶段绑定 --ticket。</text>
-    <text x="54" y="413" class="body">PreToolUse 核验有效票据，同时拦截直接调用无头 CLI 与未经确认的重负载。</text>
+    <text x="54" y="334" class="heading">分级确认：外部无头持票硬守，同端原生顺畅放行</text>
+    <text x="54" y="363" class="body">外部重负载经 plan 落盘 &lt;ticket_id&gt;_card.md，对话仅展 3 句话 chat_brief 与链接，禁重复刷票。</text>
+    <text x="54" y="388" class="body">用户批准后运行 plan --approve-ticket；执行阶段绑定 --ticket 并硬拦截裸调无头 CLI。</text>
+    <text x="54" y="413" class="body">同端只读多路、显式原生斜杠编排与子代理会话直接放行；未指示可写原生多路交宿主 ask 确认。</text>
   </g>
   <g><rect x="32" y="460" width="850" height="162" rx="14" fill="#ffffff" stroke="#b5c8e5"/>
     <text x="54" y="492" class="heading">按批准计划执行：读写边界与验证门禁严格受控</text>
-    <text x="54" y="521" class="body">batch 仅执行外部无头通道；原生子代理由当前客户端按批准计划调用。</text>
+    <text x="54" y="521" class="body">batch / gate / audit 执行外部无头通道；同端原生模式与硬化只读代理直走宿主原生编排。</text>
     <text x="54" y="546" class="body">按后端内联上限为只读文件附带精确行号，前后按过滤规则以自适应快照核验改动。</text>
-    <text x="54" y="571" class="body">gate 锁定 --write-scope 白名单并强制跑通非空 --verify-cmd。</text>
+    <text x="54" y="571" class="body">gate 锁定 --write-scope 白名单并强制跑通非空 --verify-cmd；R4 目录外写边界全程硬守。</text>
     <text x="54" y="596" class="body">触发 quota_exhausted 立即停止重试；同后端排队流熔断并保留已跑结果。</text>
   </g>
   <g><rect x="32" y="652" width="850" height="150" rx="14" fill="#eefaf4" stroke="#81bfa0"/>
     <text x="54" y="686" class="heading">完成核验与主会话 R6 终审：按验证深度如实披露</text>
-    <text x="54" y="717" class="body">派单完工硬出机械对账表（&lt;run_id&gt;_reconcile.md）；多端回执用 cross-check 查覆盖矩阵与分歧。</text>
-    <text x="54" y="743" class="body">Stop 对称拦截矛盾宣称全过与未实查否定结论，核验 Token、回执与对账链接。</text>
+    <text x="54" y="717" class="body">外部派单完工硬出机械对账表（&lt;run_id&gt;_reconcile.md）；多端回执用 cross-check 查覆盖矩阵与分歧。</text>
+    <text x="54" y="743" class="body">Stop 硬拦截外部账单缺项、测试失败谎报与重复空等；启发式文本实证默认 advisory 温和记录。</text>
     <text x="54" y="769" class="body">主会话亲自核对原文件行号与算术汇总，区分配置就位、离线单测与实际环境实测。</text>
   </g>
   <g><rect x="914" y="112" width="494" height="248" rx="14" fill="#f3efff" stroke="#b8a7dc"/>
     <text x="936" y="146" class="heading">压缩打断：分两块独立恢复</text>
     <text x="936" y="177" class="body">adaptive_policy.py 动态缩放恢复预算；</text>
-    <text x="936" y="203" class="body">collapse_historical_cards 折叠历史明细；</text>
-    <text x="936" y="229" class="body">常规用户原话与关键子代理返回摘要；</text>
+    <text x="936" y="203" class="body">手动 /compact 无损归档且不计入震荡熔断；</text>
+    <text x="936" y="229" class="body">常规用户原话、双窗口回复索引与子代理摘要；</text>
     <text x="936" y="255" class="body">独立读票据恢复总览，对话仅补展 chat_brief；</text>
     <text x="936" y="281" class="body">保留待批总览与三选项，有界带回对账指针；</text>
     <text x="936" y="307" class="body">缺项如实报缺口，无明细文件才回退长表；</text>
-    <text x="936" y="333" class="body">压缩与恢复均不构成用户批准。</text>
+    <text x="936" y="333" class="body">压缩、沉默与超时均不构成用户批准。</text>
   </g>
   <g><rect x="914" y="390" width="494" height="232" rx="14" fill="#f3efff" stroke="#b8a7dc"/>
     <text x="936" y="424" class="heading">交接打断：完整写入新对话提示词</text>
-    <text x="936" y="455" class="body">进入 drain 或 freeze 强制交接阶段时，</text>
-    <text x="936" y="481" class="body">Stop 校验【新对话提示词】完整包含</text>
-    <text x="936" y="507" class="body">精简总览表、明细链接、离线性能更新时间、</text>
-    <text x="936" y="533" class="body">选项卡、票据与 plan --resume-ticket。</text>
-    <text x="936" y="559" class="body">Codex/Claude 默认 advisory，依模式生效。</text>
+    <text x="936" y="455" class="body">四端默认 advisory；仅硬触发或显式 enforce</text>
+    <text x="936" y="481" class="body">进入 drain/freeze（活跃 /goal 不被启发式强杀）。</text>
+    <text x="936" y="507" class="body">Stop 校验【新对话提示词】、未决票据链接、</text>
+    <text x="936" y="533" class="body">plan --resume-ticket 与按需 GOAL_CANCELLED。</text>
+    <text x="936" y="559" class="body">收尾期放行只读诊断、browser_close 与 swarm 计划。</text>
   </g>
   <g><rect x="914" y="652" width="494" height="150" rx="14" fill="#f3efff" stroke="#b8a7dc"/>
     <text x="936" y="686" class="heading">新会话：复核旧票据并重建当前计划</text>
@@ -65,12 +65,12 @@
     <text x="936" y="769" class="body">按当前新会话重新生成确认票据再执行。</text>
   </g>
   <g><rect x="32" y="842" width="1376" height="220" rx="14" fill="#ffffff" stroke="#b5c8e5"/>
-    <text x="54" y="876" class="heading">共有钩子模块分工与各客户端宿主事件适配</text>
-    <text x="54" y="907" class="body">恢复与调用前：session_context_loader.py 与 handoff_gate.py 还原原话、关键返回与未决总览链接并评估交接阶段。</text>
-    <text x="54" y="933" class="body">新指令与工具前：handoff_gate.py 更新交接判断；status_guard.py 查写边界、轮询、裸调 CLI 与已批票据。</text>
-    <text x="54" y="959" class="body">回合结束时：reply_repeat_guard.py 与 handoff_gate.py 拦刷屏、矛盾全过与未实查否定，核对回执与对账。</text>
-    <text x="54" y="985" class="body">协议映射：Antigravity 挂 4 类事件；Codex/Claude 挂 5 类事件；DSH 为 soft_rules_only 并由 install.py 探测 hook_protocol。</text>
-    <text x="54" y="1011" class="body">共享基础库：user_words.py 与 hooks/_lib/ 承载跨平台锁、自适应阈值、轨迹解析与完成回执记录持久化。</text>
+    <text x="54" y="876" class="heading">单入口调度器 uguard_hook.py 与四客户端宿主事件适配</text>
+    <text x="54" y="907" class="body">恢复与调用前：uguard_hook.py 驱动 session_context_loader.py 与 handoff_gate.py 还原原话、双窗口索引与交接状态。</text>
+    <text x="54" y="933" class="body">新指令与工具前：status_guard.py 查写边界、轮询、裸调 CLI 与外部票据；同端原生斜杠与只读多路直接放行。</text>
+    <text x="54" y="959" class="body">回合结束时：reply_repeat_guard.py 与 handoff_gate.py 硬验外部账单、测试成败与重复空等，启发式门禁温和记录。</text>
+    <text x="54" y="985" class="body">协议映射：AGY 窄匹配 4 事件；Codex/Claude 单进程 5 事件（policy.json 护信任哈希）；DSH 为 no_lifecycle_hooks（原生沙箱）。</text>
+    <text x="54" y="1011" class="body">共享基础库：user_words.py 与 hooks/_lib/ 承载跨平台锁、本机覆盖层（hook_safety 只紧不松）、自适应阈值与持久化。</text>
     <text x="54" y="1037" class="body">离线确定性工具：check-grounding（含 --doc-hygiene）、read-plan、cross-check 与 reconcile 四端通用。</text>
   </g>
 </svg>
