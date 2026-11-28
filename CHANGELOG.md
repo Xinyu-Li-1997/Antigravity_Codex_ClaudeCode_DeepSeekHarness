@@ -2,6 +2,29 @@
 
 本文件记录四客户端共用规则、会话钩子、后台验证工具与上游维护流程的版本演进。当前插件版本以 `template/user-guard/plugin.json` 为准；常驻使用文档只说明机制和配置键，不重复维护版本号与性能日期。
 
+## [2.1.1] - 2026-11-28
+
+基于真实双平台长会话日志取证完成 5 项会话生命周期与写作机制修复，并刷新四客户端联网评估台账至 `2026-11-28`：
+
+- **修复回合结束门禁子代理登记崩溃（`template/user-guard/hooks/reply_repeat_guard.py`、`tests/test_guards_offline.py`）**：
+  - 修复 `_register_pending_review` 直接将 `user_words.parse_agy_created_subagent` 返回的 `dict` 加入 `pending_review_agents` 集合导致的 `TypeError: unhashable type: 'dict'` 异常，避免整回合 Stop 实证门禁、重复等待拦截与完工回执核验在启动审查子代理时退回静默放行；改为提取字符串会话标识（`conversationId` / `conversation_id` / `id`）后精确结算异步审查返回。
+- **修复三压缩均值间隔死代码并新增单回合高频压缩熔断（`template/user-guard/hooks/handoff_gate.py`、`tests/test_lifecycle_offline.py`）**：
+  - 将 `_merge_telemetry` 中 `recentAvgInterval` 计算条件由 `len(intervals) >= 3` 修正为 `len(intervals) >= 2`（仍取尾 3 段均值），激活 3 次压缩起生效的 `interval_warning`；
+  - 在 `_evaluate_triggers` 新增单回合高频压缩熔断 `turn_cp_thrashing`（单用户回合内连续压缩次数达 `DRAIN_TURN_CPS` 且近期均值间隔不高于 `DRAIN_THRASH_AVG_INTERVAL` 时直接升入 `Stage-2 drain`），阻断大文件全量吞读引发的快速连续压缩失忆循环，同时对健康宽间隔长会话保持零误触。
+- **消除只读 `git` Python AST 边界误报并加固 `git grep -O` 拦截（`template/user-guard/hooks/status_guard.py`、`template/user-guard/hooks/_lib/shell_lex.py`、`tests/test_guards_offline.py`）**：
+  - 在 `_eval_ast_path_candidates` 增补字面量 `str.join(iterable)` 静态求值（与 `os.path.join` 严格分离，防止如 `"|".join(stems)` 在只读 `git grep` 中被误判为动态未解析命令）；
+  - 在 `_bind_ast_target` 增补有限定长元组集合按槽位转置解包（兼容 `for name, r in repos:` 循环，含星号解包仍回退动态拦截），并在 `_is_ast_readonly_subprocess_call` 支持前置多候选项目内 `git -C` 路径及链式 `-C` 逐级边界核验（不混淆子命令后 `git grep -C` 上下文行数参数）；
+  - 在 `shell_lex.parse_readonly_git_prefix` 与动态尾部参数检查中拦截 `git grep` 的 `-O` / `--open-files-in-pager`（防止拉起编辑器或分页器），并清理 `" diff.external"` 前导空格笔误。
+- **新增三端双压缩窗口实质助手回复归档与短确认按需回读指针（`template/user-guard/hooks/user_words.py`、`template/user-guard/hooks/session_context_loader.py`、`tests/test_lifecycle_offline.py`）**：
+  - 在 Antigravity、Codex 与 Claude Code 压缩/恢复提取链路统一新增 `select_compaction_window_assistant_replies` 与 `save_assistant_replies_markdown`：仅提取两次压缩边界之间的实质助手回复（过滤短工具旁白，Antigravity 按需回查 `transcript_full.jsonl` 还原截断正文，窗口为空时回退保留前窗口最后 1 条），独立原子落盘至 `<session_id>_assistant_replies.md`，与用户原话档案及校验清单物理隔离；
+  - 压缩回溯消息仅注入紧凑文件路径与标题大纲索引；当最新用户指令为简短确认或指代（如“批准 / 按你建议”）时自动提示执行前先 `read_file` 查阅归档核对完整方案与参数细节，避免仅依赖有损摘要漏项。
+- **长文防输出截断分块指引、净室复演模板修复与联网配置台账刷新（`template/user-guard/skills/cae-writing/SKILL.md`、`template/user-guard/skills/cae-axioms/scripts/_axiom_lib/replay.py`、`docs/workflow-guide.md`、`docs/architecture-and-hooks.md`、`fleet_profile.json`、`plugin.json`、`tests/test_axioms_offline.py`）**：
+  - 在 `cae-writing/SKILL.md` 与 `docs/workflow-guide.md` 区分“单一全景构思”与“单回合工具输出上限”：超 20 KB 长稿先向会话 `scratch/` 提炼已核实公式与数值锚点表，再由同一执笔按逻辑章节顺序有界分块落盘，并将重型起草与盲读拆分为独立零压缩会话；
+  - 经 `cae-axioms` 真实净室 `packet_replay` 暴露并修复 `_axiom_lib/replay.py` 中 `_expected_blind_assertions_template` 的两处单源漂移：`exit_kind` 模板误写已废弃名称而非 `EXIT_KINDS` 规范值 `evolution_decoupled`，且 `objective_roles` 模板未直接列出 `OBJECTIVE_ROLES` 七分枚举，现统一由 `contract.py` 单源派生并补回归单测；
+  - 刷新 `fleet_profile.json` 的 `evaluated_at` 与 `capability_ledger.last_online_refresh_at` 至 `2026-11-28`，保持五类动态角色与订阅启停矩阵不变，并更新 DSH 上游实验性钩子协议状态说明。
+
+---
+
 ## [2.1.0] - 2026-11-28
 
 新增点名触发的通用与科学计算公理审查技能 `cae-axioms`（四层条款级单向无环法典、纯标准库双档硬公理状态机、零 Mathlib 纯核 Lean 4 真内核校验驱动与净室 `packet_replay` 复演协议），并完成全仓公开文档、架构图示、经典文献溯源、法律安全治理与多端双平台配置全面核校：

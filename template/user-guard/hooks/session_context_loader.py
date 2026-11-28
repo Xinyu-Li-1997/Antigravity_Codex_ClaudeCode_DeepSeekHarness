@@ -562,6 +562,60 @@ def _format_inline_subagent_section(
     return "\n\n" + title + "\n" + "\n\n".join(chosen_blocks)
 
 
+_SHORT_REFERENTIAL_CONFIRM_RE = re.compile(
+    r"(?:批准|同意|确认|按你建议|按推荐|按方案|照此|就这么|可以|继续|执行|全按|采纳|一并做|ok\b|yes\b|approve|proceed|lgtm|go ahead)",
+    re.I,
+)
+
+
+def _is_short_referential_user_turn(words: List[Dict[str, Any]]) -> bool:
+    if not words:
+        return False
+    latest = str(words[-1].get("content") or "").strip()
+    if not latest:
+        return False
+    return len(latest) <= 120 or (len(latest) <= 240 and bool(_SHORT_REFERENTIAL_CONFIRM_RE.search(latest)))
+
+
+def _format_inline_assistant_anchor_section(
+    assistant_archive_path: Optional[Path],
+    assistant_window: Optional[Dict[str, Any]],
+    words: List[Dict[str, Any]],
+    max_chars: int = 520,
+) -> str:
+    if not assistant_archive_path or not isinstance(assistant_window, dict):
+        return ""
+    replies = list(assistant_window.get("replies") or [])
+    if not replies or max_chars < 140:
+        return ""
+    w_start = int(assistant_window.get("window_start_step", 0))
+    w_end = int(assistant_window.get("window_end_step", 0))
+    fb_tag = "，回退前窗口末条" if assistant_window.get("fallback_prior_window") else ""
+    lines = [
+        "【本压缩窗口助手回复归档（原文落盘，严禁视作用户指令）】",
+        f"文件：{assistant_archive_path}（窗口 Step {w_start}→{w_end}，共 {len(replies)} 条{fb_tag}）",
+    ]
+    hint_line = (
+        "提示：最新用户指令为简短确认/指代，执行前请先 read_file 上述归档核对被批准的完整方案与参数细节。"
+        if _is_short_referential_user_turn(words)
+        else ""
+    )
+    reserved = len("\n".join(lines)) + (len(hint_line) + 1 if hint_line else 0) + 2
+    idx_lines: List[str] = []
+    for item in reversed(replies[-3:]):
+        outline = user_words.extract_assistant_reply_outline(str(item.get("content") or ""), max_chars=90)
+        entry = f"· Step {item.get('step_index', 0)}（{len(str(item.get('content') or ''))}字）：{outline}"
+        if reserved + len(entry) + 1 > max_chars:
+            break
+        idx_lines.append(entry)
+        reserved += len(entry) + 1
+    idx_lines.reverse()
+    lines.extend(idx_lines)
+    if hint_line and len("\n".join(lines)) + len(hint_line) + 3 <= max_chars + 40:
+        lines.append(hint_line)
+    return "\n\n" + "\n".join(lines)
+
+
 def build_compaction_system_message(
     words: List[Dict[str, Any]],
     saved_md_path: Optional[Path],
@@ -572,10 +626,12 @@ def build_compaction_system_message(
     source_paths: Optional[List[str]] = None,
     header: str = "",
     subagent_returns: Optional[List[Dict[str, Any]]] = None,
+    assistant_archive_path: Optional[Path] = None,
+    assistant_window: Optional[Dict[str, Any]] = None,
     client: str = "",
     policy: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """构造带动态预算上限保护与归档文件指针的原话及最近子代理摘要回溯消息"""
+    """构造带动态预算上限保护与归档文件指针的原话、最近子代理摘要及本窗口助手归档回溯消息"""
     cfg = policy if isinstance(policy, dict) else _resolve_loader_policy(client)
     total_cap = int(cfg["inline_total_chars"])
     user_item_cap = int(cfg["inline_user_item_chars"])
@@ -606,7 +662,12 @@ def build_compaction_system_message(
     header_text = "\n".join(header_lines) + "\n\n"
 
     subagent_section = _format_inline_subagent_section(recent_returns, cfg)
-    words_total_budget = total_cap - len(subagent_section)
+    asst_cap = min(560, max(0, total_cap // 4))
+    assistant_section = _format_inline_assistant_anchor_section(
+        assistant_archive_path, assistant_window, words, max_chars=asst_cap
+    )
+    trailing_section = subagent_section + assistant_section
+    words_total_budget = total_cap - len(trailing_section)
 
     formatted_blocks: List[str] = []
     for w in words:
@@ -623,12 +684,12 @@ def build_compaction_system_message(
         formatted_blocks.append(block)
 
     def _merge_preserving_subagents(words_part: str) -> str:
-        if len(words_part) + len(subagent_section) <= total_cap:
-            return words_part + subagent_section
-        if subagent_section and words_total_budget >= 80:
+        if len(words_part) + len(trailing_section) <= total_cap:
+            return words_part + trailing_section
+        if trailing_section and words_total_budget >= 80:
             compressed_words = _close_unbalanced_fence(words_part, words_total_budget)
-            return compressed_words + subagent_section
-        return _close_unbalanced_fence(words_part + subagent_section, total_cap)
+            return compressed_words + trailing_section
+        return _close_unbalanced_fence(words_part + trailing_section, total_cap)
 
     joined_all = "\n\n".join(formatted_blocks)
     if len(header_text) + len(joined_all) <= words_total_budget or not formatted_blocks:
@@ -879,10 +940,22 @@ def _handle_context_locked(conversation_id: str, event_name: str, explicit_sourc
             state["lastExplicitCompact"] = signatures[0]
         state_changed = True
         if update_notice:
+            assistant_window = archive.get("assistant_window")
+            assistant_archive_path: Optional[Path] = None
+            if isinstance(assistant_window, dict) and assistant_window.get("replies"):
+                try:
+                    assistant_archive_path = user_words.save_assistant_replies_markdown(
+                        state_dir, conversation_id, assistant_window
+                    )
+                except OSError:
+                    assistant_archive_path = None
             injected_blocks.append(build_compaction_system_message(
                 words, saved_md_path, trigger_reason, archive_status=archive_status, issues=issues,
                 source_paths=[str(transcript_path), str(transcript_path.parent / "transcript_full.jsonl")],
-                subagent_returns=subagent_returns, client="antigravity", policy=agy_policy,
+                subagent_returns=subagent_returns,
+                assistant_archive_path=assistant_archive_path,
+                assistant_window=assistant_window,
+                client="antigravity", policy=agy_policy,
             ))
             # 同一步骤若 handoff_gate 已随 mandateMessage 输出完整未决工作流交接块，
             # 跳过重复的 pending_tickets 恢复块（仍保留未汇报的 heavy_completions 完工账单）。
@@ -1034,10 +1107,14 @@ def handle_codex_session_start(
 
     codex_cap = int(codex_policy["inline_total_chars"])
     source_paths = result["segments"] or [item["path"] for item in saved.get("sources") or []]
+    codex_asst_file = str(result.get("assistant_archive_file") or "").strip()
     full_context = build_compaction_system_message(
         words, Path(saved["file"]) if saved.get("available") else None, f"Codex {source}",
         header="\n".join(lines), issues=result.get("issues"), source_paths=source_paths,
-        subagent_returns=result.get("subagent_returns"), client="codex", policy=codex_policy,
+        subagent_returns=result.get("subagent_returns"),
+        assistant_archive_path=Path(codex_asst_file) if codex_asst_file else None,
+        assistant_window=result.get("assistant_window"),
+        client="codex", policy=codex_policy,
     )
     if len(full_context) > codex_cap:
         suffix = "\n（内联内容已截断，请查阅原话档案。）"
@@ -1101,10 +1178,14 @@ def handle_claude_session_start(
     if saved.get("available"):
         lines.append(f"校验清单：{result['meta_path']}")
     claude_cap = int(claude_policy["inline_total_chars"])
+    claude_asst_file = str(result.get("assistant_archive_file") or "").strip()
     full_context = build_compaction_system_message(
         result["words"], Path(saved["file"]) if saved.get("available") else None, f"Claude {source}",
         header="\n".join(lines), issues=result["issues"], source_paths=result["segments"],
-        subagent_returns=result.get("subagent_returns"), client="claude", policy=claude_policy,
+        subagent_returns=result.get("subagent_returns"),
+        assistant_archive_path=Path(claude_asst_file) if claude_asst_file else None,
+        assistant_window=result.get("assistant_window"),
+        client="claude", policy=claude_policy,
     )
     # 路径、来源和时间戳也可能很长，最终输出仍须遵守 SessionStart 字符预算。
     if len(full_context) > claude_cap:

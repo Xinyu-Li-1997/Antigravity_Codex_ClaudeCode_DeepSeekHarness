@@ -4754,6 +4754,95 @@ class TestDispatchAndBillingGuards(unittest.TestCase):
             "fwd('../escape.txt')\n"
         ))
 
+    def test_v211_reply_guard_subagent_dict_and_readonly_git_ast(self):
+        """v2.1.1: 回归 reply_repeat_guard 子代理回执字典防崩溃、只读 git str.join/元组解包/多候选 -C 及 git grep -O 拦截。"""
+        from _lib import shell_lex
+
+        # 1) reply_repeat_guard._register_pending_review 兼容 parse_agy_created_subagent 返回 dict，不抛 TypeError
+        proj = self.project.parent / "proj_v211"
+        proj.mkdir(parents=True, exist_ok=True)
+        (proj / "sub" / "r1").mkdir(parents=True, exist_ok=True)
+        (proj / "sub" / "r2").mkdir(parents=True, exist_ok=True)
+        doc_body = "# 报告\n\n" + ("这是正式分析正文，用于触发长文交付复核门禁。\n" * 220)
+        doc_rel = "manuscript/report.md"
+
+        tp = self.root / "v211_subagent_dict.jsonl"
+        cid = "ag-v211-sub-dict"
+        _append_jsonl(tp, {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "重写 report.md 并请审计子代理核对"})
+        _append_jsonl(tp, {
+            "step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE",
+            "tool_calls": [{"id": "w1", "name": "write_file", "args": {"Path": doc_rel, "Content": doc_body}}],
+        })
+        _append_jsonl(tp, {"step_index": 2, "type": "GENERIC", "tool_result": {"call_id": "w1"}, "content": "Wrote file"})
+        _append_jsonl(tp, {
+            "step_index": 3, "source": "MODEL", "type": "PLANNER_RESPONSE",
+            "tool_calls": [{"id": "s1", "name": "invoke_subagent", "args": {"TypeName": "readonly-auditor", "Role": "Doc Auditor"}}],
+        })
+        _append_jsonl(tp, {
+            "step_index": 4, "type": "GENERIC", "tool_result": {"call_id": "s1"},
+            "content": 'Created the following subagent: {"conversationId": "sub-v211-audit", "status": "running"}\nSubagent is running in background.',
+        })
+        _append_jsonl(tp, {
+            "step_index": 5, "source": "MODEL", "type": "PLANNER_RESPONSE",
+            "content": "已完成 report.md 正式版重写并核查完毕，无遗留问题，可直接发布。",
+        })
+        ev_pending = reply_repeat_guard._inspect_turn_evidence(tp)
+        self.assertEqual(len(ev_pending["large_doc_writes"]), 1)
+        self.assertFalse(ev_pending["has_independent_review"], "后台审计子代理尚未返回时不得算已复核")
+
+        # 审计子代理返回后精确结算为已复核，且整个过程零 TypeError
+        _append_jsonl(tp, {
+            "step_index": 6, "source": "SYSTEM", "type": "SYSTEM_MESSAGE",
+            "content": "<SYSTEM_MESSAGE>\n[Message] sender=sub-v211-audit content=已逐行复核 report.md，全部指标与源码一致。\n</SYSTEM_MESSAGE>",
+        })
+        _append_jsonl(tp, {
+            "step_index": 7, "source": "MODEL", "type": "PLANNER_RESPONSE",
+            "content": "已按审计子代理核对结果确认 report.md 无误，本轮完成。",
+        })
+        ev_done = reply_repeat_guard._inspect_turn_evidence(tp)
+        self.assertTrue(ev_done["has_independent_review"])
+        stop_res = reply_repeat_guard.handle_stop_repeat_guard({
+            "conversationId": cid, "terminationReason": "model_stop", "transcriptPath": str(tp),
+        })
+        self.assertEqual(stop_res["decision"], "allow")
+        log_file = self.logs / "lifecycle.log"
+        if log_file.is_file():
+            self.assertNotIn("unhashable", log_file.read_text(encoding="utf-8"))
+
+        # 2) status_guard AST: str.join / 元组解包循环 / 多候选项目内 git -C 零误报；越界与 git grep -O 严格拦截
+        allowed_norm = [status_guard._normalize_cross_env_lexical(str(proj), from_shell=False)]
+        allowed_res = [status_guard._normalize_cross_env_lexical(str(proj.resolve()), from_shell=False)]
+
+        def scan(code: str):
+            return status_guard._scan_inline_python_code(
+                code, str(proj), allowed_norm, allowed_res, allow_os_temp=True
+            )
+
+        for safe_py in (
+            "import subprocess\nstems = ['flux', 'boundary', 'metric']\nsubprocess.run(['git', 'grep', '-n', '-E', '|'.join(stems)], cwd='.')\n",
+            "import subprocess\nfrom pathlib import Path\nrepos = [('r1', Path('sub/r1')), ('r2', Path('sub/r2'))]\nfor name, r in repos:\n    subprocess.check_output(['git', '-C', str(r), 'rev-parse', '--short', 'HEAD'])\n",
+            "import subprocess\nfrom pathlib import Path\nrepos = [('r1', Path('sub/r1')), ('r2', Path('sub/r2'))]\nfor name, r in repos:\n    subprocess.check_output(['git', '-C', str(r), 'show', f'HEAD:{rel}'])\n",
+            "import subprocess\nfor ctx_n in ('2', '3'):\n    subprocess.run(['git', 'grep', '-C', ctx_n, f'pat_{x}'])\n",
+        ):
+            self.assertIsNone(scan(safe_py), safe_py)
+
+        for bad_py in (
+            "import subprocess\nfrom pathlib import Path\nrepos = [('ok', Path('sub/r1')), ('bad', Path('../outside'))]\nfor name, r in repos:\n    subprocess.check_output(['git', '-C', str(r), 'show', f'HEAD:{rel}'])\n",
+            "import subprocess\nsubprocess.run(['git', '-C', 'sub', '-C', '../../outside', 'show', f'HEAD:{rel}'])\n",
+            "import subprocess\nsubprocess.run(['git', 'grep', '-O', 'vim', f'pat_{x}'])\n",
+            "import subprocess\nsubprocess.run(['git', 'grep', '--open-files-in-pager=sh', f'pat_{x}'])\n",
+            "import subprocess\nsubprocess.run(['git', 'grep', '-nO', f'pat_{x}'])\n",
+            "open('/'.join(['..', 'outside', 'pwn.txt']), 'w')\n",
+            "for a, *b in [('sub/a.txt', 'sub/b.txt')]:\n    open(a, 'w')\n",
+        ):
+            self.assertIsNotNone(scan(bad_py), bad_py)
+
+        self.assertFalse(shell_lex.parse_readonly_git_prefix(["git", "grep", "-O", "vim", "foo"])[0])
+        self.assertFalse(shell_lex.parse_readonly_git_prefix(["git", "grep", "--open-files-in-pager=vim", "foo"])[0])
+        self.assertFalse(shell_lex.parse_readonly_git_prefix(["git", "grep", "-nO", "foo"])[0])
+        self.assertFalse(shell_lex.parse_readonly_git_prefix(["git", "-c", "diff.external=sh", "diff"])[0])
+        self.assertTrue(shell_lex.parse_readonly_git_prefix(["git", "grep", "-n", "-E", "foo|bar"])[0])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

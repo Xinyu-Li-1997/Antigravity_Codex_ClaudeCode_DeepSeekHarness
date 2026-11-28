@@ -1791,6 +1791,21 @@ def _eval_ast_path_candidates(node, bindings):
                 pats = _eval_ast_path_candidates(node.args[0], bindings)
                 if pats and all(isinstance(pt, str) and _is_safe_rel_glob(pt) for pt in pats):
                     return frozenset(_AstSubtree(b) if isinstance(b, str) and not isinstance(b, _AstSafeSegment) else _AST_DYNAMIC for b in bases)
+        if name == "join" and isinstance(node.func, ast.Attribute):
+            seps = _eval_ast_path_candidates(node.func.value, bindings)
+            if seps and all(type(s) is str for s in seps):
+                if len(node.args) != 1 or node.keywords or _ast_has_unpacking(node):
+                    return dynamic
+                seqs = _eval_ast_path_candidates(node.args[0], bindings)
+                if seqs and all(isinstance(seq, tuple) and all(type(item) is str for item in seq) for seq in seqs):
+                    joined_vals = set()
+                    for sep in seps:
+                        for seq in seqs:
+                            joined_vals.add(sep.join(seq))
+                            if len(joined_vals) > _AST_MAX_CANDIDATES:
+                                return dynamic
+                    return frozenset(joined_vals) or dynamic
+                return dynamic
         if name in ("Path", "PurePath", "WindowsPath", "PosixPath", "expanduser", "abspath", "realpath", "resolve", "join", "joinpath", "str"):
             parts = [_eval_ast_path_candidates(arg, bindings) for arg in node.args]
             is_path_ctor = name in ("Path", "PurePath", "WindowsPath", "PosixPath")
@@ -1837,9 +1852,23 @@ def _tarfile_open_mode_is_mutating(call_node: ast.Call, mode_pos_idx: int, bindi
 def _bind_ast_target(target, value, bindings):
     if isinstance(target, ast.Name):
         bindings[target.id] = value
+    elif isinstance(target, ast.Starred):
+        _bind_ast_target(target.value, frozenset((_AST_DYNAMIC,)), bindings)
     elif isinstance(target, (ast.Tuple, ast.List)):
-        # value 为解包后的逐项候选集合，长度不匹配时清除全部旧绑定。
-        items = value if isinstance(value, list) and len(value) == len(target.elts) else [frozenset((_AST_DYNAMIC,))] * len(target.elts)
+        # value 为解包后的逐项候选集合（list）或有限定长元组集合（frozenset/set），不匹配或含星号解包时清除全部旧绑定。
+        n_elts = len(target.elts)
+        has_starred = any(isinstance(elt, ast.Starred) for elt in target.elts)
+        if not has_starred and isinstance(value, list) and len(value) == n_elts:
+            items = value
+        elif (
+            not has_starred
+            and isinstance(value, (frozenset, set))
+            and value
+            and all(isinstance(tup, tuple) and len(tup) == n_elts for tup in value)
+        ):
+            items = [frozenset(tup[i] for tup in value) for i in range(n_elts)]
+        else:
+            items = [frozenset((_AST_DYNAMIC,))] * n_elts
         for child, item in zip(target.elts, items):
             _bind_ast_target(child, item, bindings)
     elif isinstance(target, ast.Subscript):
@@ -2368,29 +2397,79 @@ def _is_ast_readonly_subprocess_call(
         return False
     prefix_tokens: List[str] = []
     dyn_tail_elts: List[ast.AST] = []
+    git_cwd_steps: List[frozenset] = []
+    git_head_ok = False
+    seen_subcmd = False
+    expect_c_val = False
+    expect_cfg_val = False
     for idx, elt in enumerate(cmd_expr.elts):
         vals = _eval_ast_path_candidates(elt, bindings)
-        if not dyn_tail_elts and len(vals) == 1 and all(isinstance(v, str) for v in vals):
-            prefix_tokens.append(next(iter(vals)))
+        if idx == 0:
+            if len(vals) != 1 or not all(isinstance(v, str) for v in vals):
+                return False
+            tok0 = next(iter(vals))
+            stem0 = tok0.replace("\\", "/").rsplit("/", 1)[-1].lower()
+            if stem0.endswith(".exe"):
+                stem0 = stem0[:-4]
+            if stem0 != "git":
+                return False
+            git_head_ok = True
+            prefix_tokens.append(tok0)
+            continue
+        if git_head_ok and not seen_subcmd and expect_c_val:
+            if (
+                vals
+                and _AST_DYNAMIC not in vals
+                and all(isinstance(v, str) and not isinstance(v, (_AstSubtree, _AstSafeSegment)) for v in vals)
+            ):
+                git_cwd_steps.append(vals)
+                prefix_tokens.append(next(iter(vals)) if len(vals) == 1 else "__ast_multi_git_cwd__")
+                expect_c_val = False
+                continue
+            return False
+        if len(vals) == 1 and all(isinstance(v, str) for v in vals):
+            tok = next(iter(vals))
+            prefix_tokens.append(tok)
+            if git_head_ok and not seen_subcmd:
+                if expect_cfg_val:
+                    expect_cfg_val = False
+                elif tok == "-C":
+                    expect_c_val = True
+                elif tok.startswith("-C") and len(tok) > 2:
+                    git_cwd_steps.append(frozenset((tok[2:],)))
+                elif tok in ("-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--config-env"):
+                    expect_cfg_val = True
+                elif not tok.startswith("-"):
+                    seen_subcmd = True
         else:
             dyn_tail_elts = cmd_expr.elts[idx:]
             break
     is_ro_git, git_cwd, _ = _shell_lex.parse_readonly_git_prefix(prefix_tokens)
     if not is_ro_git:
         return False
-    if git_cwd is not None:
-        if any(
-            not isinstance(cwd, (str, type(None)))
-            or not _is_write_target_allowed(
-                git_cwd, cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp, wsl_distribution, from_shell=False
-            )
-            for cwd in cwds
-        ):
-            return False
+    cur_cwds: frozenset = cwds
+    cwd_chain = git_cwd_steps if git_cwd_steps else ([frozenset((git_cwd,))] if git_cwd is not None else [])
+    for step_dirs in cwd_chain:
+        next_cwds = set()
+        for gdir in step_dirs:
+            for base_c in cur_cwds:
+                if not isinstance(base_c, (str, type(None))) or not _is_write_target_allowed(
+                    gdir, base_c, allowed_norm_keys, allowed_resolved_keys, allow_os_temp, wsl_distribution, from_shell=False
+                ):
+                    return False
+                next_cwds.add(_ast_resolve_cwd(gdir, base_c))
+                if len(next_cwds) > _AST_MAX_CANDIDATES:
+                    return False
+        cur_cwds = frozenset(next_cwds)
     for elt in dyn_tail_elts:
         vals = _eval_ast_path_candidates(elt, bindings)
         if _AST_DYNAMIC not in vals and all(isinstance(v, str) for v in vals):
-            if any(v.lower() in ("-o", "--output") or v.lower().startswith(("--output=", "-o/", "--ext-diff")) for v in vals):
+            if any(
+                v.lower() in ("-o", "--output", "--open-files-in-pager")
+                or v.lower().startswith(("--output=", "-o/", "--ext-diff", "--open-files-in-pager="))
+                or (v.startswith("-") and not v.startswith("--") and "O" in v[1:])
+                for v in vals
+            ):
                 return False
             continue
         # 允许形如 f"HEAD:{rel}" 等明确非选项前缀的动态修订表达式，拒绝可能拼出 -o/--output 的未知前缀

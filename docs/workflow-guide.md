@@ -193,7 +193,7 @@ flowchart TD
    ```powershell
    python -B -X utf8 "$HARNESS" followup --receipt "<回执路径>" --stream S1 --task "补充核对第 42 行边界条件符号" --output "<追问回执>" --redact
    ```
-2. **压缩恢复与跨会话接力**：等待审批期间若发生上下文自动压缩，钩子按可用窗口容量恢复关键用户原话、实质子任务结论、未决票据总览与对账指针，并仅补充展示 1 次确认摘要（自动压缩与用户沉默均不构成批准）。切换至新会话后，先离线复核旧票据，再在当前会话中重新生成确认单后执行：
+2. **压缩恢复与跨会话接力**：等待审批期间若发生上下文自动压缩，钩子按可用窗口容量恢复关键用户原话、实质子任务结论、未决票据总览与对账指针，并仅补充展示 1 次确认摘要（自动压缩与用户沉默均不构成批准）；同时将两次压缩之间的实质助手回复原文独立落盘并注入紧凑索引指针，遇“批准 / 按你建议”等简短确认时可按需 `read_file` 核对完整方案与参数细节。切换至新会话后，先离线复核旧票据，再在当前会话中重新生成确认单后执行：
    ```powershell
    python -B -X utf8 "$HARNESS" plan --resume-ticket "<票据标识>" --plan-dir "<授权票据目录>" --user-prompt "<用户点名原话>"
    ```
@@ -241,4 +241,4 @@ flowchart TD
 
 ### 2. 按需学术写作与改稿（`cae-writing`）
 
-撰写或大幅改写中文期刊论文、英文期刊论文、学术专著、科研报告及审稿回复时，可点名启用 [cae-writing](../template/user-guard/skills/cae-writing/SKILL.md)。协作上坚持项目自有术语与格式优先、由单一主执笔保持全篇叙事连贯，再经 `cae_harness.py task --isolation clean_room --kind review` 从新读者视角盲读查断层，终稿以 `check-grounding --target "<项目根目录>" --strict --doc-hygiene` 统一核验事实依据、本地图件与定理证明完整度；处于同行评议保密期的他人未发表稿件严禁输入在线模型。
+撰写或大幅改写中文期刊论文、英文期刊论文、学术专著、科研报告及审稿回复时，可点名启用 [cae-writing](../template/user-guard/skills/cae-writing/SKILL.md)。协作上坚持项目自有术语与格式优先、由单一主执笔保持全篇叙事连贯；长篇稿件（超 20 KB）先在会话 `scratch/` 提炼已核实的公式与数值锚点表，再按逻辑章节有界分块落盘并将定稿、双语镜像与净室盲读拆分为独立零压缩会话，避免单回合触顶输出上限截断挂死。终稿经 `cae_harness.py task --isolation clean_room --kind review` 盲读查断层，并以 `check-grounding --target "<项目根目录>" --strict --doc-hygiene` 统一核验事实依据、本地图件与定理证明完整度；处于同行评议保密期的他人未发表稿件严禁输入在线模型。

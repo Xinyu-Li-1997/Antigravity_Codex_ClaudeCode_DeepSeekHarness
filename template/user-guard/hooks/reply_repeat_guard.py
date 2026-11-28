@@ -1148,7 +1148,7 @@ _FORMAL_DOC_SKIP_NAMES = frozenset({
     "plan.md", "implementation_plan.md", "walkthrough.md",
 })
 _FORMAL_DOC_SKIP_SUFFIXES = (
-    "_card.md", "_reconcile.md", "_read_plan.md", "_cross_check.md", "_user_words.md",
+    "_card.md", "_reconcile.md", "_read_plan.md", "_cross_check.md", "_user_words.md", "_assistant_replies.md",
 )
 _LARGE_DOC_REWRITE_MIN_CHARS = 4000
 
@@ -1348,7 +1348,17 @@ def _inspect_turn_evidence(path: Path) -> Optional[Dict[str, Any]]:
     pending_review_tasks: Dict[str, bool] = {}
 
     def _register_pending_review(text: str, is_grounding: bool) -> None:
-        sub_cid = user_words.parse_agy_created_subagent(text)
+        parsed_sub = user_words.parse_agy_created_subagent(text)
+        sub_cid = ""
+        if isinstance(parsed_sub, dict):
+            sub_cid = str(
+                parsed_sub.get("conversationId")
+                or parsed_sub.get("conversation_id")
+                or parsed_sub.get("id")
+                or ""
+            ).strip()
+        elif isinstance(parsed_sub, str):
+            sub_cid = parsed_sub.strip()
         if sub_cid:
             pending_review_agents.add(sub_cid)
         for m_tid in re.finditer(

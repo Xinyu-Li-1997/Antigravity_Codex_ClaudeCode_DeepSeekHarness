@@ -1478,6 +1478,231 @@ def save_user_words_markdown(
     return out_file
 
 
+MAX_ARCHIVED_ASSISTANT_REPLIES = 8
+MAX_ARCHIVED_ASSISTANT_ITEM_CHARS = 24000
+MAX_ARCHIVED_ASSISTANT_TOTAL_CHARS = 64000
+MIN_FINAL_ASSISTANT_CHARS = 40
+MIN_TOOL_TURN_ASSISTANT_CHARS = 240
+_THOUGHT_TAG_RE = re.compile(r"<thought\b[^>]*>.*?</thought\s*>", re.DOTALL | re.IGNORECASE)
+
+
+def _clean_assistant_reply_text(raw: Any) -> str:
+    """清洗助手可见正文（剥离内部 thought 标签，保留原样 Markdown 结构与细节）。"""
+    if not isinstance(raw, str):
+        return ""
+    cleaned = _THOUGHT_TAG_RE.sub("", raw).strip()
+    return cleaned
+
+
+def _is_substantive_assistant_reply(text: str, has_tools: bool) -> bool:
+    """区分实质答复/方案提案与短工具旁白，避免归档噪音。"""
+    if not text or _archive_noise(text):
+        return False
+    if not has_tools:
+        return len(text) >= MIN_FINAL_ASSISTANT_CHARS
+    return len(text) >= MIN_TOOL_TURN_ASSISTANT_CHARS
+
+
+def _close_unbalanced_markdown_fence(text: str, max_len: Optional[int] = None) -> str:
+    if max_len is not None and len(text) > max_len:
+        text = text[:max_len]
+    fence = ""
+    for line in text.splitlines():
+        match = MARKDOWN_FENCE_RE.match(line)
+        if fence:
+            if match and match[1][0] == fence[0] and len(match[1]) >= len(fence) and not match[2].strip():
+                fence = ""
+        elif match:
+            fence = match[1]
+    if not fence:
+        return text
+    closing = ("\n" if text and not text.endswith("\n") else "") + fence
+    if max_len is not None and len(text) + len(closing) > max_len:
+        keep = max(0, max_len - len(closing))
+        return _close_unbalanced_markdown_fence(text[:keep], None)
+    return text + closing
+
+
+def select_compaction_window_assistant_replies(
+    candidates: List[Dict[str, Any]],
+    checkpoints: List[int],
+) -> Dict[str, Any]:
+    """按两次压缩边界选取本窗口实质助手回复；窗口为空时回退保留前窗口最后 1 条。"""
+    cps = sorted({int(c) for c in checkpoints if isinstance(c, int) and c >= 0})
+    items = sorted(
+        [c for c in candidates if isinstance(c, dict) and isinstance(c.get("content"), str) and c["content"].strip()],
+        key=lambda item: int(item.get("step_index", 0)),
+    )
+    if not items:
+        return {
+            "window_start_step": max(cps[-2], 0) if len(cps) >= 2 else 0,
+            "window_end_step": cps[-1] if cps else 0,
+            "prev_checkpoint_step": cps[-2] if len(cps) >= 2 else -1,
+            "latest_checkpoint_step": cps[-1] if cps else -1,
+            "fallback_prior_window": False,
+            "replies": [],
+        }
+    if cps:
+        latest_cp = cps[-1]
+        prev_cp = cps[-2] if len(cps) >= 2 else -1
+        after_latest = [item for item in items if int(item.get("step_index", 0)) > latest_cp]
+        if after_latest:
+            selected = after_latest[-MAX_ARCHIVED_ASSISTANT_REPLIES:]
+            return {
+                "window_start_step": latest_cp,
+                "window_end_step": int(selected[-1].get("step_index", latest_cp)),
+                "prev_checkpoint_step": latest_cp,
+                "latest_checkpoint_step": -1,
+                "fallback_prior_window": False,
+                "replies": selected,
+            }
+        in_window = [item for item in items if prev_cp < int(item.get("step_index", 0)) <= latest_cp]
+        if in_window:
+            selected = in_window[-MAX_ARCHIVED_ASSISTANT_REPLIES:]
+            return {
+                "window_start_step": max(prev_cp, 0),
+                "window_end_step": latest_cp,
+                "prev_checkpoint_step": prev_cp,
+                "latest_checkpoint_step": latest_cp,
+                "fallback_prior_window": False,
+                "replies": selected,
+            }
+        earlier = [item for item in items if int(item.get("step_index", 0)) <= prev_cp]
+        if earlier:
+            return {
+                "window_start_step": max(prev_cp, 0),
+                "window_end_step": latest_cp,
+                "prev_checkpoint_step": prev_cp,
+                "latest_checkpoint_step": latest_cp,
+                "fallback_prior_window": True,
+                "replies": [earlier[-1]],
+            }
+        return {
+            "window_start_step": max(prev_cp, 0),
+            "window_end_step": latest_cp,
+            "prev_checkpoint_step": prev_cp,
+            "latest_checkpoint_step": latest_cp,
+            "fallback_prior_window": False,
+            "replies": [],
+        }
+    selected = items[-MAX_ARCHIVED_ASSISTANT_REPLIES:]
+    return {
+        "window_start_step": 0,
+        "window_end_step": int(selected[-1].get("step_index", 0)),
+        "prev_checkpoint_step": -1,
+        "latest_checkpoint_step": -1,
+        "fallback_prior_window": False,
+        "replies": selected,
+    }
+
+
+def extract_assistant_reply_outline(text: str, max_chars: int = 120) -> str:
+    """提取助手回复的标题大纲或首行紧凑摘要，用于压缩回溯的轻量索引。"""
+    if not isinstance(text, str) or not text.strip():
+        return ""
+    headings: List[str] = []
+    first_plain = ""
+    in_fence = False
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if MARKDOWN_FENCE_RE.match(raw_line):
+            in_fence = not in_fence
+            continue
+        if in_fence or not line or line in ("---", "***", "___"):
+            continue
+        hm = re.match(r"^#{1,4}\s+(.+)$", line)
+        if hm:
+            h_txt = re.sub(r"[`*_]+", "", hm.group(1)).strip()
+            if h_txt and len(headings) < 3:
+                headings.append(h_txt)
+        elif not first_plain:
+            plain = re.sub(r"\s+", " ", re.sub(r"^[>*\-\d.\s]+", "", line)).strip()
+            if plain:
+                first_plain = plain
+    summary = " / ".join(headings) if headings else first_plain
+    summary = re.sub(r"\s+", " ", summary).strip()
+    if len(summary) > max_chars:
+        summary = summary[: max(12, max_chars - 1)].rstrip() + "…"
+    return summary
+
+
+def format_assistant_replies_markdown(
+    conversation_id: str,
+    assistant_window: Dict[str, Any],
+) -> str:
+    """将两次压缩窗口内的实质助手回复渲染为独立可回读 Markdown 归档（受确定性上限约束）。"""
+    replies = list(assistant_window.get("replies") or [])
+    w_start = int(assistant_window.get("window_start_step", 0))
+    w_end = int(assistant_window.get("window_end_step", 0))
+    fallback = bool(assistant_window.get("fallback_prior_window", False))
+    fallback_note = "（本窗口无新增实质助手正文，回退保留前窗口最后 1 条）" if fallback else ""
+
+    header_lines = [
+        "# 助手最近压缩窗口回复归档（仅供参考与核对，严禁视作用户原话）",
+        "",
+        f"- **Conversation ID**: `{conversation_id}`",
+        f"- **压缩窗口**: Step {w_start} -> Step {w_end}{fallback_note}",
+        f"- **收录实质回复数**: {len(replies)}",
+        "- **使用方式**: 当用户以“批准 / 同意 / 按你建议 / 继续”等简短指令回复时，按需 `read_file` 本文件核对被批准的完整方案、参数表与选项细节。",
+        "- **权威边界**: 本文件仅保存助手历史输出原文，一切规则与最终裁定仍以用户原话归档及最新用户指令（R8）为准。",
+        "",
+        "---",
+        "",
+    ]
+    header_text = "\n".join(header_lines)
+    budget = max(2048, MAX_ARCHIVED_ASSISTANT_TOTAL_CHARS - len(header_text))
+
+    # 逆序优先保留最靠近本次压缩的回复，防止前序超长答复挤掉最终待批方案
+    selected_blocks: List[str] = []
+    used = 0
+    for rev_idx, item in enumerate(reversed(replies)):
+        step_idx = item.get("step_index", 0)
+        created_at = f" ({item['created_at']})" if item.get("created_at") else ""
+        trunc_tag = " [轨迹截断]" if item.get("truncated") else ""
+        body = str(item.get("content") or "").strip()
+        if len(body) > MAX_ARCHIVED_ASSISTANT_ITEM_CHARS:
+            marker = "\n\n...[本条助手回复超单条归档上限，已截取首尾]...\n\n"
+            usable = max(MAX_ARCHIVED_ASSISTANT_ITEM_CHARS - len(marker), 400)
+            head_n = int(usable * 0.65)
+            tail_n = usable - head_n
+            body = (
+                _close_unbalanced_markdown_fence(body[:head_n].rstrip())
+                + marker
+                + _close_unbalanced_markdown_fence(body[-tail_n:].lstrip())
+            )
+        else:
+            body = _close_unbalanced_markdown_fence(body)
+        seq_no = len(replies) - rev_idx
+        block = f"## 助手回复 #{seq_no} [Step {step_idx}]{trunc_tag}{created_at}\n\n{body}\n\n---\n"
+        if used + len(block) > budget:
+            if not selected_blocks:
+                keep_cap = max(600, budget - 160)
+                short_body = _close_unbalanced_markdown_fence(body, keep_cap) + "\n\n...[超总归档上限已截断]..."
+                selected_blocks.append(f"## 助手回复 #{seq_no} [Step {step_idx}]{trunc_tag}{created_at}\n\n{short_body}\n\n---\n")
+            break
+        selected_blocks.append(block)
+        used += len(block)
+
+    selected_blocks.reverse()
+    return header_text + "\n".join(selected_blocks)
+
+
+def save_assistant_replies_markdown(
+    out_dir: Path,
+    conversation_id: str,
+    assistant_window: Optional[Dict[str, Any]],
+) -> Optional[Path]:
+    """将两次压缩窗口内的实质助手回复原子保存至 <conversationId>_assistant_replies.md（无回复时不写盘）。"""
+    if not isinstance(assistant_window, dict) or not assistant_window.get("replies"):
+        return None
+    if not valid_session_id(conversation_id):
+        raise ValueError("会话标识缺失或不合法")
+    out_file = out_dir / f"{conversation_id}_assistant_replies.md"
+    md_text = format_assistant_replies_markdown(conversation_id, assistant_window)
+    atomic_write_text(out_file, md_text)
+    return out_file
+
+
 # ④ Antigravity JSONL 解析与截断正文回查
 
 def _load_truncated_contents_map(full_transcript_path: Path, needed_indices: Set[int]) -> Dict[int, str]:
@@ -1607,6 +1832,7 @@ def extract_agy_archive(
     result: Dict[str, Any] = {
         "words": [],
         "subagent_returns": [],
+        "assistant_window": select_compaction_window_assistant_replies([], []),
         "unresolved_steps": [],
         "unverified_answers": [],
         "issues": [],
@@ -1620,6 +1846,8 @@ def extract_agy_archive(
 
     raw_candidates: List[Dict[str, Any]] = []
     raw_subagent_returns: List[Dict[str, Any]] = []
+    raw_assistant_candidates: List[Dict[str, Any]] = []
+    checkpoint_steps: List[int] = []
     pending_subagent_calls: List[Tuple[str, str, str]] = []
     subagent_registry: Dict[str, Dict[str, str]] = {}
     truncated_needed: Set[int] = set()
@@ -1654,9 +1882,14 @@ def extract_agy_archive(
                 truncated_fields = step.get("truncated_fields") or []
                 is_content_truncated = isinstance(truncated_fields, list) and "content" in truncated_fields
 
+                if step_type == "CHECKPOINT":
+                    checkpoint_steps.append(step_index)
+                    continue
+
                 if step_type == "PLANNER_RESPONSE":
                     unidentified_questions.clear()
                     calls = step.get("tool_calls")
+                    has_tools = isinstance(calls, list) and len(calls) > 0
                     if isinstance(calls, list):
                         for call in calls:
                             if not isinstance(call, dict):
@@ -1675,6 +1908,18 @@ def extract_agy_archive(
                                 pending_questions[call_id] = (step_index, _ask_question_title(call))
                             else:
                                 unidentified_questions.add(step_index)
+                    if not step.get("isSidechain") and not step.get("isMeta"):
+                        raw_asst = step.get("content") if isinstance(step.get("content"), str) else ""
+                        if raw_asst.strip() or is_content_truncated:
+                            raw_assistant_candidates.append(
+                                {
+                                    "step_index": step_index,
+                                    "created_at": created_at,
+                                    "raw_content": raw_asst,
+                                    "has_tools": has_tools,
+                                    "needs_full": is_content_truncated,
+                                }
+                            )
                     continue
 
                 if step_type in ("GENERIC", "TOOL_RESULT", "TOOL_RESPONSE"):
@@ -1787,9 +2032,48 @@ def extract_agy_archive(
         item["step_index"] for item in raw_subagent_returns if item["needs_full"]
     }
 
-    # 单次按需补全所有被截断的用户记录与子代理返回（仅用户记录计入 unresolved_steps 完整性门禁）
-    full_map = _load_truncated_contents_map(full_transcript_path, truncated_needed | subagent_truncated_needed)
+    # 仅对当前压缩窗口（及至多 2 条前窗口兜底候选）的截断助手回复按需回查 transcript_full.jsonl
+    cps_sorted = sorted({int(c) for c in checkpoint_steps if isinstance(c, int) and c >= 0})
+    if cps_sorted:
+        latest_cp_scan = cps_sorted[-1]
+        prev_cp_scan = cps_sorted[-2] if len(cps_sorted) >= 2 else -1
+        win_raw_asst = [
+            item for item in raw_assistant_candidates
+            if item["step_index"] > prev_cp_scan
+        ]
+        prior_raw_asst = [
+            item for item in raw_assistant_candidates
+            if item["step_index"] <= prev_cp_scan
+        ][-2:]
+        asst_fetch_pool = prior_raw_asst + win_raw_asst
+    else:
+        asst_fetch_pool = raw_assistant_candidates[-MAX_ARCHIVED_ASSISTANT_REPLIES * 2:]
+    assistant_truncated_needed = {
+        item["step_index"] for item in asst_fetch_pool if item["needs_full"]
+    }
+
+    # 单次按需补全所有被截断的用户记录、子代理返回与本窗口助手回复（仅用户记录计入 unresolved_steps 完整性门禁）
+    full_map = _load_truncated_contents_map(
+        full_transcript_path, truncated_needed | subagent_truncated_needed | assistant_truncated_needed
+    )
     unresolved_steps = sorted(truncated_needed.difference(full_map))
+
+    resolved_assistant_candidates: List[Dict[str, Any]] = []
+    for asst_item in asst_fetch_pool:
+        s_idx = asst_item["step_index"]
+        still_trunc = bool(asst_item["needs_full"] and s_idx not in full_map)
+        raw_txt = full_map.get(s_idx, asst_item["raw_content"]) if asst_item["needs_full"] else asst_item["raw_content"]
+        cleaned_txt = _clean_assistant_reply_text(raw_txt)
+        if _is_substantive_assistant_reply(cleaned_txt, bool(asst_item.get("has_tools"))):
+            resolved_assistant_candidates.append(
+                {
+                    "step_index": s_idx,
+                    "created_at": asst_item["created_at"],
+                    "content": cleaned_txt,
+                    "truncated": still_trunc,
+                }
+            )
+    assistant_window = select_compaction_window_assistant_replies(resolved_assistant_candidates, cps_sorted)
 
     resolved_sub_candidates: List[Dict[str, Any]] = []
     for sub_item in raw_subagent_returns:
@@ -1893,6 +2177,7 @@ def extract_agy_archive(
     result.update(
         words=results,
         subagent_returns=_merge_harness_returns(subagent_returns, harness, agy_policy),
+        assistant_window=assistant_window,
         unresolved_steps=unresolved_steps,
         unverified_answers=sorted(index for index, questions in ambiguous_outputs.items() if questions),
     )
@@ -2412,6 +2697,7 @@ def extract_codex_session_words(
             "session_id": resolved_sid or session_id or "unknown",
             "words": [],
             "subagent_returns": [],
+            "assistant_window": select_compaction_window_assistant_replies([], []),
             "segments": [],
             "sources": [],
             "issues": issues or ["未找到可读的 Codex 会话分段"],
@@ -2437,6 +2723,9 @@ def extract_codex_session_words(
     codex_agent_registry: Dict[str, Dict[str, str]] = {}
     seen_subagent_keys: Set[Tuple[str, str, str]] = set()
     raw_subagent_returns: List[Dict[str, Any]] = []
+    codex_compaction_steps: List[int] = []
+    raw_codex_assistant: List[Dict[str, Any]] = []
+    seen_codex_assistant_keys: Set[Tuple[int, str]] = set()
 
     codex_policy = policy if isinstance(policy, dict) else get_compaction_tunables("codex")
     codex_archive_cap = int(codex_policy["archive_subagent_item_chars"])
@@ -2476,6 +2765,13 @@ def extract_codex_session_words(
                         bad_lines += 1
                         continue
                     harness.feed(entry, global_step_counter)
+                    entry_step_no = entry.get("ordinal") if isinstance(entry.get("ordinal"), int) else global_step_counter
+                    if entry.get("type") == "compacted" or (
+                        entry.get("type") == "event_msg"
+                        and isinstance(entry.get("payload"), dict)
+                        and entry["payload"].get("type") in ("context_compacted", "compacted")
+                    ):
+                        codex_compaction_steps.append(entry_step_no)
                     item_obj = (
                         entry.get("payload")
                         if entry.get("type") == "response_item"
@@ -2483,8 +2779,22 @@ def extract_codex_session_words(
                     )
                     if isinstance(item_obj, dict):
                         item_type = item_obj.get("type")
-                        step_no = entry.get("ordinal") if isinstance(entry.get("ordinal"), int) else global_step_counter
+                        step_no = entry_step_no
                         ts_str = str(entry.get("timestamp") or "")
+                        if item_type == "message" and item_obj.get("role") == "assistant":
+                            asst_txt = _clean_assistant_reply_text(_codex_output_to_text(item_obj.get("content")))
+                            if _is_substantive_assistant_reply(asst_txt, has_tools=False):
+                                asst_sig = (step_no, hashlib.sha256(asst_txt.encode("utf-8")).hexdigest()[:24])
+                                if asst_sig not in seen_codex_assistant_keys:
+                                    seen_codex_assistant_keys.add(asst_sig)
+                                    raw_codex_assistant.append(
+                                        {
+                                            "step_index": step_no,
+                                            "created_at": ts_str,
+                                            "content": asst_txt,
+                                            "truncated": False,
+                                        }
+                                    )
                         if item_type in ("function_call", "custom_tool_call"):
                             raw_tool = str(item_obj.get("name") or item_obj.get("tool_name") or "").strip()
                             base_tool = raw_tool.rsplit(".", 1)[-1]
@@ -2606,6 +2916,7 @@ def extract_codex_session_words(
             sorted(raw_subagent_returns + harness.items, key=lambda item: item["step_index"]),
             codex_policy, body_getter=lambda item: item.get("raw_body") or item.get("content") or ""
         ),
+        "assistant_window": select_compaction_window_assistant_replies(raw_codex_assistant, codex_compaction_steps),
         "segments": [str(p) for p in segments],
         "sources": sources,
         "issues": issues,
@@ -2798,6 +3109,15 @@ def refresh_codex_session_archive(
         if saved.get("issue"):
             issues.append(saved["issue"])
 
+        assistant_window = parsed.get("assistant_window") or select_compaction_window_assistant_replies([], [])
+        assistant_archive_file = ""
+        if assistant_window.get("replies"):
+            try:
+                saved_asst = save_assistant_replies_markdown(user_words_dir, sid, assistant_window)
+                if saved_asst is not None:
+                    assistant_archive_file = str(saved_asst)
+            except OSError:
+                pass
     saved.pop("body_sha256", None)
     saved.pop("previous_manifest_sources", None)
     saved.pop("legacy_hash_mismatch", None)
@@ -2805,6 +3125,8 @@ def refresh_codex_session_archive(
         "complete": complete,
         "words": words,
         "subagent_returns": subagent_returns,
+        "assistant_window": assistant_window,
+        "assistant_archive_file": assistant_archive_file,
         "issues": issues,
         "saved": saved,
         "meta_path": str(meta_path),
@@ -3109,6 +3431,8 @@ def extract_claude_user_words(
     """逐行严格解码并记录读取缺口；合并排队输入并提取最近子代理返回摘要。"""
     words: List[Dict[str, Any]] = []
     subagent_returns: List[Dict[str, Any]] = []
+    claude_compaction_steps: List[int] = []
+    raw_claude_assistant: List[Dict[str, Any]] = []
     issues: List[str] = []
     sources: List[Dict[str, Any]] = []
     digest = hashlib.sha256()
@@ -3135,9 +3459,30 @@ def extract_claude_user_words(
                     queued_index = None
                     continue
                 harness.feed(entry, line_index)
+                if (
+                    entry.get("type") == "system"
+                    and entry.get("subtype") in ("compact_boundary", "microcompact_boundary")
+                ) or bool(entry.get("compactMetadata")):
+                    claude_compaction_steps.append(line_index)
                 if entry.get("type") == "assistant" and not entry.get("isSidechain"):
                     question_ids.update(_claude_question_ids_from_assistant(entry))
                     pending_subagents.update(_claude_subagent_calls_from_assistant(entry))
+                    if not entry.get("isMeta"):
+                        asst_msg = entry.get("message")
+                        asst_content = asst_msg.get("content") if isinstance(asst_msg, dict) else None
+                        has_tools = isinstance(asst_content, list) and any(
+                            isinstance(blk, dict) and blk.get("type") == "tool_use" for blk in asst_content
+                        )
+                        asst_txt = _clean_assistant_reply_text(_extract_claude_text_blocks(asst_content))
+                        if _is_substantive_assistant_reply(asst_txt, has_tools=has_tools):
+                            raw_claude_assistant.append(
+                                {
+                                    "step_index": line_index,
+                                    "created_at": str(entry.get("timestamp") or ""),
+                                    "content": asst_txt,
+                                    "truncated": False,
+                                }
+                            )
                 if pending_subagents:
                     subagent_returns.extend(
                         _extract_claude_subagent_returns_from_user(
@@ -3176,6 +3521,7 @@ def extract_claude_user_words(
             sorted(subagent_returns + harness.items, key=lambda item: item["step_index"]),
             claude_policy, body_getter=lambda item: item.get("raw_body") or item.get("content") or ""
         ),
+        "assistant_window": select_compaction_window_assistant_replies(raw_claude_assistant, claude_compaction_steps),
         "issues": issues,
         "sources": sources,
         "complete": not issues,
@@ -3250,7 +3596,17 @@ def archive_claude_session_words(
         saved.pop("body_sha256", None)
         saved.pop("previous_manifest_sources", None)
         saved.pop("legacy_hash_mismatch", None)
+        assistant_window = parsed.get("assistant_window") or select_compaction_window_assistant_replies([], [])
+        assistant_archive_file = ""
+        if assistant_window.get("replies"):
+            try:
+                saved_asst = save_assistant_replies_markdown(user_words_dir, sid, assistant_window)
+                if saved_asst is not None:
+                    assistant_archive_file = str(saved_asst)
+            except OSError:
+                pass
         result.update(complete=complete and saved.get("verified", False), words=words,
-                      subagent_returns=subagent_returns, issues=issues,
+                      subagent_returns=subagent_returns, assistant_window=assistant_window,
+                      assistant_archive_file=assistant_archive_file, issues=issues,
                       saved=saved, segments=[str(transcript)] if transcript else [])
     return result

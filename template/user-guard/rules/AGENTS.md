@@ -51,7 +51,7 @@ Antigravity、Codex、Claude Code（`cc`）与 DeepSeek Harness（`dsh`）同属
 
 **R9. 压缩交接对齐机制**：自动压缩或跨会话恢复后，依次执行四步（由 `session_context_loader.py` 与 `handoff_gate.py` 辅助核验）：
 
-1. **重读原话与关键返回**：重读钩子恢复的历轮用户原话及去噪后的实质子代理与 `timeout_salvage` 摘要，必要时回查底层会话轨迹。
+1. **重读原话与关键返回**：重读钩子恢复的历轮用户原话及去噪后的实质子代理与 `timeout_salvage` 摘要；遇“批准 / 按你建议”等简短确认时，按需 `read_file` 本压缩窗口的助手回复归档核对方案细节，必要时回查底层会话轨迹。
 2. **核对现状与未决票据**：对照真实文件、历轮原话与近期结论排查遗漏，引用按 R6 复核。待确认期间遇压缩时，由磁盘 `<ticket_id>.json` 独立加载精简 4 列总览卡与 `<ticket_id>_card.md` 链接供核对，缺失项不得凭摘要猜补。
 3. **说明进展并恢复确认**：直白说明已重读记录、已完成事项与剩余工作。若有未决重负载，仅在压缩恢复首轮或用户询问时补展 1 次 `chat_brief` 与 `<ticket_id>_card.md` 链接并等待决定；压缩、沉默与超时均不构成批准。
 4. **整理长会话交接**：收到收尾提醒时停止新开子代理、`git push` 与批量读图。进入 `drain` 或 `freeze` 强制交接时放行 `check-grounding --strict`，收口汇报已验证进展、Git 状态、待办事项与可复制的【新对话提示词】（保留项目顶层规范与资产索引入口，并将重算或批量读图与长文写作拆分为独立会话；有未决票据时附工作流总览、明细链接、票据与 `plan --resume-ticket` 命令），严禁擅自将待拍板占位符填为已拍板。Antigravity 开启 `/goal` 时末行单独输出 `<!-- GOAL_CANCELLED -->`；Codex 与 Claude Code 默认 `advisory` 提醒。

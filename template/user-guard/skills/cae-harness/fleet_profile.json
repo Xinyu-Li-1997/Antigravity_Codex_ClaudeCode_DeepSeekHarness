@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "profile_id": "fleet-snapshot-v2",
-  "evaluated_at": "2026-11-26",
+  "evaluated_at": "2026-11-28",
   "evaluation_policy": {
     "bidirectional_strength_and_defect_audit": true,
     "all_roles_dynamic": true,
@@ -163,7 +163,7 @@
         "cordis_plugin_bundle"
       ],
       "hook_protocol": "soft_rules_only",
-      "notes": "当前 CLI 未暴露标准生命周期硬钩子，由 AGENTS.md 软约束与 cae_harness.py 外部快照及隔离目录兜底。"
+      "notes": "当前发行版 CLI 未暴露标准生命周期硬钩子（上游钩子协议包仍处于 experimental 阶段），由 AGENTS.md 软约束与 cae_harness.py 外部快照及隔离目录兜底。"
     }
   },
   "excluded_or_retiring": {
@@ -500,7 +500,7 @@
     }
   },
   "capability_ledger": {
-    "last_online_refresh_at": "2026-11-26",
+    "last_online_refresh_at": "2026-11-28",
     "local_bench_verified_at": "2026-11-19",
     "online_refresh_module": "fleet-evolve",
     "dispatch_online_lookup": false

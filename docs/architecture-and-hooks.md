@@ -19,10 +19,10 @@
 | [skills/cae-axioms/](../template/user-guard/skills/cae-axioms/SKILL.md) | 通用 | 点名触发的公理审查与硬状态机技能：承载四层条款级单向公理分册与 [文献溯源](../template/user-guard/skills/cae-axioms/references/layer-citations.md)、双档状态机（`axiom_gate.py` 与 `_axiom_lib/`）、零 Mathlib 纯核 Lean 4 真内核驱动（`KernelAudit.lean` 与四份 `lean/` 骨架）及净室 `packet_replay` 协议，不增加常驻钩子 |
 | [user_words.py](../template/user-guard/hooks/user_words.py) | 通用 + 上游 | 钩子共用基础库：跨平台文件锁、原子写、三端轨迹去噪与子代理摘要提取、历史确认单折叠及账单存取 |
 | `hooks/_lib/` | 通用 + 上游 | `fs_safety.py`（重解析点防御原子写）、`shell_lex.py`（Shell 拆壳与 PowerShell 续行归一化）、`adaptive_policy.py`（读取 `modelName` 与挡位并按窗口缩放阈值）、`process_guard.py`（墙钟自毁与 POSIX 条件虚拟内存上限） |
-| [session_context_loader.py](../template/user-guard/hooks/session_context_loader.py) | 通用 + 上游 | 恢复与调用前门禁：普通回合零字节注入；压缩后分块补回原话、实质子代理摘要、未决票据总览与有界对账及阅读计划指针 |
-| [status_guard.py](../template/user-guard/hooks/status_guard.py) | 通用 + 上游 | 工具执行前门禁：静态解析文件工具、Shell 包装与内联 Python AST，拦截越界写删、本地会话删除 RPC、外部 `git worktree`、未分页 Git、无 `timeout` 桌面 GUI 挂死调用、空转轮询与裸调 CLI，核验已批票据与原生通道容量 |
+| [session_context_loader.py](../template/user-guard/hooks/session_context_loader.py) | 通用 + 上游 | 恢复与调用前门禁：普通回合零字节注入；压缩后分块补回原话、实质子代理摘要、未决票据总览与有界对账及阅读计划指针，并将两次压缩之间的实质助手回复独立落盘为可按需 `read_file` 的紧凑索引 |
+| [status_guard.py](../template/user-guard/hooks/status_guard.py) | 通用 + 上游 | 工具执行前门禁：静态解析文件工具、Shell 包装与内联 Python AST（支持字面量 `str.join`、有限元组解包循环及项目内多候选只读 `git -C`），拦截越界写删、本地会话删除 RPC、外部 `git worktree`、`git grep -O`、未分页 Git、无 `timeout` 桌面 GUI 挂死调用、空转轮询与裸调 CLI，核验已批票据与原生通道容量 |
 | [reply_repeat_guard.py](../template/user-guard/hooks/reply_repeat_guard.py) | 通用 + 上游 | 回合结束门禁（无头子进程 `CAE_HARNESS_DEPTH` 自动跳过）：拦截空等刷屏、重复贴票、局部补测冒充全过，单次扫描三端轨迹统一守卫零探测否定、局部排查全称缺口与长文单端整写免审（联动 `code_families` 角色提示），并按 `run_id` 核验回执与 `reconcile_file` 链接 |
-| [handoff_gate.py](../template/user-guard/hooks/handoff_gate.py) | 通用 + 上游 | 长会话分级交接门禁：追踪压缩次数、轨迹体积与读图字节，在 `drain`/`freeze` 阶段放行界面进度与权限只读工具、拦截会话创建删除 RPC 与新派工，并核验【新对话提示词】与待拍板占位符保护 |
+| [handoff_gate.py](../template/user-guard/hooks/handoff_gate.py) | 通用 + 上游 | 长会话分级交接门禁：追踪压缩次数、三压缩起近期均值间隔与单回合高频压缩熔断（`turn_cp_thrashing`）、轨迹体积与读图字节，在 `drain`/`freeze` 阶段放行界面进度与权限只读工具、拦截会话创建删除 RPC 与新派工，并核验【新对话提示词】与待拍板占位符保护 |
 | [install.py](../install.py)、`install.ps1`、`install.sh` | 上游专属 | 校验非符号链接与非重解析点后幂等分发四端配置；支持零进程读取 PE 与 dpkg 桌面应用版本，提供配置漂移、Windows 与 WSL2 双端对齐、DSH 协议探测及科学计算包 ABI 风险体检 |
 | [fleet_state.py](../template/user-guard/skills/fleet-evolve/scripts/fleet_state.py) | 上游专属 | 核验 `upstream_config_repo` 身份；管理提案审批锁（`propose`/`approve`）、重启重入锁（`record-pass1`/`verify-pass2`）与终审事实锚定门禁 |
 | [router.py](../template/claude/router/router.py)、[ccswitch_admin.py](../template/claude/router/ccswitch_admin.py) | 通用 + 上游 | 本地回环 `/v1/messages` 前缀分流（向非回环上游注入密钥时强制 HTTPS、输出脱敏单行日志、遇 401 或 403 使缓存失效），以及带 SQLite 在线备份的 CC Switch 切卡 |
@@ -89,6 +89,7 @@ Antigravity、Codex 与 Claude Code 按原生协议接入同一套生命周期�
 ### 3. 压缩双块恢复与跨会话接力不变量
 
 - **防二次截断与围栏闭合**：在最近 `recent_subagent_window` 条子代理返回中固定保留最新一条，归档与内联均基于完整 `raw_body` 独立截取；截断位置处于代码块内时，由 `_close_unbalanced_fence` 自动闭合围栏。
+- **双压缩窗口助手回复归档**：三端恢复钩子经 `select_compaction_window_assistant_replies` 与 `save_assistant_replies_markdown` 仅提取两次压缩边界间的实质助手回复（Antigravity 按需回查 `transcript_full.jsonl`，空窗回退前窗末条），独立写入 `<session_id>_assistant_replies.md` 并与用户原话清单物理隔离。系统注入仅附路径与标题索引；遇简短确认指令时提示先 `read_file` 核对完整方案。
 - **未决工作流独立分区**：`collapse_historical_cards` 折叠历史长表；`render_pending_workflow_block` 独立于原话预算直接读取磁盘 `<ticket_id>.json`（存在非符号链接的常规明细文件时，仅注入 4 列总览与文件链接，缺项标为 `未记录`）。`plan --resume-ticket` 保留原 `session_id` 且不自动改绑，跨会话执行须重建当前会话票据。
 
 ---

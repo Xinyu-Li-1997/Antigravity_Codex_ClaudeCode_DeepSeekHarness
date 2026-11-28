@@ -3941,6 +3941,172 @@ class TestHeavyWorkflowLifecycle(unittest.TestCase):
             "blocked_always",
         )
 
+    def test_v211_three_cp_thrashing_circuit_breaker_and_assistant_window_archive(self):
+        """v2.1.1: 验证三压缩均值间隔修复、单回合高频压缩熔断，以及三端双压缩窗口助手正文归档与短确认回读提示。"""
+        # 1) 单回合 3 次高频压缩（模拟 horses V23: 58/132/199，均值 70.5 <= 75）直接触发 turn_cp_thrashing 进入 Stage-2 drain
+        tp_v23 = self.root / "v211_v23_thrash" / "transcript.jsonl"
+        tp_v23.parent.mkdir(parents=True, exist_ok=True)
+        _append_jsonl(tp_v23, {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "全量核对并改写论文"})
+        for cp_step in (58, 132, 199):
+            _append_jsonl(tp_v23, {"step_index": cp_step, "source": "SYSTEM", "type": "CHECKPOINT"})
+        cid_v23 = "ag-v211-v23-thrash"
+        out_v23 = session_context_loader.handle_pre_invocation({"conversationId": cid_v23, "transcriptPath": str(tp_v23)})
+        msg_v23 = out_v23["injectSteps"][0]["systemMessage"]["systemMessage"]
+        self.assertIn("Stage-2 drain", msg_v23)
+        self.assertIn("近期均值间隔=70步", msg_v23)
+        gate_v23 = handoff_gate.load_gate_state(self.state, cid_v23)
+        self.assertEqual(gate_v23["phase"], "drain")
+        self.assertIn("turn_cp_thrashing", gate_v23["triggers"])
+
+        # 2) 多回合 3 次较密压缩（均间隔 60 <= 90，但单回合仅 1 次压缩）：触发 Stage-1 interval_warning，不误升 Stage-2 drain
+        tp_mt = self.root / "v211_multiturn_3cp" / "transcript.jsonl"
+        tp_mt.parent.mkdir(parents=True, exist_ok=True)
+        _append_jsonl(tp_mt, {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "第1轮"})
+        _append_jsonl(tp_mt, {"step_index": 50, "source": "SYSTEM", "type": "CHECKPOINT"})
+        _append_jsonl(tp_mt, {"step_index": 60, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "第2轮"})
+        _append_jsonl(tp_mt, {"step_index": 110, "source": "SYSTEM", "type": "CHECKPOINT"})
+        _append_jsonl(tp_mt, {"step_index": 120, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "第3轮"})
+        _append_jsonl(tp_mt, {"step_index": 170, "source": "SYSTEM", "type": "CHECKPOINT"})
+        cid_mt = "ag-v211-multiturn-3cp"
+        out_mt = session_context_loader.handle_pre_invocation({"conversationId": cid_mt, "transcriptPath": str(tp_mt)})
+        msg_mt = out_mt["injectSteps"][0]["systemMessage"]["systemMessage"]
+        self.assertIn("Stage-1 advisory", msg_mt)
+        self.assertNotIn("Stage-2 drain", msg_mt)
+        self.assertIn("近期均值间隔=60步", msg_mt)
+
+        # 3) 健康 3 压缩长会话（单回合宽间隔 140/320/500，均间隔 180 > 75 且步数跨度 500 < 650）：仅常规 cp_warning，不误触 turn_cp_thrashing
+        tp_ok3 = self.root / "v211_healthy_3cp" / "transcript.jsonl"
+        tp_ok3.parent.mkdir(parents=True, exist_ok=True)
+        _append_jsonl(tp_ok3, {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "稳步推进"})
+        for cp_step in (140, 320, 500):
+            _append_jsonl(tp_ok3, {"step_index": cp_step, "source": "SYSTEM", "type": "CHECKPOINT"})
+        cid_ok3 = "ag-v211-healthy-3cp"
+        session_context_loader.handle_pre_invocation({"conversationId": cid_ok3, "transcriptPath": str(tp_ok3)})
+        gate_ok3 = handoff_gate.load_gate_state(self.state, cid_ok3)
+        self.assertEqual(gate_ok3["phase"], "advisory")
+        self.assertNotIn("turn_cp_thrashing", gate_ok3["triggers"])
+
+        # 4) Antigravity 双压缩窗口助手回复归档（支持 transcript_full 还原、过滤旧窗口与短旁白、空窗口回退末条）
+        ag_dir = self.root / "v211_ag_asst"
+        ag_dir.mkdir(parents=True, exist_ok=True)
+        ag_tp = ag_dir / "transcript.jsonl"
+        ag_full = ag_dir / "transcript_full.jsonl"
+        old_proposal = "## 第一窗口旧提案\n这是第一次压缩前的早期方案草稿，不应混入第二次压缩窗口归档。"
+        win_proposal = (
+            "## V2.1.1 完整审批方案\n"
+            "### 1. 钩子修复\n修复 reply_repeat_guard 字典崩溃与 status_guard 只读 git 误报。\n"
+            "### 2. 公理审查\n按方案 A 运行 core 档审查并净室复演。"
+        )
+        _append_jsonl(ag_tp, {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "先检查仓库并出方案"})
+        _append_jsonl(ag_tp, {"step_index": 20, "source": "MODEL", "type": "PLANNER_RESPONSE", "content": old_proposal})
+        _append_jsonl(ag_tp, {"step_index": 50, "source": "SYSTEM", "type": "CHECKPOINT"})
+        _append_jsonl(ag_tp, {
+            "step_index": 70, "source": "MODEL", "type": "PLANNER_RESPONSE",
+            "content": "正在读取文件", "tool_calls": [{"name": "read_file", "args": {"Path": "a.py"}}],
+        })
+        _append_jsonl(ag_tp, {
+            "step_index": 110, "source": "MODEL", "type": "PLANNER_RESPONSE",
+            "content": "## V2.1.1 <truncated 200 bytes>", "truncated_fields": ["content"],
+        })
+        _append_jsonl(ag_full, {"step_index": 110, "source": "MODEL", "type": "PLANNER_RESPONSE", "content": win_proposal})
+        _append_jsonl(ag_tp, {"step_index": 115, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "按你建议做最完善的"})
+        _append_jsonl(ag_tp, {"step_index": 120, "source": "SYSTEM", "type": "CHECKPOINT"})
+
+        cid_asst = "ag-v211-asst-win"
+        out_asst = session_context_loader.handle_pre_invocation({"conversationId": cid_asst, "transcriptPath": str(ag_tp)})
+        msg_asst = out_asst["injectSteps"][0]["systemMessage"]["systemMessage"]
+        asst_file = self.state / f"{cid_asst}_assistant_replies.md"
+        self.assertTrue(asst_file.is_file())
+        asst_body = asst_file.read_text(encoding="utf-8")
+        self.assertIn("V2.1.1 完整审批方案", asst_body)
+        self.assertIn("按方案 A 运行 core 档审查", asst_body)
+        self.assertNotIn("第一窗口旧提案", asst_body)
+        self.assertNotIn("正在读取文件", asst_body)
+        self.assertIn(f"{cid_asst}_assistant_replies.md", msg_asst)
+        self.assertIn("read_file", msg_asst)
+        # 用户原话归档保持纯净，不混入助手提案正文
+        uw_body = (self.state / f"{cid_asst}_user_words.md").read_text(encoding="utf-8")
+        self.assertNotIn("V2.1.1 完整审批方案", uw_body)
+
+        # 第三次压缩与第二次压缩之间无新增助手回复时，回退保留前窗口最后 1 条实质回复
+        _append_jsonl(ag_tp, {"step_index": 260, "source": "SYSTEM", "type": "CHECKPOINT"})
+        session_context_loader.handle_pre_invocation({"conversationId": cid_asst, "transcriptPath": str(ag_tp)})
+        fb_body = asst_file.read_text(encoding="utf-8")
+        self.assertIn("回退保留前窗口最后 1 条", fb_body)
+        self.assertIn("V2.1.1 完整审批方案", fb_body)
+
+        # 5) Codex 双压缩窗口助手回复归档与校验清单完整性保持
+        cx_sid = "cx-v211-asst-win"
+        cx_rollout = self.root / "codex_home" / "sessions" / "2026" / "11" / "28" / f"rollout-2026-11-28-{cx_sid}.jsonl"
+        cx_rollout.parent.mkdir(parents=True, exist_ok=True)
+        cx_state = self.root / "codex_home" / "hooks" / "state" / "session-context"
+        _append_jsonl(cx_rollout, {"type": "session_meta", "payload": {"id": cx_sid, "cwd": str(self.root), "source": "cli"}})
+        _append_jsonl(cx_rollout, {
+            "type": "response_item", "ordinal": 1, "timestamp": "2026-11-28T08:00:00Z",
+            "payload": {
+                "type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": "制定排查方案"}],
+                "internal_chat_message_metadata_passthrough": {"content_item_metadata": [{"provenance": {"type": "user"}}]},
+            },
+        })
+        _append_jsonl(cx_rollout, {
+            "type": "response_item", "ordinal": 5, "timestamp": "2026-11-28T08:01:00Z",
+            "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "## Codex 窗口一旧回复\n这是第一次压缩前输出，应被第二窗口排除。"}]},
+        })
+        _append_jsonl(cx_rollout, {"type": "compacted", "ordinal": 10, "payload": {"window_id": "w1"}})
+        _append_jsonl(cx_rollout, {
+            "type": "response_item", "ordinal": 25, "timestamp": "2026-11-28T08:05:00Z",
+            "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "## Codex 窗口二提案\n建议采用方案 A，参数 threshold=75.0，等待确认。"}]},
+        })
+        _append_jsonl(cx_rollout, {
+            "type": "response_item", "ordinal": 28, "timestamp": "2026-11-28T08:06:00Z",
+            "payload": {
+                "type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": "批准"}],
+                "internal_chat_message_metadata_passthrough": {"content_item_metadata": [{"provenance": {"type": "user"}}]},
+            },
+        })
+        _append_jsonl(cx_rollout, {"type": "compacted", "ordinal": 30, "payload": {"window_id": "w2"}})
+        cx_out = session_context_loader.handle_codex_session_start(
+            {"session_id": cx_sid, "transcript_path": str(cx_rollout), "source": "compact", "cwd": str(self.root)},
+            state_dir_str=str(cx_state),
+            log_path_str=str(self.root / "codex_home" / "hooks" / "logs" / "sc.jsonl"),
+        )
+        cx_ctx = cx_out["hookSpecificOutput"]["additionalContext"]
+        cx_asst = cx_state.parent / "user-words" / f"{cx_sid}_assistant_replies.md"
+        self.assertTrue(cx_asst.is_file())
+        cx_asst_txt = cx_asst.read_text(encoding="utf-8")
+        self.assertIn("Codex 窗口二提案", cx_asst_txt)
+        self.assertNotIn("Codex 窗口一旧回复", cx_asst_txt)
+        self.assertIn(f"{cx_sid}_assistant_replies.md", cx_ctx)
+        self.assertIn("read_file", cx_ctx)
+        self.assertIn("归档正文哈希与清单一致", cx_ctx)
+
+        # 6) Claude Code 双压缩窗口助手回复归档与清单完整性保持
+        cl_sid = "cl-v211-asst-win"
+        cl_tp = self.root / "claude_home" / "projects" / "demo" / f"{cl_sid}.jsonl"
+        cl_tp.parent.mkdir(parents=True, exist_ok=True)
+        cl_state = self.root / "claude_home" / "hooks" / "state" / "session-context"
+        _append_jsonl(cl_tp, {"type": "user", "timestamp": "2026-11-28T08:00:00Z", "message": {"role": "user", "content": "给出修改计划"}})
+        _append_jsonl(cl_tp, {"type": "assistant", "timestamp": "2026-11-28T08:01:00Z", "message": {"role": "assistant", "content": [{"type": "text", "text": "## Claude 窗口一旧回复\n第一阶段方案细节（不应进入第二窗口）。"}]}})
+        _append_jsonl(cl_tp, {"type": "system", "subtype": "compact_boundary", "timestamp": "2026-11-28T08:02:00Z"})
+        _append_jsonl(cl_tp, {"type": "assistant", "timestamp": "2026-11-28T08:04:00Z", "message": {"role": "assistant", "content": [{"type": "text", "text": "## Claude 窗口二定案\n全部 5 项修复与回归单测路径如下，请确认执行。"}]}})
+        _append_jsonl(cl_tp, {"type": "user", "timestamp": "2026-11-28T08:05:00Z", "message": {"role": "user", "content": "同意，继续"}})
+        _append_jsonl(cl_tp, {"type": "system", "subtype": "compact_boundary", "timestamp": "2026-11-28T08:06:00Z"})
+        cl_out = session_context_loader.handle_claude_session_start(
+            {"session_id": cl_sid, "transcript_path": str(cl_tp), "source": "compact", "cwd": str(self.root)},
+            state_dir_str=str(cl_state),
+        )
+        cl_ctx = cl_out["hookSpecificOutput"]["additionalContext"]
+        cl_asst = cl_state.parent / "user-words" / f"{cl_sid}_assistant_replies.md"
+        self.assertTrue(cl_asst.is_file())
+        cl_asst_txt = cl_asst.read_text(encoding="utf-8")
+        self.assertIn("Claude 窗口二定案", cl_asst_txt)
+        self.assertNotIn("Claude 窗口一旧回复", cl_asst_txt)
+        self.assertIn(f"{cl_sid}_assistant_replies.md", cl_ctx)
+        self.assertIn("read_file", cl_ctx)
+        self.assertIn("归档正文 SHA-256 与校验清单一致", cl_ctx)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

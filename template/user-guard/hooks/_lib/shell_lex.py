@@ -935,7 +935,7 @@ def parse_readonly_git_prefix(tokens: List[str]) -> Tuple[bool, Optional[str], L
                 cfg_k = tokens[idx + 1].split("=", 1)[0].strip().lower()
                 if cfg_k.startswith(("alias.", "core.fsmonitor", "core.sshcommand", "core.pager", "pager.")) and not cfg_k.startswith(("core.pager", "pager.")):
                     return False, None, []
-                if any(cfg_k.startswith(p) for p in ("alias.", "core.fsmonitor", "core.sshcommand", "core.hooks", " diff.external", "diff.external")):
+                if any(cfg_k.startswith(p) for p in ("alias.", "core.fsmonitor", "core.sshcommand", "core.hooks", "diff.external")):
                     return False, None, []
             else:
                 return False, None, []
@@ -962,6 +962,12 @@ def parse_readonly_git_prefix(tokens: List[str]) -> Tuple[bool, Optional[str], L
         if al in ("-o", "--output") or al.startswith(("--output=", "-o/")):
             return False, git_cwd, rest
         if subcmd == "diff" and al.startswith("--ext-diff"):
+            return False, git_cwd, rest
+        if subcmd == "grep" and (
+            (arg.startswith("-") and not arg.startswith("--") and "O" in arg[1:])
+            or al == "--open-files-in-pager"
+            or al.startswith("--open-files-in-pager=")
+        ):
             return False, git_cwd, rest
     return True, git_cwd, rest
 

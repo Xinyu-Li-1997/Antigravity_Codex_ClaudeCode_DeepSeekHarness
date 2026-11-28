@@ -2313,6 +2313,16 @@ class TestCaeAxiomsOffline(unittest.TestCase):
             self.assertEqual(exh_doc["replay_certificate"]["status"], "STALE_INVALIDATED")
             self.assertEqual(exh_doc["current_state"], "STALE_INVALIDATED")
 
+            # v2.1.1: expected_replay_schema 严格单源导出 OBJECTIVE_ROLES / EXIT_KINDS / SUFFICIENT_CERTIFICATE_KINDS，禁止 drift 枚举
+            pkt_c5_manifest = json.loads((pkt_c5 / "manifest.json").read_text(encoding="utf-8"))
+            sv_schema = pkt_c5_manifest["expected_replay_schema"]["stage_verdicts"]
+            l2_role_hint = sv_schema["L2_CONSTRAINT_ROLE"]["blind_assertions"]["objective_roles"]["allowed_set"]
+            for role_tok in ("iff", "sufficient_only", "necessary_only", "veto_only", "complementary_veto", "independent", "neg_sufficient"):
+                self.assertIn(role_tok, l2_role_hint)
+            l3_exit_hint = sv_schema["L3_EMPIRICAL_EXIT"]["blind_assertions"]["exit_kind"]
+            self.assertIn("evolution_decoupled", l3_exit_hint)
+            self.assertNotIn("explicit_limit", l3_exit_hint)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

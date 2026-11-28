@@ -1282,7 +1282,7 @@ def _merge_telemetry(
 
     intervals = [cp_steps[i] - cp_steps[i - 1] for i in range(1, len(cp_steps)) if cp_steps[i] > cp_steps[i - 1]]
     recent_avg_interval: Optional[float] = None
-    if len(intervals) >= 3:
+    if len(intervals) >= 2:
         tail3 = intervals[-3:]
         recent_avg_interval = sum(tail3) / len(tail3)
 
@@ -1401,6 +1401,8 @@ def _evaluate_triggers(tel: Dict[str, Any], user_text: str) -> Tuple[List[str], 
         stage2_hits.append("cp_count")
     if cp_count >= DRAIN_THRASH_MIN_CP and avg_int is not None and avg_int <= DRAIN_THRASH_AVG_INTERVAL:
         stage2_hits.append("cp_thrashing")
+    if tel.get("turnCpCount", 0) >= DRAIN_TURN_CPS and avg_int is not None and avg_int <= DRAIN_THRASH_AVG_INTERVAL:
+        stage2_hits.append("turn_cp_thrashing")
     if tel.get("turnCpCount", 0) >= DRAIN_TURN_CPS and tel.get("turnStepSpan", 0) >= DRAIN_TURN_STEPS:
         stage2_hits.append("turn_runaway")
     if tp_bytes >= DRAIN_TRANSCRIPT_BYTES:

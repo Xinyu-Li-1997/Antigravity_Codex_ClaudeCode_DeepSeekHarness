@@ -186,16 +186,19 @@ def _expected_blind_assertions_template(stage: str, rec: Dict[str, Any]) -> Dict
     if stage in ("L2_CONSTRAINT_ROLE", "S3_CLOSURE_CONSTRAINT"):
         roles = meta.get("constraint_roles") or {}
         if isinstance(roles, dict) and roles:
+            allowed_roles = " | ".join(sorted(OBJECTIVE_ROLES))
             return {
-                "objective_roles": {cname: "<独立判定的七分角色之一>" for cname in sorted(roles.keys())},
+                "objective_roles": {cname: f"<{allowed_roles}>" for cname in sorted(roles.keys())},
             }
     if stage in ("L3_EMPIRICAL_EXIT", "S4_LOCAL_SPECTRAL_VV"):
+        allowed_exits = " | ".join(sorted(EXIT_KINDS))
         tpl: Dict[str, Any] = {
             "target_exogenous": "<true | false>",
-            "exit_kind": "<nonperceivable_constraint | sufficient_certificate | explicit_limit>",
+            "exit_kind": f"<{allowed_exits}>",
         }
         if meta.get("exit_kind") == "sufficient_certificate":
-            tpl["sufficient_certificate_kind"] = "<exhaustive_domain | artifact_bound_lean | finite_probe_only>"
+            allowed_certs = " | ".join(sorted(SUFFICIENT_CERTIFICATE_KINDS))
+            tpl["sufficient_certificate_kind"] = f"<{allowed_certs}>"
         return tpl
     return {}
 
