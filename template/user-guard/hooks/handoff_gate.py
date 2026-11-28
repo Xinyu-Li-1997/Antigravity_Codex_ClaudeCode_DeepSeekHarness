@@ -49,6 +49,7 @@ DEFAULT_DRAIN_INVOCATIONS = 4
 DEFAULT_DRAIN_ACTIONS = 8
 
 # 遥测阈值是项目收口策略的启发式参数，不能据此推断模型的上下文容量。
+DEFAULT_AGY_HANDOFF_MODE = "advisory"
 ADVISORY_CP_THRESHOLD = 3
 ADVISORY_TRANSCRIPT_BYTES = 3 * 1024 * 1024
 ADVISORY_THRASH_MIN_CP = 3
@@ -213,6 +214,7 @@ CODEX_READ_TOOLS = {
 CODEX_DELEGATION_TOOLS = {"spawn_agent", "agent", "followup_task", "send_message", "create_thread"}
 
 _HANDOFF_BUILTINS: Dict[str, Any] = {
+    "DEFAULT_AGY_HANDOFF_MODE": DEFAULT_AGY_HANDOFF_MODE,
     "DEFAULT_DRAIN_INVOCATIONS": DEFAULT_DRAIN_INVOCATIONS,
     "DEFAULT_DRAIN_ACTIONS": DEFAULT_DRAIN_ACTIONS,
     "ADVISORY_CP_THRESHOLD": ADVISORY_CP_THRESHOLD,
@@ -292,7 +294,11 @@ def _sync_handoff_tunables(
         model_name=eff_model if eff_client == "antigravity" else "",
         effort=eff_effort if eff_client == "antigravity" else "",
     )
+    raw_agy_mode = str(agy.get("default_mode") or _HANDOFF_BUILTINS["DEFAULT_AGY_HANDOFF_MODE"]).strip().lower()
+    if raw_agy_mode not in ("advisory", "enforce", "off"):
+        raw_agy_mode = _HANDOFF_BUILTINS["DEFAULT_AGY_HANDOFF_MODE"]
     resolved: Dict[str, Any] = {
+        "DEFAULT_AGY_HANDOFF_MODE": raw_agy_mode,
         "DEFAULT_DRAIN_INVOCATIONS": user_words._coerce_pos_int(agy.get("default_drain_invocations"), _HANDOFF_BUILTINS["DEFAULT_DRAIN_INVOCATIONS"]),
         "DEFAULT_DRAIN_ACTIONS": user_words._coerce_pos_int(agy.get("default_drain_actions"), _HANDOFF_BUILTINS["DEFAULT_DRAIN_ACTIONS"]),
         "ADVISORY_CP_THRESHOLD": user_words._coerce_pos_int(agy.get("advisory_cp_threshold"), _HANDOFF_BUILTINS["ADVISORY_CP_THRESHOLD"]),
@@ -903,8 +909,10 @@ def _is_handoff_target(
     norm_low = norm.lower()
     name = target.name
 
-    # 允许 Antigravity 当前对话 brain Artifact 目录写交接文档（排除系统文件与媒体上传目录）
+    # 允许 Antigravity 当前对话 brain Artifact 目录写交接文档（排除系统文件与媒体上传目录，但放行 swarm/plan.json 收尾展示）
     if conversation_id and f"/brain/{conversation_id.lower()}/" in norm_low:
+        if "/.system_generated/swarm/plan.json" in norm_low:
+            return True
         if "/.system_generated/" in norm_low or "/.user_uploaded/" in norm_low:
             return False
         if name.endswith("_user_words.md"):
@@ -1275,9 +1283,10 @@ def _merge_telemetry(
     gate_state: Dict[str, Any],
     transcript_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
-    """整合 transcript 增量遥测与实时 PreToolUse 图片读数"""
+    """整合 transcript 增量遥测与实时 PreToolUse 图片读数（剔除用户主动 /compact 防止误计压缩抖动）"""
     cp_steps_raw = compaction_state.get("checkpointSteps") or []
-    cp_steps = sorted({int(x) for x in cp_steps_raw if isinstance(x, int) and x >= 0})
+    manual_cp_set = {int(x) for x in (compaction_state.get("manualCompactSteps") or []) if isinstance(x, int) and x >= 0}
+    cp_steps = sorted({int(x) for x in cp_steps_raw if isinstance(x, int) and x >= 0 and int(x) not in manual_cp_set})
     cp_count = len(cp_steps)
 
     intervals = [cp_steps[i] - cp_steps[i - 1] for i in range(1, len(cp_steps)) if cp_steps[i] > cp_steps[i - 1]]
@@ -1593,15 +1602,26 @@ def _refresh_phase_from_telemetry(
                 )
         return changed
 
-    # 当前为 normal 或 advisory：判定是否升级到 drain 或 advisory
-    if stage2_hits:
+    # 当前为 normal 或 advisory：按模式与 /goal 活跃状态区分硬触发（宿主截断/用户指令）与启发式触发
+    _HARD_STAGE2_TRIGGERS = {"user_request", "host_banner", "user_banner_report"}
+    hard_stage2 = [tr for tr in stage2_hits if tr in _HARD_STAGE2_TRIGGERS]
+    heuristic_stage2 = [tr for tr in stage2_hits if tr not in _HARD_STAGE2_TRIGGERS]
+    agy_mode = str(DEFAULT_AGY_HANDOFF_MODE or "advisory").strip().lower()
+    allow_heuristic_drain = (agy_mode == "enforce") and not bool(tel.get("isGoalActive"))
+    effective_drain_hits = list(dict.fromkeys(hard_stage2 + (heuristic_stage2 if allow_heuristic_drain else [])))
+    effective_advisory_hits = list(dict.fromkeys(advisory_hits + ([] if allow_heuristic_drain else heuristic_stage2)))
+
+    if agy_mode == "off" and not hard_stage2:
+        return changed
+
+    if effective_drain_hits:
         gate_state["phase"] = "drain"
-        gate_state["triggers"] = list(dict.fromkeys(stage2_hits))
+        gate_state["triggers"] = effective_drain_hits
         gate_state["enteredDrainAtStep"] = tel["latestStep"]
         gate_state["handoffFileBaselines"] = {}
         gate_state["drainInvocationsRemaining"] = DEFAULT_DRAIN_INVOCATIONS
         gate_state["drainActionsRemaining"] = DEFAULT_DRAIN_ACTIONS
-        if "user_banner_report" in stage2_hits or "host_banner" in stage2_hits:
+        if "user_banner_report" in effective_drain_hits or "host_banner" in effective_drain_hits:
             gate_state["bannerDetectedAtStep"] = tel["latestStep"]
             gate_state["bannerTriggerTurnHash"] = turn_token
         user_words.append_lifecycle_log(
@@ -1612,9 +1632,9 @@ def _refresh_phase_from_telemetry(
         )
         return True
 
-    if advisory_hits and prev_phase == "normal":
+    if effective_advisory_hits and prev_phase == "normal":
         gate_state["phase"] = "advisory"
-        gate_state["triggers"] = list(dict.fromkeys(advisory_hits))
+        gate_state["triggers"] = effective_advisory_hits
         user_words.append_lifecycle_log(
             HOOKS_DIR,
             "HandoffGate:advisory",
@@ -1623,8 +1643,8 @@ def _refresh_phase_from_telemetry(
         )
         return True
 
-    if advisory_hits and prev_phase == "advisory":
-        for tr in advisory_hits:
+    if effective_advisory_hits and prev_phase == "advisory":
+        for tr in effective_advisory_hits:
             if tr not in gate_state["triggers"]:
                 gate_state["triggers"].append(tr)
                 changed = True
@@ -1794,8 +1814,14 @@ def check_pre_tool_use_locked(payload: Dict[str, Any], state_dir: Path,
 
     # 以下为 Stage-2 (drain / freeze) 精确工具门禁
     user_words.handoff_session_pending_tickets(conversation_id, state_dir)
-    # 1. 绝不允许的派工与常驻/外推工具（drain 与 freeze 均阻断）
-    if tool_name in DELEGATION_TOOLS or tool_name in MEDIA_TOOLS or tool_name.startswith("browser_"):
+    # 1. 绝不允许的派工与常驻/外推工具（drain 与 freeze 均阻断；放行 browser_close 清理与非新建定时 schedule）
+    is_blocked_browser = tool_name.startswith("browser_") and tool_name != "browser_close"
+    is_blocked_schedule = tool_name == "schedule" and bool(
+        args.get("DurationSeconds") or args.get("durationSeconds") or args.get("CronExpression") or args.get("cronExpression")
+        or (not args)
+    )
+    is_blocked_delegation = (tool_name in DELEGATION_TOOLS and tool_name != "schedule") or is_blocked_schedule
+    if is_blocked_delegation or tool_name in MEDIA_TOOLS or is_blocked_browser:
         save_gate_state(state_dir, conversation_id, gate_state)
         media_note = (
             "收口期禁止看图或生成多模态图片（图片会急剧消耗剩余上下文窗口并加剧压缩丢历史风险），请改用已有文本/脚本输出核对；"

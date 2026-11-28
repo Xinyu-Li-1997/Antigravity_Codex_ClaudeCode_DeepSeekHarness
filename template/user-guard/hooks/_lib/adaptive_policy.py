@@ -416,7 +416,7 @@ def resolve_adaptive_handoff_policy(
         raw_ht_cfg = ht.get(client)
     cfg = dict(raw_ht_cfg if isinstance(raw_ht_cfg, dict) else {})
 
-    default_fallback = "enforce" if norm_client == "antigravity" else "advisory"
+    default_fallback = "advisory"
     raw_mode = str(cfg.get("default_mode") or default_fallback).strip().lower()
     mode = raw_mode if raw_mode in {"advisory", "enforce", "off"} else default_fallback
     raw_lim = cfg.get("default_compact_limit")

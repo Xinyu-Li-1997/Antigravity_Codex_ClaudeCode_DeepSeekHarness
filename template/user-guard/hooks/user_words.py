@@ -49,7 +49,11 @@ TOOL_TIMING_HEADER_RE = re.compile(
 
 MARKDOWN_FENCE_RE = re.compile(r"^\s{0,3}(`{3,}|~{3,})(.*)$")
 GOAL_START_RE = re.compile(r"^/goal(?:\s|$)", re.IGNORECASE)
-GOAL_CANCEL_RE = re.compile(r"^(?:请)?(?:取消|停止|结束|关闭)\s*/?goal(?![A-Za-z0-9_-])", re.IGNORECASE)
+GOAL_CANCEL_RE = re.compile(
+    r"^(?:(?:请)?(?:取消|停止|结束|关闭)\s*/?goal(?![A-Za-z0-9_-])"
+    r"|(?:please\s+)?(?:stop|cancel|end|abort|finish|quit)\s+(?:the\s+)?(?:current\s+)?/?goal(?![A-Za-z0-9_-]))",
+    re.IGNORECASE,
+)
 
 # Codex Rollout 会话记录解析与归档 (供 --client codex 在 compact/resume 时调用)
 
@@ -116,19 +120,64 @@ def _valid_profile_schema_version(parsed: Any, *, allow_omitted: bool = True) ->
     return type(sv) is int and sv == 1
 
 
+def deep_merge_profile_overlay(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]:
+    """合并本机私有覆盖层 fleet_profile.local.json：仅做受控键值覆写，禁止覆盖核心结构化 schema_version 或放宽 hook_safety 安全硬下限。"""
+    merged: Dict[str, Any] = dict(base)
+    for k, v in overlay.items():
+        if k == "schema_version":
+            continue
+        if isinstance(v, dict) and isinstance(merged.get(k), dict):
+            sub = deep_merge_profile_overlay(merged[k], v)
+            if k == "hook_safety":
+                # 遵循公理边界“只能收紧、禁止覆盖放宽安全上限”
+                base_hs = base.get("hook_safety") if isinstance(base.get("hook_safety"), dict) else {}
+                for bound_k in ("max_rss_mib", "wall_timeout_sec"):
+                    if bound_k in base_hs and bound_k in sub:
+                        try:
+                            if float(sub[bound_k]) > float(base_hs[bound_k]):
+                                sub[bound_k] = base_hs[bound_k]
+                        except (TypeError, ValueError):
+                            sub[bound_k] = base_hs[bound_k]
+            merged[k] = sub
+        else:
+            merged[k] = v
+    return merged
+
+
+def _resolve_local_overlay_path(profile_path: Path) -> Optional[Path]:
+    env_local = os.environ.get("CAE_FLEET_PROFILE_LOCAL", "").strip()
+    if env_local:
+        cand = Path(env_local).expanduser()
+        return cand if (not _is_reparse_or_link(cand) and cand.is_file()) else None
+    sibling = profile_path.with_name("fleet_profile.local.json")
+    return sibling if (not _is_reparse_or_link(sibling) and sibling.is_file()) else None
+
+
 def load_fleet_profile(anchor_dir: Optional[Path] = None) -> Dict[str, Any]:
-    """按 mtime 缓存读取 fleet_profile.json（支持 CAE_FLEET_PROFILE 强隔离覆盖与缺失负缓存，异常时安全降级为空字典）。"""
+    """按 mtime 缓存读取 fleet_profile.json（支持 CAE_FLEET_PROFILE 强隔离覆盖、本机 fleet_profile.local.json 覆盖层与缺失负缓存）。"""
     env_override = os.environ.get("CAE_FLEET_PROFILE", "").strip()
     if env_override:
         cand = Path(env_override).expanduser()
         try:
             if not _is_reparse_or_link(cand) and cand.is_file():
                 st = cand.stat()
-                cache_key: Any = ("override_file", str(cand), st.st_mtime_ns, st.st_size)
+                local_path = _resolve_local_overlay_path(cand) if os.environ.get("CAE_FLEET_PROFILE_LOCAL", "").strip() else None
+                local_sig = None
+                if local_path is not None:
+                    lst = local_path.stat()
+                    local_sig = (str(local_path), lst.st_mtime_ns, lst.st_size)
+                cache_key: Any = ("override_file", str(cand), st.st_mtime_ns, st.st_size, local_sig)
                 if _FLEET_PROFILE_CACHE.get("key") == cache_key:
                     return _FLEET_PROFILE_CACHE["data"]
                 parsed = json.loads(cand.read_text(encoding="utf-8-sig"))
                 if _valid_profile_schema_version(parsed, allow_omitted=True):
+                    if local_path is not None:
+                        try:
+                            ov = json.loads(local_path.read_text(encoding="utf-8-sig"))
+                            if isinstance(ov, dict):
+                                parsed = deep_merge_profile_overlay(parsed, ov)
+                        except (OSError, UnicodeError, ValueError, RecursionError):
+                            pass
                     _FLEET_PROFILE_CACHE["key"] = cache_key
                     _FLEET_PROFILE_CACHE["version"] = int(_FLEET_PROFILE_CACHE.get("version", 0)) + 1
                     _FLEET_PROFILE_CACHE["data"] = parsed
@@ -153,11 +202,23 @@ def load_fleet_profile(anchor_dir: Optional[Path] = None) -> Dict[str, Any]:
             if _is_reparse_or_link(cand) or not cand.is_file():
                 continue
             st = cand.stat()
-            cache_key = ("file", str(cand), st.st_mtime_ns, st.st_size)
+            local_path = _resolve_local_overlay_path(cand)
+            local_sig = None
+            if local_path is not None:
+                lst = local_path.stat()
+                local_sig = (str(local_path), lst.st_mtime_ns, lst.st_size)
+            cache_key = ("file", str(cand), st.st_mtime_ns, st.st_size, local_sig)
             if _FLEET_PROFILE_CACHE.get("key") == cache_key:
                 return _FLEET_PROFILE_CACHE["data"]
             parsed = json.loads(cand.read_text(encoding="utf-8-sig"))
             if _valid_profile_schema_version(parsed, allow_omitted=False):
+                if local_path is not None:
+                    try:
+                        ov = json.loads(local_path.read_text(encoding="utf-8-sig"))
+                        if isinstance(ov, dict):
+                            parsed = deep_merge_profile_overlay(parsed, ov)
+                    except (OSError, UnicodeError, ValueError, RecursionError):
+                        pass
                 _FLEET_PROFILE_CACHE["key"] = cache_key
                 _FLEET_PROFILE_CACHE["version"] = int(_FLEET_PROFILE_CACHE.get("version", 0)) + 1
                 _FLEET_PROFILE_CACHE["data"] = parsed

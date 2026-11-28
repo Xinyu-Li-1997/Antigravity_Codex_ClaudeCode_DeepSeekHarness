@@ -39,6 +39,8 @@ TAIL_SCAN_BYTES = 256 * 1024  # 256 KB
 SIMILARITY_THRESHOLD = 0.80
 CORE_SIMILARITY_THRESHOLD = 0.75
 CONSECUTIVE_WAIT_LIMIT = 3
+EVIDENCE_GATE_MODE = "advisory"
+NATIVE_BILL_GATE_MODE = "advisory"
 
 _REPEAT_BUILTINS: Dict[str, Any] = {
     "MAX_SHORT_REPLY_CHARS": MAX_SHORT_REPLY_CHARS,
@@ -46,6 +48,8 @@ _REPEAT_BUILTINS: Dict[str, Any] = {
     "SIMILARITY_THRESHOLD": SIMILARITY_THRESHOLD,
     "CORE_SIMILARITY_THRESHOLD": CORE_SIMILARITY_THRESHOLD,
     "CONSECUTIVE_WAIT_LIMIT": CONSECUTIVE_WAIT_LIMIT,
+    "EVIDENCE_GATE_MODE": EVIDENCE_GATE_MODE,
+    "NATIVE_BILL_GATE_MODE": NATIVE_BILL_GATE_MODE,
 }
 _ACTIVE_REPEAT_BASELINE: Dict[str, Any] = dict(_REPEAT_BUILTINS)
 _LAST_REPEAT_PROFILE_TOKEN: Optional[Tuple[Any, ...]] = None
@@ -60,12 +64,20 @@ def _sync_repeat_tunables() -> None:
     _LAST_REPEAT_PROFILE_TOKEN = cache_token
     lg = user_words.get_runtime_tunables("loop_guards", HOOKS_DIR)
     cfg = lg.get("reply_repeat") if isinstance(lg.get("reply_repeat"), dict) else {}
+    raw_ev_mode = str(cfg.get("evidence_gate_mode") or _REPEAT_BUILTINS["EVIDENCE_GATE_MODE"]).strip().lower()
+    if raw_ev_mode not in ("advisory", "enforce", "off"):
+        raw_ev_mode = _REPEAT_BUILTINS["EVIDENCE_GATE_MODE"]
+    raw_native_mode = str(cfg.get("native_bill_gate_mode") or _REPEAT_BUILTINS["NATIVE_BILL_GATE_MODE"]).strip().lower()
+    if raw_native_mode not in ("advisory", "enforce", "off"):
+        raw_native_mode = _REPEAT_BUILTINS["NATIVE_BILL_GATE_MODE"]
     resolved: Dict[str, Any] = {
         "MAX_SHORT_REPLY_CHARS": user_words._coerce_pos_int(cfg.get("max_short_reply_chars"), 300, minimum=50),
         "TAIL_SCAN_BYTES": user_words._coerce_pos_int(cfg.get("tail_scan_kib"), 256, minimum=16) * 1024,
         "SIMILARITY_THRESHOLD": user_words._coerce_ratio(cfg.get("similarity_threshold"), 0.80, low=0.50, high=0.98),
         "CORE_SIMILARITY_THRESHOLD": user_words._coerce_ratio(cfg.get("core_similarity_threshold"), 0.75, low=0.45, high=0.98),
         "CONSECUTIVE_WAIT_LIMIT": user_words._coerce_pos_int(cfg.get("consecutive_wait_limit"), 3, minimum=2),
+        "EVIDENCE_GATE_MODE": raw_ev_mode,
+        "NATIVE_BILL_GATE_MODE": raw_native_mode,
     }
     mod_globals = globals()
     for name, new_val in resolved.items():
@@ -710,8 +722,16 @@ def _native_completion_bill(payload, state=None):
                     content = str(entry.get("content") or "")
                     sender, body = user_words._extract_agy_subagent_return_body(content)
                     if sender in agents and body:
-                        call, log = agents[sender]
-                        finish(sender, call, body, log=log)
+                        # 跳过多轮交互子代理（如 /teamwork）的访谈准备/中间询问/待批子票据消息，不误判为最终完工
+                        is_intermediate = bool(re.search(
+                            r"Your Teamwork run is being prepared|putting together a short task interview|"
+                            r"运行正在准备中|【待确认派工|状态[：:]\s*`*PENDING`*",
+                            body,
+                            re.I,
+                        ))
+                        if not is_intermediate:
+                            call, log = agents[sender]
+                            finish(sender, call, body, log=log)
                     notice = re.search(r"\[Message\][^\n]*\bsender=([^\s]+)[^\n]*\bcontent=(.*)", content, re.S)
                     if notice:
                         task_id = notice.group(1).rsplit("/", 1)[-1]
@@ -868,7 +888,7 @@ def _check_heavy_report_locked(payload, state_dir, sid, turn_key, reply, decisio
     entries = user_words.load_unreported_heavy_completions(sid, state_dir)
     state_file = state_dir / (sid + "_heavy_report_guard.json")
     state = user_words._read_state_json(state_file) or {}
-    native = _native_completion_bill(payload, state)
+    native = _native_completion_bill(payload, state) if NATIVE_BILL_GATE_MODE == "enforce" else None
     same_native_turn = native and state.get("native_turn") == native["turn_key"]
     if state.get("turn") != turn_key and not same_native_turn:
         state = {"turn": turn_key, "reported_native_ids": state.get("reported_native_ids", [])}
@@ -1142,10 +1162,11 @@ _FORMAL_DOC_EXTS = frozenset({".tex", ".md", ".rst"})
 _FORMAL_DOC_SKIP_DIRS = frozenset({
     "tests", "test", "scratch", "tmp", "temp", ".git", "plugin_data",
     "state", "logs", "handoff", "archive", "archived", ".system_generated",
+    ".agents", ".agent", "_agents", "_agent", "plugins", "skills", "sidecars",
 })
 _FORMAL_DOC_SKIP_NAMES = frozenset({
     "changelog.md", "license.md", "notice.md", "todo.md", "notes.md",
-    "plan.md", "implementation_plan.md", "walkthrough.md",
+    "plan.md", "implementation_plan.md", "walkthrough.md", "skill.md",
 })
 _FORMAL_DOC_SKIP_SUFFIXES = (
     "_card.md", "_reconcile.md", "_read_plan.md", "_cross_check.md", "_user_words.md", "_assistant_replies.md",
@@ -1688,12 +1709,27 @@ def _check_turn_evidence_locked(
     if ev is None:
         return None
 
-    # Gate A: 零成功探测或全报错探测却宣称“已核实未连接/不存在/不可用”（尾窗截断时不误拦）
-    if has_emp_neg and ev["succeeded"] == 0 and not ev["turn_truncated"]:
+    # Gate A/B/C 属于基于回复措辞的启发式实证检查（D3 决策：默认 advisory 记录日志不硬阻断，enforce 模式才阻断）
+    ev_mode = str(EVIDENCE_GATE_MODE or "advisory").strip().lower()
+    if ev_mode == "off":
+        return None
+
+    def _emit_evidence_hit(ev_kind: str, sig: str, reason: str) -> Optional[Tuple[str, Dict[str, Any]]]:
+        if ev_mode != "enforce":
+            advisories = record.setdefault("advisories", [])
+            if sig not in advisories:
+                advisories.append(sig)
+                _save_repeat_state(state_file, state, sid)
+            log_event(f"Stop:advisory:{ev_kind}", sid, reason)
+            return None
         if _heavy_report_blocked(state_file.parent, sid, turn_key, payload):
             return None
-        record["blockedSignatures"].append("unverified-negative-claim")
+        record["blockedSignatures"].append(sig)
         _save_repeat_state(state_file, state, sid)
+        return ev_kind, {"decision": decision, "reason": reason}
+
+    # Gate A: 零成功探测或全报错探测却宣称“已核实未连接/不存在/不可用”（尾窗截断时不误拦）
+    if has_emp_neg and ev["succeeded"] == 0 and not ev["turn_truncated"]:
         if ev["failed"] > 0:
             reason = (
                 f"【user-guard 未实查即下否定结论拦截】本轮探测命令均报错或被拦截（成功 0 条、失败 {ev['failed']} 条），"
@@ -1706,29 +1742,21 @@ def _check_turn_evidence_locked(
                 "不得直接宣称“已核实未连接/不存在/不可用”。"
                 "请按 R3.6/R4 先对本机已连渠道执行只读核实，或如实标明尚未核查。"
             )
-        return "unverified_negative_claim", {"decision": decision, "reason": reason}
+        return _emit_evidence_hit("unverified_negative_claim", "unverified-negative-claim", reason)
 
     # Gate B: 仅核查少量局部路径（未读索引/清单且未做全仓检索）却下“现有数据/材料不足或需整体重做”的全称缺口定论
     if (has_gap_verdict and ev["succeeded"] > 0 and not ev["turn_truncated"]
             and not ev["consulted_index"] and len(ev["checked_paths"]) <= 3):
-        if _heavy_report_blocked(state_file.parent, sid, turn_key, payload):
-            return None
-        record["blockedSignatures"].append("partial-scope-verdict")
-        _save_repeat_state(state_file, state, sid)
         reason = (
             "【user-guard 局部排查防全称缺口结论】本轮仅核查了少量局部路径（未读取项目总览/资产索引，也未执行全仓检索），"
             "却直接给出了“现有数据/材料/实现不足或需整体重做”的全局定论。"
             "请按 R3.6 先补查项目索引、资产目录或全仓检索核实存量，或如实标明“仅核查了哪些路径、尚未核查其余目录”。"
         )
-        return "partial_scope_verdict", {"decision": decision, "reason": reason}
+        return _emit_evidence_hit("partial_scope_verdict", "partial-scope-verdict", reason)
 
     # Gate C: 单端整篇写入正式长文（.tex / .md / .rst）却无覆盖当前交付的独立复核记录且未标明初稿待审
     if (not defer_deliverable_review and ev["large_doc_writes"] and not ev["has_independent_review"]
             and not _UNREVIEWED_DISCLOSURE_RE.search(plain)):
-        if _heavy_report_blocked(state_file.parent, sid, turn_key, payload):
-            return None
-        record["blockedSignatures"].append("solo-deliverable-review")
-        _save_repeat_state(state_file, state, sid)
         doc_names = "、".join(Path(item["path"]).name for item in ev["large_doc_writes"][:3])
         model_hint = _code_family_mismatch_hint(client, ev["active_model"], payload)
         reason = (
@@ -1738,7 +1766,7 @@ def _check_turn_evidence_locked(
             "若确为阶段初稿，请如实标明“初稿待独立审校”及未核验范围。"
             + (f" {model_hint}" if model_hint else "")
         )
-        return "solo_deliverable_review", {"decision": decision, "reason": reason}
+        return _emit_evidence_hit("solo_deliverable_review", "solo-deliverable-review", reason)
 
     return None
 

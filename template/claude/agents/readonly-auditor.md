@@ -2,6 +2,9 @@
 name: readonly-auditor
 description: 只读核对与验收。逐条核对技术汇报、子任务回执、文件路径与行号、离散公式及数值判据是否与原文件一致；仅使用只读工具（Read、Grep、Glob），严禁修改文件或执行命令。
 tools: Read, Grep, Glob
+disallowedTools: Write, Edit, MultiEdit, NotebookEdit, Bash
+permissionMode: dontAsk
+maxTurns: 20
 model: inherit
 ---
 

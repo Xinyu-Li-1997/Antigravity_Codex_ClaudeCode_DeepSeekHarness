@@ -5778,7 +5778,7 @@ else:
         # Fail-closed checks
         with self.assertRaisesRegex(harness.HarnessError, 'hooks_only'):
             harness.invoke_engine('agy:default', self.root, 'x', engines, harness.TASK_JSON_SCHEMA, isolation='hooks_only')
-        with self.assertRaisesRegex(harness.HarnessError, 'soft_rules_only'):
+        with self.assertRaisesRegex(harness.HarnessError, 'no_lifecycle_hooks'):
             harness.invoke_engine('dsh:default', self.root, 'x', engines, harness.TASK_JSON_SCHEMA, isolation='hooks_only')
         with self.assertRaisesRegex(harness.HarnessError, '冲突'):
             harness.invoke_engine('codex:default', self.root, 'x', engines, harness.TASK_JSON_SCHEMA, clean_room=True, isolation='full')

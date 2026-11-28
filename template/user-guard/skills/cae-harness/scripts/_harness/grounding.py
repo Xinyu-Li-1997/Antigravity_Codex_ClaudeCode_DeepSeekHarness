@@ -36,7 +36,7 @@ _GROUNDING_REPO_SCRIPT_TOKENS = (
     'axiom_gate.py', '$axiom_gate', '${axiom_gate}', '%axiom_gate%', '_axiom_lib',
     'fleet_state.py', 'ccswitch_admin.py', 'router.py',
     'handoff_gate.py', 'status_guard.py', 'reply_repeat_guard.py',
-    'user_words.py', 'session_context_loader.py',
+    'user_words.py', 'session_context_loader.py', 'uguard_hook.py',
     'update-cc-switch-wsl.sh', 'launch-cc-switch-wsl.sh',
 )
 

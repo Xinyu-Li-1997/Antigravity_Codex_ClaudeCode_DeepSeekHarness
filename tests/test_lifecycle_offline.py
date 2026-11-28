@@ -985,18 +985,45 @@ class TestLifecycleCompactionEngine(unittest.TestCase):
         gate_ok = handoff_gate.load_gate_state(self.plugin_data / "state", conv_healthy)
         self.assertEqual(gate_ok["phase"], "advisory")
 
-        # 3) 检查点间隔坍塌（cp >= 4 且尾 3 段间隔 <= 75）：触发 Stage-2 drain
+        # 3) v3.0: 默认 advisory 模式及活跃 /goal 均不被启发式检查点坍塌强杀；显式 enforce（非 /goal）触发 Stage-2 drain，
+        #    活跃 /goal 仅在硬触发（如 host_banner）时进入 Stage-2 drain 并要求 GOAL_CANCELLED
+        conv_thrash_goal = "ag-handoff-thrash-goal"
+        tp_th_goal = self.tmp_root / "thrash_goal.jsonl"
+        _append_jsonl(tp_th_goal, {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "/goal\n完成批量校准，不要擅自停止"})
+        s = 100
+        for _ in range(4):
+            _append_jsonl(tp_th_goal, {"step_index": s, "source": "SYSTEM", "type": "CHECKPOINT"})
+            s += 50
+        with unittest.mock.patch.object(handoff_gate, "DEFAULT_AGY_HANDOFF_MODE", "enforce"):
+            out_goal_ok = session_context_loader.handle_pre_invocation({"conversationId": conv_thrash_goal, "transcriptPath": str(tp_th_goal)})
+            self.assertNotIn("Stage-2 drain", out_goal_ok["injectSteps"][0]["systemMessage"]["systemMessage"])
+            self.assertEqual(handoff_gate.load_gate_state(self.plugin_data / "state", conv_thrash_goal)["phase"], "advisory")
+
         conv_thrash = "ag-handoff-thrash"
         tp_th = self.tmp_root / "thrash.jsonl"
         _append_jsonl(tp_th, {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "/goal\n完成批量校准，不要擅自停止"})
         s = 100
-        for i in range(4):
+        for _ in range(4):
             _append_jsonl(tp_th, {"step_index": s, "source": "SYSTEM", "type": "CHECKPOINT"})
             s += 50
+        _append_jsonl(tp_th, {"step_index": s, "source": "SYSTEM_SDK", "type": "SYSTEM_MESSAGE", "content": banner})
         out_th = session_context_loader.handle_pre_invocation({"conversationId": conv_thrash, "transcriptPath": str(tp_th)})
         msg_th = out_th["injectSteps"][0]["systemMessage"]["systemMessage"]
         self.assertIn("Stage-2 drain", msg_th)
         self.assertIn("GOAL_CANCELLED", msg_th)
+
+        # 非 /goal + 显式 enforce 模式：检查点间隔坍塌触发 Stage-2 drain
+        conv_thrash_enf = "ag-handoff-thrash-enforce"
+        tp_th_enf = self.tmp_root / "thrash_enforce.jsonl"
+        _append_jsonl(tp_th_enf, {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "完成批量校准"})
+        se = 100
+        for _ in range(4):
+            _append_jsonl(tp_th_enf, {"step_index": se, "source": "SYSTEM", "type": "CHECKPOINT"})
+            se += 50
+        with unittest.mock.patch.object(handoff_gate, "DEFAULT_AGY_HANDOFF_MODE", "enforce"):
+            out_enf = session_context_loader.handle_pre_invocation({"conversationId": conv_thrash_enf, "transcriptPath": str(tp_th_enf)})
+            self.assertIn("Stage-2 drain", out_enf["injectSteps"][0]["systemMessage"]["systemMessage"])
+            self.assertEqual(handoff_gate.load_gate_state(self.plugin_data / "state", conv_thrash_enf)["phase"], "drain")
 
         # 4) 用户发送 "请你处理好交接" 不得误触发 R8 暂缓；发送 "先别交接，继续当前对话" 则触发 overridden 宽限
         _append_jsonl(tp_th, {"step_index": s + 5, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "请你处理好交接"})
@@ -1151,12 +1178,13 @@ class TestLifecycleCompactionEngine(unittest.TestCase):
         for k in range(3):
             s += 150
             _append_jsonl(tp_r8, {"step_index": s, "source": "SYSTEM", "type": "CHECKPOINT"})
-        session_context_loader.handle_pre_invocation({"conversationId": conv_r8, "transcriptPath": str(tp_r8)})
-        self.assertEqual(handoff_gate.load_gate_state(state_dir, conv_r8)["phase"], "drain")
+        with unittest.mock.patch.object(handoff_gate, "DEFAULT_AGY_HANDOFF_MODE", "enforce"):
+            session_context_loader.handle_pre_invocation({"conversationId": conv_r8, "transcriptPath": str(tp_r8)})
+            self.assertEqual(handoff_gate.load_gate_state(state_dir, conv_r8)["phase"], "drain")
 
-        _append_jsonl(tp_r8, {"step_index": s + 5, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "取消 /goal\n先别交接，继续当前对话"})
-        session_context_loader.handle_pre_invocation({"conversationId": conv_r8, "transcriptPath": str(tp_r8)})
-        self.assertEqual(handoff_gate.load_gate_state(state_dir, conv_r8)["phase"], "overridden")
+            _append_jsonl(tp_r8, {"step_index": s + 5, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "取消 /goal\n先别交接，继续当前对话"})
+            session_context_loader.handle_pre_invocation({"conversationId": conv_r8, "transcriptPath": str(tp_r8)})
+            self.assertEqual(handoff_gate.load_gate_state(state_dir, conv_r8)["phase"], "overridden")
 
     def test_12_agy_handoff_gate_v232_workflow_swarm_and_edit_aliases(self) -> None:
         """验证 v2.32.0 / CLI v1.5.8 新增工具在 drain 与 freeze 阶段的收口门禁行为"""
@@ -3598,35 +3626,36 @@ class TestHeavyWorkflowLifecycle(unittest.TestCase):
         handoff_gate._sync_handoff_tunables("antigravity", "", "")
 
     def test_v1181_single_turn_runaway_and_full_transcript_size_trigger_drain(self):
-        # 1) 单用户回合内连续跨 4 次 CHECKPOINT 且步数跨度 >= 650 触发 turn_runaway 进入 Stage-2 drain
+        # 1) 显式 enforce 模式下，单用户回合内连续跨 4 次 CHECKPOINT 且步数跨度 >= 650 触发 turn_runaway 进入 Stage-2 drain
         tp_runaway = self.root / "runaway_compact" / "transcript.jsonl"
         tp_runaway.parent.mkdir(parents=True, exist_ok=True)
         _append_jsonl(tp_runaway, {"step_index": 167, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "批准"})
         for cp_step in (215, 434, 680, 877):
             _append_jsonl(tp_runaway, {"step_index": cp_step, "source": "SYSTEM", "type": "CHECKPOINT"})
         cid_run = "ag-v1181-runaway"
-        out_run = session_context_loader.handle_pre_invocation({"conversationId": cid_run, "transcriptPath": str(tp_runaway)})
-        self.assertIn("Stage-2 drain", out_run["injectSteps"][0]["systemMessage"]["systemMessage"])
-        gate_run = handoff_gate.load_gate_state(self.state, cid_run)
-        self.assertEqual(gate_run["phase"], "drain")
-        self.assertIn("turn_runaway", gate_run["triggers"])
+        with unittest.mock.patch.object(handoff_gate, "DEFAULT_AGY_HANDOFF_MODE", "enforce"):
+            out_run = session_context_loader.handle_pre_invocation({"conversationId": cid_run, "transcriptPath": str(tp_runaway)})
+            self.assertIn("Stage-2 drain", out_run["injectSteps"][0]["systemMessage"]["systemMessage"])
+            gate_run = handoff_gate.load_gate_state(self.state, cid_run)
+            self.assertEqual(gate_run["phase"], "drain")
+            self.assertIn("turn_runaway", gate_run["triggers"])
 
-        # 2) 紧凑版 < 3 MiB 但 transcript_full.jsonl >= 6 MiB 且 cp >= 3 触发 full_transcript_bytes
-        tp_full_dir = self.root / "full_heavy"
-        tp_full_dir.mkdir(parents=True, exist_ok=True)
-        tp_compact = tp_full_dir / "transcript.jsonl"
-        tp_full = tp_full_dir / "transcript_full.jsonl"
-        _append_jsonl(tp_compact, {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "推进"})
-        for cp_step in (120, 260, 410):
-            _append_jsonl(tp_compact, {"step_index": cp_step, "source": "SYSTEM", "type": "CHECKPOINT"})
-        with tp_full.open("wb") as fh:
-            fh.seek(6 * 1024 * 1024 + 128)
-            fh.write(b"\n")
-        cid_full = "ag-v1181-full-bytes"
-        session_context_loader.handle_pre_invocation({"conversationId": cid_full, "transcriptPath": str(tp_compact)})
-        gate_full = handoff_gate.load_gate_state(self.state, cid_full)
-        self.assertEqual(gate_full["phase"], "drain")
-        self.assertIn("full_transcript_bytes", gate_full["triggers"])
+            # 2) 紧凑版 < 3 MiB 但 transcript_full.jsonl >= 6 MiB 且 cp >= 3 触发 full_transcript_bytes
+            tp_full_dir = self.root / "full_heavy"
+            tp_full_dir.mkdir(parents=True, exist_ok=True)
+            tp_compact = tp_full_dir / "transcript.jsonl"
+            tp_full = tp_full_dir / "transcript_full.jsonl"
+            _append_jsonl(tp_compact, {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "推进"})
+            for cp_step in (120, 260, 410):
+                _append_jsonl(tp_compact, {"step_index": cp_step, "source": "SYSTEM", "type": "CHECKPOINT"})
+            with tp_full.open("wb") as fh:
+                fh.seek(6 * 1024 * 1024 + 128)
+                fh.write(b"\n")
+            cid_full = "ag-v1181-full-bytes"
+            session_context_loader.handle_pre_invocation({"conversationId": cid_full, "transcriptPath": str(tp_compact)})
+            gate_full = handoff_gate.load_gate_state(self.state, cid_full)
+            self.assertEqual(gate_full["phase"], "drain")
+            self.assertIn("full_transcript_bytes", gate_full["triggers"])
 
     def test_v1183_backtick_tokens_and_repeated_pending_ticket_guard(self):
         import reply_repeat_guard
@@ -3943,20 +3972,21 @@ class TestHeavyWorkflowLifecycle(unittest.TestCase):
 
     def test_v211_three_cp_thrashing_circuit_breaker_and_assistant_window_archive(self):
         """v2.1.1: 验证三压缩均值间隔修复、单回合高频压缩熔断，以及三端双压缩窗口助手正文归档与短确认回读提示。"""
-        # 1) 单回合 3 次高频压缩（模拟 horses V23: 58/132/199，均值 70.5 <= 75）直接触发 turn_cp_thrashing 进入 Stage-2 drain
+        # 1) 显式 enforce 模式下，单回合 3 次高频压缩（模拟 horses V23: 58/132/199，均值 70.5 <= 75）直接触发 turn_cp_thrashing 进入 Stage-2 drain
         tp_v23 = self.root / "v211_v23_thrash" / "transcript.jsonl"
         tp_v23.parent.mkdir(parents=True, exist_ok=True)
         _append_jsonl(tp_v23, {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "全量核对并改写论文"})
         for cp_step in (58, 132, 199):
             _append_jsonl(tp_v23, {"step_index": cp_step, "source": "SYSTEM", "type": "CHECKPOINT"})
         cid_v23 = "ag-v211-v23-thrash"
-        out_v23 = session_context_loader.handle_pre_invocation({"conversationId": cid_v23, "transcriptPath": str(tp_v23)})
-        msg_v23 = out_v23["injectSteps"][0]["systemMessage"]["systemMessage"]
-        self.assertIn("Stage-2 drain", msg_v23)
-        self.assertIn("近期均值间隔=70步", msg_v23)
-        gate_v23 = handoff_gate.load_gate_state(self.state, cid_v23)
-        self.assertEqual(gate_v23["phase"], "drain")
-        self.assertIn("turn_cp_thrashing", gate_v23["triggers"])
+        with unittest.mock.patch.object(handoff_gate, "DEFAULT_AGY_HANDOFF_MODE", "enforce"):
+            out_v23 = session_context_loader.handle_pre_invocation({"conversationId": cid_v23, "transcriptPath": str(tp_v23)})
+            msg_v23 = out_v23["injectSteps"][0]["systemMessage"]["systemMessage"]
+            self.assertIn("Stage-2 drain", msg_v23)
+            self.assertIn("近期均值间隔=70步", msg_v23)
+            gate_v23 = handoff_gate.load_gate_state(self.state, cid_v23)
+            self.assertEqual(gate_v23["phase"], "drain")
+            self.assertIn("turn_cp_thrashing", gate_v23["triggers"])
 
         # 2) 多回合 3 次较密压缩（均间隔 60 <= 90，但单回合仅 1 次压缩）：触发 Stage-1 interval_warning，不误升 Stage-2 drain
         tp_mt = self.root / "v211_multiturn_3cp" / "transcript.jsonl"

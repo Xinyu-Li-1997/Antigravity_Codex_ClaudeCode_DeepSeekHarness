@@ -136,16 +136,61 @@ def _fleet_profile_path():
     return Path(__file__).resolve().parent.parent / 'fleet_profile.json'
 
 
+def _deep_merge_local_overlay(base, overlay):
+    merged = dict(base)
+    for k, v in overlay.items():
+        if k == 'schema_version':
+            continue
+        if isinstance(v, dict) and isinstance(merged.get(k), dict):
+            sub = _deep_merge_local_overlay(merged[k], v)
+            if k == 'hook_safety':
+                base_hs = base.get('hook_safety') if isinstance(base.get('hook_safety'), dict) else {}
+                for bound_k in ('max_rss_mib', 'wall_timeout_sec'):
+                    if bound_k in base_hs and bound_k in sub:
+                        try:
+                            if float(sub[bound_k]) > float(base_hs[bound_k]):
+                                sub[bound_k] = base_hs[bound_k]
+                        except (TypeError, ValueError):
+                            sub[bound_k] = base_hs[bound_k]
+            merged[k] = sub
+        else:
+            merged[k] = v
+    return merged
+
+
+def _fleet_profile_local_path(profile_path):
+    env_local = os.environ.get('CAE_FLEET_PROFILE_LOCAL', '').strip()
+    if env_local:
+        cand = Path(env_local).expanduser().resolve()
+        return cand if (cand.is_file() and not _is_link(cand)) else None
+    if os.environ.get('CAE_FLEET_PROFILE', '').strip():
+        return None
+    sibling = profile_path.with_name('fleet_profile.local.json')
+    return sibling if (sibling.is_file() and not _is_link(sibling)) else None
+
+
 def _fleet_profile():
     path = _fleet_profile_path()
     try:
         st = path.stat()
-        key = (str(path), st.st_mtime_ns, st.st_size)
+        local_path = _fleet_profile_local_path(path)
+        local_key = None
+        if local_path is not None:
+            lst = local_path.stat()
+            local_key = (str(local_path), lst.st_mtime_ns, lst.st_size)
+        key = (str(path), st.st_mtime_ns, st.st_size, local_key)
         if _FLEET_PROFILE_CACHE['key'] == key and _FLEET_PROFILE_CACHE['data'] is not None:
             return _FLEET_PROFILE_CACHE['data']
         raw = json.loads(path.read_text(encoding='utf-8-sig'))
         if not isinstance(raw, dict) or raw.get('schema_version') != 1:
             raise ValueError('invalid fleet_profile schema_version')
+        if local_path is not None:
+            try:
+                ov = json.loads(local_path.read_text(encoding='utf-8-sig'))
+                if isinstance(ov, dict):
+                    raw = _deep_merge_local_overlay(raw, ov)
+            except (OSError, ValueError, RecursionError):
+                pass
         _FLEET_PROFILE_CACHE['key'] = key
         _FLEET_PROFILE_CACHE['data'] = raw
         return raw

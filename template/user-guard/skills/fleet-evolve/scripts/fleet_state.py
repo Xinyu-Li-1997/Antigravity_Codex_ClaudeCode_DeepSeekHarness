@@ -231,10 +231,26 @@ def _repo_meta(repo_root: Path) -> Dict[str, str]:
     core_paths = [
         "install.py",
         "template/user-guard/plugin.json",
+        "template/user-guard/hooks.json",
+        "template/user-guard/rules/AGENTS.md",
         "template/user-guard/skills/fleet-evolve/SKILL.md",
         "template/user-guard/skills/cae-harness/fleet_profile.json",
         "template/user-guard/skills/cae-harness/scripts/cae_harness.py",
     ]
+    for extra_dir, suffixes in (
+        (repo_root / "template" / "user-guard" / "hooks", {".py"}),
+        (repo_root / "template" / "user-guard" / "hooks" / "_lib", {".py"}),
+        (repo_root / "template" / "user-guard" / "agents", {".md"}),
+        (repo_root / "template" / "codex", {".json"}),
+        (repo_root / "template" / "codex" / "agents", {".toml"}),
+        (repo_root / "template" / "claude", {".json"}),
+        (repo_root / "template" / "claude" / "agents", {".md"}),
+        (repo_root / "template" / "_shared", {".json", ".md"}),
+    ):
+        if extra_dir.is_dir() and not _is_reparse_or_symlink(extra_dir):
+            for sub_f in sorted(extra_dir.iterdir()):
+                if sub_f.is_file() and sub_f.suffix in suffixes and not _is_reparse_or_symlink(sub_f):
+                    core_paths.append(sub_f.relative_to(repo_root).as_posix())
     harness_pkg = repo_root / "template" / "user-guard" / "skills" / "cae-harness" / "scripts" / "_harness"
     if harness_pkg.is_dir():
         for sub_py in sorted(harness_pkg.glob("*.py")):

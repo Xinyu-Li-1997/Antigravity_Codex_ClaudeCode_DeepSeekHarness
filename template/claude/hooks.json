@@ -6,15 +6,9 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 -X utf8 -I -B \"~/.claude/hooks/session_context_loader.py\" --client claude --state-dir \"~/.claude/hooks/state/session-context\" --log \"~/.claude/hooks/logs/session-context.jsonl\"",
+            "command": "python3 -X utf8 -I -B \"~/.claude/hooks/uguard_hook.py\" --client claude --event SessionStart --state-dir \"~/.claude/hooks/state\" --log-dir \"~/.claude/hooks/logs\"",
             "timeout": 45,
-            "statusMessage": "恢复本会话用户原话"
-          },
-          {
-            "type": "command",
-            "command": "python3 -X utf8 -I -B \"~/.claude/hooks/handoff_gate.py\" --client claude --mode advisory --compact-limit 0 --state-dir \"~/.claude/hooks/state/handoff\"",
-            "timeout": 10,
-            "statusMessage": "检查长会话交接状态"
+            "statusMessage": "恢复本会话用户原话与交接状态"
           }
         ]
       }
@@ -24,7 +18,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 -X utf8 -I -B \"~/.claude/hooks/handoff_gate.py\" --client claude --mode advisory --compact-limit 0 --state-dir \"~/.claude/hooks/state/handoff\"",
+            "command": "python3 -X utf8 -I -B \"~/.claude/hooks/uguard_hook.py\" --client claude --event PostCompact --state-dir \"~/.claude/hooks/state\" --log-dir \"~/.claude/hooks/logs\"",
             "timeout": 10,
             "statusMessage": "检查长会话交接状态"
           }
@@ -36,7 +30,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 -X utf8 -I -B \"~/.claude/hooks/handoff_gate.py\" --client claude --mode advisory --compact-limit 0 --state-dir \"~/.claude/hooks/state/handoff\"",
+            "command": "python3 -X utf8 -I -B \"~/.claude/hooks/uguard_hook.py\" --client claude --event UserPromptSubmit --state-dir \"~/.claude/hooks/state\" --log-dir \"~/.claude/hooks/logs\"",
             "timeout": 10,
             "statusMessage": "检查长会话交接状态"
           }
@@ -49,15 +43,9 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 -X utf8 -I -B \"~/.claude/hooks/status_guard.py\" --client claude --state-dir \"~/.claude/hooks/state\" --log-dir \"~/.claude/hooks/logs\"",
+            "command": "python3 -X utf8 -I -B \"~/.claude/hooks/uguard_hook.py\" --client claude --event PreToolUse --state-dir \"~/.claude/hooks/state\" --log-dir \"~/.claude/hooks/logs\"",
             "timeout": 15,
-            "statusMessage": "检查工作区写边界与日志重复读取"
-          },
-          {
-            "type": "command",
-            "command": "python3 -X utf8 -I -B \"~/.claude/hooks/handoff_gate.py\" --client claude --mode advisory --compact-limit 0 --state-dir \"~/.claude/hooks/state/handoff\"",
-            "timeout": 10,
-            "statusMessage": "检查长会话交接状态"
+            "statusMessage": "检查工作区写边界、票据与交接状态"
           }
         ]
       }
@@ -67,15 +55,9 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 -X utf8 -I -B \"~/.claude/hooks/reply_repeat_guard.py\" --client claude --state-dir \"~/.claude/hooks/state\" --log-dir \"~/.claude/hooks/logs\"",
+            "command": "python3 -X utf8 -I -B \"~/.claude/hooks/uguard_hook.py\" --client claude --event Stop --state-dir \"~/.claude/hooks/state\" --log-dir \"~/.claude/hooks/logs\"",
             "timeout": 15,
-            "statusMessage": "检查重复状态回复"
-          },
-          {
-            "type": "command",
-            "command": "python3 -X utf8 -I -B \"~/.claude/hooks/handoff_gate.py\" --client claude --mode advisory --compact-limit 0 --state-dir \"~/.claude/hooks/state/handoff\"",
-            "timeout": 10,
-            "statusMessage": "检查长会话交接状态"
+            "statusMessage": "检查回合回执、重复回复与交接状态"
           }
         ]
       }

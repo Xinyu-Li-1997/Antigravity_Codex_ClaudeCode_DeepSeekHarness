@@ -69,6 +69,7 @@ def _resolve_loader_policy(client: str = "", model_name: str = "", effort: str =
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
 UI_BANNER_PHRASE = "this conversation grew too large, so the history before this point may be missing or incomplete"
+MANUAL_COMPACT_RE = re.compile(r"^/compact(?:\s|$)", re.IGNORECASE)
 
 # ② 目录、日志与压缩状态读写
 
@@ -107,6 +108,8 @@ def _default_compaction_state(conversation_id: str) -> Dict[str, Any]:
         "lastExplicitCompact": [],
         "hasExplicitUserInput": False,
         "checkpointSteps": [],
+        "manualCompactSteps": [],
+        "pendingManualCompact": False,
         "mediaStepCount": 0,
         "transcriptImageSizes": {},
         "transcriptImageCallCount": 0,
@@ -358,6 +361,8 @@ def _scan_transcript_incrementally(
     has_user = bool(state.get("hasExplicitUserInput", False))
     cp_steps: List[int] = [int(x) for x in (state.get("checkpointSteps") or []) if isinstance(x, int)]
     cp_seen = set(cp_steps)
+    manual_cp_seen = {int(x) for x in (state.get("manualCompactSteps") or []) if isinstance(x, int)}
+    pending_manual_compact = bool(state.get("pendingManualCompact", False))
     media_step_count = int(state.get("mediaStepCount", 0))
     img_sizes: Dict[str, int] = dict(state.get("transcriptImageSizes") or {})
     attempt_sizes: Dict[str, int] = dict(state.get("transcriptImageAttemptSizes") or {})
@@ -416,9 +421,14 @@ def _scan_transcript_incrementally(
             if cp_num not in cp_seen:
                 cp_seen.add(cp_num)
                 cp_steps.append(cp_num)
+            if pending_manual_compact:
+                manual_cp_seen.add(cp_num)
+                pending_manual_compact = False
 
         if s_type == "USER_INPUT" or s_source == "USER_EXPLICIT":
             has_user = True
+            raw_u = user_words.clean_user_content(step.get("content") or step.get("text") or step.get("user_input"))
+            pending_manual_compact = bool(MANUAL_COMPACT_RE.match(raw_u))
 
         if s_type == "SYSTEM_MESSAGE" and s_source in ("SYSTEM", "SYSTEM_SDK"):
             text = str(step.get("content") or "").strip()
@@ -473,6 +483,8 @@ def _scan_transcript_incrementally(
     state["latestCheckpointStep"] = latest_cp
     state["hasExplicitUserInput"] = has_user
     state["checkpointSteps"] = sorted(cp_seen)
+    state["manualCompactSteps"] = sorted(manual_cp_seen)
+    state["pendingManualCompact"] = pending_manual_compact
     state["mediaStepCount"] = media_step_count
     state["transcriptImageSizes"] = img_sizes
     state["transcriptImageCallCount"] = img_call_count

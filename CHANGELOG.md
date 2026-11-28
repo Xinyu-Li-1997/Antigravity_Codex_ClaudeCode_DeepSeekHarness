@@ -2,6 +2,25 @@
 
 本文件记录四客户端共用规则、会话钩子、后台验证工具与上游维护流程的版本演进。当前插件版本以 `template/user-guard/plugin.json` 为准；常驻使用文档只说明机制和配置键，不重复维护版本号与性能日期。
 
+## [3.0.0] - 2026-11-28
+
+完成四客户端原生共存、单入口钩子瘦身、规则与代理按端因地制宜分发及公理化元更新架构大版本升级：
+
+- **同端原生编排解耦与核心冲突热修（`template/user-guard/hooks/{status_guard,session_context_loader,handoff_gate,reply_repeat_guard,user_words}.py`、`template/user-guard/skills/cae-harness/scripts/_harness/engines.py`）**：
+  - 将 `cae_harness.py plan` 外置票据收口为仅硬守卫外部无头重负载（`cae_harness_headless`）与裸调无头 CLI（补齐新版 `agy -p/--print/--prompt/--input-format stream-json` 拦截）；同端只读多路子代理、用户显式发起的原生斜杠编排（如 `/teamwork`、`/boost`、`/swarm`、`/plan`、`/grill-me`、`/browser`、`run_workflow`）及原生子代理子会话直接放行，模型未获指示擅自启动可写原生多路走宿主 `ask`，全程保留 `R4` 工作区写边界硬守卫并放宽非受管插件/边车同会话续租；
+  - 四端长会话交接默认统一为 `advisory` 温和提醒（对齐 Antigravity、Codex、Claude Code 与 DSH）；手动 `/compact` 仍触发无损原话与双窗口回复归档但独立计数不计入自动压缩抖动熔断；`/goal` 激活期不因启发式阈值强杀并扩展英文取消口令，收尾期放行 `browser_close`、查询/取消定时与 `swarm/plan.json`；
+  - `reply_repeat_guard.py` 保持对外部无头 `run_id`/成败/Token/`reconcile_file` 账单、测试失败谎报、重复贴票与连续空等的硬拦截，过滤多轮准备期中间消息，将启发式文本实证门禁默认降为 `advisory` 结构化记录并豁免 `.agents/`、`skills/` 与 `SKILL.md`；修复 `invoke_edit_worker` 可写调用误传 `readonly-collaborator` 角色缺陷。
+- **单入口钩子、窄匹配与四端因地制宜分发（`template/user-guard/hooks/uguard_hook.py`、`template/{user-guard,codex,claude}/hooks.json`、`template/_shared/agents_spec.json`、`template/{user-guard,codex,claude}/agents/`、`install.py`）**：
+  - 新增四端统一单入口调度器 `uguard_hook.py`（每事件 1 个 Python 进程），将 Codex 与 Claude Code 交接策略落盘至 `hooks/state/handoff/policy.json`，使 `hooks.json` 命令串字节恒定以保护 Codex `[hooks.state]` 信任哈希；收窄 Antigravity `PreToolUse` 正则匹配以跳过高频纯 UI 与检索工具；
+  - 新增 `template/_shared/agents_spec.json` 作为三端只读代理唯一语义源，为 Claude Code 只读代理增补 `disallowedTools`、`permissionMode: dontAsk` 与 `maxTurns` 平台硬化；
+  - 在 `rules/AGENTS.md` 与 `install.py` 实现 `@client` 条件块按端裁剪分发（消除 DSH 伪硬钩子与跨端无关条文），兼容 Codex 新版 `default_permissions` 权限体，并停止将上游专属 `fleet-evolve` 下发至四端普通项目宿主目录（升级时自动清理旧残留）。
+- **结构化配置、本机覆盖层与公理化四端元更新探针（`fleet_profile.json`、`.gitignore`、`install.py`、`fleet_state.py`、`docs/workflow-guide.md`）**：
+  - 清理 `fleet_profile.json` 散文双写窗口数字，增补 `dsh` 运行期参数与 `client_capability_baselines` 四端协议/模式基线，支持不进 Git 的同级 `fleet_profile.local.json` 覆盖层（`hook_safety` 上限只紧不松）；修复 `client_catalog_rules.claude.default_fallback_alias` 与 DSH `no_lifecycle_hooks` / `native_file_sandbox` 语义区分；
+  - 严格遵循 `cae-axioms` 命题 $B'$（只读探测 + 元配置提案/只读工单，硬禁自改主体代码层，封顶 `VERIFIED_NO_T`）：扩充 `fleet_state.py` `core_sha256` 全覆钩子、规则与代理模板；在 `install.py --audit-upgrade` 新增四端四值只读能力矩阵 `capability_matrix`、`agy plugin validate --strict` 校验、`evaluated_clients`/`skipped_clients` 防空真分母，以及运维阻断轨（`recommended_actions`，补齐 `fix_codex_package_isolation`、`fix_antigravity_manifest`、`review_claude_router_primary`、`fix_claude_fallback_alias`）与演进信号轨（`evolution_signals`，含 `evolve_dsh_hard_hooks` 与 `update_mode_workflow_guide`）双轨分离；
+  - 整篇重写公开文档并在 [docs/workflow-guide.md](docs/workflow-guide.md) 新增完整的《四客户端原生模式与本仓库协作指南》。
+
+---
+
 ## [2.1.2] - 2026-11-28
 
 基于多代理只读复盘沉淀 5 项宿主机升级发现、体检守卫与安装脚本加固：

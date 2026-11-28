@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "profile_id": "fleet-snapshot-v2",
+  "profile_id": "fleet-snapshot-v3",
   "evaluated_at": "2026-11-28",
   "evaluation_policy": {
     "bidirectional_strength_and_defect_audit": true,
@@ -27,8 +27,8 @@
       "recommended_client": "antigravity",
       "recommended_model_family": "carbon",
       "recommended_tier": "high",
-      "strengths": "现阶段中文工程表达自然平实，无工具事实幻觉率与超长上下文召回表现更稳健，适合承担课题需求澄清、架构权衡、论文/技术文档重写与主会话统筹；Gemini 4 Carbon 提供 Low、Medium、High 三挡，底层原生 1,000,000 token 窗口、Antigravity 客户端实享活跃上限 512,000 token（单分片安全预算 460,800 token），CLI 支持流式 JSON 与原生 --json-schema 结构化输出校验，直接使用客户端订阅的模型组滚动配额（5 小时窗口与 7 天周期额度），无需单独按量采购 API。同代 Gemini 4 Neon 保持启用，在外部编码代理（agy:@code，XHigh）与内部 Swarm 并行编码 worker（native_swarm，High）承担高速实现角色。",
-      "defects_and_mitigations": "Antigravity 各表面（App、IDE、插件以及 CLI 有头与无头模式）共享服务端与客户端内置的 512,000 token 活跃窗口与自动检查点压缩上限；虽较此前约 256,000 token 翻倍、每轮压缩频率约降 3.5 倍，仍低于底层 1,000,000 token API 窗口。App 与 IDE 不提供配置文件手改上限（支持以 /compact 提前手动压缩），CLI 自 v1.5.15 起支持通过 AGY_CLI_AUTO_COMPACT_OVERRIDE 在窗口上限内调整自动压缩触发阈值，且 agy models 命令不输出整数窗口字段；Carbon 输出吞吐与代理编码速度慢于同代 Neon。通过 R9 钩子按 runtime_tunables.compaction_recovery.per_client.antigravity 与 hooks/_lib/adaptive_policy.py（同步读取 camelCase modelName）基于 512,000 token 实享窗口动态缩放恢复预算并恢复历轮用户原话与实质子代理返回摘要，在 cae_harness.py 中按 512,000 token 窗口（安全预算 460,800 token）规划审查，将编码代理与并行编码 worker 按角色分流至 Neon，并继续以 R6 原文行号复核、check-grounding --strict 及 blocked_auto_tokens / agy_retiring_patterns 保证事实准确与跳过复合/待退役模型。"
+      "strengths": "现阶段中文工程表达自然平实，无工具事实幻觉率与超长上下文召回表现更稳健，适合承担课题需求澄清、架构权衡、论文/技术文档重写与主会话统筹；Gemini 4 Carbon 提供 Low、Medium、High 三挡，实际活跃窗口与单分片安全预算统一由 subscription_matrix.models 与 input_budget_safety_ratio 派生，CLI 支持流式 JSON 与原生 --json-schema 结构化输出校验，直接使用客户端订阅的模型组滚动配额（5 小时窗口与 7 天周期额度），无需单独按量采购 API。同代 Gemini 4 Neon 保持启用，在外部编码代理（agy:@code，XHigh）与内部 Swarm 并行编码 worker（native_swarm，High）承担高速实现角色。",
+      "defects_and_mitigations": "Antigravity 各表面（App、IDE、插件以及 CLI 有头与无头模式）共享客户端内置活跃窗口与自动检查点压缩上限（低于底层原生 API 窗口）；App 与 IDE 不提供配置文件手改上限（支持以 /compact 提前手动压缩），CLI 支持通过 AGY_CLI_AUTO_COMPACT_OVERRIDE 在窗口上限内调整自动压缩触发阈值，且 agy models 命令不输出整数窗口字段；Carbon 输出吞吐与代理编码速度慢于同代 Neon。通过 R9 钩子按 runtime_tunables.compaction_recovery.per_client.antigravity 与 hooks/_lib/adaptive_policy.py（同步读取 camelCase modelName）动态缩放恢复预算并恢复历轮用户原话与实质子代理返回摘要，在 cae_harness.py 中按 subscription_matrix.models 的实享活跃窗口规划审查，将编码代理与并行编码 worker 按角色分流至 Neon，并继续以 R6 原文行号复核、check-grounding --strict 及 blocked_auto_tokens / agy_retiring_patterns 保证事实准确与跳过复合/待退役模型。"
     },
     "math": {
       "candidates": [
@@ -41,8 +41,8 @@
       "recommended_client": "codex",
       "recommended_model_family": "astra",
       "recommended_tier": "max",
-      "strengths": "现阶段主力 gpt-6.2-astra 擅长长链条偏微分方程离散推导、守恒与熵稳定条件证明、雅可比矩阵求导与边界条件相容性分析；客户端缓存声明最大窗口 872,000 token（有效窗口比例 95%，单分片安全预算 745,560 token），科学终端与长程推演表现较上代 gpt-6-astra 显著提升且成本更低，连续工具调用自动复用服务端前缀缓存，支持 ChatGPT 订阅配额（5 小时滚动窗口与周度上限）或按量 API。",
-      "defects_and_mitigations": "客户端缓存默认推理强度为 low、默认窗口为 272,000 token，不显式传参无法用满窗口与推理深度；开启 ultra 委派挡位会自动派生多层子代理引发轮询超时。由 install.py 与 cae_harness.py 显式声明最大窗口与单模型非委派最高挡 max，并在只读任务前后比对工作区文件哈希快照。"
+      "strengths": "现阶段主力 gpt-6.2-astra 擅长长链条偏微分方程离散推导、守恒与熵稳定条件证明、雅可比矩阵求导与边界条件相容性分析；声明最大窗口与安全输入预算按 subscription_matrix.models 与本地 models_cache 有效窗口比例计算，科学终端与长程推演表现较上代 gpt-6-astra 显著提升且成本更低，连续工具调用自动复用服务端前缀缓存，支持 ChatGPT 订阅配额（5 小时滚动窗口与周度上限）或按量 API。",
+      "defects_and_mitigations": "客户端缓存默认推理强度较低且默认窗口低于最大声明窗口，不显式传参无法用满窗口与推理深度；开启 ultra 委派挡位会自动派生多层子代理引发轮询超时。由 install.py 与 cae_harness.py 显式声明最大窗口与单模型非委派最高挡 max，并在只读任务前后比对工作区文件哈希快照。"
     },
     "code": {
       "candidates": [
@@ -55,8 +55,8 @@
       "recommended_client": "codex",
       "recommended_model_family": "sol",
       "recommended_tier": "max",
-      "strengths": "现阶段主力 gpt-6.2-sol 适合核心数值求解器实现、跨模块重构以及配合验证命令（gate --verify-cmd）执行多轮闭环修复；客户端缓存声明最大窗口 872,000 token（单分片安全预算 745,560 token），多文件补丁修改稳定且输出更精炼。跨端编码备选 agy:@code 通过 client_catalog_rules.agy.code_families 自动路由至 Gemini 4 Neon（XHigh，客户端实享 512,000 token 窗口，底层原生 1,000,000 token），适合高吞吐代码实现与受验证命令约束的闭环修改。",
-      "defects_and_mitigations": "客户端缓存默认推理强度为 low、默认窗口为 500,000 token，且在 Windows 下无范围遍历大型目录时易因进程调用开销触发超时；脚本显式传入 max 挡位与最大窗口，派发任务须配合 --write-scope 与精确行号限定范围。"
+      "strengths": "现阶段主力 gpt-6.2-sol 适合核心数值求解器实现、跨模块重构以及配合验证命令（gate --verify-cmd）执行多轮闭环修复；声明最大窗口见 subscription_matrix.models，多文件补丁修改稳定且输出更精炼。跨端编码备选 agy:@code 通过 client_catalog_rules.agy.code_families 自动路由至 Gemini 4 Neon（XHigh），适合高吞吐代码实现与受验证命令约束的闭环修改。",
+      "defects_and_mitigations": "客户端缓存默认推理强度与默认窗口低于最大声明配置，且在 Windows 下无范围遍历大型目录时易因进程调用开销触发超时；脚本显式传入 max 挡位与最大窗口，派发任务须配合 --write-scope 与精确行号限定范围。"
     },
     "review": {
       "candidates": [
@@ -68,7 +68,7 @@
       "recommended_client": "codex",
       "recommended_model_family": "sol",
       "recommended_tier": "high",
-      "strengths": "现阶段独立代码与文档审查优先跨客户端调用 Codex gpt-6.2-sol（872,000 token 窗口）、DeepSeek Harness 内置 DeepSeek-V4-Pro（1,048,576 token 窗口）及 Antigravity carbon 系列（agy:@review 与深度审查默认选低幻觉 carbon，neon 按显式点名或编码角色调用）；常规审查默认走 high 挡以兼顾吞吐与防过度挑刺，命中物理守恒、离散算子、边界条件、并发死锁或权限越界等高危关键词时由 select_task_tier 自动升至 max 挡深审；Claude Code 客户端保留完整的五类生命周期钩子、原生 --json-schema 结构化输出校验及本地 router.py 与 CC Switch 卡片通道，按 subscription_matrix 中已启用的卡片模型参与调度。",
+      "strengths": "现阶段独立代码与文档审查优先跨客户端调用 Codex gpt-6.2-sol、DeepSeek Harness 内置 DeepSeek-V4-Pro 及 Antigravity carbon 系列（各模型声明窗口集中维护于 subscription_matrix.models；agy:@review 与深度审查默认选低幻觉 carbon，neon 按显式点名或编码角色调用）；常规审查默认走 high 挡以兼顾吞吐与防过度挑刺，命中物理守恒、离散算子、边界条件、并发死锁或权限越界等高危关键词时由 select_task_tier 自动升至 max 挡深审；Claude Code 客户端保留完整的五类生命周期钩子、原生 --json-schema 结构化输出校验及本地 router.py 与 CC Switch 卡片通道，按 subscription_matrix 中已启用的卡片模型参与调度。",
       "defects_and_mitigations": "Claude Code 当前启用的 DeepSeek 卡片为轻量模型 deepseek-flash[1M]，由脚本硬性拦截其冒充非 fast 审查角色主力；严禁接入第三方 Responses API 协议转换反代，无头只读调用固定附加 --permission-mode dontAsk 以规避 auto 分类器限流报错。"
     },
     "fast": {
@@ -81,8 +81,8 @@
       "recommended_client": "dsh",
       "recommended_model_family": "deepseek-flash",
       "recommended_tier": "low",
-      "strengths": "现阶段通过官方账号登录（deepseek-account）或 DEEPSEEK_API_KEY（~/.dsh/.credentials.yaml 或 .env）即可直连，内置 DeepSeek-V4-Pro 与 DeepSeek-V4.1-Flash 均声明 1,048,576 token 窗口（单分片安全预算 943,718 token，支持 off、low、high、max 四挡）；Antigravity 同代轻量系列 Gemini 4 Hydrogen 提供 Low、Medium、High 与 XHigh 四挡。既可单客户端独立使用，也可在显式省额度或其他客户端进入配额冷却时无损接替。",
-      "defects_and_mitigations": "DSH 命令行暂未内置生命周期钩子与原生 --json-schema 参数，长文本回执偶发包裹代码块围栏或附带底层 DSML 停止标记；由 cae_harness.py 注入单 JSON 对象输出约束并执行平衡对象解码与 DSML 尾部清洗。轻量挡仅用于显式省额度或快速表面检查，不静默替代高严谨度推导与核心审查。"
+      "strengths": "现阶段通过官方账号登录（deepseek-account）或 DEEPSEEK_API_KEY（~/.dsh/.credentials.yaml 或 .env）即可直连，内置 DeepSeek-V4-Pro 与 DeepSeek-V4.1-Flash 均在 client_catalog_rules.dsh.builtin_models 声明完整上下文窗口与 off/low/high/max 四挡；Antigravity 同代轻量系列 Gemini 4 Hydrogen 提供 Low、Medium、High 与 XHigh 四挡。既可单客户端独立使用，也可在显式省额度或其他客户端进入配额冷却时无损接替。",
+      "defects_and_mitigations": "DSH 命令行具备原生文件只读沙箱但暂未暴露标准生命周期钩子与原生 --json-schema 参数，长文本回执偶发包裹代码块围栏或附带底层 DSML 停止标记；由 cae_harness.py 注入单 JSON 对象输出约束并执行平衡对象解码与 DSML 尾部清洗。轻量挡仅用于显式省额度或快速表面检查，不静默替代高严谨度推导与核心审查。"
     }
   },
   "native_agent_profiles": {
@@ -109,6 +109,21 @@
         "run_workflow",
         "swarm"
       ],
+      "native_modes": [
+        "plan",
+        "grill-me",
+        "teamwork",
+        "boost",
+        "swarm",
+        "run_workflow",
+        "goal",
+        "compact",
+        "browser",
+        "schedule",
+        "automation",
+        "learn",
+        "plugin"
+      ],
       "subagent_model_policy": "inherit",
       "readonly_agents": [
         "readonly-auditor",
@@ -116,7 +131,7 @@
         "readonly-reader"
       ],
       "hook_protocol": "plugin_lifecycle_hooks",
-      "notes": "主会话保留用户前端选择（未闭环理论与论文期推荐低幻觉 Carbon High，成熟工程维护期可选 Neon High）；invoke_subagent 与 run_workflow 仅支持抽象挡位，只读代理保持 inherit；native_swarm 承担 code/gate 并行实现时推荐 Neon High，当主控切至非 Carbon 系列时 review/math 验收流自动推荐异构低幻觉 Carbon High（主控已为 Carbon 时保持 inherit）；外部无头 agy:@code 自动路由 Neon XHigh，单端受限时 audit 自动组建 Carbon + Neon 异构双盲审查。"
+      "notes": "主会话保留用户前端选择（未闭环理论与论文期推荐低幻觉 Carbon High，成熟工程维护期可选 Neon High）；用户显式调用的 /teamwork、/boost、/swarm、/plan 等原生编排与只读多路子代理直接放行并全程保留 R4 写边界守卫；native_swarm 承担 code/gate 并行实现时推荐 Neon High，review/math 验收流在主控非 Carbon 时推荐异构低幻觉 Carbon High。"
     },
     "codex": {
       "main_model": "gpt-6.2-sol",
@@ -125,6 +140,13 @@
       "subagent_mechanisms": [
         "spawn_agent"
       ],
+      "native_modes": [
+        "review",
+        "sandbox",
+        "plugin",
+        "agents",
+        "doctor"
+      ],
       "subagent_model_policy": "inherit",
       "readonly_agents": [
         "readonly-auditor",
@@ -132,7 +154,7 @@
         "readonly-reader"
       ],
       "hook_protocol": "hooks_json_lifecycle",
-      "notes": "默认跳过自动委派 ultra 挡位；若在 ~/.codex/agents/<agent>.toml 中显式设置 model，plan 原生解析优先读取该定义。"
+      "notes": "默认跳过自动委派 ultra 挡位；若在 ~/.codex/agents/<agent>.toml 中显式设置 model，plan 原生解析优先读取该定义；单入口 uguard_hook.py 保持 hooks.json 命令串字节恒定以保护 [hooks.state] 信任哈希。"
     },
     "claude": {
       "active_card": "DeepSeek",
@@ -145,6 +167,12 @@
         "Agent",
         "Task"
       ],
+      "native_modes": [
+        "agents",
+        "worktree",
+        "autocompact",
+        "bg"
+      ],
       "subagent_model_policy": "card_env_or_frontmatter",
       "readonly_agents": [
         "readonly-auditor",
@@ -152,7 +180,7 @@
         "readonly-reader"
       ],
       "hook_protocol": "settings_json_lifecycle",
-      "notes": "当前通过 CC Switch DeepSeek 卡片运行；如需 1M 主力模型可切换对应已启用卡片或启用本地 router.py。"
+      "notes": "当前通过 CC Switch DeepSeek 卡片运行；只读代理通过 disallowedTools 与 permissionMode: dontAsk 实现平台级只读硬化；本机私有选卡可在不进 Git 的 fleet_profile.local.json 覆盖。"
     },
     "dsh": {
       "main_model": "deepseek-flash",
@@ -162,8 +190,14 @@
       "subagent_mechanisms": [
         "cordis_plugin_bundle"
       ],
-      "hook_protocol": "soft_rules_only",
-      "notes": "当前发行版 CLI 未暴露标准生命周期硬钩子（上游钩子协议包仍处于 experimental 阶段），由 AGENTS.md 软约束与 cae_harness.py 外部快照及隔离目录兜底。"
+      "native_modes": [
+        "plugin",
+        "patch",
+        "dump-config"
+      ],
+      "hook_protocol": "no_lifecycle_hooks",
+      "sandbox_enforced": "native_file_sandbox",
+      "notes": "当前发行版 CLI 具备原生文件只读/工作区沙箱，但未暴露标准生命周期硬钩子（上游钩子协议包仍处于 experimental 阶段）；由按端裁剪的 AGENTS.md、原生文件沙箱与 cae_harness.py 外部快照及隔离目录共同兜底。"
     }
   },
   "excluded_or_retiring": {
@@ -230,7 +264,7 @@
       ]
     },
     "claude": {
-      "default_fallback_alias": "opus",
+      "default_fallback_alias": "deepseek",
       "default_interactive_effort": "xhigh",
       "router_primary_model": "k3.1-pro[1m]",
       "router_subagent_model": "deepseek-flash",
@@ -364,12 +398,23 @@
           "inline_subagent_total_chars": 1700,
           "inline_subagent_item_chars": 320,
           "archive_subagent_item_chars": 1500
+        },
+        "dsh": {
+          "inline_total_chars": 8000,
+          "inline_user_item_chars": 1400,
+          "inline_guaranteed_head_turns": 2,
+          "recent_subagent_returns": 5,
+          "recent_subagent_window": 15,
+          "min_substantive_subagent_chars": 64,
+          "inline_subagent_total_chars": 1700,
+          "inline_subagent_item_chars": 320,
+          "archive_subagent_item_chars": 1500
         }
       }
     },
     "handoff_thresholds": {
       "antigravity": {
-        "default_mode": "enforce",
+        "default_mode": "advisory",
         "default_drain_invocations": 4,
         "default_drain_actions": 8,
         "advisory_cp_threshold": 3,
@@ -402,6 +447,11 @@
         "default_mode": "advisory",
         "default_compact_limit": 0,
         "enforce_drain_actions": 4
+      },
+      "dsh": {
+        "default_mode": "advisory",
+        "default_compact_limit": 0,
+        "enforce_drain_actions": 4
       }
     },
     "loop_guards": {
@@ -414,7 +464,9 @@
         "tail_scan_kib": 256,
         "similarity_threshold": 0.8,
         "core_similarity_threshold": 0.75,
-        "consecutive_wait_limit": 3
+        "consecutive_wait_limit": 3,
+        "evidence_gate_mode": "advisory",
+        "native_bill_gate_mode": "advisory"
       },
       "status_guard": {
         "large_file_threshold_mib": 4,
@@ -501,9 +553,186 @@
   },
   "capability_ledger": {
     "last_online_refresh_at": "2026-11-28",
-    "local_bench_verified_at": "2026-11-19",
+    "local_bench_verified_at": "2026-11-28",
     "online_refresh_module": "fleet-evolve",
     "dispatch_online_lookup": false
+  },
+  "client_capability_baselines": {
+    "schema_version": 1,
+    "mode_guide_doc": "docs/workflow-guide.md",
+    "clients": {
+      "antigravity": {
+        "tested_cli_version": "1.5.19",
+        "tested_desktop_version": "2.36.0",
+        "version_alert_policy": "major_or_signal",
+        "hook_protocol": "plugin_lifecycle_hooks",
+        "adapted_hook_events": [
+          "SessionStart",
+          "PreInvocation",
+          "PreToolUse",
+          "Stop"
+        ],
+        "subagent_format": "markdown_frontmatter",
+        "adapted_subagent_mechanisms": [
+          "invoke_subagent",
+          "run_workflow",
+          "swarm"
+        ],
+        "adapted_native_modes": [
+          "plan",
+          "grill-me",
+          "teamwork",
+          "boost",
+          "swarm",
+          "run_workflow",
+          "goal",
+          "compact",
+          "browser",
+          "schedule",
+          "automation",
+          "learn",
+          "plugin"
+        ],
+        "probe_watch_signals": [
+          "PostToolUse",
+          "SubagentStart",
+          "SubagentStop",
+          "PostCompact",
+          "--settings",
+          "--mode",
+          "--sandbox",
+          "--effort",
+          "plugin validate"
+        ],
+        "deferred_or_excluded_capabilities": {
+          "PostToolUse": "deferred_phase2",
+          "SubagentStart": "deferred_phase2",
+          "SubagentStop": "deferred_phase2",
+          "PostCompact": "deferred_phase2",
+          "--settings": "already_observed",
+          "--mode": "already_observed",
+          "--sandbox": "already_observed",
+          "--effort": "already_observed",
+          "plugin validate": "already_adapted"
+        }
+      },
+      "codex": {
+        "tested_cli_version": "0.172.0",
+        "version_alert_policy": "major_or_signal",
+        "hook_protocol": "hooks_json_lifecycle",
+        "adapted_hook_events": [
+          "SessionStart",
+          "PostCompact",
+          "UserPromptSubmit",
+          "PreToolUse",
+          "Stop"
+        ],
+        "subagent_format": "toml_agent_file",
+        "adapted_subagent_mechanisms": [
+          "spawn_agent"
+        ],
+        "adapted_native_modes": [
+          "review",
+          "sandbox",
+          "plugin",
+          "agents",
+          "doctor"
+        ],
+        "probe_watch_signals": [
+          "plugin",
+          "doctor",
+          "review",
+          "sandbox",
+          "agents",
+          "default_permissions",
+          "PostToolUse",
+          "SubagentStop"
+        ],
+        "deferred_or_excluded_capabilities": {
+          "plugin": "deferred_phase2",
+          "doctor": "already_observed",
+          "review": "already_observed",
+          "sandbox": "already_observed",
+          "agents": "already_observed",
+          "default_permissions": "already_adapted",
+          "PostToolUse": "deferred_phase2",
+          "SubagentStop": "deferred_phase2"
+        }
+      },
+      "claude": {
+        "tested_cli_version": "2.1.332",
+        "version_alert_policy": "major_or_signal",
+        "hook_protocol": "settings_json_lifecycle",
+        "adapted_hook_events": [
+          "SessionStart",
+          "PostCompact",
+          "UserPromptSubmit",
+          "PreToolUse",
+          "Stop"
+        ],
+        "subagent_format": "markdown_frontmatter",
+        "adapted_subagent_mechanisms": [
+          "Agent",
+          "Task"
+        ],
+        "adapted_native_modes": [
+          "agents",
+          "worktree",
+          "autocompact",
+          "bg"
+        ],
+        "probe_watch_signals": [
+          "--agents",
+          "--autocompact",
+          "--bg",
+          "--bare",
+          "--worktree",
+          "plugin",
+          "PostToolUse"
+        ],
+        "deferred_or_excluded_capabilities": {
+          "--agents": "already_observed",
+          "--autocompact": "already_observed",
+          "--bg": "already_observed",
+          "--bare": "already_adapted",
+          "--worktree": "already_observed",
+          "plugin": "deferred_phase2",
+          "PostToolUse": "deferred_phase2"
+        }
+      },
+      "dsh": {
+        "tested_cli_version": "0.2.2-rc.5",
+        "version_alert_policy": "major_or_signal",
+        "hook_protocol": "no_lifecycle_hooks",
+        "sandbox_enforced": "native_file_sandbox",
+        "adapted_hook_events": [],
+        "subagent_format": "cordis_plugin_bundle",
+        "adapted_subagent_mechanisms": [
+          "cordis_plugin_bundle"
+        ],
+        "adapted_native_modes": [
+          "plugin",
+          "patch",
+          "dump-config"
+        ],
+        "probe_watch_signals": [
+          "PreToolUse",
+          "SessionStart",
+          "hooks.json",
+          "--hooks",
+          "plugin",
+          "--patch",
+          "--dump-config",
+          "--dump-config-schema"
+        ],
+        "deferred_or_excluded_capabilities": {
+          "plugin": "already_observed",
+          "--patch": "already_observed",
+          "--dump-config": "already_observed",
+          "--dump-config-schema": "already_observed"
+        }
+      }
+    }
   },
   "subscription_matrix": {
     "decided_at": "2026-11-23",
@@ -587,14 +816,14 @@
         "enabled": true,
         "context_window": 512000,
         "quota_scheme": "rolling_window_5h_7d",
-        "offline_perf_note": "高吞吐编码代理与并行实现主力（外部 agy:@code 默认 XHigh、内部 native_swarm 编码 worker 默认 High；底层原生 1M，Antigravity 客户端实享 512K），须配合测试或行号核验防止事实幻觉"
+        "offline_perf_note": "高吞吐编码代理与并行实现主力（外部 agy:@code 默认 XHigh、内部 native_swarm 编码 worker 默认 High），须配合测试或行号核验防止事实幻觉"
       },
       "gemini-4-carbon": {
         "agent": "agy",
         "enabled": true,
         "context_window": 512000,
         "quota_scheme": "rolling_window_5h_7d",
-        "offline_perf_note": "低幻觉主会话总控、深度推理与独立审查主力（agy:@orchestrator/@math/@review 默认 High；底层原生 1M，Antigravity 客户端实享 512K），支持 Low/Medium/High 三挡"
+        "offline_perf_note": "低幻觉主会话总控、深度推理与独立审查主力（agy:@orchestrator/@math/@review 默认 High），支持 Low/Medium/High 三挡"
       },
       "gemini-4-hydrogen": {
         "agent": "agy",
@@ -602,7 +831,7 @@
         "context_window": 512000,
         "quota_scheme": "rolling_window_5h_7d",
         "lightweight": true,
-        "offline_perf_note": "同代轻量快速系列（底层原生 1M，Antigravity 客户端实享 512K），仅用于省额度或表面格式初筛"
+        "offline_perf_note": "同代轻量快速系列，仅用于省额度或表面格式初筛"
       },
       "deepseek-flash": {
         "agent": "dsh",

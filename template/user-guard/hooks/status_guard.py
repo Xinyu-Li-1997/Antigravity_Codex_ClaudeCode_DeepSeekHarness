@@ -2992,6 +2992,7 @@ def _is_trusted_readonly_skill_root(target_path: Path) -> bool:
     gemini_home = Path.home() / ".gemini"
     skill_roots = (
         gemini_home / "antigravity" / "builtin" / "skills",
+        gemini_home / "antigravity" / "builtin" / "plugins",
         gemini_home / "antigravity" / "skills",
         gemini_home / "antigravity" / "plugins",
         gemini_home / "config" / "skills",
@@ -4396,9 +4397,84 @@ def _dispatch_commands(command: str, depth: int = 0, local_vars: Optional[Dict[s
             yield tokens
 
 
+_NATIVE_READONLY_KINDS = frozenset({
+    "research", "browser", "image-generator", "explore", "plan", "explorer",
+    "auditor", "critic", "challenger", "success auditor", "sentinel",
+    "teamwork_interviewer", "verifier", "reviewer",
+})
+_NATIVE_EXPLICIT_SLASH_RE = re.compile(
+    r"^/(?:teamwork|swarm|boost|plan|grill-me|browser|run-workflow|automation|plugin|learn)(?:\s|$|\[)",
+    re.IGNORECASE,
+)
+
+
 def _native_readonly(args):
-    kind = str(args.get("TypeName") or args.get("typeName") or args.get("agent_type") or args.get("subagent_type") or "self")
-    return kind.startswith("readonly-") or kind in ("research", "browser", "image-generator", "Explore", "Plan", "explorer")
+    kind = str(args.get("TypeName") or args.get("typeName") or args.get("agent_type") or args.get("subagent_type") or "self").strip()
+    low = kind.lower()
+    return low.startswith("readonly-") or low in _NATIVE_READONLY_KINDS
+
+
+def _is_explicit_native_command_turn(payload: Dict[str, Any]) -> bool:
+    """识别用户本轮显式键入的宿主原生编排/规划/插件斜杠命令，避免对用户本人主动指令施加二次阻断。"""
+    last_raw = user_words.clean_user_content(payload.get("lastUserInput") or payload.get("prompt") or "")
+    if last_raw and _NATIVE_EXPLICIT_SLASH_RE.match(last_raw.strip()):
+        return True
+    path = _dispatch_transcript(payload)
+    if path is None or not path.is_file():
+        return False
+    latest_user = ""
+    try:
+        with path.open("rb") as source:
+            for line in source:
+                try:
+                    entry = json.loads(user_words.decode_jsonl_line(line))
+                except (ValueError, RecursionError):
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                typ = entry.get("type")
+                if typ == "USER_INPUT" or entry.get("source") == "USER_EXPLICIT":
+                    cleaned = user_words.clean_user_content(
+                        entry.get("content") or entry.get("text") or entry.get("user_input") or ""
+                    )
+                    if cleaned:
+                        latest_user = cleaned
+                else:
+                    ut = user_words.transcript_user_text(entry, path)
+                    if ut:
+                        latest_user = user_words.clean_user_content(ut)
+    except OSError:
+        return False
+    return bool(latest_user and _NATIVE_EXPLICIT_SLASH_RE.match(latest_user.strip()))
+
+
+def _is_native_child_subagent_session(payload: Dict[str, Any]) -> bool:
+    """识别 Antigravity 原生派生子代理会话（轨迹首步为 SYSTEM_MESSAGE 且全轨迹无显式 USER_INPUT），防止嵌套派工门禁级联。"""
+    if payload.get("_client") in ("codex", "claude"):
+        return False
+    path = _dispatch_transcript(payload)
+    if path is None or not path.is_file():
+        return False
+    saw_system = False
+    try:
+        with path.open("rb") as source:
+            for idx, line in enumerate(source):
+                if idx > 64:
+                    break
+                try:
+                    entry = json.loads(user_words.decode_jsonl_line(line))
+                except (ValueError, RecursionError):
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                typ = entry.get("type")
+                if typ == "USER_INPUT" or entry.get("source") == "USER_EXPLICIT":
+                    return False
+                if typ == "SYSTEM_MESSAGE":
+                    saw_system = True
+    except OSError:
+        return False
+    return saw_system
 
 
 _HARNESS_VALUE_OPTIONS = frozenset({
@@ -4768,7 +4844,8 @@ def _find_hanging_gui_command(command: str, depth: int = 0) -> Optional[str]:
     return None
 
 
-def _check_dispatch_locked(payload, tool_name, args, sid, state_dir):
+def _check_dispatch_decision_locked(payload, tool_name, args, sid, state_dir) -> Optional[Tuple[str, str]]:
+    """返回 None（放行）或 (decision, reason)，其中 decision 为 'deny'（跨端/裸调硬阻断）或 'ask'（未显式授权的同端可写原生派工确认）。"""
     if _is_headless_subtask() or os.environ.get("USER_GUARD_DISABLE_TICKET_GATE") == "1":
         return None
     tool_name = _native_tool_name(tool_name)
@@ -4782,10 +4859,13 @@ def _check_dispatch_locked(payload, tool_name, args, sid, state_dir):
                 (cand / "install.py").is_file() and (cand / "template" / "user-guard" / "plugin.json").is_file()
                 for cand in (base_dir, *base_dir.parents)
             )
-            if not is_upstream:
+            last_in = user_words.clean_user_content(payload.get("lastUserInput") or "")
+            explicit_diag = bool(re.search(r"(?:^/plugin\b|钩子|\bhooks?\b)", last_in, re.I))
+            if not is_upstream and not explicit_diag:
                 return (
+                    "deny",
                     "【user-guard】通用课题会话无需读取门禁钩子源码自省规则：若后台任务仍在运行，"
-                    "直接简短汇报当前进展（如有未汇报重负载完工账单请一并附上成败、Token 与回执文件名）即可结束回合等待自动唤醒。"
+                    "直接简短汇报当前进展（如有未汇报重负载完工账单请一并附上成败、Token 与回执文件名）即可结束回合等待自动唤醒。",
                 )
     command = _extract_native_shell_command(args)
     shell = tool_name in ("run_command", "Bash", "PowerShell", "exec_command", "bash", "shell", "shell_command")
@@ -4794,17 +4874,19 @@ def _check_dispatch_locked(payload, tool_name, args, sid, state_dir):
         unpaged_git = _find_unpaged_git_command(command)
         if unpaged_git:
             return (
+                "deny",
                 f"【user-guard】禁止在伪终端裸跑可能拉起交互式分页器的 Git 命令（{unpaged_git}），"
-                "否则 /usr/bin/pager (less) 会等待按键卡死后台任务；请改用 `git --no-pager ...` 或前置 `GIT_PAGER=cat`。"
+                "否则 /usr/bin/pager (less) 会等待按键卡死后台任务；请改用 `git --no-pager ...` 或前置 `GIT_PAGER=cat`。",
             )
         if not args.get("IsDaemon"):
             hanging_gui = _find_hanging_gui_command(command)
             if hanging_gui:
                 return (
+                    "deny",
                     f"【user-guard】禁止在无超时上限的命令行直接调用桌面 GUI 应用（{hanging_gui}），"
                     "这类程序常忽略 --version/--help 或拉起界面导致后台任务永久卡死；"
                     "查询版本请改用 `install.py --audit-upgrade` 或只读包元数据（PE/product.json/dpkg），"
-                    "调用 CLI 请使用 `agy`/`codex`/`claude`/`dsh`，确需测试可执行文件请外包 `timeout`。"
+                    "调用 CLI 请使用 `agy`/`codex`/`claude`/`dsh`，确需测试可执行文件请外包 `timeout`。",
                 )
         for tokens in _dispatch_commands(command):
             names = [
@@ -4866,7 +4948,6 @@ def _check_dispatch_locked(payload, tool_name, args, sid, state_dir):
                 if task_like and "--dry-run" not in tail and not skip_target_metrics:
                     target = (base / Path(target_arg).expanduser()).resolve()
                     if target.exists():
-                        # 复用派工端的过滤与字节估算，目录链接、空文件等判据只维护一处；脚本缺失时拒绝因 FileNotFoundError 漏放。
                         script = _resolve_cae_harness_script(HOOKS_DIR)
                         metrics = None
                         try:
@@ -4911,16 +4992,33 @@ def _check_dispatch_locked(payload, tool_name, args, sid, state_dir):
             low = [t.lower() for t in tail]
             if any(t in low for t in ("--help", "-h", "--version")) or low[:2] in (["auth", "status"], ["plugin", "validate"]) or low[:1] == ["models"]:
                 continue
+            bare_agy_headless = head == "agy" and (
+                "task" in low
+                or any(t in ("-p", "--print", "--prompt") for t in low)
+                or "--input-format=stream-json" in low
+                or any(low[i:i+2] == ["--input-format", "stream-json"] for i in range(len(low)))
+            )
             bare = (head == "codex" and "exec" in low or head == "claude" and any(t in low for t in ("-p", "--print"))
                     or head == "dsh" and ("--profile=headless" in low or any(low[i:i+2] == ["--profile", "headless"] for i in range(len(low))))
-                    or head == "agy" and "task" in low)
+                    or bare_agy_headless)
             if bare:
-                return "【user-guard】禁止直接调用第三方子代理 CLI。请改用 cae_harness.py，保留声明窗口、非委派挡位、快照核验与额度检查。"
+                return ("deny", "【user-guard】禁止直接调用第三方子代理 CLI。请改用 cae_harness.py，保留声明窗口、非委派挡位、快照核验与额度检查。")
     native = _native_dispatch(tool_name, args)
     if not (native or heavy_tickets):
         return None
+    if native:
+        # D1 架构解耦：只读原生子代理（含并发多路）、用户显式原生斜杠命令及已获授权的原生子代理会话直接放行；
+        # 仅在代理未经用户显式指令自主发起可写多代理/工作流/swarm 且无已批票据时返回原生 ask 请用户一键确认。
+        if _native_readonly(args) and tool_name not in ("run_workflow", "swarm"):
+            native = False
+        elif _is_explicit_native_command_turn(payload) or _is_native_child_subagent_session(payload):
+            native = False
+    if not (native or heavy_tickets):
+        return None
     if not user_words.valid_session_id(sid):
-        return _ticket_required_reason(sid, state_dir)
+        if heavy_tickets:
+            return ("deny", _ticket_required_reason(sid, state_dir))
+        return ("ask", f"【user-guard 同端可写编排确认】当前未检测到用户显式原生命令，是否放行 `{tool_name}`？")
     # 外部重任务只对无轨迹且未显式启用门禁的离线夹具豁免。
     offline = not (_dispatch_transcript(payload) or os.environ.get("USER_GUARD_ENFORCE_TICKET_GATE") == "1")
     if offline and not native:
@@ -4931,7 +5029,7 @@ def _check_dispatch_locked(payload, tool_name, args, sid, state_dir):
         file = state_dir / (sid + "_dispatch_guard.json")
         state = user_words._read_state_json(file) or {}
         if not isinstance(state, dict):
-            return _ticket_required_reason(sid, state_dir)
+            return ("ask", f"【user-guard 同端可写编排确认】当前未检测到用户显式原生命令，是否放行 `{tool_name}`？")
         if state.get("turn") != turn:
             state = {"turn": turn, "count": 0, "calls": [], "channel_counts": {}}
         raw_cc = state.get("channel_counts")
@@ -4944,7 +5042,7 @@ def _check_dispatch_locked(payload, tool_name, args, sid, state_dir):
                 or any(not isinstance(k, str) or type(v) is not int or v < 0 for k, v in raw_cc.items())
             ))
         ):
-            return _ticket_required_reason(sid, state_dir)
+            return ("ask", f"【user-guard 同端可写编排确认】当前未检测到用户显式原生命令，是否放行 `{tool_name}`？")
         tc_obj = payload.get("toolCall") if isinstance(payload.get("toolCall"), dict) else {}
         identity = str(
             payload.get("tool_use_id")
@@ -5000,7 +5098,11 @@ def _check_dispatch_locked(payload, tool_name, args, sid, state_dir):
                             for row in ticket.get("streams", [])) for ticket in tickets), default=0)
         heavy = tool_name in ("run_workflow", "swarm") or not _native_readonly(args) or projected_count >= _heavy_min_streams()
         if heavy and projected_channel_count > capacity:
-            return _ticket_required_reason(sid, state_dir)
+            return (
+                "ask",
+                f"【user-guard 同端可写编排确认】代理自主请求启动 `{tool_name}`（未检测到用户显式原生斜杠命令或有效票据）。"
+                "请确认是否放行本次同端执行（项目外文件写边界仍全程生效；跨客户端重负载请改用 `cae_harness.py plan`）。",
+            )
         if not duplicate:
             state["count"] = admitted_count
             state.setdefault("channel_counts", {})[channel] = admitted_channel_count
@@ -5010,8 +5112,13 @@ def _check_dispatch_locked(payload, tool_name, args, sid, state_dir):
     for ticket_id, extra_plan_dirs in heavy_tickets:
         if not ticket_id or not user_words.find_session_approved_tickets(
                 sid, state_dir, ticket_id=ticket_id, channel="cae_harness_headless", extra_plan_dirs=extra_plan_dirs):
-            return _ticket_required_reason(sid, state_dir, extra_plan_dirs=extra_plan_dirs)
+            return ("deny", _ticket_required_reason(sid, state_dir, extra_plan_dirs=extra_plan_dirs))
     return None
+
+
+def _check_dispatch_locked(payload, tool_name, args, sid, state_dir):
+    hit = _check_dispatch_decision_locked(payload, tool_name, args, sid, state_dir)
+    return hit[1] if hit else None
 
 
 def _ticket_required_reason(sid, state_dir=None, extra_plan_dirs=()):
@@ -5084,8 +5191,13 @@ def _boundary_lease_scope_key(action_desc: str, ext_target: str, base_cwd: Optio
         return None
     home_norm = _normalize_cross_env_lexical(str(Path.home()), from_shell=False)
     if home_norm:
-        for cfg_sub in (".gemini/config", ".codex", ".claude", ".dsh", ".ssh", ".gnupg"):
+        # 精准锁定 user-guard 插件与核心全局配置，对 sidecars/ 与其他自建插件目录开放同会话租约以支持 /automation 与 /plugin
+        for cfg_sub in (".gemini/config/plugins/user-guard", ".codex", ".claude", ".dsh", ".ssh", ".gnupg"):
             if _is_under_norm_key(norm_parent, f"{home_norm.rstrip('/')}/{cfg_sub}"):
+                return None
+        cand_norm = _normalize_cross_env_lexical(str(cand), from_shell=False)
+        for exact_cfg in (".gemini/config/config.json", ".gemini/config/user_config.json"):
+            if cand_norm == f"{home_norm.rstrip('/')}/{exact_cfg}":
                 return None
     return f"dir:{norm_parent}"
 
@@ -5357,8 +5469,8 @@ def handle_pre_tool_use(payload: Dict[str, Any]) -> Dict[str, Any]:
                     )
 
     if not user_words.valid_session_id(conversation_id):
-        reason = _check_dispatch_locked(payload, tool_name, args, conversation_id, state_dir)
-        return {"decision": "deny", "reason": reason} if reason else boundary or {"decision": "allow"}
+        disp = _check_dispatch_decision_locked(payload, tool_name, args, conversation_id, state_dir)
+        return {"decision": disp[0], "reason": disp[1]} if disp else boundary or {"decision": "allow"}
     try:
         with user_words.session_state_lock(state_dir, conversation_id):
             gate_response = handoff_gate.check_pre_tool_use_locked(payload, state_dir, boundary_blocked=boundary is not None)
@@ -5371,9 +5483,9 @@ def handle_pre_tool_use(payload: Dict[str, Any]) -> Dict[str, Any]:
                     boundary = None
             if boundary is not None:
                 return boundary
-            ticket_reason = _check_dispatch_locked(payload, tool_name, args, conversation_id, state_dir)
-            if ticket_reason:
-                return {"decision": "deny", "reason": ticket_reason}
+            disp = _check_dispatch_decision_locked(payload, tool_name, args, conversation_id, state_dir)
+            if disp:
+                return {"decision": disp[0], "reason": disp[1]}
             try:
                 return _check_polling_locked(tool_name, args, conversation_id, base_cwd or cwd, workspace_paths, transcript_path_str,
                                              state_dir, logs_dir)
@@ -5887,13 +5999,13 @@ def handle_claude_pre_tool_use(payload: Dict[str, Any], state_dir: Optional[Path
         log_event("PreToolUse:workspace_boundary", sid, reason, logs_dir, client=client)
         return _claude_permission(decision, reason)
     if not user_words.valid_session_id(sid):
-        reason = _check_dispatch_locked(payload, tool_name, args, sid, state_dir)
-        return _claude_permission("deny", reason) if reason else {}
+        disp = _check_dispatch_decision_locked(payload, tool_name, args, sid, state_dir)
+        return _claude_permission(disp[0], disp[1]) if disp else {}
     try:
         with user_words.session_state_lock(state_dir, sid):
-            reason = _check_dispatch_locked(payload, tool_name, args, sid, state_dir)
-            if reason:
-                return _claude_permission("deny", reason)
+            disp = _check_dispatch_decision_locked(payload, tool_name, args, sid, state_dir)
+            if disp:
+                return _claude_permission(disp[0], disp[1])
             return _claude_check_polling(tool_name, args, sid, base_cwd or cwd, state_dir, logs_dir, client=client)
     except (OSError, ValueError) as exc:
         label = "Codex" if client == "codex" else "Claude"

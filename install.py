@@ -76,15 +76,73 @@ POSIX_HOOK_PYTHON_NAMES: Tuple[str, ...] = (
 AGY_SINGLE_EFFORT_RE = re.compile(r"^(.+)-(minimal|low|medium|high|xhigh|max)$", re.IGNORECASE)
 LEGACY_PYTHON_FLAGS = ([], ["-B"], ["-I", "-B"], HOOK_PYTHON_FLAGS)
 HANDOFF_MARKER = re.compile(r"\[user-guard codex-handoff v1 mode=(advisory|enforce|off) compact_limit=([0-9]+)\]")
-CLAUDE_HOOK_SCRIPTS = ("user_words.py", "session_context_loader.py", "status_guard.py", "reply_repeat_guard.py", "handoff_gate.py")
-CODEX_HOOK_ENTRIES = ("session_context_loader.py", "status_guard.py", "reply_repeat_guard.py", "handoff_gate.py")
+CLAUDE_HOOK_SCRIPTS = ("uguard_hook.py", "user_words.py", "session_context_loader.py", "status_guard.py", "reply_repeat_guard.py", "handoff_gate.py")
+CODEX_HOOK_ENTRIES = ("uguard_hook.py", "session_context_loader.py", "status_guard.py", "reply_repeat_guard.py", "handoff_gate.py")
 HOOK_LIB_FILES = ("__init__.py", "fs_safety.py", "shell_lex.py", "adaptive_policy.py", "process_guard.py")
 CLAUDE_RETIRED_SCRIPTS = ("background_status.py", "read_delegation_guard.py", "receipts_stop.py")
+UPSTREAM_ONLY_SKILLS = frozenset({"fleet-evolve"})
+_CLIENT_RULE_BLOCK_RE = re.compile(r"<!--\s*@client:([a-z,|]+)\s*-->([\s\S]*?)<!--\s*@/client\s*-->")
+_CLIENT_RULE_SCOPES: Dict[str, Set[str]] = {
+    "antigravity": {"antigravity", "agy", "hooks"},
+    "codex": {"codex", "hooks"},
+    "claude": {"claude", "hooks"},
+    "dsh": {"dsh"},
+}
+
+
+def render_rules_for_client(template_text: str, client: str = "") -> str:
+    """按目标客户端裁剪规则模板中的条件块；client 为空时原样保留模板文本。"""
+    normalized = template_text.replace("\r\n", "\n")
+    c_key = (client or "").strip().lower()
+    if not c_key:
+        return normalized
+    if c_key == "agy":
+        c_key = "antigravity"
+    active_scopes = _CLIENT_RULE_SCOPES.get(c_key)
+    if active_scopes is None:
+        return normalized
+
+    def _replace_block(match: re.Match) -> str:
+        tags = {tok.strip().lower() for tok in re.split(r"[,|]", match.group(1)) if tok.strip()}
+        return match.group(2) if (tags & active_scopes) else ""
+
+    rendered = _CLIENT_RULE_BLOCK_RE.sub(_replace_block, normalized)
+    rendered = re.sub(r"[ \t]+\n", "\n", rendered)
+    rendered = re.sub(r"\n{3,}", "\n\n", rendered)
+    return rendered
+
+
+def _deep_merge_profile_overlay(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]:
+    """合并本机 fleet_profile.local.json 覆盖层，禁止覆写 schema_version 且对 hook_safety 上限只紧不松。"""
+    merged: Dict[str, Any] = copy.deepcopy(base)
+
+    def _merge(dst: Dict[str, Any], src: Dict[str, Any]) -> None:
+        for k, v in src.items():
+            if k == "schema_version":
+                continue
+            if isinstance(v, dict) and isinstance(dst.get(k), dict):
+                orig_sub = copy.deepcopy(dst[k])
+                _merge(dst[k], v)
+                if k == "hook_safety":
+                    for bound_key, floor_val in (("wall_timeout_sec", 3), ("max_rss_mib", 256)):
+                        if bound_key in orig_sub and bound_key in dst[k]:
+                            bv, mv = orig_sub.get(bound_key), dst[k].get(bound_key)
+                            if isinstance(bv, (int, float)) and not isinstance(bv, bool):
+                                if isinstance(mv, (int, float)) and not isinstance(mv, bool):
+                                    dst[k][bound_key] = max(floor_val, min(bv, mv))
+                                else:
+                                    dst[k][bound_key] = bv
+            else:
+                dst[k] = copy.deepcopy(v)
+
+    _merge(merged, overlay)
+    return merged
 
 
 def _load_fleet_profile(repo_root: Optional[Path] = None) -> Dict[str, Any]:
-    """读取模型评估配置文件 fleet_profile.json（支持环境变量覆盖以供离线单测）。"""
+    """读取模型评估配置文件 fleet_profile.json（并叠加可选本机 fleet_profile.local.json 覆盖层）。"""
     env_override = os.environ.get("CAE_FLEET_PROFILE", "").strip()
+    local_override = os.environ.get("CAE_FLEET_PROFILE_LOCAL", "").strip()
     candidates: List[Path] = []
     if env_override:
         candidates.append(Path(env_override).expanduser())
@@ -95,6 +153,19 @@ def _load_fleet_profile(repo_root: Optional[Path] = None) -> Dict[str, Any]:
             if candidate.is_file() and not _is_link_or_junction(candidate):
                 parsed = json.loads(candidate.read_text(encoding="utf-8-sig"))
                 if isinstance(parsed, dict):
+                    local_path: Optional[Path] = None
+                    if local_override:
+                        local_path = Path(local_override).expanduser()
+                    elif not env_override:
+                        local_path = candidate.parent / "fleet_profile.local.json"
+                    if local_path is not None:
+                        try:
+                            if local_path.is_file() and not _is_link_or_junction(local_path):
+                                local_doc = json.loads(local_path.read_text(encoding="utf-8-sig"))
+                                if isinstance(local_doc, dict):
+                                    parsed = _deep_merge_profile_overlay(parsed, local_doc)
+                        except (OSError, UnicodeError, ValueError):
+                            pass
                     return parsed
         except (OSError, UnicodeError, ValueError):
             continue
@@ -1039,12 +1110,39 @@ def _probe_windows_wsl() -> Dict[str, Any]:
     return result
 
 
+def _run_readonly_cli_cmd(binary: str, args: List[str], *, timeout: int = 3) -> Tuple[Optional[int], str, str]:
+    """以只读隔离参数执行轻量 CLI 查询命令（--help / plugin validate 等），带严格超时与零 stdin。"""
+    cmd = (
+        [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", binary, *args]
+        if os.name == "nt" and Path(binary).suffix.lower() in {".cmd", ".bat"}
+        else [binary, *args]
+    )
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+        )
+        return proc.returncode, proc.stdout or "", proc.stderr or ""
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None, "", ""
+
+
 def _probe_dsh_hook_capability(dsh_bin: Optional[str]) -> Dict[str, Any]:
-    """探测 DSH CLI 是否已原生支持生命周期硬钩子，用于触发后续元更新（仅检查顶层 --help，不解析内部实验插件包）。"""
+    """只读探测 DSH CLI 的生命周期钩子与插件/补丁能力（四值证据，区分原生文件沙箱与生命周期钩子）。"""
     info: Dict[str, Any] = {
-        "hook_protocol": "soft_rules_only",
+        "hook_protocol": "no_lifecycle_hooks",
+        "sandbox_enforced": "native_file_sandbox",
         "hard_hooks_supported": False,
+        "evidence_state": "unknown_not_probed",
         "meta_update_trigger": "awaiting_upstream_dsh_hooks",
+        "plugin_cli_detected": False,
+        "patch_flag_detected": False,
+        "dump_config_detected": False,
     }
     if not dsh_bin:
         return info
@@ -1061,13 +1159,167 @@ def _probe_dsh_hook_capability(dsh_bin: Optional[str]) -> Dict[str, Any]:
         help_txt = proc.stdout or ""
         rc = getattr(proc, "returncode", 0)
         rc_ok = not (isinstance(rc, int) and not isinstance(rc, bool) and rc != 0)
-        if rc_ok and any(tok in help_txt for tok in ("PreToolUse", "SessionStart", "hooks.json", "--hooks")):
-            info["hook_protocol"] = "lifecycle_hooks"
-            info["hard_hooks_supported"] = True
-            info["meta_update_trigger"] = "ready_for_fleet_evolve_dsh_hooks"
+        if rc_ok:
+            info["evidence_state"] = "unsupported"
+            info["plugin_cli_detected"] = bool(re.search(r"\bplugin\b", help_txt))
+            info["patch_flag_detected"] = "--patch" in help_txt
+            info["dump_config_detected"] = "--dump-config" in help_txt
+            if any(tok in help_txt for tok in ("PreToolUse", "SessionStart", "hooks.json", "--hooks")):
+                info["hook_protocol"] = "lifecycle_hooks"
+                info["hard_hooks_supported"] = True
+                info["evidence_state"] = "detected_heuristic"
+                info["meta_update_trigger"] = "ready_for_fleet_evolve_dsh_hooks"
     except (OSError, subprocess.SubprocessError, ValueError):
         pass
     return info
+
+
+def _parse_semver_tuple(raw: Any) -> Tuple[int, ...]:
+    nums = re.findall(r"\d+", str(raw or ""))
+    return tuple(int(part) for part in nums[:3]) if nums else ()
+
+
+def _probe_client_capabilities(
+    detection: Dict[str, Any],
+    cli_versions: Dict[str, Any],
+    fleet_profile: Dict[str, Any],
+    repo_root: Path,
+    *,
+    is_sandbox_run: bool,
+    active_clients: Dict[str, bool],
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]], bool]:
+    """四客户端四值只读协议能力探针矩阵（仅探测与输出演进信号，不自动修改任何主体代码）。"""
+    baselines_cfg = fleet_profile.get("client_capability_baselines")
+    baselines = baselines_cfg.get("clients") if isinstance(baselines_cfg, dict) and isinstance(baselines_cfg.get("clients"), dict) else {}
+    mode_guide_rel = str((baselines_cfg or {}).get("mode_guide_doc") or "docs/workflow-guide.md") if isinstance(baselines_cfg, dict) else "docs/workflow-guide.md"
+    mode_guide_path = repo_root / mode_guide_rel
+    mode_guide_text = ""
+    if mode_guide_path.is_file() and not _is_link_or_junction(mode_guide_path):
+        try:
+            mode_guide_text = mode_guide_path.read_text(encoding="utf-8-sig").lower()
+        except (OSError, UnicodeError):
+            mode_guide_text = ""
+
+    matrix: Dict[str, Any] = {}
+    evolution_signals: List[Dict[str, Any]] = []
+    manifest_failed = False
+
+    for client_name in ("antigravity", "codex", "claude", "dsh"):
+        base = baselines.get(client_name) if isinstance(baselines.get(client_name), dict) else {}
+        det = detection.get(client_name) if isinstance(detection.get(client_name), dict) else {}
+        binary = det.get("native_binary")
+        cli_ver = cli_versions.get(client_name)
+        tested_ver = base.get("tested_cli_version")
+        watch_signals = [str(s) for s in (base.get("probe_watch_signals") or ()) if isinstance(s, str) and s]
+        deferred_map = base.get("deferred_or_excluded_capabilities") if isinstance(base.get("deferred_or_excluded_capabilities"), dict) else {}
+        adapted_modes = [str(m) for m in (base.get("adapted_native_modes") or ()) if isinstance(m, str) and m]
+
+        signal_states: Dict[str, str] = {sig: "unknown_not_probed" for sig in watch_signals}
+        new_actionable_signals: List[str] = []
+        tolerated_signals: List[str] = []
+        manifest_validation: Optional[Dict[str, Any]] = None
+        probe_status = "unknown_not_probed"
+
+        if not is_sandbox_run and isinstance(binary, str) and binary.strip():
+            rc, out_txt, err_txt = _run_readonly_cli_cmd(binary, ["--help"], timeout=3)
+            combined_help = (out_txt + "\n" + err_txt).strip()
+            if rc == 0 and combined_help:
+                probe_status = "probed_help"
+                for sig in watch_signals:
+                    matched = (sig in combined_help) if sig.startswith("-") or "." in sig or " " in sig else bool(re.search(rf"\b{re.escape(sig)}\b", combined_help))
+                    if matched:
+                        signal_states[sig] = "detected_heuristic"
+                        if sig in deferred_map:
+                            tolerated_signals.append(sig)
+                        else:
+                            new_actionable_signals.append(sig)
+                    else:
+                        signal_states[sig] = "unsupported"
+            if client_name == "antigravity":
+                tpl_dir = repo_root / "template" / "user-guard"
+                if tpl_dir.is_dir():
+                    v_rc, v_out, v_err = _run_readonly_cli_cmd(
+                        binary, ["plugin", "validate", "--strict", str(tpl_dir)], timeout=6,
+                    )
+                    if v_rc == 0:
+                        manifest_validation = {"state": "supported_verified", "ok": True}
+                    elif v_rc is not None:
+                        manifest_validation = {"state": "unsupported", "ok": False, "detail": (v_err or v_out).strip()[:200]}
+                        manifest_failed = True
+                    else:
+                        manifest_validation = {"state": "unknown_not_probed", "ok": None}
+
+        if client_name == "dsh" and det.get("hard_hooks_supported"):
+            if "PreToolUse" not in new_actionable_signals and "hooks.json" not in new_actionable_signals:
+                new_actionable_signals.append("dsh_lifecycle_hooks")
+            if signal_states.get("PreToolUse") == "unknown_not_probed":
+                signal_states["PreToolUse"] = "detected_heuristic"
+
+        ver_cur = _parse_semver_tuple(cli_ver)
+        ver_base = _parse_semver_tuple(tested_ver)
+        major_bump = bool(ver_cur and ver_base and ver_cur[0] > ver_base[0])
+
+        missing_doc_modes: List[str] = []
+        if mode_guide_text and adapted_modes:
+            for m_name in adapted_modes:
+                if m_name.lower() not in mode_guide_text:
+                    missing_doc_modes.append(m_name)
+
+        if new_actionable_signals or major_bump:
+            drift_state = "drift_needs_adapter"
+        elif tolerated_signals or (ver_cur and ver_base and ver_cur > ver_base):
+            drift_state = "drift_tolerated"
+        else:
+            drift_state = "aligned"
+
+        entry: Dict[str, Any] = {
+            "active": bool(active_clients.get(client_name, False)),
+            "probe_status": probe_status,
+            "cli_version": cli_ver,
+            "tested_cli_version": tested_ver,
+            "major_version_jump": major_bump,
+            "hook_protocol": det.get("hook_protocol") if client_name == "dsh" else base.get("hook_protocol"),
+            "drift_state": drift_state,
+            "signals": signal_states,
+            "actionable_signals": new_actionable_signals,
+            "tolerated_signals": tolerated_signals,
+            "missing_mode_guide_entries": missing_doc_modes,
+        }
+        if manifest_validation is not None:
+            entry["manifest_validation"] = manifest_validation
+        matrix[client_name] = entry
+
+        if active_clients.get(client_name, False):
+            if client_name == "dsh" and det.get("hard_hooks_supported"):
+                evolution_signals.append({
+                    "code": "evolve_dsh_hard_hooks",
+                    "client": "dsh",
+                    "evidence_state": det.get("evidence_state") or "detected_heuristic",
+                    "requires_doc_update": True,
+                    "detail": "DSH CLI --help 检出生命周期钩子关键词（启发式探测），建议立项评估硬钩子适配并补齐实测用例",
+                })
+            elif new_actionable_signals or major_bump:
+                evolution_signals.append({
+                    "code": f"evolve_{client_name}_capabilities",
+                    "client": client_name,
+                    "evidence_state": "detected_heuristic",
+                    "signals": new_actionable_signals,
+                    "major_version_jump": major_bump,
+                    "requires_doc_update": True,
+                    "detail": f"{client_name} 检测到未豁免新能力信号或主版本跃迁，建议在 fleet-evolve 评估并更新适配与模式指南",
+                })
+            if missing_doc_modes:
+                evolution_signals.append({
+                    "code": "update_mode_workflow_guide",
+                    "client": client_name,
+                    "evidence_state": "supported_verified",
+                    "missing_modes": missing_doc_modes,
+                    "doc": mode_guide_rel,
+                    "requires_doc_update": True,
+                    "detail": f"{mode_guide_rel} 尚未涵盖 {client_name} 已登记的原生模式: {', '.join(missing_doc_modes)}",
+                })
+
+    return matrix, evolution_signals, manifest_failed
 
 
 def detect_installed_apps() -> Dict[str, Any]:
@@ -1392,6 +1644,8 @@ def detect_zotero_mcp_executable(explicit_cmd: str = "") -> Optional[str]:
 def should_ignore_template_item(path: Path) -> bool:
     if len(path.parts) >= 2 and path.parts[0] == "hooks" and path.parts[1] in ("state", "logs"):
         return True
+    if len(path.parts) >= 2 and path.parts[0] == "skills" and path.parts[1] in UPSTREAM_ONLY_SKILLS:
+        return True
     return any(part in IGNORED_NAMES for part in path.parts) or path.suffix.lower() in IGNORED_SUFFIXES
 
 
@@ -1538,7 +1792,8 @@ def _validate_mirror(template_dir: Path, target_dir: Path) -> None:
 
 
 def mirror_sync_plugin(
-    template_dir: Path, target_plugin_dir: Path, dry_run: bool = False, *, hooks_bytes: Optional[bytes] = None,
+    template_dir: Path, target_plugin_dir: Path, dry_run: bool = False, *,
+    hooks_bytes: Optional[bytes] = None, rules_bytes: Optional[bytes] = None,
 ) -> None:
     """
     将 template_dir 镜像同步至 target_plugin_dir，并精准清理陈旧废弃文件与 __pycache__。
@@ -1552,7 +1807,12 @@ def mirror_sync_plugin(
         rel = src.relative_to(template_dir)
         dst = target_plugin_dir / rel
         original = _read_optional_bytes(dst)
-        content = hooks_bytes if hooks_bytes is not None and rel == Path("hooks.json") else src.read_bytes()
+        if hooks_bytes is not None and rel == Path("hooks.json"):
+            content = hooks_bytes
+        elif rules_bytes is not None and rel == Path("rules/AGENTS.md"):
+            content = rules_bytes
+        else:
+            content = src.read_bytes()
         if original != content:
             pending_updates.append((src, FileChange(dst, original, content)))
 
@@ -1844,8 +2104,47 @@ def _managed_skill_names(template_dir: Path) -> List[str]:
         return ["cae-harness"]
     return sorted(
         entry.name for entry in skills_root.iterdir()
-        if entry.is_dir() and not entry.name.startswith(".") and entry.name != "__pycache__"
+        if entry.is_dir()
+        and not entry.name.startswith(".")
+        and entry.name != "__pycache__"
+        and entry.name not in UPSTREAM_ONLY_SKILLS
     )
+
+
+def _clean_retired_upstream_skills(skills_root: Path, dry_run: bool = False) -> None:
+    """清理升级前旧版同步到宿主技能目录的上游专属维护技能（如 fleet-evolve）。"""
+    if not skills_root.is_dir() or _is_link_or_junction(skills_root):
+        return
+    for name in sorted(UPSTREAM_ONLY_SKILLS):
+        retired_dir = skills_root / name
+        if not retired_dir.exists() or _is_link_or_junction(retired_dir) or not retired_dir.is_dir():
+            continue
+        _validate_path(retired_dir, directory=True)
+        _validate_tree_links(retired_dir)
+        if dry_run:
+            print(f"  [Dry-Run CLEAN] 将清理旧版下发的上游专属技能目录: {retired_dir}")
+        else:
+            # Windows 下历史目录/文件可能带有只读属性（FILE_ATTRIBUTE_READONLY）；树内已验无符号链接，先解除只读位再清理
+            for walk_root, dir_names, file_names in os.walk(retired_dir, topdown=False, followlinks=False):
+                w_root = Path(walk_root)
+                for fn in file_names:
+                    fp = w_root / fn
+                    try:
+                        os.chmod(fp, stat.S_IWRITE | stat.S_IREAD)
+                    except OSError:
+                        pass
+                for dn in dir_names:
+                    dp = w_root / dn
+                    try:
+                        os.chmod(dp, stat.S_IWRITE | stat.S_IREAD | stat.S_IEXEC)
+                    except OSError:
+                        pass
+            try:
+                os.chmod(retired_dir, stat.S_IWRITE | stat.S_IREAD | stat.S_IEXEC)
+            except OSError:
+                pass
+            shutil.rmtree(retired_dir)
+            print(f"  [-] 已清理旧版下发的上游专属技能目录: {retired_dir}")
 
 
 def codex_skill_target(
@@ -1964,6 +2263,10 @@ def _model_efforts(model: Dict[str, Any]) -> List[str]:
 
 
 def _apply_codex_workspace_boundary(editor: "CodexConfig") -> None:
+    if editor.data.get("default_permissions") is not None:
+        # Codex 新版权限体系若已显式配置 default_permissions，严禁混写旧式 sandbox_mode
+        editor.add_defaults((), {"approval_policy": '"on-request"'})
+        return
     sandbox_mode = editor.data.get("sandbox_mode")
     if sandbox_mode is None or sandbox_mode == "danger-full-access":
         sandbox_mode = "workspace-write"
@@ -2032,7 +2335,7 @@ def _sync_codex_workspace_boundary(codex_root: Path, dry_run: bool = False) -> N
 
 
 def _sync_codex_global_rules(template_rules_path: Path, codex_root: Path, dry_run: bool = False) -> None:
-    _sync_global_rules(template_rules_path, codex_root / "AGENTS.md", "Codex", dry_run)
+    _sync_global_rules(template_rules_path, codex_root / "AGENTS.md", "Codex", dry_run, client="codex")
 
 
 _LOCAL_ENV_COLLISIONS = re.compile(r"^([ \t]*(?:(?:[-*+]|\d+\.)[ \t]+)?(?:#{1,6}[ \t]+)?(?:\*{1,2})?)(R10|R11)\.", re.MULTILINE)
@@ -2074,11 +2377,14 @@ def _find_custom_rules_tail_start(text: str) -> Optional[int]:
     return custom_env_start if custom_env_start is not None else following_start
 
 
-def _sync_global_rules(template_rules_path: Path, rules_path: Path, label: str, dry_run: bool) -> None:
-    """以完整模板更新规则，保留自定义尾段并迁移与标准规则冲突的编号。"""
+def _sync_global_rules(
+    template_rules_path: Path, rules_path: Path, label: str, dry_run: bool, *, client: str = "",
+) -> None:
+    """以按客户端裁剪后的完整模板更新规则，保留自定义尾段并迁移与标准规则冲突的编号。"""
     if not template_rules_path.is_file():
         return
-    template_text = _decode_utf8(template_rules_path, template_rules_path.read_bytes()).replace("\r\n", "\n")
+    raw_template = _decode_utf8(template_rules_path, template_rules_path.read_bytes()).replace("\r\n", "\n")
+    template_text = render_rules_for_client(raw_template, client) if client else raw_template
 
     codex_agents = rules_path
     original = _read_optional_bytes(codex_agents)
@@ -2149,6 +2455,30 @@ class CodexHooksPlan(NamedTuple):
     compact_limit: int
 
 
+def _read_handoff_policy_file(handoff_dir: Path) -> Optional[Tuple[str, int]]:
+    policy_path = handoff_dir / "policy.json"
+    try:
+        raw = _read_optional_bytes(policy_path)
+        if raw is None:
+            return None
+        doc = _read_json_object(policy_path, raw)
+        mode = str(doc.get("mode") or "").strip().lower()
+        lim = doc.get("compact_limit")
+        if mode in {"advisory", "enforce", "off"} and isinstance(lim, int) and not isinstance(lim, bool) and lim >= 0:
+            return mode, lim
+    except (OSError, ValueError, TypeError):
+        pass
+    return None
+
+
+def _handoff_policy_file_change(handoff_dir: Path, mode: str, compact_limit: int) -> Optional[FileChange]:
+    policy_path = handoff_dir / "policy.json"
+    _validate_path(policy_path, directory=False)
+    original = _read_optional_bytes(policy_path)
+    content = _preserve_text_format(_json_bytes({"mode": mode, "compact_limit": int(compact_limit)}), original)
+    return FileChange(policy_path, original, content) if content != original else None
+
+
 def _codex_hook_tokens(handler: Dict[str, Any]) -> List[str]:
     if handler.get("type") != "command" or not isinstance(handler.get("command"), str):
         return []
@@ -2205,6 +2535,16 @@ def _codex_managed_hook(
         actual_flags = tokens[1:idx]
         if not any(actual_flags == launcher + flags for flags in LEGACY_PYTHON_FLAGS):
             return ManagedCodexHook("custom", None)
+        if script_name == "uguard_hook.py":
+            if (
+                len(args) == 8
+                and args[:3] == ["--client", "codex", "--event"]
+                and args[3] in {"SessionStart", "PostCompact", "UserPromptSubmit", "PreToolUse", "Stop"}
+                and args[4] == "--state-dir" and matches(args[5], hook_root / "state")
+                and args[6] == "--log-dir" and matches(args[7], hook_root / "logs")
+            ):
+                return ManagedCodexHook("uguard", interpreter)
+            return ManagedCodexHook("custom", None)
         if script_name == "session_context_loader.py" and args[:2] == ["--client", "codex"]:
             rest = args[2:]
             if rest and (
@@ -2236,6 +2576,7 @@ def _codex_handoff_policy(
     doc: Dict[str, Any], policies: Set[Tuple[str, int]], requested_mode: Optional[str],
     requested_limit: Optional[int], *, repo_root: Optional[Path] = None,
     model_name: str = "", effort: str = "", explicit_window: Optional[int] = None,
+    policy_file_value: Optional[Tuple[str, int]] = None,
 ) -> Tuple[str, int]:
     description = doc.get("description", "")
     if not isinstance(description, str):
@@ -2247,6 +2588,8 @@ def _codex_handoff_policy(
         if len(markers) != 1 or match is None:
             raise ValueError("Codex 钩子 description 中的交接配置标记无效或重复")
         policies.add((match[1], int(match[2])))
+    elif not policies and policy_file_value is not None:
+        policies.add(policy_file_value)
 
     modes = {mode for mode, _ in policies}
     limits = {limit for _, limit in policies}
@@ -2277,13 +2620,22 @@ def _read_codex_hooks(path: Path, raw: Optional[bytes]) -> Dict[str, Any]:
     return doc
 
 
+_CODEX_LEGACY_PRIMARY_KIND = {
+    "SessionStart": "loader",
+    "PostCompact": "gate",
+    "UserPromptSubmit": "gate",
+    "PreToolUse": "status_guard.py",
+    "Stop": "reply_repeat_guard.py",
+}
+
+
 def _plan_codex_hooks(
     hooks_path: Path, template_path: Path, py_cmd: str,
     mode: Optional[str] = None, compact_limit: Optional[int] = None,
     *, verify_interpreters: bool = True, repo_root: Optional[Path] = None,
     config_bytes: Optional[bytes] = None,
 ) -> CodexHooksPlan:
-    """逐条识别本项目钩子并合并，保留用户 handler、信任信息及交接策略。"""
+    """逐条识别本项目钩子并合并为单入口 uguard_hook.py，保留用户 handler、信任信息及交接策略。"""
     _validate_path(hooks_path, directory=False)
     codex_root = hooks_path.parent.resolve()
     original = _read_optional_bytes(hooks_path)
@@ -2332,9 +2684,11 @@ def _plan_codex_hooks(
                 cx_window = raw_cw
         except (UnicodeError, tomllib.TOMLDecodeError, ValueError, RecursionError):
             pass
+    policy_file_val = _read_handoff_policy_file(codex_root / "hooks" / "state" / "handoff")
     mode, compact_limit = _codex_handoff_policy(
         doc, policies, mode, compact_limit, repo_root=repo_root,
         model_name=cx_model, effort=cx_effort, explicit_window=cx_window,
+        policy_file_value=policy_file_val,
     )
 
     for event, groups in defaults.items():
@@ -2342,8 +2696,8 @@ def _plan_codex_hooks(
         desired = {}
         for handler in groups[0]["hooks"]:
             name = next(name for name in CODEX_HOOK_ENTRIES if name in handler["command"])
-            kind = {"handoff_gate.py": "gate", "session_context_loader.py": "loader"}.get(name, name)
-            if kind == "gate" and mode == "off":
+            kind = {"uguard_hook.py": "uguard", "handoff_gate.py": "gate", "session_context_loader.py": "loader"}.get(name, name)
+            if mode == "off" and (kind == "gate" or (kind == "uguard" and event in {"PostCompact", "UserPromptSubmit"})):
                 continue
             command = handler["command"].replace("--mode advisory --compact-limit 0", f"--mode {mode} --compact-limit {compact_limit}")
             script_start = command.index('"~/.codex/')
@@ -2361,35 +2715,48 @@ def _plan_codex_hooks(
         retained = set()
         first_matching_group = None
         merged = []
+        primary_legacy = _CODEX_LEGACY_PRIMARY_KIND.get(event)
         for group in existing:
             matching = group.get("matcher") == matcher
+            has_uguard = any(
+                classifications.get(id(h)) and classifications[id(h)].kind == "uguard"
+                for h in group["hooks"]
+            )
+            has_primary_legacy = any(
+                classifications.get(id(h)) and classifications[id(h)].kind == primary_legacy
+                for h in group["hooks"]
+            )
             handlers = []
             custom_slots = set()
             for handler in group["hooks"]:
                 managed = classifications[id(handler)]
                 if managed and managed.kind == "custom" and matching and event == "SessionStart":
-                    if any(Path(token).name == "session_context_loader.py" for token in _codex_hook_tokens(handler)):
-                        custom_slots.add("loader")
+                    if any(Path(token).name in {"session_context_loader.py", "uguard_hook.py"} for token in _codex_hook_tokens(handler)):
+                        custom_slots.add("uguard")
                 if managed is None or managed.kind == "custom" or (managed.kind == "loader" and event != "SessionStart"):
                     handlers.append(handler)
                     continue
                 kind = managed.kind
-                if matching and kind in desired and kind not in retained:
+                target_kind = kind
+                if kind not in desired and "uguard" in desired and matching:
+                    if not has_uguard and (kind == primary_legacy or not has_primary_legacy):
+                        target_kind = "uguard"
+                if matching and target_kind in desired and target_kind not in retained:
                     updated_handler = handler
-                    if handler["command"] != desired[kind]["command"]:
+                    if handler["command"] != desired[target_kind]["command"]:
                         if verify_interpreters and (managed.interpreter is None or not _is_working_python_cmd(*managed.interpreter)):
-                            updated_handler = {**handler, "command": desired[kind]["command"]}
+                            updated_handler = {**handler, "command": desired[target_kind]["command"]}
                         else:
                             tokens = _codex_hook_tokens(handler)
                             launcher = managed.interpreter[1] if managed.interpreter else (
                                 tokens[1:2] if PureWindowsPath(tokens[0]).name.lower() in {"py", "py.exe"} and tokens[1:2] in PY_LAUNCHER_ARGS else []
                             )
-                            latest_args = _codex_hook_tokens(desired[kind])[py_prefix_size:]
+                            latest_args = _codex_hook_tokens(desired[target_kind])[py_prefix_size:]
                             if tokens[1:] != launcher + HOOK_PYTHON_FLAGS + latest_args:
                                 prefix = " ".join([quote_exe(tokens[0]), *launcher, *HOOK_PYTHON_FLAGS])
-                                updated_handler = {**handler, "command": prefix + desired[kind]["command"][len(py_cmd):]}
+                                updated_handler = {**handler, "command": prefix + desired[target_kind]["command"][len(py_cmd):]}
                     handlers.append(updated_handler)
-                    retained.add(kind)
+                    retained.add(target_kind)
             retained.update(custom_slots)
             if handlers or not group["hooks"]:
                 updated_group = {**group, "hooks": handlers}
@@ -2427,7 +2794,7 @@ def _sync_codex_hooks(
     plan: CodexHooksPlan,
     dry_run: bool = False,
 ) -> None:
-    """同步 Codex 生命周期钩子脚本，逐条合并已登记的 handler。"""
+    """同步 Codex 单入口与共享生命周期钩子脚本，合并注册表并落盘交接策略。"""
     hooks_path = codex_root / "hooks.json"
     dst_hooks_dir = codex_root / "hooks"
     mode, compact_limit = plan.mode, plan.compact_limit
@@ -2481,6 +2848,9 @@ def _sync_codex_hooks(
         prefix = "[Dry-Run]" if dry_run else "[+]"
         print(f"{prefix} {action} Codex 钩子脚本至 {dst_hooks_dir}: {', '.join(scripts_updated)}")
 
+    policy_change = _handoff_policy_file_change(dst_hooks_dir / "state" / "handoff", mode, compact_limit)
+    _apply_file_change(policy_change, dry_run)
+
     if plan.change is None:
         print("[*] Codex 钩子注册表已是最新状态，保留现有文件字节。")
     elif dry_run:
@@ -2529,6 +2899,7 @@ def _validate_codex_assets(
             _validate_path(hooks_dir / "_lib" / lib_name, directory=False)
         for rel in ("state", "state/handoff", "state/session-context", "state/user-words", "logs"):
             _validate_path(hooks_dir / rel, directory=True)
+        _validate_path(hooks_dir / "state" / "handoff" / "policy.json", directory=False)
         _validate_path(hooks_dir / "logs" / "session-context.jsonl", directory=False)
         for pycache in (hooks_dir / "__pycache__", hooks_dir / "_lib" / "__pycache__"):
             _validate_tree_links(_validate_path(pycache, directory=True))
@@ -2539,7 +2910,7 @@ def _validate_codex_assets(
 
 
 def _sync_claude_global_rules(template_rules_path: Path, claude_root: Path, dry_run: bool = False) -> None:
-    _sync_global_rules(template_rules_path, claude_root / "CLAUDE.md", "Claude Code", dry_run)
+    _sync_global_rules(template_rules_path, claude_root / "CLAUDE.md", "Claude Code", dry_run, client="claude")
 
 
 def _sync_claude_agents(claude_template_dir: Path, claude_root: Path, dry_run: bool = False) -> None:
@@ -2597,6 +2968,7 @@ def _claude_handoff_policy(
     handlers: List[Dict[str, Any]], mode: Optional[str], compact_limit: Optional[int],
     *, repo_root: Optional[Path] = None,
     model_name: str = "", effort: str = "", explicit_window: Optional[int] = None,
+    policy_file_value: Optional[Tuple[str, int]] = None,
 ) -> Tuple[str, int]:
     policies = set()
     for handler in handlers:
@@ -2608,6 +2980,8 @@ def _claude_handoff_policy(
                 policies.add((old_mode, int(old_limit)))
         except (ValueError, IndexError):
             continue
+    if not policies and policy_file_value is not None:
+        policies.add(policy_file_value)
     modes, limits = {item[0] for item in policies}, {item[1] for item in policies}
     if (mode is None and len(modes) > 1) or (compact_limit is None and len(limits) > 1):
         raise ValueError("Claude 交接策略不一致，请显式指定 --claude-handoff-mode 和 --claude-handoff-compactions")
@@ -2621,7 +2995,7 @@ def _plan_claude_settings(
     include_hooks: bool = True, include_model: bool = True, overwrite_model: bool = False,
     verify_interpreters: bool = True, repo_root: Optional[Path] = None,
 ) -> CodexHooksPlan:
-    """按目标脚本路径迁移托管钩子，其余设置及第三方 handler 保持原值。"""
+    """按目标脚本路径迁移托管钩子为单入口 uguard_hook.py，其余设置及第三方 handler 保持原值。"""
     original = _read_optional_bytes(settings_path)
     doc = _read_json_object(settings_path, original)
     initial = copy.deepcopy(doc)
@@ -2634,12 +3008,14 @@ def _plan_claude_settings(
             doc["effortLevel"] = _default_claude_effort(repo_root)
         if overwrite_model:
             env.pop("CLAUDE_CODE_EFFORT_LEVEL", None)
+    policy_file_val = _read_handoff_policy_file(claude_root / "hooks" / "state" / "handoff")
     if include_hooks:
         events = doc.setdefault("hooks", {})
         if not isinstance(events, dict):
             raise ValueError(f"{settings_path} 的 hooks 必须是对象")
         defaults = _read_json_object(template_path, template_path.read_bytes())["hooks"]
         managed = {}
+        managed_events: Set[str] = set()
         prefixes = {}
         verified = {}
         gates = []
@@ -2655,6 +3031,7 @@ def _plan_claude_settings(
                     if name is None:
                         continue
                     managed[id(handler)] = name
+                    managed_events.add(event)
                     if name == "handoff_gate.py":
                         gates.append(handler)
                     tokens = _claude_hook_tokens(handler)
@@ -2669,13 +3046,18 @@ def _plan_claude_settings(
                             quote = ((lambda value: '"' + value + '"' if Path(value).is_absolute() or any(c.isspace() for c in value) else value)
                                      if os.name == "nt" else shlex.quote)
                             prefixes.setdefault(name, " ".join([quote(executable), *launcher, *HOOK_PYTHON_FLAGS]))
-        # 关闭模式通过现有托管钩子中不含 gate 的状态沿用，无需添加非标准 settings 字段。
+        # 关闭模式通过现有托管钩子不含交接事件或 policy.json 沿用，无需添加非标准 settings 字段。
+        has_uguard = any(sname == "uguard_hook.py" for sname in managed.values())
         modern = any("args" not in handler and "--client" in tokens
                      and tokens[2 if tokens[1:2] in PY_LAUNCHER_ARGS else 1:][:4] == HOOK_PYTHON_FLAGS
                      for groups in events.values() for group in groups for handler in group["hooks"]
                      if id(handler) in managed for tokens in [_claude_hook_tokens(handler)])
-        if mode is None and managed and modern and not gates:
-            mode = "off"
+        if mode is None and managed and modern:
+            if has_uguard:
+                if not (managed_events & {"PostCompact", "UserPromptSubmit"}):
+                    mode = "off"
+            elif not gates:
+                mode = "off"
         cl_model = str(env.get("ANTHROPIC_MODEL") or "").strip()
         cl_effort = str(doc.get("effortLevel") or "").strip()
         raw_cl_win = str(env.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS") or "").strip()
@@ -2683,6 +3065,7 @@ def _plan_claude_settings(
         mode, compact_limit = _claude_handoff_policy(
             gates, mode, compact_limit, repo_root=repo_root,
             model_name=cl_model, effort=cl_effort, explicit_window=cl_window,
+            policy_file_value=policy_file_val,
         )
         for event, groups in list(events.items()):
             retained = []
@@ -2701,7 +3084,7 @@ def _plan_claude_settings(
             for handler in default_group["hooks"]:
                 command = handler["command"]
                 name = next(name for name in CLAUDE_HOOK_SCRIPTS if name in command)
-                if name == "handoff_gate.py" and mode == "off":
+                if mode == "off" and (name == "handoff_gate.py" or (name == "uguard_hook.py" and event in {"PostCompact", "UserPromptSubmit"})):
                     continue
                 command = command[command.index('"~/.claude/'):]
                 command = re.sub(r'"~/.claude/([^"\n]+)"',
@@ -2771,6 +3154,8 @@ def _sync_claude_hooks(
             else:
                 shutil.rmtree(cache)
     _clean_legacy_session_lock_files(hooks_dir / "state", dry_run=dry_run)
+    policy_change = _handoff_policy_file_change(hooks_dir / "state" / "handoff", plan.mode, plan.compact_limit)
+    _apply_file_change(policy_change, dry_run)
     _apply_file_change(plan.change, dry_run)
 
 
@@ -2834,6 +3219,7 @@ def _validate_claude_assets(repo_root: Path, claude_root: Path, args: argparse.N
             _validate_path(hooks_dir / name, directory=False)
         for rel in ("state", "state/handoff", "state/session-context", "state/user-words", "logs"):
             _validate_path(hooks_dir / rel, directory=True)
+        _validate_path(hooks_dir / "state" / "handoff" / "policy.json", directory=False)
         _validate_path(hooks_dir / "logs" / "session-context.jsonl", directory=False)
         _validate_tree_links(hooks_dir / "__pycache__")
         _validate_tree_links(hooks_dir / "_lib" / "__pycache__")
@@ -3116,9 +3502,11 @@ def _rules_core(raw: bytes) -> str:
     return re.split(r"^##[ \t]+工具与[^\n]*", text, maxsplit=1, flags=re.MULTILINE)[0].rstrip()
 
 
-def _rules_equal(actual_raw: bytes, expected_raw: bytes) -> bool:
+def _rules_equal(actual_raw: bytes, expected_raw: bytes, *, client: str = "") -> bool:
     actual_text = actual_raw.decode("utf-8-sig").replace("\r\n", "\n")
     expected_text = expected_raw.decode("utf-8-sig").replace("\r\n", "\n")
+    if client:
+        expected_text = render_rules_for_client(expected_text, client)
     tail_start = _find_custom_rules_tail_start(actual_text)
     if tail_start is not None:
         return (actual_text[:tail_start].rstrip() == expected_text.rstrip()
@@ -3318,6 +3706,7 @@ def _build_adaptive_meta_summary(
     cl: Dict[str, Any],
     repo_root: Optional[Path] = None,
     ag_models: Optional[List[Dict[str, Any]]] = None,
+    dsh: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     adaptive_policy = _load_adaptive_policy_readonly(repo_root)
     if adaptive_policy is None:
@@ -3334,11 +3723,18 @@ def _build_adaptive_meta_summary(
     cl_window = int(raw_cl_win) if raw_cl_win.isdigit() and int(raw_cl_win) > 0 else None
     cl_model_val = str(cl_mapping.get("ANTHROPIC_MODEL") or "").strip()
     cl_effort_val = "" if (not cl_model_val and cl_window is None) else str(cl.get("effortLevel") or "").strip()
+    dsh_np = (fleet_profile.get("native_agent_profiles") or {}).get("dsh")
+    dsh_np = dsh_np if isinstance(dsh_np, dict) else {}
+    dsh_model_val = str((dsh or {}).get("model") or dsh_np.get("headless_default_model") or dsh_np.get("main_model") or "").strip()
+    dsh_effort_val = str(dsh_np.get("main_tier") or "").strip() if dsh_model_val else ""
+    dsh_raw_win = dsh_np.get("context_window")
+    dsh_win_val = dsh_raw_win if isinstance(dsh_raw_win, int) and not isinstance(dsh_raw_win, bool) and dsh_raw_win > 0 else None
     out: Dict[str, Any] = {}
     for cname, model_val, effort_val, win_val in (
         ("antigravity", ag_model_val, ag_effort_val, ag_win_val),
         ("codex", cx_model_val, cx_effort_val, cx_win_val),
         ("claude", cl_model_val, cl_effort_val, cl_window),
+        ("dsh", dsh_model_val, dsh_effort_val, dsh_win_val),
     ):
         if not model_val and win_val is None:
             effort_val = ""
@@ -3521,13 +3917,21 @@ def audit_upgrade_status(
             errors[str(path)] = type(exc).__name__
             return None
 
-    def drift(root: Path, sources: List[Tuple[Path, str]], *, core_rules: bool = False) -> List[str]:
+    def drift(root: Path, sources: List[Tuple[Path, str]], *, core_rules: bool = False, client: str = "") -> List[str]:
         result = []
         for source, relative in sources:
             actual = read_raw(root / relative)
             expected = source.read_bytes()
             try:
-                equal = actual is not None and (_rules_equal(actual, expected) if core_rules and relative.endswith(".md") and "/" not in relative else actual == expected)
+                if actual is None:
+                    equal = False
+                elif client == "antigravity" and relative == "rules/AGENTS.md":
+                    rendered = render_rules_for_client(expected.decode("utf-8-sig"), "antigravity").encode("utf-8")
+                    equal = actual == rendered
+                elif core_rules and relative.endswith(".md") and "/" not in relative:
+                    equal = _rules_equal(actual, expected, client=client)
+                else:
+                    equal = actual == expected
             except UnicodeError:
                 equal = False
             if not equal:
@@ -3541,7 +3945,7 @@ def audit_upgrade_status(
     ag["upgrade_recommended"] = version_tuple(ag["installed_version"]) < version_tuple(repo_version)
     ag_sources = [(source, source.relative_to(template).as_posix()) for source in _template_files(template)
                   if source.relative_to(template).as_posix() != "hooks.json"]
-    ag["drift_files"] = drift(target_plugin_dir, ag_sources)
+    ag["drift_files"] = drift(target_plugin_dir, ag_sources, client="antigravity")
     def extend_stale_mirror_drift(drift_list: List[str], tpl_dir: Path, dst_dir: Path, rel_root: Path) -> None:
         try:
             for stale in _stale_mirror_files(tpl_dir, dst_dir):
@@ -3674,12 +4078,19 @@ def audit_upgrade_status(
     cx_sources += [(source, "agents/" + source.name) for source in sorted((repo_root / "template/codex/agents").glob("*.toml"))]
     cx_sources += [(template / "hooks" / name, "hooks/" + name) for name in _codex_hook_script_names()]
     cx_sources += [(template / "hooks" / "_lib" / lib_name, "hooks/_lib/" + lib_name) for lib_name in HOOK_LIB_FILES if (template / "hooks" / "_lib" / lib_name).is_file()]
-    skill_sources = [(source, source.relative_to(template).as_posix()) for source in _template_files(template / "skills")]
-    cx_sources += skill_sources
     managed_skill_names = _managed_skill_names(template)
-    cx["drift_files"] = drift(codex_root, cx_sources, core_rules=True)
+    skill_sources = [
+        (source, source.relative_to(template).as_posix())
+        for sname in managed_skill_names
+        for source in _template_files(template / "skills" / sname)
+    ]
+    cx_sources += skill_sources
+    cx["drift_files"] = drift(codex_root, cx_sources, core_rules=True, client="codex")
     for sname in managed_skill_names:
         extend_stale_mirror_drift(cx["drift_files"], template / "skills" / sname, codex_root / "skills" / sname, codex_root)
+    for retired_sk in sorted(UPSTREAM_ONLY_SKILLS):
+        if (codex_root / "skills" / retired_sk).is_dir() and not _is_link_or_junction(codex_root / "skills" / retired_sk):
+            cx["drift_files"].append(f"skills/{retired_sk}")
     codex_hooks_path = codex_root / "hooks.json"
     try:
         cx_plan = _plan_codex_hooks(
@@ -3789,10 +4200,13 @@ def audit_upgrade_status(
     cl_sources += [(template / "hooks" / "_lib" / lib_name, "hooks/_lib/" + lib_name) for lib_name in HOOK_LIB_FILES if (template / "hooks" / "_lib" / lib_name).is_file()]
     cl_sources += [(repo_root / "template/claude/router/ccswitch_admin.py", "hooks/ccswitch_admin.py")]
     cl_sources += skill_sources
-    cl["drift_files"] = drift(claude_root, cl_sources, core_rules=True)
+    cl["drift_files"] = drift(claude_root, cl_sources, core_rules=True, client="claude")
     cl["drift_files"].extend("hooks/" + name for name in CLAUDE_RETIRED_SCRIPTS if read_raw(claude_root / "hooks" / name) is not None)
     for sname in managed_skill_names:
         extend_stale_mirror_drift(cl["drift_files"], template / "skills" / sname, claude_root / "skills" / sname, claude_root)
+    for retired_sk in sorted(UPSTREAM_ONLY_SKILLS):
+        if (claude_root / "skills" / retired_sk).is_dir() and not _is_link_or_junction(claude_root / "skills" / retired_sk):
+            cl["drift_files"].append(f"skills/{retired_sk}")
     if not cl["hooks_aligned"]:
         cl["drift_files"].append("settings.json")
     router_sources = [(source, source.name) for source in _template_files(repo_root / "template/claude/router")]
@@ -3804,12 +4218,17 @@ def audit_upgrade_status(
 
     dsh_det = detection.get("dsh", {})
     dsh = _audit_cli(dsh_det)
-    dsh["hook_protocol"] = dsh_det.get("hook_protocol", "soft_rules_only")
+    dsh["hook_protocol"] = dsh_det.get("hook_protocol", "no_lifecycle_hooks")
+    dsh["sandbox_enforced"] = dsh_det.get("sandbox_enforced", "native_file_sandbox")
     dsh["hard_hooks_supported"] = bool(dsh_det.get("hard_hooks_supported", False))
+    dsh["evidence_state"] = dsh_det.get("evidence_state", "unknown_not_probed")
     dsh["meta_update_trigger"] = dsh_det.get("meta_update_trigger", "awaiting_upstream_dsh_hooks")
-    dsh["drift_files"] = drift(dsh_root, [(template / "rules/AGENTS.md", "AGENTS.md"), *skill_sources], core_rules=True)
+    dsh["drift_files"] = drift(dsh_root, [(template / "rules/AGENTS.md", "AGENTS.md"), *skill_sources], core_rules=True, client="dsh")
     for sname in managed_skill_names:
         extend_stale_mirror_drift(dsh["drift_files"], template / "skills" / sname, dsh_root / "skills" / sname, dsh_root)
+    for retired_sk in sorted(UPSTREAM_ONLY_SKILLS):
+        if (dsh_root / "skills" / retired_sk).is_dir() and not _is_link_or_junction(dsh_root / "skills" / retired_sk):
+            dsh["drift_files"].append(f"skills/{retired_sk}")
     dsh["credentials_present"] = any((dsh_root / name).is_file() for name in (".credentials.yaml", ".env"))
     if app_scope == "all":
         ag_active, cx_active, cl_active = True, True, True
@@ -4006,12 +4425,37 @@ def audit_upgrade_status(
         expect_cc_router or cl["router"]["installed"] or cl["router"]["config_exists"] or uses_local_router
     )
     cc_active = cl_active and inspect_cc_db and bool(not is_sandbox_run or ccswitch_db.is_file())
+    capability_matrix, evolution_signals, manifest_failed = _probe_client_capabilities(
+        detection,
+        {
+            "antigravity": ag.get("version"),
+            "codex": cx.get("version"),
+            "claude": cl.get("version"),
+            "dsh": dsh.get("version"),
+        },
+        fleet_profile,
+        repo_root,
+        is_sandbox_run=is_sandbox_run,
+        active_clients={
+            "antigravity": ag_active,
+            "codex": cx_active,
+            "claude": cl_active,
+            "dsh": dsh_active,
+        },
+    )
+    excluded_vendor_ids = {
+        str(item.get("vendor") or "").strip().lower()
+        for item in ((fleet_profile.get("excluded_or_retiring") or {}).get("excluded_vendors") or ())
+        if isinstance(item, dict)
+    }
     actions = []
     if ag_active:
         if ag["drift_files"] or ag["upgrade_recommended"]:
             actions.append("sync_antigravity_plugin")
         if ag["configured_model_retiring"]:
             actions.append("review_antigravity_models")
+        if manifest_failed:
+            actions.append("fix_antigravity_manifest")
     if cx_active:
         if cx["drift_files"]:
             actions.append("sync_codex")
@@ -4019,16 +4463,25 @@ def audit_upgrade_status(
             actions.append("sync_codex_model_defaults" if latest else "refresh_codex_model_catalog")
         if (cx.get("hooks_trust") or {}).get("status") == "untrusted_or_partial":
             actions.append("review_codex_hook_trust")
+        if cx.get("package_isolation_warning"):
+            actions.append("fix_codex_package_isolation")
     if cl_active:
         if cl["drift_files"]:
             actions.append("sync_claude")
         if cl["effortLevel"] != _default_claude_effort(repo_root) or cl["locked_effort_env"]:
             actions.append("sync_claude_model_defaults")
+        if "anthropic_native_claude" in excluded_vendor_ids:
+            fb_alias = str(cl_rules.get("default_fallback_alias") or "").strip().lower()
+            if fb_alias in {"claude", "opus", "sonnet", "haiku"}:
+                actions.append("fix_claude_fallback_alias")
+        if uses_local_router:
+            rp_model = str(cl_rules.get("router_primary_model") or "").strip()
+            rp_entry = (matrix.get("models") or {}).get(rp_model) if rp_model else None
+            if isinstance(rp_entry, dict) and rp_entry.get("enabled") is False:
+                actions.append("review_claude_router_primary")
     if dsh_active:
         if dsh["drift_files"]:
             actions.append("sync_dsh")
-        if dsh.get("hard_hooks_supported"):
-            actions.append("upgrade_dsh_hook_protocol")
     if router_active and (router_drift or not cl["router"]["config_exists"]):
         actions.append("sync_cc_router")
     if cc_active:
@@ -4049,6 +4502,16 @@ def audit_upgrade_status(
             actions.append("review_ccswitch_schema")
     if errors:
         actions.append("repair_unreadable_configs")
+    evaluated_clients = [
+        cname for cname, is_on in (
+            ("antigravity", ag_active), ("codex", cx_active), ("claude", cl_active), ("dsh", dsh_active),
+        ) if is_on
+    ]
+    skipped_clients = [
+        cname for cname, is_on in (
+            ("antigravity", ag_active), ("codex", cx_active), ("claude", cl_active), ("dsh", dsh_active),
+        ) if not is_on
+    ]
     toolchain = _audit_host_toolchain(is_sandbox_run=is_sandbox_run, detection=detection)
     eval_policy = fleet_profile.get("evaluation_policy") if isinstance(fleet_profile.get("evaluation_policy"), dict) else {}
     native_profiles = fleet_profile.get("native_agent_profiles") if isinstance(fleet_profile.get("native_agent_profiles"), dict) else {}
@@ -4120,9 +4583,16 @@ def audit_upgrade_status(
               "cross_side_status": cross_side_status,
               "antigravity": ag, "codex": cx, "claude": cl, "dsh": dsh, "cc_switch": cc,
               "subscription_candidates": subscription_candidates,
-              "summary": {"all_aligned": not actions, "recommended_actions": actions},
+              "capability_matrix": capability_matrix,
+              "summary": {
+                  "all_aligned": not actions,
+                  "recommended_actions": actions,
+                  "evolution_signals": evolution_signals,
+                  "evaluated_clients": evaluated_clients,
+                  "skipped_clients": skipped_clients,
+              },
               "adaptive_meta": _build_adaptive_meta_summary(
-                  fleet_profile, ag, cx, cl, repo_root=repo_root, ag_models=ag_models,
+                  fleet_profile, ag, cx, cl, repo_root=repo_root, ag_models=ag_models, dsh=dsh,
               ),
               "read_errors": errors}
     roots = [(home, "~"), (target_plugin_dir, "<antigravity>"), (codex_root, "<codex>"), (claude_root, "<claude>"),
@@ -4274,12 +4744,12 @@ def main() -> None:
     parser.add_argument("--target-dir", type=str, default="",
                         help="自定义反重力插件目录。配置 Zotero 时须采用 <配置目录>/plugins/user-guard 布局")
     parser.add_argument("--codex-home", type=str, default="", help="自定义 Codex 主配置目录（默认 $CODEX_HOME 或 ~/.codex，用于沙箱全量验证）")
-    parser.add_argument("--codex-skills-dir", default="", help="仅自定义 Codex 技能根目录（其下安装托管技能 cae-harness、cae-writing、cae-axioms 与 fleet-evolve，兼容隔离验证）")
+    parser.add_argument("--codex-skills-dir", default="", help="仅自定义 Codex 技能根目录（其下安装托管课题技能 cae-harness、cae-writing 与 cae-axioms，兼容隔离验证）")
     parser.add_argument("--claude-home", default="", help="Claude Code 主目录（默认 $CLAUDE_CONFIG_DIR 或 ~/.claude）")
     parser.add_argument("--dsh-home", default="", help="DeepSeek Harness 主目录（默认 $DSH_HOME 或 ~/.dsh）")
     parser.add_argument("--no-dsh-rules", action="store_true", help="跳过 DSH 全局 AGENTS.md")
-    parser.add_argument("--no-dsh-skill", action="store_true", help="跳过 DSH 托管技能（cae-harness、cae-writing、cae-axioms、fleet-evolve）")
-    parser.add_argument("--no-claude-skill", action="store_true", help="跳过 Claude 托管技能（cae-harness、cae-writing、cae-axioms、fleet-evolve）")
+    parser.add_argument("--no-dsh-skill", action="store_true", help="跳过 DSH 托管课题技能（cae-harness、cae-writing、cae-axioms）")
+    parser.add_argument("--no-claude-skill", action="store_true", help="跳过 Claude 托管课题技能（cae-harness、cae-writing、cae-axioms）")
     parser.add_argument("--no-claude-rules", action="store_true", help="跳过 Claude 全局 CLAUDE.md")
     parser.add_argument("--no-claude-agents", action="store_true", help="跳过 Claude 只读子代理")
     parser.add_argument("--no-claude-hooks", action="store_true", help="跳过 Claude 钩子同步")
@@ -4293,7 +4763,7 @@ def main() -> None:
     parser.add_argument("--skip-test", action="store_true", help="跳过安装后的全套自动化回归测试")
     parser.add_argument("--no-zotero", action="store_true", help="跳过本机可选 Zotero MCP 自动探测与配置")
     parser.add_argument("--zotero-cmd", type=str, default="", help="显式指定本地 zotero-mcp 可执行文件路径")
-    parser.add_argument("--no-codex-skill", action="store_true", help="跳过 Codex 托管技能（cae-harness、cae-writing、cae-axioms、fleet-evolve）安装")
+    parser.add_argument("--no-codex-skill", action="store_true", help="跳过 Codex 托管课题技能（cae-harness、cae-writing、cae-axioms）安装")
     parser.add_argument("--no-codex-rules", action="store_true", help="跳过 Codex 全局 AGENTS.md 核心总纲同步")
     parser.add_argument("--no-codex-agents", action="store_true", help="跳过 Codex 只读子代理 (agents/*.toml) 同步")
     parser.add_argument("--no-codex-hooks", action="store_true", help="跳过 Codex 钩子 (hooks.json + hooks/) 同步")
@@ -4537,8 +5007,14 @@ def main() -> None:
             agy_zotero_change = _plan_user_zotero(agy_config_root, zotero_exe)
         if target_plugin_dir is not None or (codex_root is not None and not args.no_codex_hooks) or (claude_root is not None and not args.no_claude_hooks):
             py_cmd = detect_hook_python_command(antigravity=target_plugin_dir is not None)
+        agy_rules_bytes = None
         if target_plugin_dir is not None:
             agy_hooks = _agy_hooks_bytes((template_dir / "hooks.json").read_bytes(), py_cmd)
+            raw_agy_rules = _decode_utf8(
+                template_dir / "rules" / "AGENTS.md",
+                (template_dir / "rules" / "AGENTS.md").read_bytes(),
+            )
+            agy_rules_bytes = render_rules_for_client(raw_agy_rules, "antigravity").encode("utf-8")
         install_notices: List[str] = []
         if codex_root is not None:
             _validate_path(codex_root / "config.toml", directory=False)
@@ -4598,7 +5074,10 @@ def main() -> None:
     try:
         # 部署反重力侧。
         if target_plugin_dir is not None:
-            mirror_sync_plugin(template_dir, target_plugin_dir, dry_run=args.dry_run, hooks_bytes=agy_hooks)
+            mirror_sync_plugin(
+                template_dir, target_plugin_dir, dry_run=args.dry_run,
+                hooks_bytes=agy_hooks, rules_bytes=agy_rules_bytes,
+            )
             _apply_file_change(agy_zotero_change, args.dry_run)
             for change in agy_model_changes:
                 _apply_file_change(change, args.dry_run)
@@ -4607,6 +5086,8 @@ def main() -> None:
         if install_cx:
             for skill_dst in codex_skill_dirs:
                 mirror_sync_plugin(template_dir / "skills" / skill_dst.name, skill_dst, dry_run=args.dry_run)
+            if codex_skill_dirs:
+                _clean_retired_upstream_skills(codex_skill_dirs[0].parent, dry_run=args.dry_run)
             if full_codex_sync and codex_root is not None:
                 if not args.dry_run:
                     codex_root.mkdir(parents=True, exist_ok=True)
@@ -4621,6 +5102,7 @@ def main() -> None:
             if not args.no_claude_skill:
                 for name in skill_names:
                     mirror_sync_plugin(template_dir / "skills" / name, claude_root / "skills" / name, dry_run=args.dry_run)
+                _clean_retired_upstream_skills(claude_root / "skills", dry_run=args.dry_run)
             if not args.no_claude_rules:
                 _sync_claude_global_rules(template_dir / "rules/AGENTS.md", claude_root, args.dry_run)
             if not args.no_claude_agents:
@@ -4638,10 +5120,11 @@ def main() -> None:
                 _sync_cc_router(claude_template_dir / "router", claude_root, args.dry_run)
         if dsh_root is not None:
             if not args.no_dsh_rules:
-                _sync_global_rules(template_dir / "rules/AGENTS.md", dsh_root / "AGENTS.md", "DeepSeek Harness", args.dry_run)
+                _sync_global_rules(template_dir / "rules/AGENTS.md", dsh_root / "AGENTS.md", "DeepSeek Harness", args.dry_run, client="dsh")
             if not args.no_dsh_skill:
                 for name in skill_names:
                     mirror_sync_plugin(template_dir / "skills" / name, dsh_root / "skills" / name, dry_run=args.dry_run)
+                _clean_retired_upstream_skills(dsh_root / "skills", dry_run=args.dry_run)
         if retire_ccswitch:
             result = ccswitch_admin.retire_prompts_and_skills(
                 ccswitch_db, purge=args.purge_ccswitch_legacy, dry_run=args.dry_run

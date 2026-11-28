@@ -629,14 +629,21 @@ class TestEndToEndIntegration(unittest.TestCase):
             for group in groups
             for handler in group.get("hooks", [])
         ]
-        for script_name in ("session_context_loader.py", "status_guard.py", "reply_repeat_guard.py", "handoff_gate.py"):
-            self.assertTrue(any(script_name in cmd for cmd in claude_cmds), f"Claude hooks.json 缺少 {script_name}")
+        self.assertEqual(len(claude_cmds), 5, "Claude hooks.json 须每事件仅注册 1 条单入口 uguard_hook.py")
+        for event_name in ("SessionStart", "PostCompact", "UserPromptSubmit", "PreToolUse", "Stop"):
+            ev_cmds = [h["command"] for g in claude_events[event_name] for h in g.get("hooks", [])]
+            self.assertEqual(len(ev_cmds), 1, f"Claude {event_name} 应仅注册 1 条单入口 handler")
+            self.assertIn("uguard_hook.py", ev_cmds[0])
+            self.assertIn(f"--event {event_name}", ev_cmds[0])
         for md_name in ("readonly-auditor.md", "readonly-reader.md", "readonly-collaborator.md"):
             claude_agent_path = claude_tpl / "agents" / md_name
             self.assertTrue(claude_agent_path.is_file(), f"缺少 Claude 只读子代理模板: {md_name}")
             claude_agent_text = claude_agent_path.read_text(encoding="utf-8")
             self.assertTrue(claude_agent_text.startswith(f"---\nname: {claude_agent_path.stem}\n"))
             self.assertIn("tools: Read, Grep, Glob", claude_agent_text)
+            self.assertIn("disallowedTools: Write, Edit, MultiEdit, NotebookEdit, Bash", claude_agent_text)
+            self.assertIn("permissionMode: dontAsk", claude_agent_text)
+            self.assertIn("maxTurns: 20", claude_agent_text)
             self.assertIn("model: inherit", claude_agent_text)
             self.assertIn("严禁修改任何文件", claude_agent_text)
             self.assertIn("#L10-L25", claude_agent_text)
@@ -1419,7 +1426,7 @@ class TestEndToEndIntegration(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()):
                 INSTALLER._sync_codex_global_rules(tpl_rules, codex_dir, dry_run=False)
             synced = codex_agents.read_text(encoding="utf-8")
-            self.assertIn("R3.1. 四端对等层级与按专长协作编排", synced)
+            self.assertIn("R3.1. 四端对等协作与原生编排共存", synced)
             self.assertIn("R3.6. 验收红线与诚实披露", synced)
             migrated_env_tail = (
                 "## 工具与本机运行环境（自定义）\n"
@@ -1631,20 +1638,31 @@ class TestEndToEndIntegration(unittest.TestCase):
                     "workspacePaths": [str(ws_dir)], "toolCall": {"name": name, "args": args},
                 })
 
-            # 写入人类首条含 /goal 指令与 16 次 CHECKPOINT，直接激发 Stage-2 drain
+            # 写入人类首条含 /goal 指令与 16 次 CHECKPOINT：v3.0 下活跃 /goal 不被启发式阈值强杀（仅 Stage-1 advisory）
             lines = [json.dumps({"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "/goal\n执行端到端长会话验证"}, ensure_ascii=False)]
             for idx in range(1, 17):
                 lines.append(json.dumps({"step_index": idx * 100, "source": "SYSTEM", "type": "CHECKPOINT"}))
             tp.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
             conv_id = "e2e-handoff-conv"
+            out_pre_adv = run_sub(pre_cmd, {"conversationId": conv_id, "transcriptPath": str(tp), "hookEventName": "PreInvocation"})
+            self.assertEqual(len(out_pre_adv["injectSteps"]), 1)
+            self.assertNotIn("Stage-2 drain", out_pre_adv["injectSteps"][0]["systemMessage"]["systemMessage"])
+
+            # 追加硬触发（宿主长度告警 banner）后即刻进入 Stage-2 drain，并要求停机时附带 GOAL_CANCELLED
+            with open(tp, "a", encoding="utf-8", newline="\n") as f:
+                f.write(json.dumps({
+                    "step_index": 1601, "source": "SYSTEM_SDK", "type": "SYSTEM_MESSAGE",
+                    "content": "This conversation grew too large, so the history before this point may be missing or incomplete.",
+                }, ensure_ascii=False) + "\n")
             out_pre = run_sub(pre_cmd, {"conversationId": conv_id, "transcriptPath": str(tp), "hookEventName": "PreInvocation"})
             self.assertEqual(len(out_pre["injectSteps"]), 1)
             self.assertIn("Stage-2 drain", out_pre["injectSteps"][0]["systemMessage"]["systemMessage"])
 
-            # 子进程调用 invoke_subagent 必被阻断；写交接档放行
+            # 子进程调用 invoke_subagent 必被阻断；写交接档放行；纯 UI 工具已从 PreToolUse matcher 收窄豁免
             out_subagent = dispatch_pre_tool("invoke_subagent", {})
             self.assertEqual(out_subagent["decision"], "deny")
+            self.assertFalse(any(re.search(g["matcher"], "update_focus") for g in hooks_cfg["PreToolUse"]))
 
             out_handoff = dispatch_pre_tool(
                 "write_to_file", {"TargetFile": str(ws_dir / "HANDOFF_NEXT.md"), "CodeContent": "# handoff"},
@@ -1654,8 +1672,22 @@ class TestEndToEndIntegration(unittest.TestCase):
             gate_state = json.loads(gate_path.read_bytes())
             gate_state["phase"] = "freeze"
             gate_path.write_text(json.dumps(gate_state), encoding="utf-8")
-            self.assertEqual(dispatch_pre_tool("new_tool_without_guard_alias", {})["decision"], "deny")
-            self.assertEqual(dispatch_pre_tool("finish", {})["decision"], "allow")
+            # freeze 阶段：对单入口 uguard_hook.py 直接传入未知工具名仍严格 fail-closed 拦截
+            pre_tool_cmd = hooks_cfg["PreToolUse"][0]["hooks"][0]["command"]
+            self.assertEqual(
+                run_sub(pre_tool_cmd, {
+                    "conversationId": conv_id, "cwd": str(ws_dir), "workspacePaths": [str(ws_dir)],
+                    "toolCall": {"name": "new_tool_without_guard_alias", "args": {}},
+                })["decision"],
+                "deny",
+            )
+            self.assertEqual(
+                run_sub(pre_tool_cmd, {
+                    "conversationId": conv_id, "cwd": str(ws_dir), "workspacePaths": [str(ws_dir)],
+                    "toolCall": {"name": "finish", "args": {}},
+                })["decision"],
+                "allow",
+            )
 
             # Stop 子进程验收缺失 prompt / GOAL_CANCELLED 时阻断，补全后放行
             with open(tp, "a", encoding="utf-8", newline="\n") as f:
@@ -1684,7 +1716,7 @@ class TestEndToEndIntegration(unittest.TestCase):
             out_stop_ok = run_sub(stop_cmd, {"conversationId": conv_id, "terminationReason": "NO_TOOL_CALL", "transcriptPath": str(tp)})
             self.assertEqual(out_stop_ok["decision"], "allow")
 
-            # 运行单 Codex 安装生成的默认提示钩子。
+            # 运行单 Codex 安装生成的默认提示钩子（单入口 uguard_hook.py + policy.json 持久化）。
             codex_only_home = root / "codex_only"
             proc_cx = subprocess.run(
                 [
@@ -1707,12 +1739,15 @@ class TestEndToEndIntegration(unittest.TestCase):
                 timeout=30,
             )
             self.assertEqual(proc_cx.returncode, 0, proc_cx.stderr)
+            self.assertTrue((codex_only_home / "hooks" / "uguard_hook.py").is_file())
             self.assertTrue((codex_only_home / "hooks" / "handoff_gate.py").is_file())
             self.assertTrue((codex_only_home / "hooks" / "session_context_loader.py").is_file())
             self.assertTrue((codex_only_home / "hooks" / "status_guard.py").is_file())
             self.assertTrue((codex_only_home / "hooks" / "reply_repeat_guard.py").is_file())
             codex_hooks = json.loads((codex_only_home / "hooks.json").read_text(encoding="utf-8"))["hooks"]
             self.assertEqual(set(codex_hooks), {"SessionStart", "PostCompact", "UserPromptSubmit", "PreToolUse", "Stop"})
+            cx_policy = json.loads((codex_only_home / "hooks" / "state" / "handoff" / "policy.json").read_text(encoding="utf-8"))
+            self.assertEqual((cx_policy["mode"], cx_policy["compact_limit"]), ("advisory", 0))
             sid = "isolated-codex-handoff"
             rollout = codex_only_home / f"rollout-{sid}.jsonl"
             rollout.write_text(json.dumps({"type": "session_meta", "payload": {"id": sid, "source": "cli"}}) + "\n", encoding="utf-8")
@@ -1721,8 +1756,8 @@ class TestEndToEndIntegration(unittest.TestCase):
                 ("PostCompact", {"turn_id": "turn-1", "trigger": "auto"}, "systemMessage"),
                 ("SessionStart", {"source": "compact"}, "hookSpecificOutput"),
             ):
-                handler = next(h for h in codex_hooks[event][0]["hooks"] if "handoff_gate.py" in h["command"])
-                self.assertIn("--mode advisory --compact-limit 0", handler["command"])
+                handler = next(h for h in codex_hooks[event][0]["hooks"] if "uguard_hook.py" in h["command"])
+                self.assertIn(f"--client codex --event {event}", handler["command"])
                 result = subprocess.run(
                     _build_subprocess_cmd(handler["command"]),
                     input=json.dumps({"hook_event_name": event, "session_id": sid, "cwd": str(root),
@@ -1759,10 +1794,12 @@ class TestEndToEndIntegration(unittest.TestCase):
             legacy = {"description": "用户原有说明\n第二行", "hooks": {"SessionStart": [{"matcher": "^(compact|resume)$", "hooks": [valid, sibling]}, other_group],
                                 "Notification": other_event, "Stop": [{"hooks": [other_gate, shared_path_gate]}]}}
             quote = (lambda value: '"' + value + '"') if os.name == "nt" else shlex.quote
-            log = (loader_path.parent / "logs" / "session-context.jsonl").as_posix()
+            uguard_path = (loader_path.parent / "uguard_hook.py").as_posix()
+            guard_state_raw = (loader_path.parent / "state").as_posix()
+            guard_logs_raw = (loader_path.parent / "logs").as_posix()
             expected_loader = {**valid, "command": (
-                f'{quote(sys.executable)} -X utf8 -I -B {quote(loader_path.as_posix())} '
-                f'--client codex --state-dir {quote(state_dir)} --log {quote(log)}'
+                f'{quote(sys.executable)} -X utf8 -I -B {quote(uguard_path)} '
+                f'--client codex --event SessionStart --state-dir {quote(guard_state_raw)} --log-dir {quote(guard_logs_raw)}'
             )}
             expected_legacy = json.loads(json.dumps(legacy))
             expected_legacy["hooks"]["SessionStart"][0]["hooks"][0] = expected_loader
@@ -1776,7 +1813,8 @@ class TestEndToEndIntegration(unittest.TestCase):
             result = install()
             self.assertEqual(result.returncode, 0, result.stderr)
             upgraded_bytes = hooks_path.read_bytes()
-            upgraded = json.loads(upgraded_bytes)["hooks"]
+            upgraded_doc = json.loads(upgraded_bytes)
+            upgraded = upgraded_doc["hooks"]
             self.assertEqual(upgraded["SessionStart"][0]["hooks"][:2], [expected_loader, sibling])
             self.assertEqual(upgraded["SessionStart"][1], other_group)
             self.assertEqual(upgraded["Notification"], other_event)
@@ -1786,10 +1824,15 @@ class TestEndToEndIntegration(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(hooks_path.read_bytes(), upgraded_bytes)
 
+            policy_path = codex_root / "hooks" / "state" / "handoff" / "policy.json"
             result = install("--codex-handoff-mode", "enforce", "--codex-handoff-compactions", "2")
             self.assertEqual(result.returncode, 0, result.stderr)
             enforce_bytes = hooks_path.read_bytes()
-            self.assertIn(b"--mode enforce --compact-limit 2", enforce_bytes)
+            enforce_doc = json.loads(enforce_bytes)
+            # 切换 advisory -> enforce 时仅更新 policy.json 与 description 标记，hooks 命令串保持字节不变以保护 trusted_hash
+            self.assertEqual(enforce_doc["hooks"], upgraded)
+            self.assertIn("mode=enforce compact_limit=2", enforce_doc["description"])
+            self.assertEqual(json.loads(policy_path.read_bytes()), {"mode": "enforce", "compact_limit": 2})
             result = install()
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(hooks_path.read_bytes(), enforce_bytes)
@@ -1802,20 +1845,21 @@ class TestEndToEndIntegration(unittest.TestCase):
             result = install("--codex-handoff-mode", "off")
             self.assertEqual(result.returncode, 0, result.stderr)
             disabled_bytes = hooks_path.read_bytes()
+            self.assertEqual(json.loads(policy_path.read_bytes()), {"mode": "off", "compact_limit": 2})
             py_prefix = INSTALLER.detect_hook_python_command()
-            guard_state = quote((loader_path.parent / "state").as_posix())
-            guard_logs = quote((loader_path.parent / "logs").as_posix())
+            guard_state = quote(guard_state_raw)
+            guard_logs = quote(guard_logs_raw)
             expected_status = {
                 "type": "command",
-                "command": f'{py_prefix} {quote((loader_path.parent / "status_guard.py").as_posix())} '
-                           f'--client codex --state-dir {guard_state} --log-dir {guard_logs}',
-                "timeout": 15, "statusMessage": "检查工作区写边界与日志重复读取",
+                "command": f'{py_prefix} {quote(uguard_path)} '
+                           f'--client codex --event PreToolUse --state-dir {guard_state} --log-dir {guard_logs}',
+                "timeout": 15, "statusMessage": "检查工作区写边界、票据与交接状态",
             }
             expected_reply = {
                 "type": "command",
-                "command": f'{py_prefix} {quote((loader_path.parent / "reply_repeat_guard.py").as_posix())} '
-                           f'--client codex --state-dir {guard_state} --log-dir {guard_logs}',
-                "timeout": 15, "statusMessage": "检查重复状态回复",
+                "command": f'{py_prefix} {quote(uguard_path)} '
+                           f'--client codex --event Stop --state-dir {guard_state} --log-dir {guard_logs}',
+                "timeout": 15, "statusMessage": "检查回合回执、重复回复与交接状态",
             }
             self.assertEqual(json.loads(disabled_bytes), {
                 **expected_legacy, "description": legacy["description"] + "\n[user-guard codex-handoff v1 mode=off compact_limit=2]",
@@ -1831,7 +1875,8 @@ class TestEndToEndIntegration(unittest.TestCase):
             self.assertEqual(hooks_path.read_bytes(), disabled_bytes)
             result = install("--codex-handoff-mode", "advisory")
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn(b"--mode advisory --compact-limit 2", hooks_path.read_bytes())
+            self.assertIn("mode=advisory compact_limit=2", json.loads(hooks_path.read_bytes())["description"])
+            self.assertEqual(json.loads(policy_path.read_bytes()), {"mode": "advisory", "compact_limit": 2})
 
             for malformed in (b"{bad json", b'{"hooks":{"SessionStart":{}}}', b'{"hooks":{},"hooks":{}}'):
                 with self.subTest(malformed=malformed):
@@ -1893,6 +1938,10 @@ class TestEndToEndIntegration(unittest.TestCase):
             script_args = [(root / "hooks" / "session_context_loader.py").as_posix(), "--client", "codex",
                            "--state-dir", (root / "hooks" / "state" / "session-context").as_posix(),
                            "--log", (root / "hooks" / "logs" / "session-context.jsonl").as_posix()]
+            upgraded_args = [(root / "hooks" / "uguard_hook.py").as_posix(), "--client", "codex",
+                             "--event", "SessionStart",
+                             "--state-dir", (root / "hooks" / "state").as_posix(),
+                             "--log-dir", (root / "hooks" / "logs").as_posix()]
             for executable, launcher in prefixes:
                 for flags in (["-I", "-B"], INSTALLER.HOOK_PYTHON_FLAGS):
                     for arg_count in (3, 5, 7):
@@ -1911,15 +1960,13 @@ class TestEndToEndIntegration(unittest.TestCase):
                                 plan = INSTALLER._plan_codex_hooks(path, template, replacement)
                                 probe.assert_called_once_with(interpreter, launcher)
                                 self.assertEqual(path.read_bytes(), original)
-                                if flags == INSTALLER.HOOK_PYTHON_FLAGS and arg_count == len(script_args):
-                                    self.assertIsNone(plan.change)
-                                else:
-                                    self.assertIsNotNone(plan.change)
-                                    handler = json.loads(plan.change.content)["hooks"]["SessionStart"][0]["hooks"][0]
-                                    self.assertEqual(INSTALLER._codex_hook_tokens(handler),
-                                                     [executable, *launcher, *INSTALLER.HOOK_PYTHON_FLAGS, *script_args])
-                                    self.assertEqual(handler, {**old, "command": handler["command"]})
-                                    path.write_bytes(plan.change.content)
+                                # 旧 session_context_loader.py 统一平滑升级为单入口 uguard_hook.py，保留原可用解释器前缀与自定义字段
+                                self.assertIsNotNone(plan.change)
+                                handler = json.loads(plan.change.content)["hooks"]["SessionStart"][0]["hooks"][0]
+                                self.assertEqual(INSTALLER._codex_hook_tokens(handler),
+                                                 [executable, *launcher, *INSTALLER.HOOK_PYTHON_FLAGS, *upgraded_args])
+                                self.assertEqual(handler, {**old, "command": handler["command"]})
+                                path.write_bytes(plan.change.content)
                                 installed = path.read_bytes()
                                 self.assertIsNone(INSTALLER._plan_codex_hooks(path, template, replacement).change)
                                 self.assertEqual(path.read_bytes(), installed)
@@ -2475,7 +2522,10 @@ class TestEndToEndIntegration(unittest.TestCase):
             interpreter = str(Path(sys.executable).resolve())
             quote = (lambda value: '"' + value + '"') if os.name == "nt" else shlex.quote
             script = (root / "hooks" / "handoff_gate.py").as_posix()
+            uguard = (root / "hooks" / "uguard_hook.py").as_posix()
             state = (root / "hooks" / "state" / "handoff").as_posix()
+            guard_state = (root / "hooks" / "state").as_posix()
+            guard_logs = (root / "hooks" / "logs").as_posix()
             old_prefix = f'{quote(interpreter)} -X utf8 -I -B'
             old = {"type": "command", "command": (
                 f'{old_prefix} {quote(script)} --client codex --mode advisory --compact-limit 0 --state-dir {quote(state)}'
@@ -2490,20 +2540,26 @@ class TestEndToEndIntegration(unittest.TestCase):
                     plan = INSTALLER._plan_codex_hooks(path, REPO_ROOT / "template/codex/hooks.json", replacement, "enforce", 3)
                     probe.assert_called_once_with(interpreter, [])
                     self.assertIsNotNone(plan.change)
+                    self.assertEqual((plan.mode, plan.compact_limit), ("enforce", 3))
                     handler = json.loads(plan.change.content)["hooks"]["Stop"][0]["hooks"][0]
                     tokens = INSTALLER._codex_hook_tokens(handler)
                     expected_prefix = old_prefix if working else replacement
                     prefix_tokens = INSTALLER._codex_hook_tokens({"type": "command", "command": expected_prefix})
                     self.assertEqual(tokens[:-9], prefix_tokens)
-                    self.assertEqual(tokens[-9:], [script, "--client", "codex", "--mode", "enforce",
-                                                  "--compact-limit", "3", "--state-dir", state])
+                    self.assertEqual(tokens[-9:], [uguard, "--client", "codex", "--event", "Stop",
+                                                  "--state-dir", guard_state, "--log-dir", guard_logs])
                     self.assertEqual(handler["timeout"], old["timeout"])
                     self.assertEqual(handler["statusMessage"], old["statusMessage"])
                     self.assertEqual(path.read_bytes(), original)
             with mock.patch.object(INSTALLER, "_hook_python_candidates", return_value=[("", interpreter, [])]), \
                     mock.patch.object(INSTALLER, "_is_working_python_cmd", return_value=True):
-                plan = INSTALLER._plan_codex_hooks(path, REPO_ROOT / "template/codex/hooks.json", replacement, "advisory", 0)
-            self.assertEqual(json.loads(plan.change.content)["hooks"]["Stop"][0]["hooks"][0], old)
+                plan_adv = INSTALLER._plan_codex_hooks(path, REPO_ROOT / "template/codex/hooks.json", replacement, "advisory", 0)
+                plan_enf = INSTALLER._plan_codex_hooks(path, REPO_ROOT / "template/codex/hooks.json", replacement, "enforce", 3)
+            # 无论 advisory 还是 enforce，单入口 uguard_hook.py 命令串严格字节一致
+            self.assertEqual(
+                json.loads(plan_adv.change.content)["hooks"]["Stop"][0]["hooks"][0],
+                json.loads(plan_enf.change.content)["hooks"]["Stop"][0]["hooks"][0],
+            )
 
     def test_39_installer_entrypoints_preserve_required_encodings(self) -> None:
         ps1 = (REPO_ROOT / "install.ps1").read_bytes()
@@ -2740,8 +2796,8 @@ class TestEndToEndIntegration(unittest.TestCase):
                 probe.assert_called_once_with(interpreter, [])
                 self.assertIsNotNone(plan.change)
                 upgraded = json.loads(plan.change.content)["hooks"]["SessionStart"][0]["hooks"]
-                self.assertEqual(len(upgraded), 2)
-                self.assertEqual(sum("session_context_loader.py" in h["command"] for h in upgraded), 1)
+                self.assertEqual(len(upgraded), 1)
+                self.assertEqual(sum("uguard_hook.py" in h["command"] for h in upgraded), 1)
                 self.assertEqual(upgraded[0]["timeout"], 29)
                 self.assertEqual(upgraded[0]["statusMessage"], "保留既有状态提示")
                 hooks_path.write_bytes(plan.change.content)

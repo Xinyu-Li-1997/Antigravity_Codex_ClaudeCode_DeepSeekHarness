@@ -1712,7 +1712,7 @@ def _validate_isolation(prefix, mode, readonly):
         if prefix == 'agy':
             raise HarnessError('agy 后端不支持仅保留钩子并剥离全局规则/技能的 hooks_only 模式，请选用 codex 或 claude')
         if prefix == 'dsh':
-            raise HarnessError('dsh 当前为软规则模式（soft_rules_only），不支持 hooks_only 隔离，请选用 no_skills、clean_room 或改用 codex/claude')
+            raise HarnessError('dsh 当前无原生生命周期硬钩子（no_lifecycle_hooks，仅原生文件沙箱），不支持 hooks_only 隔离，请选用 no_skills、clean_room 或改用 codex/claude')
 
 
 def _copy_tree_no_links(src_dir, dst_dir):
@@ -2498,7 +2498,7 @@ def invoke_readonly_engine(spec, target_dir, prompt, backends, timeout_sec=600, 
 def invoke_edit_worker(spec, target_dir, prompt, backends, timeout_sec=600, effort=None, retry_quota=False,
                        *, profile=None, batch=None, receipt=None, isolation='', stage_files=None, **session):
     result = invoke_engine(spec, target_dir, prompt, backends, TASK_JSON_SCHEMA, False, timeout_sec,
-                           'readonly-collaborator', stage_files, effort, retry_quota, profile=profile, batch=batch, receipt=receipt,
+                           None, stage_files, effort, retry_quota, profile=profile, batch=batch, receipt=receipt,
                            isolation=isolation, **session)
     return json.dumps(result, ensure_ascii=False)
 

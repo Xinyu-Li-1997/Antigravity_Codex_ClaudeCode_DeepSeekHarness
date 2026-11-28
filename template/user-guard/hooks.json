@@ -3,24 +3,24 @@
     "SessionStart": [
       {
         "type": "command",
-        "command": "python3 -X utf8 -I -B ./hooks/session_context_loader.py --event SessionStart",
+        "command": "python3 -X utf8 -I -B ./hooks/uguard_hook.py --client antigravity --event SessionStart",
         "timeout": 30
       }
     ],
     "PreInvocation": [
       {
         "type": "command",
-        "command": "python3 -X utf8 -I -B ./hooks/session_context_loader.py --event PreInvocation",
+        "command": "python3 -X utf8 -I -B ./hooks/uguard_hook.py --client antigravity --event PreInvocation",
         "timeout": 30
       }
     ],
     "PreToolUse": [
       {
-        "matcher": ".*",
+        "matcher": "^(?:run_command|command_status|write_file|write_to_file|edit_file|replace_file_content|multi_replace_file_content|sed_file|notebook_edit|apply_patch|read_file|view_file|view_image|open_image|generate_image|imagegen|manage_task|run_workflow|swarm|invoke_subagent|define_subagent|manage_subagents|send_message|post_message|swarm_wait|schedule|browser_.*|call_mcp_tool)$",
         "hooks": [
           {
             "type": "command",
-            "command": "python3 -X utf8 -I -B ./hooks/status_guard.py",
+            "command": "python3 -X utf8 -I -B ./hooks/uguard_hook.py --client antigravity --event PreToolUse",
             "timeout": 15
           }
         ]
@@ -29,7 +29,7 @@
     "Stop": [
       {
         "type": "command",
-        "command": "python3 -X utf8 -I -B ./hooks/reply_repeat_guard.py",
+        "command": "python3 -X utf8 -I -B ./hooks/uguard_hook.py --client antigravity --event Stop",
         "timeout": 15
       }
     ]

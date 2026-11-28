@@ -13,6 +13,9 @@ template/user-guard/hooks/state/
 template/user-guard/hooks/logs/
 *.log
 
+# Local per-machine profile overlay (never commit host-private card/model choices)
+fleet_profile.local.json
+
 # OS / Editor files
 .DS_Store
 Thumbs.db

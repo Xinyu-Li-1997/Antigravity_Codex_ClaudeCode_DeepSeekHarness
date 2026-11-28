@@ -1,10 +1,10 @@
 # 科学计算与工程研发日常工作流指南
 
-本文面向已完成本机全局安装（见 [仓库总说明](../README.md#一安装与快速上手)）的科研人员与工程师，结合偏微分方程（PDE）求解器和系统软件研发场景，说明任务分流原则、显式点名与角色选路、大型仓库分片阅读、求解器编码验收闭环，以及超时续接与压缩恢复操作。
+本文面向已完成本机全局安装（见 [仓库总说明](../README.md#一安装与快速上手)）的科研人员与工程师，结合偏微分方程（PDE）求解器和系统软件研发场景，系统说明四客户端原生模式与本仓库的配合方式、跨端派工与角色选路、大型仓库分片阅读、求解器编码验收闭环，以及压缩恢复与按需技能协同。
 
-模块架构与钩子细节见 [架构设计与钩子说明](architecture-and-hooks.md#三全通道确认票据与四阶段共有钩子)，完整命令参数与确认单字段定义见 [cae-harness 技能规程](../template/user-guard/skills/cae-harness/SKILL.md#两道可用性检查与全通道确认单)。
+模块架构与钩子细节见 [架构设计与钩子说明](architecture-and-hooks.md#三全通道确认票据与四阶段共有钩子)，完整命令参数与确认单字段定义见 [cae-harness 技能规程](../template/user-guard/skills/cae-harness/SKILL.md#两道可用性检查与跨端确认单)。
 
-Windows 统一使用 `python -B -X utf8`，WSL2 与 Linux 使用 `python3 -B -X utf8`。下文多行命令示例采用 PowerShell 续行符 `` ` ``，在 WSL2 或 Linux Bash 中请替换为 `\` 并去掉 `python` 后的环境变量差异。文中 `<...>` 表示按实际课题替换的占位符；票据与回执应保存于授权工作目录内。执行命令前，先将 `HARNESS` 指向本机任意已安装客户端对应的技能脚本（维护本配置仓库时可指向 `template/user-guard/skills/cae-harness/scripts/cae_harness.py`）：
+Windows 统一使用 `python -B -X utf8`，WSL2 与 Linux 使用 `python3 -B -X utf8`。下文多行命令示例采用 PowerShell 续行符 `` ` ``，在 WSL2 或 Linux Bash 中请替换为 `\`。文中 `<...>` 表示按实际课题替换的占位符；票据与回执应保存于授权工作目录内。执行命令前，先将 `HARNESS` 指向本机任意已安装客户端对应的技能脚本（维护本配置仓库时可指向 `template/user-guard/skills/cae-harness/scripts/cae_harness.py`）：
 
 ```powershell
 # Windows PowerShell（按本机已安装客户端任选一行）：
@@ -24,9 +24,61 @@ HARNESS="$HOME/.gemini/config/plugins/user-guard/skills/cae-harness/scripts/cae_
 
 ---
 
-## 一、任务分流、显式点名与角色选路
+## 一、四客户端原生模式与本仓库协作指南
 
-主会话保持用户选定的客户端、模型与推理强度。任务分流遵循按**上下文污染度**切分的原则：**局部修改、强耦合小步联动、零星审查修订与本机环境操作，留在主会话直接闭环**，不必按待办条目机械拆单；**广度调研、大文件通读、接口边界清晰的数理推导与成块求解器实现，以及独立代码与文档审查**，交由原生子代理或后台隔离进程执行，仅带回摘要与落盘链接，配合外置清单与分段交接防止主会话过早频繁压缩。
+面对四个客户端不断丰富的新功能，先记住一条总分工原则，避免同端内耗或重复造轮子：
+
+- **同软件里的事，直接用宿主原生能力**：构思访谈、制定计划、同端多代理并行、手动清理上下文、浏览器交互、定时自动化与插件体检，直接使用当前客户端原生命令；本仓库门禁对用户显式发起的原生模式和只读并发直接放行，只守住项目外写边界（`R4`）与压缩防失忆（`R9`）。
+- **跨软件、铁面验收与公理级深审，用本仓库独有工具**：需要跨不同模型做独立双盲审查、长链数理推导、`--write-scope` 加 `--verify-cmd` 强制闭环编码、离线确定性核验（`read-plan`、`cross-check`、`reconcile`、`check-grounding`）或按需公理验证（`cae-axioms`）时，调用本仓库技能。
+
+### 1. Antigravity（`agy`）各原生模式用法与配合
+
+| 原生模式或功能 | 适用场景 | 与本仓库的配合方式 |
+| --- | --- | --- |
+| `/grill-me` 与 `/plan` | 需求模糊时先交互澄清，或复杂改动前对齐执行计划 | 原生交互直接放行；需要跨模型双盲方案对比时，再把定稿需求交给 `cae-harness` 盲出备选方案 |
+| `/teamwork` | 大型跨模块工程需要多代理自治推进 | 用户显式发起后直接放行（内部访谈与嵌套子代理均不再触发外置票据阻断），`R4` 写边界全程有效；收口后再用 `reconcile` 与 `check-grounding` 独立核账 |
+| `/boost` | 复杂研究或编码需要深思熟虑与多视角校验 | 适合同端深推理直接推进；若需要异构模型交叉挑刺，在关键节点再追加跨端 `audit` |
+| `/swarm` | 明确拆分为多个独立编辑分片的同端并行开发 | 并行编辑流各自在隔离工作副本推进；合并前由主会话做 `reconcile` 依赖核对与全量回归 |
+| `run_workflow` | 需用 Python 编排扇出、流水线或规则聚合的多步代理任务 | 只读聚合直接放行，内部静态写边界按 `R4` 守卫（交互主会话不再因工作区内动态路径变量误杀） |
+| `/goal` | 夜间或长时持续推进直至达标 | 默认 `advisory` 模式且 `/goal` 激活期不因启发式压缩次数强杀；支持中英文取消口令，仅宿主真实截断或用户喊停时才强制交接 |
+| `/compact` | 主动压缩历史释放上下文窗口 | 正常触发无损原话归档与双窗口助手回复归档，且单独计数，不计入自动压缩抖动熔断 |
+| `/browser` | 网页交互、前端可视化排查与表单流程 | 原生放行；进入强制收尾期仍放行 `browser_close` 清理页面 |
+| `/schedule` 与 `automation` | 定时巡检、延时提醒或后台周期任务 | 日常直接使用；收尾期放行查询与取消已有定时，仅拦新建周期任务 |
+| `/learn` 与 `/plugin` | 总结经验生成局部技能，或查看管理插件 | `/learn` 生成的课题 `.agents/`、`skills/` 与 `SKILL.md` 不触发论文长文免审误拦；`/plugin` 校验可配合 `agy plugin validate --strict` |
+| `research` 与 `readonly-*` | 快速代码检索、长文献摘录与逐行核对 | 探索源码用原生 `research`；严格原文摘录与行号核验用 `readonly-reader`、`readonly-auditor`、`readonly-collaborator`，多路只读直接放行 |
+
+### 2. Codex（`codex`）原生模式与配合
+
+| 原生模式或能力 | 适用场景 | 与本仓库的配合方式 |
+| --- | --- | --- |
+| `codex review` | 本机交互终端快速评审当前工作区改动 | 适合同端快评；重大架构或跨模型盲审再交给 `cae-harness audit` 或 `batch` |
+| `codex sandbox` 与 `default_permissions` | 操作系统级目录与命令写边界防护 | 安装器自动兼容新版 `default_permissions`（不再强写冲突的旧式 `sandbox_mode`），与单入口 `uguard_hook.py` 构成双重边界 |
+| `codex agents` 与 `spawn_agent` | 原生子代理并行读写 | 仓库下发的 `readonly-*.toml` 显式锁定 `sandbox_mode = "read-only"` 并关闭插件与记忆干扰；同端只读直接放行 |
+| `codex plugin` 与 `codex doctor` | 管理 Codex 扩展包与排查环境健康 | 与 `install.py --audit-upgrade` 互补；单入口命令字节恒定，切换交接模式不再破坏 `[hooks.state]` 信任哈希 |
+
+### 3. Claude Code（`claude`）原生模式与配合
+
+| 原生模式或能力 | 适用场景 | 与本仓库的配合方式 |
+| --- | --- | --- |
+| `Agent`、`Task` 与 `claude --agents` | 委派只读审查或隔离实现子代理 | 仓库下发的 `readonly-*.md` 通过 `disallowedTools`、`permissionMode: dontAsk` 与 `maxTurns` 实现平台级硬只读 |
+| `claude --worktree` | 隔离 Git 工作树试错或独立实现 | 与仓库 `R4` 写边界协同；切忌在未获授权的项目外目录手工创建工作树 |
+| `claude --autocompact` 与 `--bg` | 长上下文自动压缩与后台会话执行 | 与单入口 `uguard_hook.py` 的 `SessionStart` / `PostCompact` 无损原话恢复无缝配合 |
+| CC Switch 卡片与 `router.py` | 多供应商切换或主从分流 | 推荐用配套 `ccswitch_admin.py` 切卡；私有卡片与模型启停覆盖存入不进 Git 的 `fleet_profile.local.json` |
+
+### 4. DeepSeek Harness（`dsh`）原生模式与配合
+
+| 原生模式或能力 | 适用场景 | 与本仓库的配合方式 |
+| --- | --- | --- |
+| `dsh plugin` 与 `dsh --patch` | 加载 Cordis 扩展包或配置补丁 | 安装器同步裁剪后的 `~/.dsh/AGENTS.md`（剔除伪硬钩子与跨端杂项）与三项课题技能，不改动 `.credentials.yaml` 或 `cordis.patch.yml` |
+| `dsh --dump-config` 与原生文件沙箱 | 查看当前生效配置并依托内置文件只读沙箱执行 | DSH 现阶段为 `no_lifecycle_hooks`（内置 `native_file_sandbox`），高严谨度跨端任务通过 `cae-harness` 的隔离工作区与前后文件快照兜底 |
+
+> 本节与 `fleet_profile.json` 中的 `client_capability_baselines` 联动：客户端发布新能力或主版本跃迁时，`install.py --audit-upgrade` 会在 `summary.evolution_signals` 中自动提示同步更新本使用指南。
+
+---
+
+## 二、任务分流、显式点名与角色选路
+
+主会话保持用户选定的客户端、模型与推理强度。局部修改、强耦合小步联动、零星审查修订与本机环境操作留在主会话直接闭环；大体积通读、长链数理推导、成块求解器实现与跨模型独立审查交由隔离后台进程执行，仅带回摘要与落盘链接。
 
 派工前可离线核查本机各端可用状态（仅读取本地配置，不触发联网刷新，也不调用模型）：
 
@@ -45,7 +97,7 @@ python -B -X utf8 "$HARNESS" assess --caller auto --redact
 | “采用 `high` 挡运行”“以 `--isolation clean_room` 空上下文审阅文档” | 锁定推理挡位或隔离级别 | 非 `fast` 专业角色即使降挡仍保留主力模型；后端不支持所选隔离级别时显式拒绝 |
 | “由 Codex 与 DSH 并行交叉审查此模块” | 识别并列语义，不误锁单端 | 保留多路配置中各分支各自指定的客户端、模型与隔离级别 |
 | “推导弯曲网格 GCL 离散判据”“审查 `src/flux/` 边界相容性” | 按 `role:math`、`role:code`、`role:review` 或 `<client>:@<role>` 选路 | 跳过自动派生多层子代理的 `ultra`；审查命中守恒律、离散算子或权限越界关键词时自动升至 `max` 挡 |
-| “提取三篇文献的控制方程与对应源码行号” | 调用同端 `readonly-reader`、`readonly-collaborator` 或 `readonly-auditor` | 禁止修改文件与运行测试，仅用于原文摘录与行号初筛，不替代跨客户端独立审查 |
+| “提取三篇文献的控制方程与对应源码行号” | 调用同端 `readonly-reader`、`readonly-collaborator` 或 `readonly-auditor` | 禁止修改文件与运行测试，多路只读直接放行，不替代跨客户端独立审查 |
 
 ### 2. 四级正交隔离（`--isolation`）
 
@@ -53,14 +105,14 @@ python -B -X utf8 "$HARNESS" assess --caller auto --redact
 
 | 隔离级别 | 保留与剥离范围 | 支持后端与适用场景 |
 | --- | --- | --- |
-| `full` | 保留全局规则、安全钩子（DSH 当前为软规则）与技能 | `codex`、`claude`、`dsh` 默认值；常规推导、编码验证与遵循全局规范的审查 |
-| `no_skills` | 保留全局规则与安全钩子（DSH 当前无原生硬钩子，保留软规则与无头快照守卫），剥离技能包与斜杠命令 | 四端通用（`agy` 默认值）；减少技能文档对上下文窗口的占用 |
+| `full` | 保留全局规则、安全钩子（DSH 当前为 `no_lifecycle_hooks` 与原生文件沙箱）与技能 | `codex`、`claude`、`dsh` 默认值；常规推导、编码验证与遵循全局规范的审查 |
+| `no_skills` | 保留全局规则与安全钩子（DSH 保留裁剪规则、原生沙箱与外部快照守卫），剥离技能包与斜杠命令 | 四端通用（`agy` 默认值）；减少技能文档对上下文窗口的占用 |
 | `hooks_only` | 仅保留底层凭据与安全钩子，剥离全局规则与技能 | 仅 `codex`、`claude`；`agy` 与当前 `dsh` 显式拒绝 |
 | `clean_room` | 仅保留凭据，剥离规则、钩子、技能、项目说明与斜杠命令 | `codex`、`claude`、`dsh`（仅限只读）；新读者视角盲审文档或无草稿独立方案设计 |
 
 ### 3. 五类常见协作模式
 
-具体模型映射与阈值集中维护于 [fleet_profile.json](../template/user-guard/skills/cae-harness/fleet_profile.json)。主会话模型系列可按课题验证条件选择：尚未建立自动验证的理论推导与论文阶段宜选用审慎推理系列，编译与单元测试门禁完备的工程维护阶段可选用编码系列。针对以下五类协作场景，可在指令中直接声明需求以启用对应编排：
+具体模型映射与阈值集中维护于 [fleet_profile.json](../template/user-guard/skills/cae-harness/fleet_profile.json)（可由同级 `fleet_profile.local.json` 做本机覆盖）。针对以下五类协作场景，可在指令中直接声明需求以启用对应编排：
 
 | 协作目标 | 指令表述示例 | 实际编排方式 |
 | --- | --- | --- |
@@ -72,9 +124,9 @@ python -B -X utf8 "$HARNESS" assess --caller auto --redact
 
 ---
 
-## 二、大型仓库分片阅读、审批执行与机械对账
+## 三、大型仓库分片阅读、审批执行与机械对账
 
-面对大型求解器仓库或超长技术文档，直接全量读入易触发频繁的上下文压缩，或造成跳行漏读与配套文档遗漏。建议按 **读前评估分片 → 票据生成与审批执行 → 跨端核对与机械对账** 三个阶段推进（对应下方四步命令）：
+面对大型求解器仓库或超长技术文档，直接全量读入易触发频繁压缩或跳行漏读。建议按 **读前评估分片 → 票据生成与审批执行 → 跨端核对与机械对账** 三个阶段推进：
 
 ```powershell
 # 1. 纯离线读前评估与分片（保存阅读计划 JSON 并导出审批工作流）
@@ -115,14 +167,14 @@ python -B -X utf8 "$HARNESS" reconcile `
 
 四项操作要点：
 
-- **简洁确认单**：小范围单路只读在轻任务阈值内静默执行。多路并发、可写任务或超阈值委派前，`plan` 将 4 列总览与分路 14 项明细写入 `<ticket_id>_card.md`，对话界面仅显示三句话确认摘要与文件链接；登记 `plan --approve-ticket` 后钩子放行执行。
+- **简洁确认单**：小范围单路只读在轻任务阈值内静默执行；外部无头重负载先经 `plan` 将 4 列总览与 14 项明细写入 `<ticket_id>_card.md`，对话界面仅显示三句话确认摘要与文件链接，登记 `plan --approve-ticket` 后放行执行。
 - **跨端双审显式指定两端**：两个 `role:review` 不保证自动落到不同客户端，双源交叉审阅应显式指定两端（如 `codex:@review` 与 `dsh:@review`）或直接调用 `audit --left ... --right ...`。
 - **波次联动中止**：多波次 `batch` 中，前序波次同目录可写流失败时，后续波次默认中止（仅显式声明 `"run_on_upstream_failure": true` 的只读流继续执行）。
-- **完工自动生成对账表**：重负载任务完成后自动写入确定性机械对账表 `<run_id>_reconcile.md`（不向目标业务仓库写入文件），记录实际修改与未同步更新的文件、静态依赖关系及关联检查项状态，并由三端回合结束钩子核验回复是否包含完整的回执与对账表链接。
+- **完工自动生成对账表**：外部重负载完成后自动写入确定性机械对账表 `<run_id>_reconcile.md`（不向目标业务仓库写入文件），记录实际修改与未同步更新的文件及静态依赖，并由三端回合结束钩子硬核验回执与对账表链接。
 
 ---
 
-## 三、求解器编码验收闭环（二维 Euler HLLC 示例）
+## 四、求解器编码验收闭环（二维 Euler HLLC 示例）
 
 ### 1. 无头任务单五要素
 
@@ -187,23 +239,19 @@ flowchart TD
 
 ---
 
-## 四、超时续接、压缩恢复与对称核验
+## 五、超时续接、压缩恢复与证据分级（`R3.6`）
 
-1. **持久化续接与超时抢救**：外部无头会话默认持久化保存（传入 `--ephemeral` 可关闭）。任务临近超时时先降低推理挡位并整理阶段结果，达到硬超时后仍保留已有输出与会话标识；后续可通过 `followup` 基于原会话上下文与权限边界增量追问，无需重新完整运行：
+1. **持久化续接与超时抢救**：外部无头会话默认持久化保存（传入 `--ephemeral` 可关闭）。任务临近超时时先降低推理挡位并整理阶段结果，达到硬超时后仍保留已有输出与会话标识；后续可通过 `followup` 基于原会话上下文与权限边界增量追问：
    ```powershell
    python -B -X utf8 "$HARNESS" followup --receipt "<回执路径>" --stream S1 --task "补充核对第 42 行边界条件符号" --output "<追问回执>" --redact
    ```
-2. **压缩恢复与跨会话接力**：等待审批期间若发生上下文自动压缩，钩子按可用窗口容量恢复关键用户原话、实质子任务结论、未决票据总览与对账指针，并仅补充展示 1 次确认摘要（自动压缩与用户沉默均不构成批准）；同时将两次压缩之间的实质助手回复原文独立落盘并注入紧凑索引指针，遇“批准 / 按你建议”等简短确认时可按需 `read_file` 核对完整方案与参数细节。切换至新会话后，先离线复核旧票据，再在当前会话中重新生成确认单后执行：
+2. **压缩恢复与跨会话接力**：四端交接门禁默认均为 `advisory` 提醒。压缩或手动 `/compact` 后，钩子分块还原历轮用户原话、实质子任务结论、未决票据总览与对账指针，并将两次压缩间的实质助手回复独立落盘供按需 `read_file` 核对。切换至新会话后，先离线复核旧票据，再在当前会话中重建确认单后执行：
    ```powershell
    python -B -X utf8 "$HARNESS" plan --resume-ticket "<票据标识>" --plan-dir "<授权票据目录>" --user-prompt "<用户点名原话>"
    ```
-3. **对称核验与主会话终审**：三端回合结束钩子同步守卫正向冒充与负向武断：既禁止局部补测或失败回执冒充“全部通过”，也禁止零探测宣称“已核实不存在”、仅查少量局部文件便断言“现有数据不足须重做”，或单端整写长文却不经复核也不标明初稿状态。本机排查直连主机或共享目录时，应保留完整命令输出以核实状态，仅在写入公开文档或对外汇报时执行脱敏。长会话交接提示词须保留项目总纲与资产索引入口，并将重算、批量读图与长文写作拆分为独立会话；所有后台回执与引用行号仍须由主会话按 `R6` 亲自打开原文件逐行复核（完整细则见 [cae-harness 技能规程](../template/user-guard/skills/cae-harness/SKILL.md)）。
+3. **确定性核验与主会话终审**：三端回合结束钩子对外部重负载回执、机械对账链接、局部补测冒充全过与重复空等执行硬拦截，对启发式文本实证默认记录结构化提醒。所有后台回执与引用行号仍须由主会话按 `R6` 亲自打开原文件逐行复核。
 
----
-
-## 五、定量验证的四级证据矩阵（`R3.6`）
-
-阶段汇报与合入审查须如实标注当前所处的证据等级，未执行环节直接标明“未验证”，仅列核心验证链路缺口：
+阶段汇报与合入审查须如实标注当前所处的四级定量证据，未执行环节直接标明“未验证”：
 
 | 证据等级 | 判定标准与回执特征 | 典型科学计算与工程判据 |
 | --- | --- | --- |
@@ -228,17 +276,10 @@ flowchart TD
 
 实际使用按三步推进：
 
-1. **按任务性质选择档位（`--profile`）**：
-   - 通用软件架构、配置策略、技术文稿与跨模块边界审查选用 **`--profile core`**（四关链 `L0`–`L3`，零物理与 CAE 字段，仅依赖 `LogicCore.lean` 40 条定理）。
-   - 偏微分方程离散、理性力学与工程仿真建模选用 **`--profile cae`**（五关链 `S0`–`S4`，叠加层 1.5、层 2M 与第二层 `2A`）。
-2. **离线推进结构审查，根冲突即刻截断**：
-   - 将 `AXIOM_GATE` 指向本机已安装的 `skills/cae-axioms/scripts/axiom_gate.py`，依次执行 `init` 与 `advance`。任一根层关口确立不可满足冲突时，状态机锁入 `HALT_ROOT_CONFLICT`，仅允许通过 `resolve`（`rebase_ontology` 或 `downgrade_claim`）派生保留完整冲突历史的新子单。
-   - 常规离线走完全部关口到达 **`STRUCTURE_PASSED`**，仅表示结构与自检无冲突，不等于独立核验通过（`report --require-verified` 会拒绝放行）。
-3. **需要独立终审封板时：净室 `packet_replay` 与可选 Lean 4 真内核校验**：
-   - 先运行 `export-packet` 导出剥离主会话自评结论的纯净盲包，经 `cae_harness.py plan` 获批后对独立包目录执行 `cae_harness.py task --clean-room --kind review` 完成 1 次隔离盲审（净室镜像与内联自动携带 `manifest.json` 与全部 `blobs/<sha256>`）。
-   - 再运行 `verify-replay` 交叉验签票据、对账账本、文件树双哈希与盲推断言（含实跑探针时显式传 `--allow-probe-exec` 当轮重跑本地锁定命令），按证据强度升格为 **`VERIFIED_NO_T`**（缺乏充分证明或穷举证书的外生工程案卷最高可达态）或 **`VERIFIED_T_ASSERTED`**（须承载穷举域或绑定被审工件的真内核 Lean 4 定理并披露桥接前提）。
-   - 本机或 WSL2 已安装 Lean 4 时，可随时运行 `check-lean --profile core --run-lean` 或 `--profile cae --run-lean`（Windows 侧调用 WSL2 加 `--wsl-lean`）执行零 Mathlib 真内核重放核验。
+1. **按任务性质选择档位（`--profile`）**：通用软件架构、配置策略与跨模块边界审查选用 `--profile core`（四关链 `L0`–`L3`，零物理与 CAE 字段）；偏微分方程离散、理性力学与工程仿真建模选用 `--profile cae`（五关链 `S0`–`S4`，叠加层 1.5、层 2M 与第二层 `2A`）。
+2. **离线推进结构审查，根冲突即刻截断**：将 `AXIOM_GATE` 指向本机已安装的 `skills/cae-axioms/scripts/axiom_gate.py`，依次执行 `init` 与 `advance`。任一根层关口确立不可满足冲突时锁入 `HALT_ROOT_CONFLICT`，仅允许经 `resolve` 派生新子单；离线走完到达 `STRUCTURE_PASSED` 不等于独立核验通过。
+3. **需要独立终审封板时执行净室复演与可选 Lean 4 校验**：运行 `export-packet` 导出剥离主会话自评的盲包，经 `cae_harness.py plan` 获批后对包目录执行 `cae_harness.py task --clean-room --kind review`，再运行 `verify-replay` 交叉验签升格为 `VERIFIED_NO_T` 或 `VERIFIED_T_ASSERTED`。本机或 WSL2 已安装 Lean 4 时，可随时运行 `check-lean --profile core --run-lean` 或 `--profile cae --run-lean`（Windows 调用 WSL2 加 `--wsl-lean`）执行零 Mathlib 真内核重放核验。
 
 ### 2. 按需学术写作与改稿（`cae-writing`）
 
-撰写或大幅改写中文期刊论文、英文期刊论文、学术专著、科研报告及审稿回复时，可点名启用 [cae-writing](../template/user-guard/skills/cae-writing/SKILL.md)。协作上坚持项目自有术语与格式优先、由单一主执笔保持全篇叙事连贯；长篇稿件（超 20 KB）先在会话 `scratch/` 提炼已核实的公式与数值锚点表，再按逻辑章节有界分块落盘并将定稿、双语镜像与净室盲读拆分为独立零压缩会话，避免单回合触顶输出上限截断挂死。终稿经 `cae_harness.py task --isolation clean_room --kind review` 盲读查断层，并以 `check-grounding --target "<项目根目录>" --strict --doc-hygiene` 统一核验事实依据、本地图件与定理证明完整度；处于同行评议保密期的他人未发表稿件严禁输入在线模型。
+撰写或大幅改写中文期刊论文、英文期刊论文、学术专著、科研报告及审稿回复时，可点名启用 [cae-writing](../template/user-guard/skills/cae-writing/SKILL.md)。协作上坚持项目自有术语与格式优先、由单一主执笔保持全篇叙事连贯；长篇稿件（超 20 KB）先在会话 `scratch/` 提炼已核实的公式与数值锚点表，再按逻辑章节有界分块落盘并将定稿、双语镜像与净室盲读拆分为独立零压缩会话。终稿经 `cae_harness.py task --isolation clean_room --kind review` 盲读查断层，并以 `check-grounding --target "<项目根目录>" --strict --doc-hygiene` 统一核验；处于同行评议保密期的他人未发表稿件严禁输入在线模型。

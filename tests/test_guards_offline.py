@@ -616,13 +616,36 @@ class TestGuardsOffline(unittest.TestCase):
         _append_jsonl(tp, {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "/goal\n逐批执行并核图"})
         session_context_loader.handle_pre_invocation({"conversationId": conv_id, "transcriptPath": str(tp)})
 
-        # 构造 4 张合计 >100MB 的模拟 PNG 并在单回合内连续 read_file，第 4 张跨过 100MB 阈值当场进 drain 并阻断读图
+        # 1) v3.0: 非 /goal 显式 enforce 模式下，4 张合计 >100MB PNG 跨过 100MB 阈值当场进 drain 并阻断读图
+        conv_img_enf = "guard-handoff-011-img-enf"
+        tp_img_enf = self.tmp_root / "img_enf.jsonl"
+        _append_jsonl(tp_img_enf, {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "逐批核图"})
+        with unittest.mock.patch.object(status_guard.handoff_gate, "DEFAULT_AGY_HANDOFF_MODE", "enforce"):
+            session_context_loader.handle_pre_invocation({"conversationId": conv_img_enf, "transcriptPath": str(tp_img_enf)})
+            for i in range(4):
+                img = ws_dir / f"page_{i}.png"
+                with open(img, "wb") as f:
+                    f.seek(26 * 1024 * 1024 - 1)
+                    f.write(b"\0")
+                res = status_guard.handle_pre_tool_use(
+                    {
+                        "conversationId": conv_img_enf,
+                        "cwd": str(ws_dir),
+                        "workspacePaths": [str(ws_dir)],
+                        "transcriptPath": str(tp_img_enf),
+                        "toolCall": {"name": "read_file", "args": {"Path": str(img)}},
+                    }
+                )
+                if i < 3:
+                    self.assertEqual(res["decision"], "allow")
+                else:
+                    self.assertEqual(res["decision"], "deny")
+                    self.assertIn("禁止继续调用 `read_file` 看图", res["reason"])
+
+        # 2) /goal 会话不被默认 advisory 或启发式读图强杀；仅在硬触发（如用户要求交接）后进入 drain/freeze 并验收 GOAL_CANCELLED
         for i in range(4):
             img = ws_dir / f"page_{i}.png"
-            with open(img, "wb") as f:
-                f.seek(26 * 1024 * 1024 - 1)
-                f.write(b"\0")
-            res = status_guard.handle_pre_tool_use(
+            res_goal_img = status_guard.handle_pre_tool_use(
                 {
                     "conversationId": conv_id,
                     "cwd": str(ws_dir),
@@ -631,11 +654,20 @@ class TestGuardsOffline(unittest.TestCase):
                     "toolCall": {"name": "read_file", "args": {"Path": str(img)}},
                 }
             )
-            if i < 3:
-                self.assertEqual(res["decision"], "allow")
-            else:
-                self.assertEqual(res["decision"], "deny")
-                self.assertIn("禁止继续调用 `read_file` 看图", res["reason"])
+            self.assertEqual(res_goal_img["decision"], "allow")
+        _append_jsonl(tp, {"step_index": 5, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "请整理交接并停机"})
+        session_context_loader.handle_pre_invocation({"conversationId": conv_id, "transcriptPath": str(tp)})
+        res_drain_img = status_guard.handle_pre_tool_use(
+            {
+                "conversationId": conv_id,
+                "cwd": str(ws_dir),
+                "workspacePaths": [str(ws_dir)],
+                "transcriptPath": str(tp),
+                "toolCall": {"name": "read_file", "args": {"Path": str(ws_dir / "page_0.png")}},
+            }
+        )
+        self.assertEqual(res_drain_img["decision"], "deny")
+        self.assertIn("禁止继续调用 `read_file` 看图", res_drain_img["reason"])
 
         # 非图片文本 read_file 仍放行
         txt_file = ws_dir / "summary.txt"
@@ -2162,33 +2194,38 @@ class TestDispatchAndBillingGuards(unittest.TestCase):
                 self.assertEqual(self.pre("run_command", {"CommandLine": "codex exec work"})["decision"], "allow")
 
     def test_native_ticket_count_turn_reset_and_ticket_validity(self):
+        # v3.0 D1: 同端原生只读多路直接放行；未获用户原生斜杠指示的同端可写编排走宿主 ask 确认（而非外置 deny）；
+        # 若已存在对应通道的 APPROVED 票据则直接核销放行并在容量耗尽后回到 ask。
         no_trace = {"conversationId": "native-offline", "toolCall": {"name": "run_workflow", "args": {"Script": "print(1)"}}}
         with unittest.mock.patch.dict(os.environ, {"USER_GUARD_ENFORCE_TICKET_GATE": "0"}):
-            self.assertEqual(status_guard.handle_pre_tool_use(no_trace)["decision"], "deny")
+            self.assertEqual(status_guard.handle_pre_tool_use(no_trace)["decision"], "ask")
+        # 同端只读子代理（单路与多路并行）均直接放行
         self.assertEqual(self.pre("invoke_subagent", {"TypeName": "readonly-reader"})["decision"], "allow")
-        self.assertEqual(self.pre("invoke_subagent", {"TypeName": "readonly-auditor"})["decision"], "deny")
+        self.assertEqual(self.pre("invoke_subagent", {"TypeName": "readonly-auditor"})["decision"], "allow")
+        self.assertEqual(self.pre("invoke_subagent", {"TypeName": "research"})["decision"], "allow")
+        # 未授权同端可写编排统一返回 ask（交宿主权限确认），不再强制 deny
         for tool, args in (("run_workflow", {}), ("swarm", {"action": "add"}),
                            ("invoke_subagent", {"TypeName": "self"}), ("spawn_agent", {}), ("Agent", {"subagent_type": "general-purpose"})):
-            self.assertEqual(self.pre(tool, args)["decision"], "deny")
+            self.assertEqual(self.pre(tool, args)["decision"], "ask", (tool, args))
         self.approve(channel="cae_harness_headless")
-        self.assertEqual(self.pre("run_workflow")["decision"], "deny")
+        self.assertEqual(self.pre("run_workflow")["decision"], "ask")
         self.approve(expires=time.time() - 1)
-        self.assertEqual(self.pre("run_workflow")["decision"], "deny")
+        self.assertEqual(self.pre("run_workflow")["decision"], "ask")
         self.approve(status="PENDING")
-        self.assertEqual(self.pre("run_workflow")["decision"], "deny")
+        self.assertEqual(self.pre("run_workflow")["decision"], "ask")
         self.approve(sid="bob")
-        self.assertEqual(self.pre("run_workflow")["decision"], "deny")
+        self.assertEqual(self.pre("run_workflow")["decision"], "ask")
         self.approve(channel="native_workflow")
         self.assertEqual(self.pre("run_workflow")["decision"], "allow")
-        self.assertEqual(self.pre("run_workflow")["decision"], "deny")
-        self.assertEqual(self.pre("swarm", {"action": "add"})["decision"], "deny")
-        self.assertEqual(self.pre("invoke_subagent", {"TypeName": "self"})["decision"], "deny")
+        self.assertEqual(self.pre("run_workflow")["decision"], "ask")
+        self.assertEqual(self.pre("swarm", {"action": "add"})["decision"], "ask")
+        self.assertEqual(self.pre("invoke_subagent", {"TypeName": "self"})["decision"], "ask")
         _append_jsonl(self.trace, {"type": "USER_INPUT", "step_index": 7, "content": "下一项"})
         (self.state / "dispatch_plans/ticket-fixture.json").unlink()
         self.assertEqual(self.pre("invoke_subagent", {"TypeName": "readonly-reader"})["decision"], "allow")
         with unittest.mock.patch.object(status_guard, "_heavy_min_streams", return_value=3):
             self.assertEqual(self.pre("invoke_subagent", {"TypeName": "research"})["decision"], "allow")
-            self.assertEqual(self.pre("invoke_subagent", {"TypeName": "research"})["decision"], "deny")
+            self.assertEqual(self.pre("invoke_subagent", {"TypeName": "research"})["decision"], "allow")
 
     def test_harness_heavy_and_offline_fixture_switch(self):
         for command in ("batch", "gate", "audit", "task --kind code", "task --kind=code"):
@@ -2336,22 +2373,22 @@ class TestDispatchAndBillingGuards(unittest.TestCase):
         self.approve(channel="native_subagent", count=2)
         for _ in range(2):
             self.assertEqual(self.pre("spawn_agent", {"agent_type": "self"})["decision"], "allow")
-        self.assertEqual(self.pre("Agent", {"subagent_type": "general-purpose"})["decision"], "deny")
-        self.assertEqual(self.pre("run_workflow")["decision"], "deny")
+        self.assertEqual(self.pre("Agent", {"subagent_type": "general-purpose"})["decision"], "ask")
+        self.assertEqual(self.pre("run_workflow")["decision"], "ask")
         self.approve(channel="native_swarm")
         self.assertEqual(self.pre("swarm", {"action": "add"})["decision"], "allow")
-        self.assertEqual(self.pre("swarm", {"action": "add"})["decision"], "deny")
+        self.assertEqual(self.pre("swarm", {"action": "add"})["decision"], "ask")
 
     def test_native_swarm_stream_weight_counts_tasks_and_n(self):
         self.approve(channel="native_swarm", count=2)
-        self.assertEqual(self.pre("swarm", {"action": "add", "name": "w", "tasks": ["a", "b", "c"]})["decision"], "deny")
-        self.assertEqual(self.pre("swarm", {"action": "add", "name": "w", "n": 3})["decision"], "deny")
+        self.assertEqual(self.pre("swarm", {"action": "add", "name": "w", "tasks": ["a", "b", "c"]})["decision"], "ask")
+        self.assertEqual(self.pre("swarm", {"action": "add", "name": "w", "n": 3})["decision"], "ask")
         self.assertEqual(self.pre("swarm", {"action": "add", "name": "w", "tasks": ["a", "b"]})["decision"], "allow")
-        self.assertEqual(self.pre("swarm", {"action": "add", "name": "w2"})["decision"], "deny")
+        self.assertEqual(self.pre("swarm", {"action": "add", "name": "w2"})["decision"], "ask")
 
         self.approve(channel="native_swarm", sid="swarm-n-sess", count=2)
         self.assertEqual(self.pre("swarm", {"action": "add", "name": "w", "n": 2}, sid="swarm-n-sess")["decision"], "allow")
-        self.assertEqual(self.pre("swarm", {"action": "add", "name": "w2", "n": 1}, sid="swarm-n-sess")["decision"], "deny")
+        self.assertEqual(self.pre("swarm", {"action": "add", "name": "w2", "n": 1}, sid="swarm-n-sess")["decision"], "ask")
 
     def test_path_regressions_and_invalid_session(self):
         outside = self.root / "outside"
@@ -2551,14 +2588,20 @@ class TestDispatchAndBillingGuards(unittest.TestCase):
                   "streams": [{"stream_id": "S1", "native_id": "agent1", "engine": "readonly-reader"},
                               {"stream_id": "S2", "native_id": "agent2", "engine": "readonly-auditor"}]}
         with unittest.mock.patch.object(reply_repeat_guard, "_native_completion_bill", return_value=native):
-            blocked = reply_repeat_guard._check_heavy_report_locked({}, self.state, "native-boundary", "turn",
-                "S10 成功，S2 成功；Token 26；子代理日志见轨迹", "block")
-            self.assertEqual(blocked["decision"], "block")
-            accepted = reply_repeat_guard._check_heavy_report_locked({}, self.state, "native-boundary", "turn",
-                "S1 成功，S2 成功；Token 26；子代理日志见轨迹", "block")
-            self.assertIsNone(accepted)
-            saved = json.loads((self.state / "native-boundary_heavy_report_guard.json").read_text(encoding="utf-8"))
-            self.assertEqual(saved["reported_native_ids"], ["agent1", "agent2"])
+            # 默认 advisory 模式不硬阻断同端原生账单
+            self.assertIsNone(reply_repeat_guard._check_heavy_report_locked(
+                {}, self.state, "native-boundary-adv", "turn", "S10 成功，S2 成功", "block"
+            ))
+            # 显式 enforce 模式严格校验原生流号边界并记录已汇报集合
+            with unittest.mock.patch.object(reply_repeat_guard, "NATIVE_BILL_GATE_MODE", "enforce"):
+                blocked = reply_repeat_guard._check_heavy_report_locked({}, self.state, "native-boundary", "turn",
+                    "S10 成功，S2 成功；Token 26；子代理日志见轨迹", "block")
+                self.assertEqual(blocked["decision"], "block")
+                accepted = reply_repeat_guard._check_heavy_report_locked({}, self.state, "native-boundary", "turn",
+                    "S1 成功，S2 成功；Token 26；子代理日志见轨迹", "block")
+                self.assertIsNone(accepted)
+                saved = json.loads((self.state / "native-boundary_heavy_report_guard.json").read_text(encoding="utf-8"))
+                self.assertEqual(saved["reported_native_ids"], ["agent1", "agent2"])
 
     def test_native_workflow_and_subagents_completion_not_start_handles(self):
         for index in range(2):
@@ -2568,16 +2611,19 @@ class TestDispatchAndBillingGuards(unittest.TestCase):
         self.assertIsNone(reply_repeat_guard._native_completion_bill({"transcriptPath": str(self.trace)}))
         for index in range(2):
             _append_jsonl(self.trace, {"type": "SYSTEM_MESSAGE", "content": "<SYSTEM_MESSAGE>\n[Message] sender=agent-" + str(index) + " content=核对完成\n</SYSTEM_MESSAGE>"})
-        response = self.stop("antigravity", "native", "核对完成")
-        self.assertEqual(response["decision"], "continue")
-        self.assertIn("未单独暴露 Token 整数", response["reason"])
-        self.assertIn("agent-0.jsonl", response["reason"])
-        self.assertNotIn("reason", self.stop("antigravity", "native", "两路完成；未单独暴露 Token 整数；子代理日志在轨迹中"))
-        self.assertNotIn("reason", self.stop("antigravity", "native", "已汇报"))
-        _append_jsonl(self.trace, {"type": "USER_INPUT", "step_index": 20, "content": "执行工作流"})
-        _append_jsonl(self.trace, {"type": "PLANNER_RESPONSE", "tool_calls": [{"id": "workflow", "name": "run_workflow", "args": {}}]})
-        _append_jsonl(self.trace, {"type": "GENERIC", "tool_result": {"call_id": "workflow"}, "content": "完成"})
-        self.assertEqual(self.stop("antigravity", "native", "已结束")["decision"], "continue")
+        # 默认 advisory 不硬拦截同端原生子代理汇报；显式 enforce 保持逐项补全约束
+        self.assertEqual(self.stop("antigravity", "native-adv", "核对完成")["decision"], "allow")
+        with unittest.mock.patch.object(reply_repeat_guard, "NATIVE_BILL_GATE_MODE", "enforce"):
+            response = self.stop("antigravity", "native", "核对完成")
+            self.assertEqual(response["decision"], "continue")
+            self.assertIn("未单独暴露 Token 整数", response["reason"])
+            self.assertIn("agent-0.jsonl", response["reason"])
+            self.assertNotIn("reason", self.stop("antigravity", "native", "两路完成；未单独暴露 Token 整数；子代理日志在轨迹中"))
+            self.assertNotIn("reason", self.stop("antigravity", "native", "已汇报"))
+            _append_jsonl(self.trace, {"type": "USER_INPUT", "step_index": 20, "content": "执行工作流"})
+            _append_jsonl(self.trace, {"type": "PLANNER_RESPONSE", "tool_calls": [{"id": "workflow", "name": "run_workflow", "args": {}}]})
+            _append_jsonl(self.trace, {"type": "GENERIC", "tool_result": {"call_id": "workflow"}, "content": "完成"})
+            self.assertEqual(self.stop("antigravity", "native", "已结束")["decision"], "continue")
 
     def test_single_task_receipt_binding_and_single_swarm_bill(self):
         for command in ("task", "gate", "batch"):
@@ -2638,15 +2684,18 @@ class TestDispatchAndBillingGuards(unittest.TestCase):
                 _append_jsonl(self.trace, {"type": "response_item", "payload": {
                     "type": "function_call_output", "call_id": "wait-call", "output": json.dumps({"status": {
                         "agent-0": {"completed": "核对完成"}, "agent-1": {"failed": "核对失败"}}})}})
-            response = self.stop(client, "native-" + client, "核对完成")
-            self.assertEqual(response["decision"], "block", client)
-            self.assertIn(str(self.trace.resolve()), response["reason"])
-            if client == "claude":
-                self.assertIn('"total_tokens": 16', response["reason"])
-            else:
-                self.assertIn("失败", response["reason"])
-            self.assertNotIn("reason", self.stop(client, "native-" + client,
-                "两路完成返回；Token 未单独暴露整数；子代理轨迹见 transcript.jsonl"))
+            # 默认 advisory 不硬拦截原生子代理账单；显式 enforce 保持三端拦截与补全
+            self.assertNotIn("decision", self.stop(client, "native-adv-" + client, "核对完成"))
+            with unittest.mock.patch.object(reply_repeat_guard, "NATIVE_BILL_GATE_MODE", "enforce"):
+                response = self.stop(client, "native-" + client, "核对完成")
+                self.assertEqual(response["decision"], "block", client)
+                self.assertIn(str(self.trace.resolve()), response["reason"])
+                if client == "claude":
+                    self.assertIn('"total_tokens": 16', response["reason"])
+                else:
+                    self.assertIn("失败", response["reason"])
+                self.assertNotIn("reason", self.stop(client, "native-" + client,
+                    "两路完成返回；Token 未单独暴露整数；子代理轨迹见 transcript.jsonl"))
 
         self.completion("cli-fixture")
         payload = {"session_id": "cli-fixture", "transcript_path": str(self.trace), "last_assistant_message": "结束"}
@@ -2700,46 +2749,53 @@ class TestDispatchAndBillingGuards(unittest.TestCase):
                 self.assertIsNone(reply_repeat_guard._native_completion_bill({"transcript_path": str(self.trace)}))
                 _append_jsonl(self.trace, done)
                 sid = "async-writer-" + client
-                result = self.stop(client, sid, "完成；Token 1；回执稍后补")
-                self.assertIn(result["decision"], ("continue", "block"))
-                self.assertIn("write", result["reason"])
-                self.assertNotIn("reason", self.stop(client, sid, "1 路完成；Token 无法统计；子代理日志见 transcript.jsonl"))
-                state = json.loads((self.state / (sid + "_heavy_report_guard.json")).read_text(encoding="utf-8"))
-                self.assertIn("write-call", state["reported_native_ids"])
-                _append_jsonl(self.trace, later_user)
-                self.assertNotIn("reason", self.stop(client, sid, "已汇报"))
+                with unittest.mock.patch.object(reply_repeat_guard, "NATIVE_BILL_GATE_MODE", "enforce"):
+                    result = self.stop(client, sid, "完成；Token 1；回执稍后补")
+                    self.assertIn(result["decision"], ("continue", "block"))
+                    self.assertIn("write", result["reason"])
+                    self.assertNotIn("reason", self.stop(client, sid, "1 路完成；Token 无法统计；子代理日志见 transcript.jsonl"))
+                    state = json.loads((self.state / (sid + "_heavy_report_guard.json")).read_text(encoding="utf-8"))
+                    self.assertIn("write-call", state["reported_native_ids"])
+                    _append_jsonl(self.trace, later_user)
+                    self.assertNotIn("reason", self.stop(client, sid, "已汇报"))
 
     def test_native_call_id_idempotence_and_identical_user_turns(self):
+        # 同端只读子代理直接放行；可写原生子代理的 APPROVED 票据核销按 call_id 幂等且超额回到 ask
+        ro_payload = {"conversationId": "idempotent", "transcriptPath": str(self.trace),
+                      "tool_use_id": "ro-1", "toolCall": {"name": "invoke_subagent", "args": {"TypeName": "readonly-reader"}}}
+        self.assertEqual(status_guard.handle_pre_tool_use(ro_payload)["decision"], "allow")
+        self.approve(channel="native_subagent", sid="idempotent", count=1)
         payload = {"conversationId": "idempotent", "transcriptPath": str(self.trace),
-                   "tool_use_id": "first", "toolCall": {"name": "invoke_subagent", "args": {"TypeName": "readonly-reader"}}}
+                   "tool_use_id": "first", "toolCall": {"name": "invoke_subagent", "args": {"TypeName": "self"}}}
         for _ in range(2):
             self.assertEqual(status_guard.handle_pre_tool_use(payload)["decision"], "allow")
         payload["tool_use_id"] = "second"
-        self.assertEqual(status_guard.handle_pre_tool_use(payload)["decision"], "deny")
-        _append_jsonl(self.trace, {"type": "USER_INPUT", "step_index": 1, "content": "检查工程"})
+        self.assertEqual(status_guard.handle_pre_tool_use(payload)["decision"], "ask")
+        _append_jsonl(self.trace, {"type": "USER_INPUT", "step_index": 1, "content": "/teamwork 检查工程"})
         self.assertEqual(status_guard.handle_pre_tool_use(payload)["decision"], "allow")
 
     def test_async_workflow_completion_and_same_turn_single_correction(self):
         payload = {"transcriptPath": str(self.trace)}
-        for index in range(2):
-            key = "workflow-" + str(index)
-            _append_jsonl(self.trace, {"type": "PLANNER_RESPONSE", "tool_calls": [
-                {"id": key, "name": "run_workflow", "args": {}}]})
-            _append_jsonl(self.trace, {"type": "GENERIC", "tool_result": {"call_id": key},
-                "content": "Command is running in background with ID: task-" + str(index)})
-            if index == 0:
-                self.assertIsNone(reply_repeat_guard._native_completion_bill(payload))
-            _append_jsonl(self.trace, {"type": "SYSTEM_MESSAGE", "content": "<SYSTEM_MESSAGE>\n[Message] sender=fixture/task-" +
-                str(index) + " content=Task finished\n</SYSTEM_MESSAGE>"})
-            response = self.stop("antigravity", "async", "执行结束")
-            if index == 0:
-                self.assertEqual(response["decision"], "continue")
-            else:
-                self.assertNotIn("reason", response)
-        # 子代理返回可能在宿主中形成新的消息步骤，同一用户回合仍只能补正一次。
-        _append_jsonl(self.trace, {"type": "SYSTEM_MESSAGE", "content":
-            "<SYSTEM_MESSAGE>\n[Message] sender=fixture content=核对完成\n</SYSTEM_MESSAGE>"})
-        self.assertNotIn("reason", self.stop("antigravity", "async", "执行结束"))
+        with unittest.mock.patch.object(reply_repeat_guard, "NATIVE_BILL_GATE_MODE", "enforce"):
+            for index in range(2):
+                key = "workflow-" + str(index)
+                _append_jsonl(self.trace, {"type": "PLANNER_RESPONSE", "tool_calls": [
+                    {"id": key, "name": "run_workflow", "args": {}}]})
+                _append_jsonl(self.trace, {"type": "GENERIC", "tool_result": {"call_id": key},
+                    "content": "Command is running in background with ID: task-" + str(index)})
+                if index == 0:
+                    self.assertIsNone(reply_repeat_guard._native_completion_bill(payload))
+                _append_jsonl(self.trace, {"type": "SYSTEM_MESSAGE", "content": "<SYSTEM_MESSAGE>\n[Message] sender=fixture/task-" +
+                    str(index) + " content=Task finished\n</SYSTEM_MESSAGE>"})
+                response = self.stop("antigravity", "async", "执行结束")
+                if index == 0:
+                    self.assertEqual(response["decision"], "continue")
+                else:
+                    self.assertNotIn("reason", response)
+            # 子代理返回可能在宿主中形成新的消息步骤，同一用户回合仍只能补正一次。
+            _append_jsonl(self.trace, {"type": "SYSTEM_MESSAGE", "content":
+                "<SYSTEM_MESSAGE>\n[Message] sender=fixture content=核对完成\n</SYSTEM_MESSAGE>"})
+            self.assertNotIn("reason", self.stop("antigravity", "async", "执行结束"))
 
     @unittest.skipUnless(os.name == "nt", "Windows 路径 API 缓冲扩容边界")
     def test_long_path_api_resizes_when_required_size_equals_capacity(self):
@@ -3610,6 +3666,7 @@ class TestDispatchAndBillingGuards(unittest.TestCase):
                 {"name": "invoke_subagent", "args": {"TypeName": "readonly-reader", "Role": "R2"}},
             ],
         })
+        # v3.0 D1: 同端多路只读子代理直接放行，无需外置票据；未授权同端可写并行子代理走宿主 ask 确认
         res_unapp = status_guard.handle_pre_tool_use({
             "conversationId": "v118-unapp",
             "cwd": str(self.project),
@@ -3617,7 +3674,15 @@ class TestDispatchAndBillingGuards(unittest.TestCase):
             "transcriptPath": str(tp_unapproved),
             "toolCall": {"name": "invoke_subagent", "args": {"TypeName": "readonly-reader", "Role": "R1"}},
         })
-        self.assertEqual(res_unapp["decision"], "deny")
+        self.assertEqual(res_unapp["decision"], "allow")
+        res_unapp_wr = status_guard.handle_pre_tool_use({
+            "conversationId": "v118-unapp",
+            "cwd": str(self.project),
+            "workspacePaths": [str(self.project)],
+            "transcriptPath": str(tp_unapproved),
+            "toolCall": {"name": "invoke_subagent", "args": {"TypeName": "self", "Role": "W1"}},
+        })
+        self.assertEqual(res_unapp_wr["decision"], "ask")
 
         # 获批 4 路并发 + 前序曾有被 deny 记录：4 路应全部 allow
         self.approve(channel="native_subagent", sid="v118-par4", count=4)
@@ -4046,50 +4111,53 @@ class TestDispatchAndBillingGuards(unittest.TestCase):
             }
             return reply_repeat_guard.handle_claude_stop_repeat_guard(payload, state_dir=self.state, logs_dir=self.logs)
 
-        for client in ("antigravity", "codex", "claude"):
-            expected_block = "continue" if client == "antigravity" else "block"
-            with self.subTest(neg_client=client):
-                # 1) 零实质探测（Antigravity 仅有 update_focus OK 亦不算实质探测）-> 拦截
-                trivial = [{"step_index": 1, "type": "GENERIC", "content": "Created At: t\nCompleted At: t\nOK"}] if client == "antigravity" else []
-                res_zero = run_case(client, f"zero-{client}", trivial, claim_reply)
-                self.assertEqual(res_zero.get("decision"), expected_block)
-                self.assertIn("未实查即下否定结论拦截", res_zero.get("reason", ""))
+        # 默认 advisory 模式下 Gate A 不硬阻断，显式 enforce 模式下严格三端拦截
+        self.assertEqual(run_case("antigravity", "zero-adv", [], claim_reply).get("decision"), "allow")
+        with unittest.mock.patch.object(reply_repeat_guard, "EVIDENCE_GATE_MODE", "enforce"):
+            for client in ("antigravity", "codex", "claude"):
+                expected_block = "continue" if client == "antigravity" else "block"
+                with self.subTest(neg_client=client):
+                    # 1) 零实质探测（Antigravity 仅有 update_focus OK 亦不算实质探测）-> 拦截
+                    trivial = [{"step_index": 1, "type": "GENERIC", "content": "Created At: t\nCompleted At: t\nOK"}] if client == "antigravity" else []
+                    res_zero = run_case(client, f"zero-{client}", trivial, claim_reply)
+                    self.assertEqual(res_zero.get("decision"), expected_block)
+                    self.assertIn("未实查即下否定结论拦截", res_zero.get("reason", ""))
 
-                # 2) 所有探测命令均报错/非零退出 -> 拦截并报告失败数
-                if client == "antigravity":
-                    failed_rows = [
-                        {"step_index": 1, "type": "GENERIC", "status": "DONE", "content": "Command exited with code 1.\nbash syntax error"},
-                        {"step_index": 2, "type": "GENERIC", "status": "ERROR", "content": "tool call denied by pre-tool hook"},
-                    ]
-                    ok_rows = [{"step_index": 1, "type": "GENERIC", "status": "DONE", "content": "Command exited with code 0.\npeer-host reachable"}]
-                elif client == "codex":
-                    failed_rows = [
-                        {"type": "response_item", "payload": {"type": "function_call_output", "call_id": "c1", "output": "Exit code: 1\nsyntax error"}},
-                        {"type": "response_item", "payload": {"type": "local_shell_call_output", "call_id": "c2", "output": json.dumps({"output": "err", "metadata": {"exit_code": 2}})}},
-                    ]
-                    ok_rows = [{"type": "response_item", "payload": {"type": "function_call_output", "call_id": "c1", "output": "Exit code: 0\nno shares"}}]
-                else:
-                    failed_rows = [
-                        {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "t1", "is_error": True, "content": "bash syntax error"}]}},
-                        {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "t2", "content": "Command exited with code 1"}]}},
-                    ]
-                    ok_rows = [{"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "t1", "content": "Command exited with code 0\nno shares"}]}}]
+                    # 2) 所有探测命令均报错/非零退出 -> 拦截并报告失败数
+                    if client == "antigravity":
+                        failed_rows = [
+                            {"step_index": 1, "type": "GENERIC", "status": "DONE", "content": "Command exited with code 1.\nbash syntax error"},
+                            {"step_index": 2, "type": "GENERIC", "status": "ERROR", "content": "tool call denied by pre-tool hook"},
+                        ]
+                        ok_rows = [{"step_index": 1, "type": "GENERIC", "status": "DONE", "content": "Command exited with code 0.\npeer-host reachable"}]
+                    elif client == "codex":
+                        failed_rows = [
+                            {"type": "response_item", "payload": {"type": "function_call_output", "call_id": "c1", "output": "Exit code: 1\nsyntax error"}},
+                            {"type": "response_item", "payload": {"type": "local_shell_call_output", "call_id": "c2", "output": json.dumps({"output": "err", "metadata": {"exit_code": 2}})}},
+                        ]
+                        ok_rows = [{"type": "response_item", "payload": {"type": "function_call_output", "call_id": "c1", "output": "Exit code: 0\nno shares"}}]
+                    else:
+                        failed_rows = [
+                            {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "t1", "is_error": True, "content": "bash syntax error"}]}},
+                            {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "t2", "content": "Command exited with code 1"}]}},
+                        ]
+                        ok_rows = [{"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "t1", "content": "Command exited with code 0\nno shares"}]}}]
 
-                res_fail = run_case(client, f"allfail-{client}", failed_rows, claim_reply)
-                self.assertEqual(res_fail.get("decision"), expected_block)
-                self.assertIn("失败 2 条", res_fail.get("reason", ""))
+                    res_fail = run_case(client, f"allfail-{client}", failed_rows, claim_reply)
+                    self.assertEqual(res_fail.get("decision"), expected_block)
+                    self.assertIn("失败 2 条", res_fail.get("reason", ""))
 
-                # 3) 续跑态不二次拦截
-                res_cont = run_case(client, f"allfail-{client}", failed_rows, claim_reply, active=True)
-                self.assertNotIn("reason", res_cont)
+                    # 3) 续跑态不二次拦截
+                    res_cont = run_case(client, f"allfail-{client}", failed_rows, claim_reply, active=True)
+                    self.assertNotIn("reason", res_cont)
 
-                # 4) 有至少一条实质探测成功 -> 放行
-                res_ok = run_case(client, f"ok-{client}", ok_rows, claim_reply)
-                self.assertNotIn("reason", res_ok)
+                    # 4) 有至少一条实质探测成功 -> 放行
+                    res_ok = run_case(client, f"ok-{client}", ok_rows, claim_reply)
+                    self.assertNotIn("reason", res_ok)
 
-                # 5) 诚实标明局部排查范围或仅转述规则条文 -> 零探测亦不误拦
-                self.assertNotIn("reason", run_case(client, f"hedge-{client}", [], hedged_reply))
-                self.assertNotIn("reason", run_case(client, f"meta-{client}", [], meta_reply))
+                    # 5) 诚实标明局部排查范围或仅转述规则条文 -> 零探测亦不误拦
+                    self.assertNotIn("reason", run_case(client, f"hedge-{client}", [], hedged_reply))
+                    self.assertNotIn("reason", run_case(client, f"meta-{client}", [], meta_reply))
 
     def test_turn_evidence_partial_scope_and_solo_doc_review_three_clients(self):
         """Antigravity / Codex / Claude 三端统一守卫：局部排查全称缺口定论拦截 + 跨格式正式长文单端免审提醒与模型角色提示。"""
@@ -4199,91 +4267,94 @@ class TestDispatchAndBillingGuards(unittest.TestCase):
             rows.append({"type": "user", "message": {"content": results}})
             return rows
 
-        for client in ("antigravity", "codex", "claude"):
-            expected_block = "continue" if client == "antigravity" else "block"
-            with self.subTest(evidence_client=client):
-                # Gate B: 仅读单个局部文件即下全称缺口定论 -> 拦截；披露局部范围、读过索引文件或续跑态 -> 放行
-                narrow_rows = make_read_rows(client, "data/MATRIX.json")
-                res_gap = run_case(client, f"gap-{client}", narrow_rows, gap_verdict)
-                self.assertEqual(res_gap.get("decision"), expected_block)
-                self.assertIn("局部排查防全称缺口结论", res_gap.get("reason", ""))
-                self.assertNotIn("reason", run_case(client, f"gap-cont-{client}", narrow_rows, gap_verdict, active=True))
-                self.assertNotIn("reason", run_case(client, f"gap-scoped-{client}", narrow_rows, scoped_gap))
-                # 跨句拼接的未限定全称定论仍须拦截（范围声明仅豁免所在句）
-                split_gap = "仅核查了 MATRIX.json。现有数据本身确实不够，必须重做整套算法。"
-                self.assertEqual(run_case(client, f"gap-split-{client}", narrow_rows, split_gap).get("decision"), expected_block)
-                index_rows = make_read_rows(client, "docs/records/repository_map.md")
-                self.assertNotIn("reason", run_case(client, f"gap-idx-{client}", index_rows, gap_verdict))
+        # 默认 advisory 模式下 Gate B/C 不硬阻断，显式 enforce 模式下严格三端拦截
+        self.assertEqual(run_case("antigravity", "gap-adv", make_read_rows("antigravity", "data/MATRIX.json"), gap_verdict).get("decision"), "allow")
+        with unittest.mock.patch.object(reply_repeat_guard, "EVIDENCE_GATE_MODE", "enforce"):
+            for client in ("antigravity", "codex", "claude"):
+                expected_block = "continue" if client == "antigravity" else "block"
+                with self.subTest(evidence_client=client):
+                    # Gate B: 仅读单个局部文件即下全称缺口定论 -> 拦截；披露局部范围、读过索引文件或续跑态 -> 放行
+                    narrow_rows = make_read_rows(client, "data/MATRIX.json")
+                    res_gap = run_case(client, f"gap-{client}", narrow_rows, gap_verdict)
+                    self.assertEqual(res_gap.get("decision"), expected_block)
+                    self.assertIn("局部排查防全称缺口结论", res_gap.get("reason", ""))
+                    self.assertNotIn("reason", run_case(client, f"gap-cont-{client}", narrow_rows, gap_verdict, active=True))
+                    self.assertNotIn("reason", run_case(client, f"gap-scoped-{client}", narrow_rows, scoped_gap))
+                    # 跨句拼接的未限定全称定论仍须拦截（范围声明仅豁免所在句）
+                    split_gap = "仅核查了 MATRIX.json。现有数据本身确实不够，必须重做整套算法。"
+                    self.assertEqual(run_case(client, f"gap-split-{client}", narrow_rows, split_gap).get("decision"), expected_block)
+                    index_rows = make_read_rows(client, "docs/records/repository_map.md")
+                    self.assertNotIn("reason", run_case(client, f"gap-idx-{client}", index_rows, gap_verdict))
 
-                # Gate C: 通用覆盖 .md 与 .tex 整篇大改单端免审 -> 拦截；标明初稿、已跑门禁、写入失败或非交付文件 -> 放行；失败审查不豁免
-                for doc_path in ("docs/design_spec.md", "paper/main.tex"):
-                    tag = Path(doc_path).suffix.lstrip(".")
-                    w_rows = make_write_rows(client, doc_path, big_body)
-                    res_solo = run_case(client, f"solo-{tag}-{client}", w_rows, solo_done)
-                    self.assertEqual(res_solo.get("decision"), expected_block)
-                    self.assertIn("长文交付自审提醒", res_solo.get("reason", ""))
-                    self.assertNotIn("reason", run_case(client, f"draft-{tag}-{client}", w_rows, draft_disclosed))
-                    w_rev = make_write_rows(client, doc_path, big_body, with_review=True)
-                    self.assertNotIn("reason", run_case(client, f"rev-{tag}-{client}", w_rev, solo_done))
-                    w_rev_fail = make_write_rows(client, doc_path, big_body, with_review=True, review_err=True)
-                    self.assertEqual(run_case(client, f"revfail-{tag}-{client}", w_rev_fail, solo_done).get("decision"), expected_block)
-                    w_denied = make_write_rows(client, doc_path, big_body, write_err=True)
-                    self.assertNotIn("reason", run_case(client, f"werr-{tag}-{client}", w_denied, solo_done))
+                    # Gate C: 通用覆盖 .md 与 .tex 整篇大改单端免审 -> 拦截；标明初稿、已跑门禁、写入失败或非交付文件 -> 放行；失败审查不豁免
+                    for doc_path in ("docs/design_spec.md", "paper/main.tex"):
+                        tag = Path(doc_path).suffix.lstrip(".")
+                        w_rows = make_write_rows(client, doc_path, big_body)
+                        res_solo = run_case(client, f"solo-{tag}-{client}", w_rows, solo_done)
+                        self.assertEqual(res_solo.get("decision"), expected_block)
+                        self.assertIn("长文交付自审提醒", res_solo.get("reason", ""))
+                        self.assertNotIn("reason", run_case(client, f"draft-{tag}-{client}", w_rows, draft_disclosed))
+                        w_rev = make_write_rows(client, doc_path, big_body, with_review=True)
+                        self.assertNotIn("reason", run_case(client, f"rev-{tag}-{client}", w_rev, solo_done))
+                        w_rev_fail = make_write_rows(client, doc_path, big_body, with_review=True, review_err=True)
+                        self.assertEqual(run_case(client, f"revfail-{tag}-{client}", w_rev_fail, solo_done).get("decision"), expected_block)
+                        w_denied = make_write_rows(client, doc_path, big_body, write_err=True)
+                        self.assertNotIn("reason", run_case(client, f"werr-{tag}-{client}", w_denied, solo_done))
 
-                # 非正式交付文件（CHANGELOG.md / tests/）不误拦
-                non_deliv = make_write_rows(client, "CHANGELOG.md", big_body)
-                self.assertNotIn("reason", run_case(client, f"chg-{client}", non_deliv, solo_done))
+                    # 非正式交付文件（CHANGELOG.md / tests/）不误拦
+                    non_deliv = make_write_rows(client, "CHANGELOG.md", big_body)
+                    self.assertNotIn("reason", run_case(client, f"chg-{client}", non_deliv, solo_done))
 
-        # Gate A / B 边界回归：中文“不可用”纳入拦截；无关成功写入不充当探测证据；单文件 rg 不视作全仓检索；尾窗截断不误拦
-        self.assertEqual(run_case("antigravity", "neg-unavail", [], "已核实该通道不可用。").get("decision"), "continue")
-        probe_fail_plus_write = [
-            {"step_index": 1, "type": "PLANNER_RESPONSE", "tool_calls": [
-                {"name": "run_command", "args": {"CommandLine": json.dumps("ssh peer")}},
-                {"name": "write_file", "args": {"Path": json.dumps("notes.txt"), "Content": json.dumps("hi")}},
-            ]},
-            {"step_index": 2, "type": "GENERIC", "status": "DONE", "content": "Command exited with code 1.\nfailed"},
-            {"step_index": 3, "type": "GENERIC", "status": "DONE", "content": "Wrote file"},
-        ]
-        self.assertEqual(
-            run_case("antigravity", "neg-write-no-probe", probe_fail_plus_write, "已核实对端未连接。").get("decision"),
-            "continue",
-        )
-        single_file_rg = [
-            {"step_index": 1, "type": "PLANNER_RESPONSE", "tool_calls": [
-                {"name": "run_command", "args": {"CommandLine": json.dumps("rg energy docs/chapter.md")}},
-            ]},
-            {"step_index": 2, "type": "GENERIC", "status": "DONE", "content": "Command exited with code 0.\nline 1"},
-        ]
-        self.assertEqual(
-            run_case("antigravity", "gap-single-rg", single_file_rg, gap_verdict).get("decision"),
-            "continue",
-        )
-        # 超过 256 KiB 尾窗截断时（无回合起点）不将缺失早期探测误判为零探测
-        tp_big = self.root / "ev_truncated.jsonl"
-        big_rows = [
-            {"step_index": 0, "type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "查对端"},
-            {"step_index": 1, "type": "GENERIC", "status": "DONE", "content": "Command exited with code 0.\nok"},
-            {"step_index": 2, "type": "PLANNER_RESPONSE", "content": "x" * (300 * 1024)},
-            {"step_index": 3, "type": "PLANNER_RESPONSE", "content": "已核实对端未连接。"},
-        ]
-        write_rows(tp_big, big_rows)
-        with unittest.mock.patch.object(reply_repeat_guard, "get_data_dirs", return_value=(self.state, self.logs)):
-            res_trunc = reply_repeat_guard.handle_stop_repeat_guard({
-                "conversationId": "trunc-agy", "transcriptPath": str(tp_big), "terminationReason": "model_stop",
-            })
-        self.assertEqual(res_trunc.get("decision"), "allow")
+            # Gate A / B 边界回归：中文“不可用”纳入拦截；无关成功写入不充当探测证据；单文件 rg 不视作全仓检索；尾窗截断不误拦
+            self.assertEqual(run_case("antigravity", "neg-unavail", [], "已核实该通道不可用。").get("decision"), "continue")
+            probe_fail_plus_write = [
+                {"step_index": 1, "type": "PLANNER_RESPONSE", "tool_calls": [
+                    {"name": "run_command", "args": {"CommandLine": json.dumps("ssh peer")}},
+                    {"name": "write_file", "args": {"Path": json.dumps("notes.txt"), "Content": json.dumps("hi")}},
+                ]},
+                {"step_index": 2, "type": "GENERIC", "status": "DONE", "content": "Command exited with code 1.\nfailed"},
+                {"step_index": 3, "type": "GENERIC", "status": "DONE", "content": "Wrote file"},
+            ]
+            self.assertEqual(
+                run_case("antigravity", "neg-write-no-probe", probe_fail_plus_write, "已核实对端未连接。").get("decision"),
+                "continue",
+            )
+            single_file_rg = [
+                {"step_index": 1, "type": "PLANNER_RESPONSE", "tool_calls": [
+                    {"name": "run_command", "args": {"CommandLine": json.dumps("rg energy docs/chapter.md")}},
+                ]},
+                {"step_index": 2, "type": "GENERIC", "status": "DONE", "content": "Command exited with code 0.\nline 1"},
+            ]
+            self.assertEqual(
+                run_case("antigravity", "gap-single-rg", single_file_rg, gap_verdict).get("decision"),
+                "continue",
+            )
+            # 超过 256 KiB 尾窗截断时（无回合起点）不将缺失早期探测误判为零探测
+            tp_big = self.root / "ev_truncated.jsonl"
+            big_rows = [
+                {"step_index": 0, "type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "查对端"},
+                {"step_index": 1, "type": "GENERIC", "status": "DONE", "content": "Command exited with code 0.\nok"},
+                {"step_index": 2, "type": "PLANNER_RESPONSE", "content": "x" * (300 * 1024)},
+                {"step_index": 3, "type": "PLANNER_RESPONSE", "content": "已核实对端未连接。"},
+            ]
+            write_rows(tp_big, big_rows)
+            with unittest.mock.patch.object(reply_repeat_guard, "get_data_dirs", return_value=(self.state, self.logs)):
+                res_trunc = reply_repeat_guard.handle_stop_repeat_guard({
+                    "conversationId": "trunc-agy", "transcriptPath": str(tp_big), "terminationReason": "model_stop",
+                })
+            self.assertEqual(res_trunc.get("decision"), "allow")
 
-        # 动态模型角色提示：Antigravity 运行在 fleet_profile.json code_families (neon) 整写正式长文时附带 deep_families (carbon) 提示
-        neon_rows = make_write_rows("antigravity", "docs/architecture_spec.md", big_body, model="gemini-4-neon-xhigh")
-        res_neon = run_case("antigravity", "solo-neon-hint", neon_rows, solo_done)
-        self.assertEqual(res_neon.get("decision"), "continue")
-        self.assertIn("gemini-4-neon-xhigh", res_neon.get("reason", ""))
-        self.assertIn("carbon", res_neon.get("reason", ""))
+            # 动态模型角色提示：Antigravity 运行在 fleet_profile.json code_families (neon) 整写正式长文时附带 deep_families (carbon) 提示
+            neon_rows = make_write_rows("antigravity", "docs/architecture_spec.md", big_body, model="gemini-4-neon-xhigh")
+            res_neon = run_case("antigravity", "solo-neon-hint", neon_rows, solo_done)
+            self.assertEqual(res_neon.get("decision"), "continue")
+            self.assertIn("gemini-4-neon-xhigh", res_neon.get("reason", ""))
+            self.assertIn("carbon", res_neon.get("reason", ""))
 
-        carbon_rows = make_write_rows("antigravity", "docs/architecture_spec.md", big_body, model="gemini-4-carbon-high")
-        res_carbon = run_case("antigravity", "solo-carbon-nohint", carbon_rows, solo_done)
-        self.assertEqual(res_carbon.get("decision"), "continue")
-        self.assertNotIn("编码高吞吐系列", res_carbon.get("reason", ""))
+            carbon_rows = make_write_rows("antigravity", "docs/architecture_spec.md", big_body, model="gemini-4-carbon-high")
+            res_carbon = run_case("antigravity", "solo-carbon-nohint", carbon_rows, solo_done)
+            self.assertEqual(res_carbon.get("decision"), "continue")
+            self.assertNotIn("编码高吞吐系列", res_carbon.get("reason", ""))
 
     def test_v203_gui_hang_guard_and_conversation_delete_rpc_boundary(self):
         """禁止无 timeout 直接调用桌面 GUI 二进制导致后台挂死，并把 ConversationService/DeleteConversation 纳入边界确认。"""
@@ -4356,17 +4427,17 @@ class TestDispatchAndBillingGuards(unittest.TestCase):
         --help 豁免、Antigravity default_mode=enforce、fullyIdle=False 推迟终态自审与 brain 目录豁免。"""
         from _lib import adaptive_policy
 
-        # 1) adaptive_policy 中 antigravity 默认 default_mode 为 enforce（codex/claude 保持 advisory）
+        # 1) v3.0 D2: adaptive_policy 中四端默认 default_mode 统一为 advisory
         real_profile = json.loads(
             (HOOKS_DIR.parent / "skills" / "cae-harness" / "fleet_profile.json").read_text(encoding="utf-8")
         )
         self.assertEqual(
             adaptive_policy.resolve_adaptive_handoff_policy(real_profile, "antigravity")["default_mode"],
-            "enforce",
+            "advisory",
         )
         self.assertEqual(
             adaptive_policy.resolve_adaptive_handoff_policy({}, "antigravity")["default_mode"],
-            "enforce",
+            "advisory",
         )
         self.assertEqual(
             adaptive_policy.resolve_adaptive_handoff_policy({}, "codex")["default_mode"],
@@ -4481,15 +4552,16 @@ class TestDispatchAndBillingGuards(unittest.TestCase):
             "transcriptPath": str(tp_idle),
         })
         self.assertEqual(res_busy["decision"], "allow")
-        # 后台空闲后，未审校且未标注初稿仍正常触发 Gate C
-        res_idle = reply_repeat_guard.handle_stop_repeat_guard({
-            "conversationId": "v204-busy-defer",
-            "terminationReason": "model_stop",
-            "fullyIdle": True,
-            "transcriptPath": str(tp_idle),
-        })
-        self.assertEqual(res_idle["decision"], "continue")
-        self.assertIn("长文交付自审提醒", res_idle.get("reason", ""))
+        # 后台空闲后，默认 advisory 不硬拦截，显式 enforce 模式下未审校且未标注初稿仍正常触发 Gate C
+        with unittest.mock.patch.object(reply_repeat_guard, "EVIDENCE_GATE_MODE", "enforce"):
+            res_idle = reply_repeat_guard.handle_stop_repeat_guard({
+                "conversationId": "v204-busy-defer",
+                "terminationReason": "model_stop",
+                "fullyIdle": True,
+                "transcriptPath": str(tp_idle),
+            })
+            self.assertEqual(res_idle["decision"], "continue")
+            self.assertIn("长文交付自审提醒", res_idle.get("reason", ""))
 
         # 同一份文档在运行 check-grounding 返回 exit 2 但 findings 全部位于其他旧文件时，放行不再死循环
         tp_cg = base_tmp / "tp_cg.jsonl"
@@ -4654,14 +4726,23 @@ class TestDispatchAndBillingGuards(unittest.TestCase):
             "content": 'Command exited with code 0.\n{"hygiene_only": true, "checked_files": ["docs/brain/report.tex"], "findings": []}',
         })
         _append_jsonl(tp_hyg, {"type": "PLANNER_RESPONSE", "source": "MODEL", "step_index": 6, "content": "已完成 docs/brain/report.tex 定稿交付。"})
-        res_gate_c = reply_repeat_guard.handle_stop_repeat_guard({
-            "conversationId": "v204-adv-gatec",
+        # 默认 advisory 不硬拦截长文自审；显式 enforce 仍严拦仅跑 --hygiene-only 的长文交付
+        res_gate_c_adv = reply_repeat_guard.handle_stop_repeat_guard({
+            "conversationId": "v204-adv-gatec-adv",
             "terminationReason": "model_stop",
             "fullyIdle": True,
             "transcriptPath": str(tp_hyg),
         })
-        self.assertEqual(res_gate_c["decision"], "continue")
-        self.assertIn("长文交付自审提醒", res_gate_c.get("reason", ""))
+        self.assertEqual(res_gate_c_adv["decision"], "allow")
+        with unittest.mock.patch.object(reply_repeat_guard, "EVIDENCE_GATE_MODE", "enforce"):
+            res_gate_c = reply_repeat_guard.handle_stop_repeat_guard({
+                "conversationId": "v204-adv-gatec",
+                "terminationReason": "model_stop",
+                "fullyIdle": True,
+                "transcriptPath": str(tp_hyg),
+            })
+            self.assertEqual(res_gate_c["decision"], "continue")
+            self.assertIn("长文交付自审提醒", res_gate_c.get("reason", ""))
 
     def test_v205_ast_kwargs_bound_path_parent_and_pure_fn_budget(self):
         """v2.0.5: 回归位置/单键已绑定实参不被 **kwargs 误污染、Path.parent 词法求值与纯只读函数免重复展开。"""

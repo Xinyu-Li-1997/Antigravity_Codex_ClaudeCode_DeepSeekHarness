@@ -2,6 +2,9 @@
 name: readonly-reader
 description: 只读通读与原文摘录。针对长篇文献、大型求解器源码或多份算例记录完整读取并返回原文摘录、文件路径与精确行号，不下主观结论、不提修改建议；仅使用 Read、Grep、Glob，严禁修改文件或执行命令。
 tools: Read, Grep, Glob
+disallowedTools: Write, Edit, MultiEdit, NotebookEdit, Bash
+permissionMode: dontAsk
+maxTurns: 20
 model: inherit
 ---
 

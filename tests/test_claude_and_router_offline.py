@@ -1431,7 +1431,8 @@ class TestClaudeInstallerAndUpgradeAudit(OfflineSandbox):
         self.assertIn("AGENTS.md", report["codex"]["drift_files"])
         self.install(*args)
         expected_tail = tail.replace("\nR10.", "\nL1.").replace("- **R11.", "- **L2.")
-        self.assertEqual(rules.read_text(encoding="utf-8"), template + "\n\n" + expected_tail)
+        rendered_codex = installer.render_rules_for_client(template, "codex").rstrip()
+        self.assertEqual(rules.read_text(encoding="utf-8"), rendered_codex + "\n\n" + expected_tail)
         before = self.snapshot()
         report = json.loads(self.install(*args, "--audit-upgrade").stdout)
         self.assertEqual(report["codex"]["drift_files"], [])
@@ -1458,7 +1459,7 @@ class TestClaudeInstallerAndUpgradeAudit(OfflineSandbox):
     def test_codex_all_hook_scripts_run_and_off_removes_gate(self):
         args = ["--app", "codex", "--codex-home", self.codex]
         self.install(*args)
-        names = {"session_context_loader.py", "status_guard.py", "reply_repeat_guard.py", "handoff_gate.py", "user_words.py"}
+        names = {"uguard_hook.py", "session_context_loader.py", "status_guard.py", "reply_repeat_guard.py", "handoff_gate.py", "user_words.py"}
         for name in names:
             path = self.codex / "hooks" / name
             self.assertEqual(path.read_bytes(), (HOOKS_DIR / name).read_bytes())
@@ -1466,11 +1467,11 @@ class TestClaudeInstallerAndUpgradeAudit(OfflineSandbox):
                                     cwd=self.project, capture_output=True, text=True, encoding="utf-8", timeout=15)
             self.assertEqual(result.returncode, 0, result.stderr)
         doc = json.loads((self.codex / "hooks.json").read_bytes())
-        for event, name in (("PreToolUse", "status_guard.py"), ("Stop", "reply_repeat_guard.py")):
-            handlers = [h for g in doc["hooks"][event] for h in g["hooks"] if name in h["command"]]
+        for event in ("PreToolUse", "Stop"):
+            handlers = [h for g in doc["hooks"][event] for h in g["hooks"] if "uguard_hook.py" in h["command"]]
             self.assertEqual(len(handlers), 1)
             self.assertEqual(handlers[0]["timeout"], 15)
-            self.assertIn("--client codex", handlers[0]["command"])
+            self.assertIn(f"--client codex --event {event}", handlers[0]["command"])
             payload = {"session_id": "codex_fixture", "cwd": str(self.project), "hook_event_name": event,
                        "stop_hook_active": True, "tool_name": "Read",
                        "tool_input": {"file_path": str(self.project / "solver.py")}}
@@ -1487,9 +1488,12 @@ class TestClaudeInstallerAndUpgradeAudit(OfflineSandbox):
         self.assertEqual(gate.read_bytes(), (HOOKS_DIR / "handoff_gate.py").read_bytes())
         self.assertTrue(all((self.codex / "hooks" / name).is_file() for name in names))
         doc = json.loads((self.codex / "hooks.json").read_bytes())
-        self.assertNotIn("handoff_gate.py", json.dumps(doc["hooks"]))
-        for event, name in (("PreToolUse", "status_guard.py"), ("Stop", "reply_repeat_guard.py")):
-            handler = next(h for g in doc["hooks"][event] for h in g["hooks"] if name in h["command"])
+        self.assertNotIn("PostCompact", doc["hooks"])
+        self.assertNotIn("UserPromptSubmit", doc["hooks"])
+        policy = json.loads((self.codex / "hooks/state/handoff/policy.json").read_bytes())
+        self.assertEqual(policy["mode"], "off")
+        for event in ("PreToolUse", "Stop"):
+            handler = next(h for g in doc["hooks"][event] for h in g["hooks"] if "uguard_hook.py" in h["command"])
             payload = {"session_id": "codex_off_fixture", "cwd": str(self.project), "hook_event_name": event,
                        "stop_hook_active": True, "tool_name": "Read",
                        "tool_input": {"file_path": str(self.project / "solver.py")}}
@@ -1512,15 +1516,12 @@ class TestClaudeInstallerAndUpgradeAudit(OfflineSandbox):
         self.install(*args)
         registry = self.codex / "hooks.json"
         original = registry.read_bytes()
-        for event, name in (("PreToolUse", "status_guard.py"), ("Stop", "reply_repeat_guard.py")):
+        for event, script_name in (("PreToolUse", "status_guard.py"), ("Stop", "reply_repeat_guard.py")):
             with self.subTest(event=event):
                 doc = json.loads(original)
                 expected_doc = copy.deepcopy(doc)
                 for group in doc["hooks"][event]:
-                    group["hooks"] = [handler for handler in group["hooks"] if name not in handler["command"]]
-                for group in expected_doc["hooks"][event]:
-                    restored = [handler for handler in group["hooks"] if name in handler["command"]]
-                    group["hooks"] = [handler for handler in group["hooks"] if name not in handler["command"]] + restored
+                    group["hooks"] = [handler for handler in group["hooks"] if "uguard_hook.py" not in handler["command"]]
                 registry.write_bytes((json.dumps(doc) + "\n").encode("utf-8"))
                 before = self.snapshot()
                 report = json.loads(self.install(*args, "--audit-upgrade").stdout)
@@ -1529,14 +1530,14 @@ class TestClaudeInstallerAndUpgradeAudit(OfflineSandbox):
                 self.assertEqual(self.snapshot(), before)
                 self.install(*args)
                 self.assertEqual(json.loads(registry.read_bytes()), expected_doc)
-                script = self.codex / "hooks" / name
+                script = self.codex / "hooks" / script_name
                 script.unlink()
                 before = self.snapshot()
                 report = json.loads(self.install(*args, "--audit-upgrade").stdout)
-                self.assertIn("hooks/" + name, report["codex"]["drift_files"])
+                self.assertIn("hooks/" + script_name, report["codex"]["drift_files"])
                 self.assertEqual(self.snapshot(), before)
                 self.install(*args)
-                self.assertEqual(script.read_bytes(), (HOOKS_DIR / name).read_bytes())
+                self.assertEqual(script.read_bytes(), (HOOKS_DIR / script_name).read_bytes())
                 report = json.loads(self.install(*args, "--audit-upgrade").stdout)
                 self.assertTrue(report["codex"]["hooks_aligned"])
                 self.assertEqual(report["codex"]["drift_files"], [])
@@ -1744,11 +1745,10 @@ class TestClaudeInstallerAndUpgradeAudit(OfflineSandbox):
         with mock.patch.object(installer, "_is_working_python_cmd", return_value=False):
             plan = installer._plan_claude_settings(path, REPO_ROOT / "template/claude/hooks.json", prefix)
         doc = json.loads(plan.change.content)
-        for event, name in (("PreToolUse", "status_guard.py"), ("Stop", "reply_repeat_guard.py")):
-            handler = next(h for g in doc["hooks"][event] for h in g["hooks"] if name in h["command"])
+        for event in ("SessionStart", "PreToolUse", "Stop"):
+            handler = next(h for g in doc["hooks"][event] for h in g["hooks"] if "uguard_hook.py" in h["command"])
             self.assertTrue(handler["command"].startswith(prefix + " "))
-        loader = next(h for g in doc["hooks"]["SessionStart"] for h in g["hooks"] if "session_context_loader.py" in h["command"])
-        self.assertTrue(loader["command"].startswith(prefix + " "))
+            self.assertIn(f"--event {event}", handler["command"])
 
     def test_claude_upgrade_migrates_hooks_preserves_user_assets_and_is_idempotent(self):
         db = self.database()
@@ -1845,7 +1845,7 @@ class TestClaudeInstallerAndUpgradeAudit(OfflineSandbox):
                             self.assertNotEqual(name, "session_context_loader.py")
         self.assertNotIn("Bash|PowerShell|Read|Grep", [group.get("matcher") for group in updated["hooks"]["PreToolUse"]])
         installed_loader = next(handler for group in updated["hooks"]["SessionStart"] for handler in group["hooks"]
-                                if "session_context_loader.py" in handler["command"])
+                                if "uguard_hook.py" in handler["command"])
         live = subprocess.run(installer._claude_hook_tokens(installed_loader), cwd=self.project,
                               input=json.dumps({**self.payload, "source": "compact"}), capture_output=True,
                               text=True, encoding="utf-8", timeout=20)
@@ -1996,8 +1996,11 @@ class TestClaudeInstallerAndUpgradeAudit(OfflineSandbox):
         self.assertTrue((self.claude_home / 'skills/cae-harness/SKILL.md').is_file())
         (dsh / 'AGENTS.md').write_text('stale\n', encoding='utf-8')
         run_main(['--app', 'all'], detection)
+        rendered_dsh = installer.render_rules_for_client(
+            (REPO_ROOT / 'template/user-guard/rules/AGENTS.md').read_text(encoding='utf-8'), 'dsh'
+        ).encode('utf-8')
         self.assertEqual(installer._rules_core((dsh / 'AGENTS.md').read_bytes()),
-                         installer._rules_core((REPO_ROOT / 'template/user-guard/rules/AGENTS.md').read_bytes()))
+                         installer._rules_core(rendered_dsh))
 
     def test_audit_reports_harness_drift_on_each_installed_peer(self):
         dsh = self.root / 'target/dsh'
@@ -2102,14 +2105,19 @@ class TestClaudeInstallerAndUpgradeAudit(OfflineSandbox):
         args = ["--app", "claude", "--claude-home", self.claude_home]
         self.install(*args, "--claude-handoff-mode", "enforce", "--claude-handoff-compactions", "3")
         path = self.claude_home / "settings.json"
+        policy_path = self.claude_home / "hooks/state/handoff/policy.json"
         initial = path.read_bytes(), path.stat().st_mtime_ns
         self.install(*args)
         self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), initial)
-        self.assertIn(b"--mode enforce --compact-limit 3", path.read_bytes())
+        self.assertEqual(json.loads(policy_path.read_bytes()), {"mode": "enforce", "compact_limit": 3})
+        self.assertIn(b"uguard_hook.py", path.read_bytes())
         self.install(*args, "--claude-handoff-mode", "off")
         self.assertEqual((self.claude_home / "hooks/handoff_gate.py").read_bytes(), (HOOKS_DIR / "handoff_gate.py").read_bytes())
-        self.assertNotIn("handoff_gate.py", json.dumps(json.loads(path.read_bytes())["hooks"]))
-        for name in ("status_guard.py", "reply_repeat_guard.py"):
+        off_hooks = json.loads(path.read_bytes())["hooks"]
+        self.assertNotIn("PostCompact", off_hooks)
+        self.assertNotIn("UserPromptSubmit", off_hooks)
+        self.assertEqual(json.loads(policy_path.read_bytes())["mode"], "off")
+        for name in ("uguard_hook.py", "status_guard.py", "reply_repeat_guard.py"):
             result = subprocess.run([sys.executable, "-B", "-X", "utf8", "-I", str(self.claude_home / "hooks" / name), "--help"],
                                     cwd=self.project, capture_output=True, text=True, encoding="utf-8", timeout=15)
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -2377,7 +2385,7 @@ class TestClaudeInstallerAndUpgradeAudit(OfflineSandbox):
             self.root / "missing.db", detection=detection_v171, is_sandbox_run=True,
         )
         self.assertEqual(rep_sbx["codex"]["hooks_trust"]["status"], "unrecorded")
-        self.assertEqual(rep_sbx["codex"]["hooks_trust"]["managed_count"], 8)
+        self.assertEqual(rep_sbx["codex"]["hooks_trust"]["managed_count"], 5)
         self.assertEqual(rep_sbx["codex"]["hooks_trust"]["trusted_count"], 0)
         self.assertNotIn("review_codex_hook_trust", rep_sbx["summary"]["recommended_actions"])
         self.assertIn("gemini-4-argon-high", rep_sbx["antigravity"]["retiring_models"])
@@ -2402,9 +2410,8 @@ class TestClaudeInstallerAndUpgradeAudit(OfflineSandbox):
         # 3) 仅信任部分槽位时在沙箱也报 untrusted_or_partial 与 review_codex_hook_trust
         hooks_path_str = str((self.codex / "hooks.json").resolve())
         all_slots = [
-            "session_start:0:0", "session_start:0:1", "post_compact:0:0",
-            "user_prompt_submit:0:0", "pre_tool_use:0:0", "pre_tool_use:0:1",
-            "stop:0:0", "stop:0:1",
+            "session_start:0:0", "post_compact:0:0",
+            "user_prompt_submit:0:0", "pre_tool_use:0:0", "stop:0:0",
         ]
         partial_blocks = "\n".join(
             f"\n[hooks.state.'{hooks_path_str}:{slot}']\ntrusted_hash = \"sha256:abc123\"\n"
@@ -2416,11 +2423,11 @@ class TestClaudeInstallerAndUpgradeAudit(OfflineSandbox):
             self.root / "missing.db", detection=detection_v171, is_sandbox_run=True,
         )
         self.assertEqual(rep_partial["codex"]["hooks_trust"]["status"], "untrusted_or_partial")
-        self.assertEqual(rep_partial["codex"]["hooks_trust"]["trusted_count"], 7)
-        self.assertEqual(rep_partial["codex"]["hooks_trust"]["missing_entries"], ["<codex>/hooks.json:stop:0:1"])
+        self.assertEqual(rep_partial["codex"]["hooks_trust"]["trusted_count"], 4)
+        self.assertEqual(rep_partial["codex"]["hooks_trust"]["missing_entries"], ["<codex>/hooks.json:stop:0:0"])
         self.assertIn("review_codex_hook_trust", rep_partial["summary"]["recommended_actions"])
 
-        # 4) 8 条受管钩子全部记录且 hooks.json 无漂移时 status == slots_recorded（诚实标明 hash_verified=False）
+        # 4) 5 条受管单入口钩子全部记录且 hooks.json 无漂移时 status == slots_recorded（诚实标明 hash_verified=False）
         full_blocks = "\n".join(
             f"\n[hooks.state.'{hooks_path_str}:{slot}']\ntrusted_hash = \"sha256:abc123\"\n"
             for slot in all_slots
@@ -2432,7 +2439,7 @@ class TestClaudeInstallerAndUpgradeAudit(OfflineSandbox):
         )
         self.assertEqual(rep_trusted["codex"]["hooks_trust"]["status"], "slots_recorded")
         self.assertFalse(rep_trusted["codex"]["hooks_trust"]["hash_verified"])
-        self.assertEqual(rep_trusted["codex"]["hooks_trust"]["trusted_count"], 8)
+        self.assertEqual(rep_trusted["codex"]["hooks_trust"]["trusted_count"], 5)
         self.assertEqual(rep_trusted["codex"]["hooks_trust"]["missing_entries"], [])
         self.assertNotIn("review_codex_hook_trust", rep_trusted["summary"]["recommended_actions"])
 
@@ -2741,18 +2748,20 @@ class TestClaudeInstallerAndUpgradeAudit(OfflineSandbox):
         dsh = self.root / "target/dsh"
         db = self.database()
         self.install(*self.all_args(), "--dsh-home", dsh)
-        expected_skill = (REPO_ROOT / "template/user-guard/skills/fleet-evolve/SKILL.md").read_bytes()
-        expected_state = (REPO_ROOT / "template/user-guard/skills/fleet-evolve/scripts/fleet_state.py").read_bytes()
+        expected_harness = (REPO_ROOT / "template/user-guard/skills/cae-harness/SKILL.md").read_bytes()
         peer_roots = {
             "antigravity": self.plugin,
             "codex": self.codex,
             "claude": self.claude_home,
             "dsh": dsh,
         }
+        # v3.0 D5: 上游专属 fleet-evolve 不再分发至宿主机目标目录；残留旧目录会被审计标出并在重装时自动清理
         for root in peer_roots.values():
-            self.assertEqual((root / "skills/fleet-evolve/SKILL.md").read_bytes(), expected_skill)
-            self.assertEqual((root / "skills/fleet-evolve/scripts/fleet_state.py").read_bytes(), expected_state)
-            (root / "skills/fleet-evolve/SKILL.md").write_text("# drifted\n", encoding="utf-8")
+            self.assertFalse((root / "skills/fleet-evolve").exists())
+            self.assertEqual((root / "skills/cae-harness/SKILL.md").read_bytes(), expected_harness)
+            stale_fe = root / "skills/fleet-evolve/SKILL.md"
+            stale_fe.parent.mkdir(parents=True, exist_ok=True)
+            stale_fe.write_text("# legacy fleet-evolve\n", encoding="utf-8")
 
         admin.prepare_cards(db, admin.default_router_port())
         with closing(sqlite3.connect(db)) as con:
@@ -2774,7 +2783,14 @@ class TestClaudeInstallerAndUpgradeAudit(OfflineSandbox):
             detection={}, is_sandbox_run=True, app_scope="all", dsh_home=dsh,
         )
         for name in peer_roots:
-            self.assertIn("skills/fleet-evolve/SKILL.md", report[name]["drift_files"])
+            self.assertTrue(
+                any(item.startswith("skills/fleet-evolve") for item in report[name]["drift_files"]),
+                (name, report[name]["drift_files"]),
+            )
+        # 重新安装自动清理残留的宿主机 fleet-evolve 目录
+        self.install(*self.all_args(), "--dsh-home", dsh)
+        for root in peer_roots.values():
+            self.assertFalse((root / "skills/fleet-evolve").exists())
         serialized = json.dumps(report, ensure_ascii=False)
         self.assertNotIn("alice_private_account_label", serialized)
         self.assertNotIn("bob_broken_secret_card", serialized)
@@ -3499,7 +3515,7 @@ class TestShard3RouterInstallerFixes(OfflineSandbox):
             stale_targets = {
                 "antigravity": (plugin / "hooks/retired_old.py", "hooks/retired_old.py"),
                 "codex": (codex / "skills/cae-harness/scripts/retired_cx.py", "skills/cae-harness/scripts/retired_cx.py"),
-                "claude": (self.claude_home / "skills/fleet-evolve/scripts/retired_cl.py", "skills/fleet-evolve/scripts/retired_cl.py"),
+                "claude": (self.claude_home / "skills/cae-harness/scripts/retired_cl.py", "skills/cae-harness/scripts/retired_cl.py"),
                 "dsh": (dsh / "skills/cae-harness/retired_dsh.md", "skills/cae-harness/retired_dsh.md"),
             }
             for path, _ in stale_targets.values():
@@ -4073,31 +4089,29 @@ class TestShard3RouterInstallerFixes(OfflineSandbox):
         merged = json.loads(plan.change.content)
 
         ss_hooks = merged["hooks"]["SessionStart"][0]["hooks"]
-        self.assertEqual(len(ss_hooks), 3)
+        self.assertEqual(len(ss_hooks), 2)
         self.assertTrue(ss_hooks[0]["command"].startswith(new_py_cmd + " "))
+        self.assertIn("uguard_hook.py", ss_hooks[0]["command"])
         self.assertEqual(ss_hooks[0]["timeout"], 29)
         self.assertIn(custom_sh, ss_hooks)
-        self.assertEqual(sum("handoff_gate.py" in h["command"] for h in ss_hooks), 1)
 
         pre_hooks = merged["hooks"]["PreToolUse"][0]["hooks"]
-        status_managed = [h for h in pre_hooks if "status_guard.py" in h["command"] and h not in (py2_custom, py310_custom)]
+        status_managed = [h for h in pre_hooks if "uguard_hook.py" in h["command"] and h not in (py2_custom, py310_custom)]
         self.assertEqual(len(status_managed), 1)
         self.assertTrue(status_managed[0]["command"].startswith(new_py_cmd + " "))
 
         stop_hooks = merged["hooks"]["Stop"][0]["hooks"]
-        self.assertEqual(len(stop_hooks), 2)
-        for h in stop_hooks:
-            self.assertTrue(h["command"].startswith(new_py_cmd + " "))
-        migrated_gate = next(h for h in stop_hooks if "handoff_gate.py" in h["command"])
-        self.assertIn("--mode enforce --compact-limit 4", migrated_gate["command"])
-        self.assertEqual(migrated_gate["timeout"], 41)
+        self.assertEqual(len(stop_hooks), 1)
+        self.assertTrue(stop_hooks[0]["command"].startswith(new_py_cmd + " "))
+        self.assertIn("uguard_hook.py", stop_hooks[0]["command"])
+        self.assertIn("--event Stop", stop_hooks[0]["command"])
 
-        # Working interpreter with legacy flags on handoff_gate.py still upgrades flags to HOOK_PYTHON_FLAGS
+        # Working interpreter with legacy flags on uguard_hook.py still upgrades flags to HOOK_PYTHON_FLAGS
         hooks_path.write_bytes(plan.change.content)
         doc_working_legacy = json.loads(hooks_path.read_text(encoding="utf-8"))
         for group in doc_working_legacy["hooks"].get("Stop", []):
             for h in group["hooks"]:
-                if "handoff_gate.py" in h["command"]:
+                if "uguard_hook.py" in h["command"]:
                     h["command"] = h["command"].replace("-X utf8 -I -B", "-I -B", 1)
         user_words.atomic_write_json(hooks_path, doc_working_legacy)
         with mock.patch.object(installer, "_hook_python_candidates", return_value=candidates), \
@@ -4808,7 +4822,7 @@ class TestShard3RouterInstallerFixes(OfflineSandbox):
         dsh_dir = self.root / "v1160_meta_dst/dsh"
         audit = installer.audit_upgrade_status(src_root, ag_dir, cx_dir, cl_dir, dsh_dir, app_scope="all")
         self.assertIn("adaptive_meta", audit)
-        self.assertEqual(set(audit["adaptive_meta"].keys()), {"antigravity", "codex", "claude"})
+        self.assertEqual(set(audit["adaptive_meta"].keys()), {"antigravity", "codex", "claude", "dsh"})
 
         # Verify ccswitch_admin._build_card_templates consumes adaptive defaults when subscription_matrix has enabled claude models
         prof_path = self.root / "adaptive_card_profile.json"
@@ -4926,11 +4940,14 @@ class TestShard3RouterInstallerFixes(OfflineSandbox):
             self.assertEqual(real_target.read_text(encoding="utf-8"), "orig")
 
         # 3) install._probe_dsh_hook_capability & probe_apps dsh native_binary probe
-        self.assertEqual(installer._probe_dsh_hook_capability(None)["hook_protocol"], "soft_rules_only")
+        dsh_none = installer._probe_dsh_hook_capability(None)
+        self.assertEqual(dsh_none["hook_protocol"], "no_lifecycle_hooks")
+        self.assertEqual(dsh_none["evidence_state"], "unknown_not_probed")
         fake_res = mock.Mock(stdout="Usage: dsh [OPTIONS] --hooks PreToolUse SessionStart", stderr="")
         with mock.patch.object(installer.subprocess, "run", return_value=fake_res):
             up = installer._probe_dsh_hook_capability("/usr/local/bin/dsh")
             self.assertTrue(up["hard_hooks_supported"])
+            self.assertEqual(up["evidence_state"], "detected_heuristic")
             self.assertEqual(up["meta_update_trigger"], "ready_for_fleet_evolve_dsh_hooks")
         fake_bin = self.root / "fake_dsh_bin"
         fake_bin.mkdir(parents=True, exist_ok=True)
