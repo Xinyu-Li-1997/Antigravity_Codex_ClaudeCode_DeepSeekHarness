@@ -2,6 +2,22 @@
 
 本文件记录四客户端共用规则、会话钩子、后台验证工具与上游维护流程的版本演进。当前插件版本以 `template/user-guard/plugin.json` 为准；常驻使用文档只说明机制和配置键，不重复维护版本号与性能日期。
 
+## [2.1.2] - 2026-11-28
+
+基于多代理只读复盘沉淀 5 项宿主机升级发现、体检守卫与安装脚本加固：
+
+- **统一独立 `codex-package` 目录发现与优先级（`install.py`、`template/user-guard/skills/cae-harness/scripts/_harness/config.py`、`tests/test_harness_offline.py`、`tests/test_claude_and_router_offline.py`）**：
+  - 将独立包目录 `~/.local/share/codex-package/bin/codex[.exe]` 纳入 Windows、POSIX 与 WSL2 跨侧探测的最高优先级，并加入 `_prefer_codex_package_binaries` 的 `standalone_bins` 豁免，避免独立安装的完整包被 `mtime` 更新的 WindowsApps MSIX 或残留桌面缓存反杀；
+  - 修正 `_harness/config.py` 在 `PATH` 命中 WindowsApps 时跳过用户独立安装以及 POSIX `shutil.which` 未排除 `/mnt/[a-z]/` 互操作包装器的缺口；在 `install.py --audit-upgrade` 新增 `codex.package_isolation_warning` 只读检查，告警直接混压进共享 `~/.local/` 的 `codex-package`。
+- **升级 CC Switch `schema 29` 基线并显式暴露超基线告警（`template/claude/router/ccswitch_admin.py`、`install.py`、`docs/architecture-and-hooks.md`）**：
+  - 经双侧实库核对将 `TESTED_MAX_SCHEMA` 升至 `29`，并扩展 `disable-prompts --app-type` 支持 `dsh`；
+  - 在 `install.py --audit-upgrade` 新增 `review_ccswitch_schema` 建议码，当宿主数据库 `schema_version` 超出 `TESTED_MAX_SCHEMA` 时不再静默返回 `all_aligned: true`。
+- **强化 `--sync-model-defaults` 缺缓存汇总告警、管道健壮性与升级核验纪律（`install.py`、`template/claude/router/update-cc-switch-wsl.sh`、`template/user-guard/skills/fleet-evolve/SKILL.md`、`docs/architecture-and-hooks.md`）**：
+  - 当 `--sync-model-defaults` 因缺少有效 `models_cache.json` 跳过更新时，在 `install.py` 结束横幅旁输出醒目 `[!]` 提示并注明 `--skip-test` 增量补同步路径；同步更正 `docs/architecture-and-hooks.md` 对 `refresh_codex_model_catalog` 的误导表述；
+  - 在 `update-cc-switch-wsl.sh` 为 `sudo apt install` 重定向 `</dev/null`，防止外层管道执行时被 `apt` 耗尽标准输入；在 `fleet-evolve/SKILL.md` 增补宿主机客户端升级四条核验纪律（读发行说明与多文件包隔离、禁用非交互管道假冒烟、按序收尾与回退明示）。
+
+---
+
 ## [2.1.1] - 2026-11-28
 
 基于真实双平台长会话日志取证完成 5 项会话生命周期与写作机制修复，并刷新四客户端联网评估台账至 `2026-11-28`：

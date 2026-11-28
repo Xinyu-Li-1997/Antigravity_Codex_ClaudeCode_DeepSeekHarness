@@ -668,7 +668,11 @@ def _windows_app_binaries(home: Path, local_app: Path, name: str) -> Tuple[Optio
         ]
     elif name == "codex":
         codex_dir = local_app / "OpenAI" / "Codex"
-        cli = [home / ".local" / "bin" / "codex.exe", home / ".cargo" / "bin" / "codex.exe"]
+        cli = [
+            home / ".local" / "share" / "codex-package" / "bin" / "codex.exe",
+            home / ".local" / "bin" / "codex.exe",
+            home / ".cargo" / "bin" / "codex.exe",
+        ]
         desktop = [codex_dir / "Codex.exe"]
         try:
             if codex_dir.is_dir():
@@ -732,14 +736,33 @@ def _native_cli(name: str, home: Path) -> Optional[str]:
             return found
     if os.name == "nt":
         local_app = Path(os.environ.get("LOCALAPPDATA") or str(home / "AppData" / "Local"))
+        if name == "codex":
+            standalone_cli = _first_executable([
+                home / ".local" / "share" / "codex-package" / "bin" / "codex.exe",
+                home / ".local" / "bin" / "codex.exe",
+                home / ".cargo" / "bin" / "codex.exe",
+            ], windows=True)
+            if standalone_cli:
+                return standalone_cli
+            which_cli = shutil.which("codex.exe") or shutil.which("codex")
+            if which_cli:
+                which_norm = Path(which_cli).as_posix().lower()
+                if "/microsoft/windowsapps/" not in which_norm and "/windowsapps/" not in which_norm and "/openai/codex/bin/" not in which_norm:
+                    return which_cli
         local_cli, _ = _windows_app_binaries(home, local_app, name)
         found = local_cli or shutil.which(f"{name}.exe") or shutil.which(name)
         if name == "codex" and found and "/microsoft/windowsapps/" in Path(found).as_posix().lower():
             return None
         return found
     candidates = [home / ".local" / "bin" / name]
-    if name in {"agy", "codex"}:
-        candidates.insert(0, home / (".gemini" if name == "agy" else ".cargo") / "bin" / name)
+    if name == "agy":
+        candidates.insert(0, home / ".gemini" / "bin" / name)
+    elif name == "codex":
+        candidates = [
+            home / ".local" / "share" / "codex-package" / "bin" / name,
+            home / ".local" / "bin" / name,
+            home / ".cargo" / "bin" / name,
+        ]
     if name == "claude":
         candidates.append(home / ".npm-global" / "bin" / name)
     if name == "dsh":
@@ -962,7 +985,7 @@ def _probe_windows_wsl() -> Dict[str, Any]:
         '}; '
         'for name in agy codex claude dsh cc-switch; do '
         '  bin=; '
-        '  for candidate in "$HOME/.gemini/bin/$name" "$HOME/.local/bin/$name" "$HOME/.cargo/bin/$name" '
+        '  for candidate in "$HOME/.gemini/bin/$name" "$HOME/.local/share/codex-package/bin/$name" "$HOME/.local/bin/$name" "$HOME/.cargo/bin/$name" '
         '    "$HOME/.npm-global/bin/$name" "/usr/local/bin/$name" "/usr/bin/$name" '
         '    "/opt/DeepSeek Harness/resources/runtime/cli/bin/$name" "$(command -v "$name" 2>/dev/null)"; do '
         '    if is_native "$candidate"; then bin=$candidate; break; fi; '
@@ -1017,7 +1040,7 @@ def _probe_windows_wsl() -> Dict[str, Any]:
 
 
 def _probe_dsh_hook_capability(dsh_bin: Optional[str]) -> Dict[str, Any]:
-    """探测 DSH CLI 是否已原生支持生命周期硬钩子，用于触发后续元更新。"""
+    """探测 DSH CLI 是否已原生支持生命周期硬钩子，用于触发后续元更新（仅检查顶层 --help，不解析内部实验插件包）。"""
     info: Dict[str, Any] = {
         "hook_protocol": "soft_rules_only",
         "hard_hooks_supported": False,
@@ -1072,7 +1095,11 @@ def detect_installed_apps() -> Dict[str, Any]:
     ) -> Tuple[Optional[str], Optional[str]]:
         standalone_bins = set()
         if user_home is not None:
-            for user_bin in (user_home / ".local" / "bin" / "codex.exe", user_home / ".cargo" / "bin" / "codex.exe"):
+            for user_bin in (
+                user_home / ".local" / "share" / "codex-package" / "bin" / "codex.exe",
+                user_home / ".local" / "bin" / "codex.exe",
+                user_home / ".cargo" / "bin" / "codex.exe",
+            ):
                 try:
                     standalone_bins.add(str(user_bin.resolve()).lower())
                 except OSError:
@@ -1839,7 +1866,8 @@ def codex_skill_target(
 
 
 def _apply_codex_frontier_max(
-    editor: "CodexConfig", cache_path: Path, *, overwrite: bool, repo_root: Optional[Path] = None,
+    editor: "CodexConfig", cache_path: Path, *, overwrite: bool,
+    repo_root: Optional[Path] = None, notices: Optional[List[str]] = None,
 ) -> None:
     """按本机模型目录补齐缺项，显式覆盖时才更新已有模型及挡位。"""
     keys = ("model", "model_reasoning_effort")
@@ -1864,6 +1892,11 @@ def _apply_codex_frontier_max(
                   if isinstance(model, dict) and isinstance(model.get("slug"), str) and model["slug"]]
     except (OSError, ValueError):
         print(f"[*] 未读取到有效的 Codex 模型目录 {cache_path}，默认模型设置保持原样。")
+        if overwrite and notices is not None:
+            notices.append(
+                f"未找到有效 Codex 模型目录 {cache_path}，--sync-model-defaults 未更新默认模型；"
+                "请先完成登录并启动一次 codex 生成缓存，再附 --sync-model-defaults --skip-test 重跑。"
+            )
         return
 
     if cur_model and not overwrite:
@@ -1968,6 +2001,7 @@ def _apply_codex_zotero(editor: "CodexConfig", zotero_exe: str) -> None:
 def _plan_codex_config(
     codex_root: Path, *, include_sandbox: bool, include_model: bool,
     overwrite_model: bool, zotero_exe: Optional[str], repo_root: Optional[Path] = None,
+    notices: Optional[List[str]] = None,
 ) -> Optional["FileChange"]:
     """先在内存中合并 TOML 并校验，双端安装可在写入前统一报错。"""
     editor = CodexConfig(codex_root / "config.toml")
@@ -1975,7 +2009,10 @@ def _plan_codex_config(
     if zotero_exe:
         _apply_codex_zotero(editor, zotero_exe)
     if include_model:
-        _apply_codex_frontier_max(editor, codex_root / "models_cache.json", overwrite=overwrite_model, repo_root=repo_root)
+        _apply_codex_frontier_max(
+            editor, codex_root / "models_cache.json", overwrite=overwrite_model,
+            repo_root=repo_root, notices=notices,
+        )
     return editor.change()
 
 
@@ -3686,6 +3723,36 @@ def audit_upgrade_status(
         codex_version=cx.get("version"), is_sandbox_run=is_sandbox_run,
         hooks_aligned=cx["hooks_aligned"],
     )
+    pkg_iso_warn: Optional[str] = None
+    raw_cx_bin = cx.get("native_binary")
+    if isinstance(raw_cx_bin, str) and raw_cx_bin.strip():
+        try:
+            cx_bin_path = Path(raw_cx_bin).expanduser().resolve()
+            pkg_root = cx_bin_path.parent.parent
+            if (pkg_root / "codex-package.json").is_file():
+                shared_local = (home / ".local").resolve()
+                if pkg_root == shared_local:
+                    pkg_iso_warn = (
+                        "Codex 完整包直接混放于共享 ~/.local 根目录，同目录其他工具符号链接会触发 "
+                        "package link escapes its root；建议迁移至独立目录 ~/.local/share/codex-package/。"
+                    )
+                else:
+                    bin_dir = pkg_root / "bin"
+                    if bin_dir.is_dir():
+                        for entry in bin_dir.iterdir():
+                            if entry.is_symlink():
+                                try:
+                                    if not entry.resolve().is_relative_to(pkg_root):
+                                        pkg_iso_warn = (
+                                            f"Codex 完整包 bin 目录存在指向包根外部的符号链接（{entry.name}），"
+                                            "可能触发 package link escapes its root。"
+                                        )
+                                        break
+                                except OSError:
+                                    pass
+        except OSError:
+            pass
+    cx["package_isolation_warning"] = pkg_iso_warn
 
     cl = _audit_cli(detection.get("claude", {}))
     settings_path = claude_root / "settings.json"
@@ -3818,9 +3885,11 @@ def audit_upgrade_status(
     settings_uses_router = _url_points_to_local_router(env.get("ANTHROPIC_BASE_URL"), port)
     card_uses_router = False
     inspect_cc_db = not is_sandbox_run or explicit_cc
+    cc_tested_max_schema: Optional[int] = None
     if inspect_cc_db:
         try:
             admin = _load_ccswitch_admin(repo_root)
+            cc_tested_max_schema = getattr(admin, "TESTED_MAX_SCHEMA", None)
             probe_port = port if (cl_active and settings_uses_router) else None
             cc.update(admin.inspect_status(ccswitch_db, settings_path, router_port=probe_port))
             current_card = cc.get("current_claude_card")
@@ -3971,6 +4040,13 @@ def audit_upgrade_status(
             actions.append("start_cc_router")
         if cc.get("inspection_error"):
             actions.append("inspect_ccswitch_schema")
+        elif (
+            isinstance(cc.get("schema_version"), int)
+            and not isinstance(cc.get("schema_version"), bool)
+            and isinstance(cc_tested_max_schema, int)
+            and cc["schema_version"] > cc_tested_max_schema
+        ):
+            actions.append("review_ccswitch_schema")
     if errors:
         actions.append("repair_unreadable_configs")
     toolchain = _audit_host_toolchain(is_sandbox_run=is_sandbox_run, detection=detection)
@@ -4463,11 +4539,13 @@ def main() -> None:
             py_cmd = detect_hook_python_command(antigravity=target_plugin_dir is not None)
         if target_plugin_dir is not None:
             agy_hooks = _agy_hooks_bytes((template_dir / "hooks.json").read_bytes(), py_cmd)
+        install_notices: List[str] = []
         if codex_root is not None:
             _validate_path(codex_root / "config.toml", directory=False)
             codex_config_change = _plan_codex_config(
                 codex_root, include_sandbox=not args.no_sandbox_config, include_model=not args.no_model_config,
                 overwrite_model=args.sync_model_defaults, zotero_exe=zotero_exe, repo_root=repo_root,
+                notices=install_notices,
             )
             if not args.no_codex_hooks:
                 codex_hooks_plan = _plan_codex_hooks(
@@ -4638,6 +4716,10 @@ def main() -> None:
             print("\n[!] 自动化回归测试未全部通过，请检查上方输出日志。", file=sys.stderr)
             sys.exit(result.returncode)
 
+    if install_notices:
+        print()
+        for notice in install_notices:
+            print(f"[!] {notice}")
     print("\n" + "=" * 80)
     if args.skip_test:
         print("  指定目标配置同步完成，本次已按参数跳过回归测试。")

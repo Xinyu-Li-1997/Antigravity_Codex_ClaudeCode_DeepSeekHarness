@@ -133,9 +133,10 @@ $$
 
 运行 `install.py --audit-upgrade` 返回 `summary.all_aligned: false` 时，按 `summary.recommended_actions` 处理：
 
-- `refresh_codex_model_catalog`：登录一次客户端生成本地模型目录缓存；
-- `sync_codex_model_defaults` 或 `sync_claude_model_defaults`：需同步推荐默认模型与强度时，加 `--sync-model-defaults` 重跑 `install.py`；
+- `refresh_codex_model_catalog`：先完成登录并实际启动一次 Codex 客户端生成本地模型目录缓存 `models_cache.json`；
+- `sync_codex_model_defaults` 或 `sync_claude_model_defaults`：确认本地模型目录缓存已就绪后，加 `--sync-model-defaults --skip-test` 重跑 `install.py`（全量回归验证时可省略 `--skip-test`）；
 - `review_codex_hook_trust`：Codex 已启用钩子信任记录但部分受管槽位缺失，或 `hooks.json` 存在漂移（只读体检按槽位覆盖度报告 `slots_recorded` 且不复算宿主内部哈希），请在 Codex 交互终端执行 `/hooks` 复核并重新批准；
+- `review_ccswitch_schema`：CC Switch 数据库 `schema_version` 高于 `ccswitch_admin.py` 已测基线，请核查表结构兼容性后更新基线；
 - `start_cc_router`：按需启动本地 `router.py`；
 - `upgrade_dsh_hook_protocol`：官方 DSH CLI 已开放硬钩子，可纳入上游演进；
 - 若 `cross_side_status.dual_side_sync_required` 为 `true`，请在 Windows 与 WSL2 两侧分别同步。

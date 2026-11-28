@@ -5760,6 +5760,90 @@ class TestShard3RouterInstallerFixes(OfflineSandbox):
         self.assertNotIn("LEAK_DIAG_MARKER_991", full_log)
         self.assertNotIn("LEAK_UPSTREAM_MARKER_992", full_log)
 
+    def test_v212_codex_package_discovery_isolation_schema29_and_sync_notice(self):
+        """V2.1.2: 独立 codex-package 优先级、混放 ~/.local 体检告警、schema 29 与 review_ccswitch_schema 及缺缓存汇总提示。"""
+        admin = _load_module("ccswitch_admin_v212", REPO_ROOT / "template/claude/router/ccswitch_admin.py")
+        self.assertEqual(admin.TESTED_MAX_SCHEMA, 29)
+
+        # 1) Windows _native_cli 与 detect_installed_apps 均须优先独立 codex-package 而非更新 mtime 的 MSIX
+        fake_home = self.root / "v212_home"
+        pkg_root = fake_home / ".local" / "share" / "codex-package"
+        pkg_exe = pkg_root / "bin" / "codex.exe"
+        desktop_cache = fake_home / "AppData" / "Local" / "OpenAI" / "Codex" / "bin" / "old" / "codex.exe"
+        msix_exe = self.root / "v212_msix" / "app" / "resources" / "codex.exe"
+        for p in (pkg_exe, desktop_cache, msix_exe):
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(b"MZ-stub")
+        (pkg_root / "codex-package.json").write_text('{"layoutVersion":1,"version":"0.172.0"}', encoding="utf-8")
+        os.utime(pkg_exe, ns=(1_700_000_000_000_000_000, 1_700_000_000_000_000_000))
+        os.utime(msix_exe, ns=(1_900_000_000_000_000_000, 1_900_000_000_000_000_000))
+
+        native_path_cls = type(fake_home)
+        with mock.patch.object(installer.os, "name", "nt"), \
+             mock.patch.object(installer, "Path", native_path_cls), \
+             mock.patch.object(installer.shutil, "which", side_effect=lambda cmd, *a, **kw: str(desktop_cache) if cmd in ("codex", "codex.exe") else None), \
+             mock.patch.object(installer, "_first_executable", side_effect=lambda cands, windows=False: next((str(c) for c in cands if os.path.isfile(str(c))), None)), \
+             mock.patch.object(native_path_cls, "home", return_value=fake_home), \
+             mock.patch.object(installer, "_find_windows_codex_package", return_value=(str(msix_exe), None)), \
+             mock.patch.object(installer, "_probe_windows_wsl", return_value=None), \
+             mock.patch.dict(os.environ, {"LOCALAPPDATA": str(fake_home / "AppData" / "Local")}, clear=False):
+            self.assertEqual(installer._native_cli("codex", fake_home), str(pkg_exe))
+            det = installer.detect_installed_apps()
+            self.assertEqual(native_path_cls(det["codex"]["native_binary"]).resolve(), pkg_exe.resolve())
+
+        # 2) audit_upgrade 检测混放 ~/.local 的 codex-package 告警与超基线 CC Switch schema 建议码
+        sbx_home = self.root / "v212_audit_home"
+        mixed_bin = sbx_home / ".local" / "bin" / ("codex.exe" if os.name == "nt" else "codex")
+        mixed_bin.parent.mkdir(parents=True, exist_ok=True)
+        mixed_bin.write_bytes(b"stub")
+        if os.name != "nt":
+            mixed_bin.chmod(0o755)
+        (sbx_home / ".local" / "codex-package.json").write_text('{"layoutVersion":1}', encoding="utf-8")
+
+        sbx_cc_db = sbx_home / ".cc-switch" / "cc-switch.db"
+        sbx_cc_db.parent.mkdir(parents=True, exist_ok=True)
+        with closing(sqlite3.connect(sbx_cc_db)) as con:
+            con.execute("CREATE TABLE providers (id TEXT PRIMARY KEY, app_type TEXT, name TEXT, settings_config TEXT, is_current INTEGER DEFAULT 0)")
+            con.execute("CREATE TABLE prompts (id TEXT PRIMARY KEY, app_type TEXT, name TEXT, enabled INTEGER DEFAULT 0)")
+            con.execute("CREATE TABLE skills (id TEXT PRIMARY KEY, name TEXT, enabled_claude INTEGER DEFAULT 0, enabled_codex INTEGER DEFAULT 0)")
+            con.execute(f"PRAGMA user_version={admin.TESTED_MAX_SCHEMA + 1}")
+            con.commit()
+
+        fake_det = {
+            "platform": sys.platform, "is_wsl": False, "wsl_probe": None,
+            "antigravity": {"native_installed": False, "native_binary": None, "interop_available": False},
+            "codex": {"native_installed": True, "native_binary": str(mixed_bin), "interop_available": False},
+            "claude": {"native_installed": False, "native_binary": None, "interop_available": False},
+            "dsh": {"native_installed": False, "native_binary": None, "interop_available": False},
+            "cc_switch": {"native_installed": True, "native_desktop_binary": "cc-switch", "interop_available": False},
+        }
+        with mock.patch.object(installer.Path, "home", return_value=sbx_home):
+            rep = installer.audit_upgrade_status(
+                REPO_ROOT, app_scope="all",
+                codex_root=sbx_home / ".codex", claude_root=sbx_home / ".claude",
+                dsh_home=sbx_home / ".dsh", ccswitch_db=sbx_cc_db,
+                detection=fake_det, is_sandbox_run=True,
+            )
+        self.assertIsNotNone(rep["codex"]["package_isolation_warning"])
+        self.assertIn("codex-package", rep["codex"]["package_isolation_warning"])
+        self.assertIn("review_ccswitch_schema", rep["summary"]["recommended_actions"])
+        self.assertFalse(rep["summary"]["all_aligned"])
+
+        # 3) --sync-model-defaults 在缺少 models_cache.json 时末尾输出醒目 [!] 提示
+        sync_cx = self.root / "v212_sync_codex"
+        sync_cx.mkdir(parents=True, exist_ok=True)
+        proc = subprocess.run(
+            [
+                sys.executable, "-B", "-X", "utf8", str(REPO_ROOT / "install.py"),
+                "--app", "codex", "--codex-home", str(sync_cx),
+                "--sync-model-defaults", "--no-codex-hooks", "--no-zotero", "--skip-test", "--yes",
+            ],
+            capture_output=True, text=True, encoding="utf-8", cwd=str(REPO_ROOT), timeout=30,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("[!] 未找到有效 Codex 模型目录", proc.stdout)
+        self.assertIn("--sync-model-defaults --skip-test", proc.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

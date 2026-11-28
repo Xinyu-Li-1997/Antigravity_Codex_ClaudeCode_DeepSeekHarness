@@ -196,7 +196,7 @@ if [ "${#TARGET_PIDS[@]}" -gt 0 ]; then
         sleep 0.2
     fi
 fi
-if ! sudo apt install -y "$deb"; then
+if ! sudo apt install -y "$deb" </dev/null; then
     if [ "$WAS_RUNNING" -eq 1 ] && [ -n "$LAUNCHER" ]; then
         pkg_st="$(dpkg-query -W -f='${Status}' cc-switch 2>/dev/null || true)"
         if [ -n "$pkg_st" ] && [[ "$pkg_st" != *"half-"* && "$pkg_st" != *"deinstall"* && "$pkg_st" != *"unpacked"* && "$pkg_st" != *"not-installed"* ]]; then

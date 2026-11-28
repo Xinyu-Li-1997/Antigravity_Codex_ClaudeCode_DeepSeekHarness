@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 MIN_SUPPORTED_SCHEMA = 23
-TESTED_MAX_SCHEMA = 28
+TESTED_MAX_SCHEMA = 29
 
 KIMI_PLACEHOLDER = "PASTE_KIMI_API_KEY_HERE"
 DEEPSEEK_PLACEHOLDER = "PASTE_DEEPSEEK_API_KEY_HERE"
@@ -1420,7 +1420,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_prompts.add_argument(
         "--app-type",
         action="append",
-        choices=("claude", "codex", "agy", "opencode", "gemini"),
+        choices=("claude", "codex", "agy", "opencode", "gemini", "dsh"),
         help="Optional app_type filter (repeatable; default disables all enabled prompts)",
     )
     p_prompts.add_argument("--dry-run", action="store_true")

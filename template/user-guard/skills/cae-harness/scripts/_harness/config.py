@@ -565,9 +565,26 @@ def _find_binary(name):
             raise HarnessError(f'指定的 {name} 程序不存在')
         return found
     home = Path.home()
+    is_posix = _is_posix()
+
+    def _codex_standalone(user_home, *, windows):
+        exe = 'codex.exe' if windows else 'codex'
+        return (
+            user_home / '.local' / 'share' / 'codex-package' / 'bin' / exe,
+            user_home / '.local' / 'bin' / exe,
+            user_home / '.cargo' / 'bin' / exe,
+        )
+
+    if name == 'codex':
+        for standalone in _codex_standalone(home, windows=not is_posix):
+            if standalone.is_file():
+                return str(standalone)
+
     found = shutil.which(name)
+    if found and is_posix and re.match(r'^/mnt/[a-z]/', Path(found).as_posix().lower()):
+        found = None
     if found and Path(found).suffix.lower() not in ('.cmd', '.bat'):
-        if name == 'codex' and not _is_posix():
+        if name == 'codex' and not is_posix:
             local_app = Path(os.environ.get('LOCALAPPDATA') or (home / 'AppData' / 'Local'))
             codex_bin_root = local_app / 'OpenAI' / 'Codex' / 'bin'
             found_path = Path(found)
@@ -588,32 +605,38 @@ def _find_binary(name):
                     found = None
         if found:
             return found
-    candidates = [home / '.gemini' / 'bin' / ('agy' if _is_posix() else 'agy.exe')] if name == 'agy' else []
-    if name == 'codex' and not _is_posix():
-        for standalone in (home / '.local' / 'bin' / 'codex.exe', home / '.cargo' / 'bin' / 'codex.exe'):
-            if standalone.is_file():
-                return str(standalone)
+    candidates = [home / '.gemini' / 'bin' / ('agy' if is_posix else 'agy.exe')] if name == 'agy' else []
+    if name == 'codex' and not is_posix:
         local_app = Path(os.environ.get('LOCALAPPDATA') or (home / 'AppData' / 'Local'))
         pkg_cli = _find_windows_codex_package_cli() if not os.environ.get('CAE_CODEX_HOME') else None
         candidates.extend(_rank_codex_candidates([*_sorted_codex_binaries(local_app / 'OpenAI' / 'Codex' / 'bin'), pkg_cli]))
-    candidates.append(home / '.local' / 'bin' / (name if _is_posix() else name + '.exe'))
+    candidates.append(home / '.local' / 'bin' / (name if is_posix else name + '.exe'))
     for candidate in candidates:
         if candidate.is_file():
             return str(candidate)
-    if name == 'codex' and _is_posix() and shutil.which('wslpath'):
+    if name == 'codex' and is_posix and shutil.which('wslpath'):
+        win_desktop_bins = []
+        if shutil.which('cmd.exe'):
+            try:
+                win_profile = _windows_env('USERPROFILE')
+                if win_profile:
+                    win_home = Path(_wsl_path(win_profile, windows=False))
+                    for standalone in _codex_standalone(win_home, windows=True):
+                        if standalone.is_file():
+                            return str(standalone)
+            except (HarnessError, OSError):
+                pass
+            try:
+                local_app = Path(_wsl_path(_windows_env('LOCALAPPDATA'), windows=False))
+                win_desktop_bins = _sorted_codex_binaries(local_app / 'OpenAI' / 'Codex' / 'bin')
+            except (HarnessError, OSError):
+                pass
         found_exe = shutil.which('codex.exe')
         found_norm = Path(found_exe).as_posix().lower() if found_exe else ''
         is_alias_stub = '/microsoft/windowsapps/' in found_norm
         in_managed = ('/windowsapps/' in found_norm) or ('/openai/codex/bin/' in found_norm)
         if found_exe and not in_managed:
             return found_exe
-        win_desktop_bins = []
-        if shutil.which('cmd.exe'):
-            try:
-                local_app = Path(_wsl_path(_windows_env('LOCALAPPDATA'), windows=False))
-                win_desktop_bins = _sorted_codex_binaries(local_app / 'OpenAI' / 'Codex' / 'bin')
-            except (HarnessError, OSError):
-                pass
         pkg_cli = _find_windows_codex_package_cli() if not os.environ.get('CAE_CODEX_HOME') else None
         real_found = found_exe if (found_exe and not is_alias_stub) else None
         ranked = _rank_codex_candidates([*win_desktop_bins, pkg_cli, real_found])

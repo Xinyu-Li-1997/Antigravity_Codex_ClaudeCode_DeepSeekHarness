@@ -63,6 +63,14 @@ python -B -X utf8 -m unittest discover -s tests -p "test_*.py" -v
 
 本机已装 `agy` 时配合 `agy plugin validate --strict template/user-guard` 校验清单。
 
+### 宿主机客户端升级核验纪律
+
+获用户授权升级宿主机客户端或工具链二进制时，执行四条硬核验：
+1. **读完发行说明再选包与隔离部署**：下载前必读上游 release notes 与完整资产列表；含配套守护进程或资源目录的多文件分发包（如 `codex-package`）须部署至独立根目录（如 `~/.local/share/<pkg>/`），严禁混压进共享 `~/.local/`。
+2. **禁止假阳性冒烟代替启动验收**：交互界面或守护进程类命令行工具禁止仅以 `--version`、`login status` 或非交互管道退出作为验收依据，须在真实伪终端（POSIX 伪终端或 Windows ConPTY）下实测启动且无包校验或路径逃逸报错。
+3. **按序收尾且最小化用户干预**：仅将浏览器 OAuth 授权与交互式钩子信任留给用户本人；增量补同步默认模型时先确认模型目录缓存已就绪，并由代理直接附 `--skip-test` 执行，避免拖慢用户终端。
+4. **双侧一致性与如实披露**：分别核验 Windows 与 WSL2 目录布局、体检告警及超基线数据库 schema；任何权限回退或未实测边界须明示，严禁隐瞒或以帮助命令冒充启动通过。
+
 ## 提案、同步与重启复核
 
 触及审批节点时用 `fleet_state.py propose` 登记方案，全局同步先运行 `install.py --dry-run --yes` 展示完整路径待用户决定；获批后执行 `approve` 及同步，并用 `install.py --audit-upgrade` 核查 `summary.all_aligned`。主会话客户端升级或切换需重启时，以 `record-pass1`、`verify-pass2` 及 `clear --verified --readback-done --session-id "<重启后会话标识>"`（无活跃重启认领锁时可省略 `--session-id`）通过事实锚定硬门禁后归位：

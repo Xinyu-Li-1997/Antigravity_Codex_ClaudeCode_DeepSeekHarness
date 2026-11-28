@@ -8574,6 +8574,49 @@ else:
         bad_tokens = {f['token'] for f in rep_bad['findings'] if f['category'] == 'ungrounded_identifier'}
         self.assertIn('--bogus-axiom-flag', bad_tokens)
 
+    def test_v212_codex_package_isolated_priority_and_posix_mnt_filter(self):
+        """V2.1.2: 独立 codex-package 与 .local/bin 须优先于 mtime 更新的 WindowsApps/Desktop 与 POSIX /mnt 包装器。"""
+        fake_home = self.root / 'v212-win-home'
+        pkg_bin = fake_home / '.local' / 'share' / 'codex-package' / 'bin' / 'codex.exe'
+        local_bin = fake_home / '.local' / 'bin' / 'codex.exe'
+        desktop_bin = fake_home / 'AppData' / 'Local' / 'OpenAI' / 'Codex' / 'bin' / 'old' / 'codex.exe'
+        msix_bin = self.root / 'v212-winapps' / 'OpenAI.Codex_26.1120_x64' / 'app' / 'resources' / 'codex.exe'
+        for p in (pkg_bin, local_bin, desktop_bin, msix_bin):
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(b'MZ-codex')
+        os.utime(pkg_bin, ns=(1_700_000_000_000_000_000, 1_700_000_000_000_000_000))
+        os.utime(local_bin, ns=(1_700_000_000_000_000_000, 1_700_000_000_000_000_000))
+        os.utime(msix_bin, ns=(1_900_000_000_000_000_000, 1_900_000_000_000_000_000))
+
+        with patch.object(harness, '_is_posix', return_value=False), \
+             patch.object(harness.Path, 'home', return_value=fake_home), \
+             patch.object(harness.shutil, 'which', return_value=str(desktop_bin)), \
+             patch.object(harness, '_find_windows_codex_package_cli', return_value=msix_bin), \
+             patch.dict(os.environ, {'LOCALAPPDATA': str(fake_home / 'AppData' / 'Local')}, clear=True):
+            self.assertEqual(harness._find_binary('codex'), str(pkg_bin))
+
+        pkg_bin.unlink()
+        with patch.object(harness, '_is_posix', return_value=False), \
+             patch.object(harness.Path, 'home', return_value=fake_home), \
+             patch.object(harness.shutil, 'which', return_value=str(msix_bin)), \
+             patch.object(harness, '_find_windows_codex_package_cli', return_value=msix_bin), \
+             patch.dict(os.environ, {'LOCALAPPDATA': str(fake_home / 'AppData' / 'Local')}, clear=True):
+            self.assertEqual(harness._find_binary('codex'), str(local_bin))
+
+        posix_home = self.root / 'v212-posix-home'
+        posix_pkg = posix_home / '.local' / 'share' / 'codex-package' / 'bin' / 'codex'
+        posix_pkg.parent.mkdir(parents=True, exist_ok=True)
+        posix_pkg.write_text('#!/bin/sh\n', encoding='utf-8')
+        with patch.object(harness, '_is_posix', return_value=True), \
+             patch.object(harness.Path, 'home', return_value=posix_home), \
+             patch.object(harness.shutil, 'which', side_effect=lambda cmd, *a, **kw: '/mnt/c/tools/OpenAI/Codex/bin/codex' if cmd == 'codex' else None):
+            self.assertEqual(harness._find_binary('codex'), str(posix_pkg))
+        posix_pkg.unlink()
+        with patch.object(harness, '_is_posix', return_value=True), \
+             patch.object(harness.Path, 'home', return_value=posix_home), \
+             patch.object(harness.shutil, 'which', side_effect=lambda cmd, *a, **kw: '/mnt/c/tools/OpenAI/Codex/bin/codex' if cmd == 'codex' else None):
+            self.assertIsNone(harness._find_binary('codex'))
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
